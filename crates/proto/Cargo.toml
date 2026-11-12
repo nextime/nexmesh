@@ -4,8 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The pairing client pulls in certificate generation and an HTTP client, which
+# `nexmesh-mcpd` has no use for: it is the tiny per-agent shim and should stay
+# that way.
+pair-client = ["dep:rcgen", "dep:reqwest", "dep:anyhow"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+rcgen = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }

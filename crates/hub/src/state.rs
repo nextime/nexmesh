@@ -109,6 +109,11 @@ pub struct AppState {
     respawning: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Where per-agent transcripts live, beside the database.
     pub transcripts: Arc<std::path::PathBuf>,
+    /// Where the fleet CA lives, for signing pairing requests.
+    pki: Arc<std::path::PathBuf>,
+    /// The pairing listener's address, so the dashboard can show the exact
+    /// command to run. None means pairing is switched off.
+    pair_listen: Arc<Option<String>>,
     /// Live node sockets, so the hub can push a spawn or a kill. A node absent
     /// from this map is unreachable, whatever the database says.
     nodes: Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>,
@@ -131,6 +136,8 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             transcripts: Arc::new(transcripts),
+            pki: Arc::new(std::path::PathBuf::from(expand("~/.nexmesh/pki"))),
+            pair_listen: Arc::new(None),
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
@@ -145,6 +152,8 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             transcripts: Arc::new(std::env::temp_dir().join("nexmesh-test-transcripts")),
+            pki: Arc::new(std::env::temp_dir().join("nexmesh-test-pki")),
+            pair_listen: Arc::new(None),
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
@@ -158,6 +167,29 @@ impl AppState {
 
     pub fn end_respawn(&self, slot_id: &str) {
         self.respawning.lock().unwrap().remove(slot_id);
+    }
+
+    pub fn pki_dir(&self) -> std::path::PathBuf {
+        self.pki.as_ref().clone()
+    }
+
+    pub fn with_pki_dir(mut self, dir: &str) -> Self {
+        self.pki = Arc::new(std::path::PathBuf::from(expand(dir)));
+        self
+    }
+
+    pub fn with_pair_listen(mut self, addr: Option<String>) -> Self {
+        self.pair_listen = Arc::new(addr);
+        self
+    }
+
+    pub fn pair_listen(&self) -> Option<String> {
+        self.pair_listen.as_ref().clone()
+    }
+
+    /// Is there a CA to sign pairing requests with?
+    pub fn pki_ready(&self) -> bool {
+        self.pki.join("ca-cert.pem").exists() && self.pki.join("ca-key.pem").exists()
     }
 
     // ------------------------------------------------------------ attach ----

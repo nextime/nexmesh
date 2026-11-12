@@ -8,7 +8,7 @@
 // file, or <https://www.gnu.org/licenses/>, for the full terms.
 
 //! `nexmesh` -- the operator CLI. Runs on any machine and talks to the hub over
-//! HTTP, so it works from the laptop whether or not the laptop hosts anything.
+//! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
 mod install;
 mod tlstrust;
@@ -20,20 +20,24 @@ use serde_json::{json, Value};
 #[derive(Parser)]
 #[command(name = "nexmesh", version, about = "nexmesh fleet control")]
 struct Args {
-    #[arg(long, env = "NEXMESH_HUB_HTTP", default_value = "http://127.0.0.1:7870")]
+    #[arg(long, global = true, env = "NEXMESH_HUB_HTTP", default_value = "http://127.0.0.1:7870")]
     hub: String,
     /// Operator token. Mint one with `nexmesh-hub operator-token <label>`.
-    #[arg(long, env = "NEXMESH_OPERATOR_TOKEN")]
+    #[arg(long, global = true, env = "NEXMESH_OPERATOR_TOKEN")]
     token: Option<String>,
     /// PEM file with the hub's certificate (or its CA), for a self-signed hub.
-    #[arg(long, env = "NEXMESH_CA_CERT")]
+    #[arg(long, global = true, env = "NEXMESH_CA_CERT")]
     ca_cert: Option<String>,
     /// Your client certificate, when the hub requires mutual TLS.
-    #[arg(long, env = "NEXMESH_CLIENT_CERT", requires = "client_key")]
+    #[arg(long, global = true, env = "NEXMESH_CLIENT_CERT", requires = "client_key")]
     client_cert: Option<String>,
     /// Private key for --client-cert.
-    #[arg(long, env = "NEXMESH_CLIENT_KEY", requires = "client_cert")]
+    #[arg(long, global = true, env = "NEXMESH_CLIENT_KEY", requires = "client_cert")]
     client_key: Option<String>,
+    /// Directory holding a paired identity; anything not passed explicitly is
+    /// taken from here.
+    #[arg(long, global = true, env = "NEXMESH_IDENTITY", default_value = nexmesh_proto::identity::DEFAULT_DIR)]
+    identity_dir: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -139,6 +143,23 @@ enum Cmd {
         /// Bytes of scrollback to replay first.
         #[arg(long, default_value_t = 16384)]
         replay: usize,
+    },
+    /// Join a fleet as an operator, using a one-time code from the dashboard.
+    /// Your key is generated here and never leaves this machine.
+    Pair {
+        /// The hub's pairing address, e.g. https://machine-a:7871
+        #[arg(long = "pair-hub")]
+        pair_hub: String,
+        /// The code shown in the dashboard.
+        #[arg(long)]
+        code: String,
+        /// The address to use afterwards, e.g. https://machine-a:7870
+        #[arg(long)]
+        connect: Option<String>,
+        /// Accept the hub's certificate without verifying it, for a first
+        /// contact you have decided to trust.
+        #[arg(long)]
+        insecure: bool,
     },
     /// Register the orchestrator as an MCP server in one of your agent CLIs,
     /// so you can spin up teams from whatever session you are in.
@@ -455,7 +476,25 @@ async fn attach(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // A paired identity supplies anything not given explicitly.
+    let identity = nexmesh_proto::identity::load(&args.identity_dir);
+    if let Some(id) = &identity {
+        if args.token.is_none() {
+            args.token = Some(id.identity.token.clone());
+        }
+        if args.ca_cert.is_none() {
+            args.ca_cert = Some(id.ca_cert_path());
+        }
+        if args.client_cert.is_none() && args.client_key.is_none() {
+            args.client_cert = Some(id.cert_path());
+            args.client_key = Some(id.key_path());
+        }
+        if let (Some(h), true) = (&id.identity.hub, args.hub == "http://127.0.0.1:7870") {
+            args.hub = h.clone();
+        }
+    }
+
     let base = args.hub.trim_end_matches('/').to_string();
     let _ = TOKEN.set(args.token.clone());
     let identity = match (&args.client_cert, &args.client_key) {
@@ -662,6 +701,20 @@ async fn main() -> Result<()> {
 
         Cmd::Attach { session, who, replay } => {
             attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref(), identity).await?;
+        }
+
+        Cmd::Pair { pair_hub, code, connect, insecure } => {
+            let p = nexmesh_proto::pair_client::pair(
+                &pair_hub, &code, &args.identity_dir,
+                connect.as_deref(), args.ca_cert.as_deref(), insecure,
+            )
+            .await?;
+            println!("Paired as {} '{}'.", p.kind, p.name);
+            println!("Identity written to {}", p.identity_file.display());
+            println!("\nTry it:  nexmesh nodes");
+            println!("Then give your CLIs the orchestrator:");
+            println!("  nexmesh install-orchestrator --cli claude");
+            return Ok(());
         }
 
         Cmd::InstallOrchestrator { cli_id, clis, name, orch, dry_run } => {

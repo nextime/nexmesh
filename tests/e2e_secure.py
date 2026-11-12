@@ -58,7 +58,7 @@ def main():
     global CTX
     print("=== 1. the hub generates its own certificate ===")
     r = hub_cli("gen-cert", "--host", "127.0.0.1", "--host", "localhost",
-                "--host", "sissy", "--out", T)
+                "--host", "machine-b", "--out", T)
     cert, key = f"{T}/cert.pem", f"{T}/key.pem"
     check("gen-cert wrote a cert and key", os.path.exists(cert) and os.path.exists(key), r.stdout + r.stderr)
     check("the private key is not world-readable",
@@ -78,7 +78,7 @@ def main():
           "operator-token" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-200:])
 
     print("\n=== 3. mint an operator token and start with TLS ===")
-    out = hub_cli("operator-token", "laptop").stdout
+    out = hub_cli("operator-token", "machine-b").stdout
     optok = [l.split()[1] for l in out.splitlines() if l.startswith("token:")][0]
     check("operator token minted", len(optok) == 48, out)
     check("the token itself is never stored",
@@ -125,10 +125,10 @@ def main():
           s == 401, f"{s} {j}")
 
     print("\n=== 6. a node enrols over wss:// trusting that certificate ===")
-    tok = hub_cli("enrol", "sissy").stdout
+    tok = hub_cli("enrol", "machine-b").stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"wss://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", f"{ROOT}/clis", "--sock", SOCK,
+        "--name", "machine-b", "--clis", f"{ROOT}/clis", "--sock", SOCK,
         "--mcpd", f"{BIN}/nexmesh-mcpd", "--ca-cert", cert],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
@@ -145,7 +145,7 @@ def main():
     # than waiting for it to give up.
     logf = f"{T}/untrusted.log"
     p2 = subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"wss://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", f"{ROOT}/clis", "--sock", f"{T}/n2.sock",
+        "--name", "machine-b", "--clis", f"{ROOT}/clis", "--sock", f"{T}/n2.sock",
         "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(logf, "w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1"))
@@ -164,7 +164,7 @@ def main():
     print("\n=== 8. the real CLI, with and without the token ===")
     r = nexmesh("nodes", token=optok, ca=cert)
     check("nexmesh nodes works with a token over TLS",
-          r.returncode == 0 and "sissy" in r.stdout, r.stdout + r.stderr)
+          r.returncode == 0 and "machine-b" in r.stdout, r.stdout + r.stderr)
     r = nexmesh("nodes", ca=cert)
     check("nexmesh nodes fails cleanly without a token",
           r.returncode != 0 and "authentication required" in (r.stdout + r.stderr),
@@ -178,7 +178,7 @@ def main():
           r.returncode != 0, (r.stdout + r.stderr)[-200:])
 
     print("\n=== 9. revocation takes effect ===")
-    hub_cli("revoke-operator", "laptop")
+    hub_cli("revoke-operator", "machine-b")
     s, j = https("GET", "/v1/nodes", token=optok)
     check("a revoked operator token stops working", s == 401, f"{s} {j}")
     r = hub_cli("operators")

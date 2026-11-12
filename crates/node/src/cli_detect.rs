@@ -1,9 +1,9 @@
 //! Find which agent CLIs this machine can actually run.
 //!
-//! Agent CLIs install themselves in awkward places -- on this laptop claude is
-//! in ~/.local/bin, opencode in ~/.opencode/bin and qwen in ~/.npm-global/bin,
-//! none of which are on a non-login shell's PATH. Each descriptor therefore
-//! carries its own `extra_paths`.
+//! Agent CLIs install themselves in awkward places: claude in ~/.local/bin,
+//! opencode in ~/.opencode/bin, qwen in ~/.npm-global/bin -- none of which are
+//! on a non-login shell's PATH. Each descriptor therefore carries its own
+//! `extra_paths`.
 
 use anyhow::{Context, Result};
 use nexmesh_proto::cli_descriptor::CliDescriptor;

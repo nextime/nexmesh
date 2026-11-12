@@ -677,7 +677,7 @@ mod tests {
         ).unwrap();
         db.execute(
             "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,last_seen_ms,lease_expires_ms)
-             VALUES ('n-zeiss','zeiss','linux','x86_64','0.1.0','online',?,?,?)",
+             VALUES ('n-machine-a','machine-a','linux','x86_64','0.1.0','online',?,?,?)",
             params![now, now, now + 60000],
         ).unwrap();
         db.execute(
@@ -698,8 +698,8 @@ mod tests {
             ).unwrap();
         }
         for (aid, slot, prov, node) in [
-            ("a-eng", "sl-eng", "managed", Some("n-zeiss")),
-            ("a-rev", "sl-rev", "managed", Some("n-zeiss")),
+            ("a-eng", "sl-eng", "managed", Some("n-machine-a")),
+            ("a-rev", "sl-rev", "managed", Some("n-machine-a")),
             ("a-ext", "sl-ext", "external", None),
         ] {
             db.execute(
@@ -809,10 +809,10 @@ mod tests {
         let now = now_ms();
         db.execute(
             "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,last_seen_ms,lease_expires_ms)
-             VALUES ('n-lisa','lisa','linux','x86_64','0.1.0','online',?,?,?)",
+             VALUES ('n-machine-c','machine-c','linux','x86_64','0.1.0','online',?,?,?)",
             params![now, now, now + 60000],
         ).unwrap();
-        for (wid, node) in [("w-z", "n-zeiss"), ("w-l", "n-lisa")] {
+        for (wid, node) in [("w-z", "n-machine-a"), ("w-l", "n-machine-c")] {
             db.execute(
                 "INSERT INTO workspaces (id, session_id, name, kind, node_id) VALUES (?,'s1',?, 'node_local', ?)",
                 params![wid, wid, node],

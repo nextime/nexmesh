@@ -1,4 +1,4 @@
-# Claude Code. Verified against the binary on sissy.
+# Claude Code. Verified against the binary on machine-b.
 [cli]
 id = "claude"
 display_name = "Claude Code"

@@ -73,14 +73,14 @@ class Mcpd:
 def main():
     optok = [l.split()[1] for l in hub_cli("operator-token", "dash").stdout.splitlines()
              if l.startswith("token:")][0]
-    tok = [l.split()[1] for l in hub_cli("enrol", "sissy").stdout.splitlines()
+    tok = [l.split()[1] for l in hub_cli("enrol", "machine-b").stdout.splitlines()
            if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
         f"127.0.0.1:{PORT}", "serve"], stdout=open(f"{T}/hub.log","w"),
         stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
     until(lambda: req("/healthz")[1].get("ok"))
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", f"{ROOT}/clis", "--sock", SOCK,
+        "--name", "machine-b", "--clis", f"{ROOT}/clis", "--sock", SOCK,
         "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
@@ -112,7 +112,7 @@ def main():
     print("\n=== build a session with something in it ===")
     sid = req("/v1/sessions", optok, "POST", {"name": "dash-demo", "workspaces": [
         {"name": "app", "kind": "repo", "repo_url": "git@git:app.git",
-         "mounts": {"sissy": WS}}],
+         "mounts": {"machine-b": WS}}],
         "plan": ["design", "implement", "review"]})[1]["session_id"]
     max_ = Mcpd(sid, "Max", "engineer"); iris = Mcpd(sid, "Iris", "code reviewer")
     pt = [l.split()[1] for l in hub_cli("participant-token", "hermes", "--session", sid)

@@ -1224,6 +1224,7 @@ dependencies = [
  "nexmesh-proto",
  "nix 0.29.0",
  "portable-pty",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1256,6 +1257,9 @@ dependencies = [
 name = "nexmesh-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "rcgen",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

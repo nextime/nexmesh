@@ -102,6 +102,21 @@
   .bar > i { display: block; height: 100%; background: var(--ok); }
 
   .empty { padding: 26px 16px; color: var(--dim); text-align: center; }
+  .pair { padding: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .pair input[type=text] { width: 150px; }
+  .code {
+    margin: 12px; padding: 14px 16px; border-radius: 10px;
+    background: color-mix(in srgb, var(--ok) 12%, var(--panel2));
+    border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+  }
+  .code .big {
+    font-family: var(--mono); font-size: 25px; letter-spacing: 2px;
+    font-weight: 650; user-select: all;
+  }
+  .code pre {
+    margin: 10px 0 0; padding: 9px 11px; background: var(--bg); border-radius: 7px;
+    overflow-x: auto; font-family: var(--mono); font-size: 12.5px; user-select: all;
+  }
   .err {
     margin: 12px 16px 0; padding: 10px 13px; border-radius: 8px;
     background: color-mix(in srgb, var(--bad) 14%, var(--panel));
@@ -270,21 +285,43 @@ function render() {
     tile((snap.nodes || []).filter((n) => n.connected).length + "/" + (snap.nodes || []).length, "nodes"),
   ].join("");
 
+  const openCodes = (snap.pairing || []).filter((c) => c.state === "open").length;
   const counts = {
     agents: (d && d.agents || []).length, messages: (d && d.messages || []).length,
     plan: (d && d.plan || []).length, knowledge: (d && d.knowledge || []).length,
     files: ((d && d.locks || []).length + (d && d.zones || []).length),
-    fleet: (snap.nodes || []).length,
+    fleet: (snap.nodes || []).length + openCodes,
   };
   $("tabs").innerHTML = TABS.map((t) =>
     `<button aria-selected="${t === tab}" onclick="location.hash='${t}'">${t}` +
     `<span class="count"> ${counts[t] || 0}</span></button>`).join("");
 
-  $("view").innerHTML = !d
+  // The view is replaced wholesale on every poll, which would eat anything
+  // being typed and wipe a freshly minted code off the screen. Carry that
+  // state across the rebuild, caret included.
+  const keep = {
+    name: $("pairName") ? $("pairName").value : null,
+    start: $("pairName") ? $("pairName").selectionStart : null,
+    end: $("pairName") ? $("pairName").selectionEnd : null,
+    out: $("pairOut") ? $("pairOut").innerHTML : null,
+    focus: document.activeElement ? document.activeElement.id : null,
+  };
+
+  $("view").innerHTML = (!d && tab !== "fleet")
     ? `<div class="panel"><div class="empty">No sessions yet. Create one with
-         <code>nexmesh new-session &lt;name&gt;</code>.</div></div>`
+         <code>nexmesh new-session &lt;name&gt;</code>, or pair a machine on the
+         <a href="#fleet">fleet</a> tab.</div></div>`
     : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
          knowledge: viewKnowledge, files: viewFiles, fleet: viewFleet })[tab](d, now);
+
+  if (keep.name !== null && $("pairName")) {
+    $("pairName").value = keep.name;
+    if (keep.focus === "pairName") {
+      $("pairName").focus();
+      try { $("pairName").setSelectionRange(keep.start, keep.end); } catch (e) {}
+    }
+  }
+  if (keep.out && $("pairOut")) $("pairOut").innerHTML = keep.out;
 
   if (tab === "messages") {
     const f = document.querySelector(".feed");
@@ -402,17 +439,97 @@ function viewFiles(d, now) {
   return out;
 }
 
-function viewFleet() {
+function viewFleet(d, now) {
   const n = snap.nodes || [];
-  if (!n.length) return empty("No nodes enrolled. Run nexmesh-hub enrol <name> and start a node.");
-  return panel(`<table><thead><tr><th>Node</th><th>State</th><th class="hide">Platform</th>
-      <th>Agent CLIs</th></tr></thead><tbody>` +
-    n.map((x) => `<tr>
-      <td class="mono">${esc(x.name)}</td>
-      <td><span class="badge ${x.connected ? "ok" : "bad"}">${x.connected ? "connected" : esc(x.status)}</span></td>
-      <td class="hide muted tiny">${esc(x.os)}/${esc(x.arch)}</td>
-      <td class="mono tiny">${(x.clis || []).map(esc).join(" · ") || "<span class=muted>none</span>"}</td>
-    </tr>`).join("") + "</tbody></table>");
+  let out = n.length
+    ? panel(`<table><thead><tr><th>Node</th><th>State</th><th class="hide">Platform</th>
+        <th>Agent CLIs</th></tr></thead><tbody>` +
+      n.map((x) => `<tr>
+        <td class="mono">${esc(x.name)}</td>
+        <td><span class="badge ${x.connected ? "ok" : "bad"}">${x.connected ? "connected" : esc(x.status)}</span></td>
+        <td class="hide muted tiny">${esc(x.os)}/${esc(x.arch)}</td>
+        <td class="mono tiny">${(x.clis || []).map(esc).join(" · ") || "<span class=muted>none</span>"}</td>
+      </tr>`).join("") + "</tbody></table>")
+    : empty("No machines yet. Pair one below.");
+
+  out += `<h3 class="tiny muted" style="margin:16px 2px 4px">Pairing</h3>`;
+  if (!snap.hub.pair_listen) {
+    out += empty("Pairing is off. Start the hub with --pair-listen <addr:port> to turn it on.");
+    return out;
+  }
+  if (!snap.hub.pki_ready) {
+    out += empty("No certificate authority yet. Run `nexmesh-hub pki init --host <this host>` once.");
+    return out;
+  }
+  out += panel(`<div class="pair">
+      <input id="pairName" type="text" placeholder="name, e.g. machine-b" spellcheck="false">
+      <button onclick="mint('node')">Pair a machine</button>
+      <button onclick="mint('operator')">Pair an operator</button>
+      <span class="tiny muted">a one-time code, valid 15 minutes</span>
+    </div><div id="pairOut"></div>` + pairTable(now));
+  return out;
+}
+
+function pairTable(now) {
+  const codes = (snap.pairing || []).filter((c) => c.state !== "expired" || false);
+  if (!codes.length) return "";
+  return `<table><thead><tr><th>Name</th><th>Kind</th><th>State</th>
+      <th class="num">Expires</th><th></th></tr></thead><tbody>` +
+    codes.map((c) => `<tr>
+      <td class="mono">${esc(c.name)}</td>
+      <td class="muted tiny">${esc(c.kind)}</td>
+      <td><span class="badge ${c.state === "open" ? "warn" : c.state === "used" ? "ok" : ""}">${esc(c.state)}</span></td>
+      <td class="num tiny muted">${c.state === "open" ? "in " + ago(2 * now - c.expires_at_ms, now) : "—"}</td>
+      <td class="num">${c.state === "open"
+        ? `<button class="tiny" onclick="revokeCode('${esc(c.id)}')">revoke</button>` : ""}</td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+
+/// The address a freshly paired machine should dial. The hub may be bound to a
+/// wildcard, which is useless to type, so fall back to whatever host the
+/// browser used to get here.
+function pairUrl() {
+  const bind = String(snap.hub.pair_listen || "");
+  const port = bind.split(":").pop();
+  const host = bind.replace(/:[^:]*$/, "");
+  const useful = host && !["0.0.0.0", "[::]", "::", ""].includes(host) ? host : location.hostname;
+  return `${location.protocol}//${useful}:${port}`;
+}
+
+async function mint(kind) {
+  const name = ($("pairName").value || "").trim();
+  if (!name) { $("pairName").focus(); return; }
+  const headers = { "content-type": "application/json" };
+  if (token) headers.authorization = "Bearer " + token;
+  const r = await fetch("/v1/pair/codes", { method: "POST", headers,
+    body: JSON.stringify({ kind, name }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    $("pairOut").innerHTML = `<div class="err">${esc(j.error || "could not create a code")}</div>`;
+    return;
+  }
+  // The code is shown once, here. It is not in the snapshot and cannot be
+  // fetched again.
+  const hubUrl = location.origin;
+  const cmd = kind === "node"
+    ? `nexmesh-node pair --hub ${pairUrl()} --code ${j.code} \\\n    --connect ${hubUrl.replace(/^http/, "ws")}`
+    : `nexmesh pair --pair-hub ${pairUrl()} --code ${j.code} --connect ${hubUrl}`;
+  $("pairOut").innerHTML = `<div class="code">
+      <div class="tiny muted">one-time code for ${esc(j.kind)} “${esc(j.name)}” —
+        shown once, expires in ${j.ttl_minutes} minutes</div>
+      <div class="big">${esc(j.code)}</div>
+      <div class="tiny muted" style="margin-top:9px">Run this on ${esc(j.name)}:</div>
+      <pre>${esc(cmd)}</pre>
+      <div class="tiny muted">Its key is generated there and never sent here.</div>
+    </div>`;
+  tick();
+}
+
+async function revokeCode(id) {
+  const headers = {};
+  if (token) headers.authorization = "Bearer " + token;
+  await fetch(`/v1/pair/codes/${encodeURIComponent(id)}/revoke`, { method: "POST", headers });
+  tick();
 }
 
 // Try without a token first: a hub with no operator tokens is open, and asking

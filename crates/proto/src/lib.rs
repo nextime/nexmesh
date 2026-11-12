@@ -11,13 +11,16 @@
 //!
 //! Transport shape: a node always *dials out* to the hub and holds one
 //! long-lived WebSocket. The hub never opens a connection to a node. That one
-//! decision is what lets a node live behind NAT, on a roaming laptop, or on a
+//! decision is what lets a node live behind NAT, on a roaming machine, or on a
 //! public host with no inbound port, without any later redesign.
 //!
 //! Everything below -- spawns, kills, message injection and interactive
 //! attach -- is multiplexed over that single socket.
 
 pub mod cli_descriptor;
+pub mod identity;
+#[cfg(feature = "pair-client")]
+pub mod pair_client;
 pub mod localsock;
 pub mod tools;
 
@@ -467,8 +470,8 @@ mod tests {
 
     #[test]
     fn lock_scopes_do_not_collide() {
-        let n = LockScope::Node { node_id: "zeiss".into() };
-        let w = LockScope::Workspace { workspace_id: "zeiss".into() };
+        let n = LockScope::Node { node_id: "machine-a".into() };
+        let w = LockScope::Workspace { workspace_id: "machine-a".into() };
         assert_ne!(n.as_key(), w.as_key());
     }
 

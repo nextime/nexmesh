@@ -77,7 +77,7 @@ mod tests {
             role: "engineer",
             role_description: "You write the implementation.",
             session_name: "auth",
-            node_name: "zeiss",
+            node_name: "machine-a",
             workspace_path: "/srv/app",
             shared_workspace: shared,
             task: "Build the login flow.",
@@ -88,7 +88,7 @@ mod tests {
     fn the_prompt_names_the_agent_its_machine_and_its_task() {
         let p = first_prompt(&brief(true));
         assert!(p.contains("You are Max, the engineer"));
-        assert!(p.contains("zeiss"));
+        assert!(p.contains("machine-a"));
         assert!(p.contains("/srv/app"));
         assert!(p.contains("Build the login flow."));
         assert!(p.contains("signal_done"));

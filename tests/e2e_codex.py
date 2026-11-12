@@ -61,7 +61,7 @@ def until(fn, seconds=30.0, step=0.3):
     return None
 
 def main():
-    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
                          capture_output=True, text=True).stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
@@ -69,7 +69,7 @@ def main():
         stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
     until(lambda: http("GET", "/healthz")[1].get("ok"))
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
                  FAKECODEX_LOG=FAKELOG)))
@@ -77,11 +77,11 @@ def main():
     check("node online with the app-server test agent", bool(ok))
 
     sid = http("POST", "/v1/sessions", {"name": "codextest", "workspaces": [
-        {"name": "local", "kind": "node_local", "node": "sissy", "mounts": {"sissy": WS}}]})[1]["session_id"]
+        {"name": "local", "kind": "node_local", "node": "machine-b", "mounts": {"machine-b": WS}}]})[1]["session_id"]
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "fakecodex",
         "mode": "headless", "display_name": "Cx", "role": "engineer",
         "workspace": "local", "task": "exercise the app-server driver",
-        "placement": {"node": "sissy"}})
+        "placement": {"node": "machine-b"}})
     slot = j["slot_id"]
     check("slot created", s == 200, str(j))
     s, j = http("POST", f"/v1/slots/{slot}/spawn")

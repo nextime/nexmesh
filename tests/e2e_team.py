@@ -87,7 +87,7 @@ def main():
     os.makedirs(WS_DIR, exist_ok=True)
 
     print("\n=== 1. hub up, node enrolled ===")
-    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
                          capture_output=True, text=True).stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     hub = subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen", f"127.0.0.1:{PORT}", "serve"],
@@ -97,8 +97,8 @@ def main():
     check("hub answers /healthz", wait_http())
 
     node = subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", f"{ROOT}/clis", "--sock", SOCK,
-        "--mcpd", f"{BIN}/nexmesh-mcpd", "--label", "laptop"],
+        "--name", "machine-b", "--clis", f"{ROOT}/clis", "--sock", SOCK,
+        "--mcpd", f"{BIN}/nexmesh-mcpd", "--label", "machine-b"],
         stdout=open(f"{_T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1"))
     procs.append(node)
@@ -115,8 +115,8 @@ def main():
 
     print("\n=== 2. session with a node-local workspace ===")
     s, j = http("POST", "/v1/sessions", {"name": "e2e",
-        "workspaces": [{"name": "local", "kind": "node_local", "node": "sissy",
-                        "mounts": {"sissy": WS_DIR}}],
+        "workspaces": [{"name": "local", "kind": "node_local", "node": "machine-b",
+                        "mounts": {"machine-b": WS_DIR}}],
         "plan": ["wire the chain", "prove delivery"]})
     check("session created", s == 200 and "session_id" in j, str(j))
     sid = j.get("session_id")
@@ -199,7 +199,7 @@ def main():
     check("provenance distinguishes attached from external",
           provs.get("Max") == "attached" and provs.get("Hermes") == "external", str(provs))
     hosts = {a["name"]: a["host"] for a in j["agents"]}
-    check("the CLI agent is located on its machine", hosts.get("Max") == "sissy", str(hosts))
+    check("the CLI agent is located on its machine", hosts.get("Max") == "machine-b", str(hosts))
 
     print("\n=== 8. locks are node-scoped for a node-local workspace ===")
     t = max_.tool("acquire_file", {"path": "src/main.rs", "purpose": "edit"})

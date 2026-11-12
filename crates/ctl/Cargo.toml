@@ -9,7 +9,7 @@ name = "nexmesh"
 path = "src/main.rs"
 
 [dependencies]
-nexmesh-proto = { workspace = true }
+nexmesh-proto = { workspace = true, features = ["pair-client"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }

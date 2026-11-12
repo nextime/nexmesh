@@ -9,7 +9,7 @@ name = "nexmesh-node"
 path = "src/main.rs"
 
 [dependencies]
-nexmesh-proto = { workspace = true }
+nexmesh-proto = { workspace = true, features = ["pair-client"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
@@ -17,6 +17,7 @@ nix = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }

@@ -88,7 +88,7 @@ def main():
     check("it has produced output before nexmesh ever saw it",
           "FAKETUI READY" in pane, pane[:200])
 
-    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
                          capture_output=True, text=True).stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
@@ -102,7 +102,7 @@ def main():
     # Deliberately start the node from inside a TMUX env var, the condition
     # that makes a nested client refuse.
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
                  TMUX="/tmp/fake-tmux-socket,1234,0")))
@@ -117,7 +117,7 @@ def main():
     print("\n=== 2. adopt it ===")
     sid = http("POST", "/v1/sessions", {"name": "adopttest"})[1]["session_id"]
     s, j = http("POST", f"/v1/sessions/{sid}/adopt",
-        {"node": "sissy", "tmux_target": SRC, "name": "Legacy", "role": "pre-existing"})
+        {"node": "machine-b", "tmux_target": SRC, "name": "Legacy", "role": "pre-existing"})
     check("adopt accepted", s == 200 and j.get("slot_id"), str(j))
     check("the reply is honest about it not being a team member",
           "not a team member" in json.dumps(j).lower(), str(j))
@@ -127,9 +127,9 @@ def main():
     check("attach succeeds", t.expect("attached to Legacy"), t.buf[-300:])
     check("we see the screen of the session that was already running",
           t.expect("FAKETUI READY"), t.buf[-500:])
-    t.send("hello from sissy\n")
+    t.send("hello from machine-b\n")
     check("we can type into the adopted session",
-          t.expect("you said: hello from sissy"), t.buf[-500:])
+          t.expect("you said: hello from machine-b"), t.buf[-500:])
 
     print("\n=== 4. the original session is undisturbed ===")
     sessions = tmux("list-sessions", "-F", "#{session_name} #{session_group}")
@@ -139,7 +139,7 @@ def main():
           any(SRC in l for l in grouped), sessions)
     pane = tmux("capture-pane", "-p", "-t", SRC)
     check("what we typed landed in the original pane",
-          "hello from sissy" in pane, pane[-300:])
+          "hello from machine-b" in pane, pane[-300:])
 
     print("\n=== 5. detaching leaves everything running ===")
     t.send("\x1d")
@@ -154,7 +154,7 @@ def main():
 
     print("\n=== 6. a bad target fails cleanly ===")
     s, j = http("POST", f"/v1/sessions/{sid}/adopt",
-        {"node": "sissy", "tmux_target": "", "name": "Bad"})
+        {"node": "machine-b", "tmux_target": "", "name": "Bad"})
     check("an empty target is refused", s >= 400, f"{s} {j}")
     before = len(http("GET", f"/v1/sessions/{sid}/status")[1]["agents"])
     s, j = http("POST", f"/v1/sessions/{sid}/adopt",

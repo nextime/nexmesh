@@ -1,4 +1,4 @@
-# Gemini CLI. Not installed on sissy.
+# Gemini CLI. Not installed on machine-b.
 [cli]
 id = "gemini"
 display_name = "Gemini CLI"

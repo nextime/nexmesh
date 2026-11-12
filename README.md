@@ -51,7 +51,7 @@ of the four is a port away:
 | `process.kill(pid, 0)` on pids from the DB (`broker.ts:326,372,593,1658`) | Every node has a pid 4242. A hub probing or signalling a remote agent's pid hits an unrelated **local** process. | Identity is `(node_id, pid, start_ticks)`. The hub cannot signal anything; only the owning node can, after verifying the triple. |
 | No auth anywhere on the broker HTTP API | The API spawns processes, so exposing the socket is RCE. | Per-node enrolment tokens, SHA-256 at rest, verified before any frame is honoured. The token decides identity, so a node can't claim another's history. |
 | `Bun.spawn` + stdio pipes in the orchestrator | A pipe does not cross a machine boundary, so the driver must live where the CLI does. | A `node` daemon per machine owns spawning and driving. This component has no equivalent in the original. |
-| Locks keyed `(session_id, file_path)` | `src/**` on zeiss is not `src/**` on lisa. | Locks are keyed by **scope**: `node:<id>` for local work, `ws:<id>` for a tree several machines hold. |
+| Locks keyed `(session_id, file_path)` | `src/**` on machine-a is not `src/**` on machine-c. | Locks are keyed by **scope**: `node:<id>` for local work, `ws:<id>` for a tree several machines hold. |
 
 Plus: its three bespoke CLI drivers become declarative descriptors, so adding
 a CLI is a TOML file rather than a Rust change — and an agent no longer has to
@@ -60,7 +60,7 @@ be a CLI at all.
 ## Shape
 
 ```
-        laptop (roaming)            zeiss (always on)           any other host
+          machine B (roaming)              machine A (always on)            any other machine
    ┌────────────────────┐      ┌─────────────────────┐      ┌──────────────────┐
    │ nexmesh (ctl)      │      │   nexmesh-hub       │      │  nexmesh-node    │
    │ nexmesh-node       │──────▶  SQLite: sessions,  ◀──────│  spawns + drives │
@@ -75,7 +75,7 @@ be a CLI at all.
 A node **always dials out** to the hub and holds one WebSocket; the hub never
 connects to a node. Spawns, kills, message injection and interactive attach are
 all multiplexed over that socket. That single choice is why a node works
-unchanged on a roaming laptop, behind NAT, or on a public host with no inbound
+unchanged on a roaming machine, behind NAT, or on a public host with no inbound
 port — so starting with two machines does not paint us into a corner.
 
 ## Binaries
@@ -172,7 +172,7 @@ nexmesh install-orchestrator --cli claude   --token <operator-token>
 nexmesh install-orchestrator --cli opencode --token <operator-token>
 # then, in that CLI:
 #   "list my nodes"
-#   "start a team on zeiss: a claude engineer to build the login flow and an
+#   "start a team on machine-a: a claude engineer to build the login flow and an
 #    opencode reviewer; the repo is at /srv/app"
 ```
 
@@ -338,7 +338,7 @@ forever.
 ## Adopting a session that is already running
 
 ```bash
-nexmesh adopt se-1234abcd --node zeiss --tmux work --name Legacy
+nexmesh adopt se-1234abcd --node machine-a --tmux work --name Legacy
 nexmesh attach se-1234abcd Legacy
 ```
 
@@ -373,9 +373,9 @@ Attach relays a pty **the node created**. That distinction decides what works:
 | adopted with `nexmesh adopt` | the real terminal: watch **and type**, alongside your own client |
 | an external participant (a hermes agent) | nothing — there is no terminal at all |
 
-So a `claude` agent that nexmesh launched on zeiss in interactive mode is fully
-drivable from the laptop. A `claude` you started yourself in a bare ssh session
-on zeiss is **not**: that pty belongs to your shell. Start it inside tmux and
+So a `claude` agent that nexmesh launched on machine-a in interactive mode is fully
+drivable from machine B. A `claude` you started yourself in a bare ssh session
+on machine-a is **not**: that pty belongs to your shell. Start it inside tmux and
 `nexmesh adopt` reaches it — see above.
 
 ## Security
@@ -394,19 +394,50 @@ protected by default rather than by remembering. Revoking the last operator
 token does **not** turn authentication off — that would open the fleet at the
 exact moment you are reacting to a leak.
 
+**Pairing: no certificate wrangling.** Copying key material around by hand is
+how this goes wrong, so a machine or a person joins with a one-time code from
+the dashboard's **fleet** tab (or `POST /v1/pair/codes`):
+
+```bash
+# shown in the dashboard, to run on the new machine:
+nexmesh-node pair --hub https://machine-a:7871 --code JVJB-FQXS-4N8C-DCR7 \
+    --connect wss://machine-a:7870
+nexmesh-node                      # no flags: it reads the identity it was given
+
+# and for a person:
+nexmesh pair --pair-hub https://machine-a:7871 --code ... --connect https://machine-a:7870
+nexmesh nodes                     # likewise
+```
+
+The key pair is generated **on the joining machine** and the private key never
+travels: only a certificate request goes to the hub, which signs it and sends
+back a certificate, the CA certificate and a token. The hub never sees the key,
+and nor does anyone watching the wire.
+
+The code is the whole boundary for that moment, so: bound in advance to one
+identity, single-use, expiring in minutes, stored only as a hash, shown exactly
+once, and revocable from the dashboard. A requester does not get to choose the
+name it is issued — the hub replaces the subject with the one the code was
+bound to. Every failure gives the same message, so nobody can probe which codes
+exist.
+
+A machine being paired has no certificate yet, so it cannot use the mutual-TLS
+port. Pairing therefore gets its own listener (`--pair-listen`), serving only
+the claim endpoint, and it is off unless you ask for it.
+
 **Mutual TLS: yes.** A token is a bearer secret — copy it and you are that
 node. A client certificate adds something that cannot be lifted out of a log,
 an environment listing or a config file, so reaching the hub needs both.
 
 ```bash
-nexmesh-hub pki init --host zeiss --host 192.168.42.3   # CA + the hub's own cert
-nexmesh-hub pki issue zeiss --out /tmp/zeiss            # one per node, and per operator
+nexmesh-hub pki init --host machine-a --host 10.0.0.2   # CA + the hub's own cert
+nexmesh-hub pki issue machine-a --out /tmp/machine-a    # by hand, if you prefer
 nexmesh-hub --tls-cert ~/.nexmesh/pki/server-cert.pem \
             --tls-key  ~/.nexmesh/pki/server-key.pem \
             --client-ca ~/.nexmesh/pki/ca-cert.pem --listen 0.0.0.0:7870 serve
 
-nexmesh-node --hub wss://zeiss:7870 --ca-cert ca-cert.pem \
-             --client-cert zeiss-cert.pem --client-key zeiss-key.pem
+nexmesh-node --hub wss://machine-a:7870 --ca-cert ca-cert.pem \
+             --client-cert machine-a-cert.pem --client-key machine-a-key.pem
 ```
 
 The CA key never leaves the hub; a node gets only `ca-cert.pem` plus its own
@@ -427,11 +458,11 @@ the hub issued. That is a narrowing worth having and it is not done.
 **Encrypted: yes, natively.**
 
 ```bash
-nexmesh-hub gen-cert --host zeiss --host 192.168.42.3     # self-signed, key mode 0600
+nexmesh-hub gen-cert --host machine-a --host 10.0.0.2     # self-signed, key mode 0600
 nexmesh-hub --tls-cert ~/.nexmesh/cert.pem --tls-key ~/.nexmesh/key.pem \
             --listen 0.0.0.0:7870 serve
 # each node and operator trusts that certificate explicitly
-nexmesh-node --hub wss://zeiss:7870 --ca-cert /etc/nexmesh/hub-cert.pem
+nexmesh-node --hub wss://machine-a:7870 --ca-cert /etc/nexmesh/hub-cert.pem
 export NEXMESH_OPERATOR_TOKEN=...  NEXMESH_CA_CERT=/etc/nexmesh/hub-cert.pem
 ```
 
@@ -483,24 +514,24 @@ reconnect-with-backoff and identity-checked signalling.
   `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-107 unit tests, plus ten end-to-end suites that drive real processes
+116 unit tests, plus eleven end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt codex dashboard orchestrator mtls; do
+for t in team spawn attach secure driver adopt codex dashboard orchestrator mtls pairing; do
   python3 -I tests/e2e_$t.py || break
 done
 
 # a two-machine team, by hand
-nexmesh-hub enrol zeiss                     # on the hub, once per node
+nexmesh-hub enrol machine-a                     # on the hub, once per node
 nexmesh-hub --listen 127.0.0.1:7870 serve
 NEXMESH_TOKEN=... nexmesh-node --hub ws://hub:7870 --clis ./clis
 nexmesh nodes
-nexmesh new-session auth --workspace src --kind node_local --node zeiss --path /srv/app
+nexmesh new-session auth --workspace src --kind node_local --node machine-a --path /srv/app
 nexmesh add-agent se-xxxx --cli claude --name Max --role engineer \
-        --workspace src --node zeiss --task "Build the login flow." --owns 'src/**'
+        --workspace src --node machine-a --task "Build the login flow." --owns 'src/**'
 nexmesh spawn sl-xxxx
 nexmesh status se-xxxx
 ```
@@ -525,6 +556,9 @@ CLI can run the fleet.
 
 **Next** -- workspace sync for shared-repo sessions; releasing and pausing
 agents from the orchestrator; binding certificate names to identities.
+
+Throughout this document, machines are called *machine A*, *machine B* and so
+on; substitute your own.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 
@@ -533,7 +567,7 @@ MCP orchestrator server so a Claude Code session can drive the fleet.
 - Devuan/sysvinit hosts need `/etc/init.d` scripts, not systemd units.
 - Build `--target x86_64-unknown-linux-musl` for a dependency-free drop-in.
 - **Do not** build with `-C target-cpu=native` on a host with AVX and ship it to
-  one without (bukkake, Celeron J1900).
+  one without (machine-c, Celeron J1900).
 - Bind the hub to loopback or a VPN address. Never `0.0.0.0` without TLS.
 
 ## License

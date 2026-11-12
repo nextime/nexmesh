@@ -50,7 +50,7 @@ def main():
         except OSError: pass
     os.makedirs(WS, exist_ok=True)
 
-    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
         capture_output=True, text=True).stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB,
@@ -66,7 +66,7 @@ def main():
     check("hub up", up)
 
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", CLIS, "--sock", SOCK,
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK,
         "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{_T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
@@ -80,26 +80,26 @@ def main():
 
     print("\n=== placement ===")
     s, j = http("POST", "/v1/sessions", {"name": "spawntest",
-        "workspaces": [{"name": "local", "kind": "node_local", "node": "sissy",
-                        "mounts": {"sissy": WS}}]})
+        "workspaces": [{"name": "local", "kind": "node_local", "node": "machine-b",
+                        "mounts": {"machine-b": WS}}]})
     sid = j["session_id"]
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "fakecli",
         "mode": "headless", "display_name": "Max", "role": "engineer",
         "role_description": "You implement.", "workspace": "local",
         "task": "Prove the managed spawn path works.",
-        "placement": {"node": "sissy"}, "file_ownership": ["src/**"]})
+        "placement": {"node": "machine-b"}, "file_ownership": ["src/**"]})
     check("slot created", s == 200 and "slot_id" in j, str(j))
     slot = j.get("slot_id")
 
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "nosuchcli",
-        "display_name": "Ghost", "placement": {"node": "sissy"}})
+        "display_name": "Ghost", "placement": {"node": "machine-b"}})
     ghost = j.get("slot_id")
     s2, j2 = http("POST", f"/v1/slots/{ghost}/spawn")
     check("spawning a CLI the node lacks is refused with a clear reason",
           s2 >= 400 and "nosuchcli" in json.dumps(j2), f"{s2} {j2}")
 
     s, j = http("POST", f"/v1/slots/{slot}/spawn")
-    check("spawn accepted and placed on sissy", s == 200 and j.get("node") == "sissy", str(j))
+    check("spawn accepted and placed on machine-b", s == 200 and j.get("node") == "machine-b", str(j))
 
     print("\n=== the spawned agent reaches the hub ===")
     summary = None
@@ -113,7 +113,7 @@ def main():
     check("the spawned CLI registered and called a tool",
           summary is not None and "reporting in" in (summary or {}).get("summary", ""), str(summary))
     check("it is recorded as a MANAGED agent on its node",
-          summary and summary["provenance"] == "managed" and summary["host"] == "sissy", str(summary))
+          summary and summary["provenance"] == "managed" and summary["host"] == "machine-b", str(summary))
 
     # Knowledge written by the spawned agent must be readable afterwards.
     import sqlite3

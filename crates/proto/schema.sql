@@ -35,6 +35,24 @@ CREATE TABLE IF NOT EXISTS node_tokens (
   revoked_at_ms INTEGER
 );
 
+-- One-time, short-lived codes that let a machine or a person enrol itself.
+--
+-- Pairing is the moment a stranger becomes a member, so the code is the whole
+-- security boundary: it is single-use, expires quickly, is bound in advance to
+-- the identity it may claim, and only its hash is stored. The private key is
+-- generated on the far end and never travels.
+CREATE TABLE IF NOT EXISTS pairing_codes (
+  id            TEXT PRIMARY KEY,
+  code_sha256   TEXT NOT NULL UNIQUE,
+  kind          TEXT NOT NULL,            -- node | operator
+  name          TEXT NOT NULL,            -- the identity this code may claim
+  issued_at_ms  INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  used_at_ms    INTEGER,
+  used_from     TEXT,
+  revoked_at_ms INTEGER
+);
+
 -- Credentials for operators: the people (and scripts) that drive the fleet.
 -- An operator token is the most powerful credential here -- it can create
 -- sessions, spawn processes on any node and attach to any agent's terminal --

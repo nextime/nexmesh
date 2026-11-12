@@ -57,7 +57,7 @@ def until(fn, seconds=25.0, step=0.3):
     return None
 
 def main():
-    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
                          capture_output=True, text=True).stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
@@ -65,17 +65,17 @@ def main():
         stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
     until(lambda: http("GET", "/healthz")[1].get("ok") if _try() else None)
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
     ok = until(lambda: "fakestream" in (http("GET","/v1/nodes")[1].get("nodes") or [{}])[0].get("clis", []))
     check("node online with the stream-json test agent", bool(ok))
 
     sid = http("POST", "/v1/sessions", {"name": "drivertest", "workspaces": [
-        {"name": "local", "kind": "node_local", "node": "sissy", "mounts": {"sissy": WS}}]})[1]["session_id"]
+        {"name": "local", "kind": "node_local", "node": "machine-b", "mounts": {"machine-b": WS}}]})[1]["session_id"]
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "fakestream",
         "mode": "headless", "display_name": "Max", "role": "engineer",
-        "workspace": "local", "task": "exercise the driver", "placement": {"node": "sissy"}})
+        "workspace": "local", "task": "exercise the driver", "placement": {"node": "machine-b"}})
     slot = j["slot_id"]
     s, j = http("POST", f"/v1/slots/{slot}/spawn")
     check("driven agent spawned", s == 200, str(j))
@@ -137,7 +137,7 @@ def main():
     print("\n=== flap detection stops a hopeless slot ===")
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "fakecrash",
         "mode": "headless", "display_name": "Doomed", "role": "engineer",
-        "workspace": "local", "task": "die", "placement": {"node": "sissy"}})
+        "workspace": "local", "task": "die", "placement": {"node": "machine-b"}})
     doomed = j["slot_id"]
     http("POST", f"/v1/slots/{doomed}/spawn")
     flapped = until(lambda: q("SELECT status,restarts FROM slots WHERE id=?", (doomed,))[0]["status"] == "flapping", seconds=70)

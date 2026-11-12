@@ -104,12 +104,12 @@ mod tests {
             let db = st.db.lock().unwrap();
             db.execute(
                 "INSERT INTO operator_tokens (token_sha256, label, issued_at_ms) VALUES (?,?,?)",
-                rusqlite::params![crate::state::sha256_hex("s3cret"), "laptop", 1],
+                rusqlite::params![crate::state::sha256_hex("s3cret"), "machine-b", 1],
             )
             .unwrap();
         }
         assert!(st.operator_auth_configured());
-        assert_eq!(st.authenticate_operator("s3cret").as_deref(), Some("laptop"));
+        assert_eq!(st.authenticate_operator("s3cret").as_deref(), Some("machine-b"));
         assert!(st.authenticate_operator("wrong").is_none());
         {
             let db = st.db.lock().unwrap();

@@ -119,6 +119,46 @@ pub fn issue_client(dir: &Path, name: &str, out: &Path) -> Result<(PathBuf, Path
     Ok((cert_path, key_path))
 }
 
+/// Sign a certificate request produced on another machine.
+///
+/// The subject is REPLACED with the name the pairing code was bound to: a
+/// requester does not get to choose the identity it is issued, only to prove
+/// it holds the matching private key. Everything else in the request is
+/// discarded for the same reason.
+pub fn sign_csr(dir: &Path, csr_pem: &str, name: &str) -> Result<String> {
+    anyhow::ensure!(
+        csr_pem.contains("CERTIFICATE REQUEST"),
+        "that does not look like a PEM certificate request"
+    );
+    let ca = Ca::load(dir)?;
+    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem)
+        .context("parsing the certificate request")?;
+
+    csr.params.distinguished_name = rcgen::DistinguishedName::new();
+    csr.params
+        .distinguished_name
+        .push(DnType::CommonName, name.to_string());
+    csr.params.subject_alt_names = vec![rcgen::SanType::DnsName(
+        name.try_into().context("that name cannot go in a certificate")?,
+    )];
+    csr.params.is_ca = IsCa::NoCa;
+    csr.params.key_usages =
+        vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
+    csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    csr.params.use_authority_key_identifier_extension = true;
+
+    let cert = csr
+        .signed_by(&ca.cert, &ca.key)
+        .context("signing the certificate request")?;
+    Ok(cert.pem())
+}
+
+/// The CA certificate, for handing to whoever is pairing.
+pub fn ca_cert_pem(dir: &Path) -> Result<String> {
+    std::fs::read_to_string(dir.join("ca-cert.pem"))
+        .with_context(|| format!("reading the CA certificate in {}", dir.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,7 +172,7 @@ mod tests {
     #[test]
     fn init_writes_a_ca_and_a_server_certificate() {
         let d = tmp("init");
-        let files = init(&d, &["zeiss".into(), "192.168.42.3".into()]).unwrap();
+        let files = init(&d, &["machine-a".into(), "10.0.0.2".into()]).unwrap();
         assert_eq!(files.len(), 4);
         for (_, p) in &files {
             assert!(p.exists(), "{}", p.display());
@@ -152,7 +192,7 @@ mod tests {
             let m = std::fs::metadata(d.join(f)).unwrap().permissions().mode();
             assert_eq!(m & 0o777, 0o600, "{f} is {:o}", m & 0o777);
         }
-        let (_, key) = issue_client(&d, "zeiss", &d).unwrap();
+        let (_, key) = issue_client(&d, "machine-a", &d).unwrap();
         let m = std::fs::metadata(&key).unwrap().permissions().mode();
         assert_eq!(m & 0o777, 0o600, "client key is {:o}", m & 0o777);
         std::fs::remove_dir_all(&d).ok();
@@ -165,11 +205,11 @@ mod tests {
         let d = tmp("issue");
         init(&d, &["h".into()]).unwrap();
         let out = tmp("issue-out");
-        let (cert, key) = issue_client(&d, "zeiss", &out).unwrap();
+        let (cert, key) = issue_client(&d, "machine-a", &out).unwrap();
         assert!(cert.exists() && key.exists());
         assert!(std::fs::read_to_string(&cert).unwrap().contains("BEGIN CERTIFICATE"));
         // And again, for a second node.
-        assert!(issue_client(&d, "lisa", &out).is_ok());
+        assert!(issue_client(&d, "machine-c", &out).is_ok());
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -177,8 +217,36 @@ mod tests {
     #[test]
     fn issuing_without_a_ca_says_what_to_do() {
         let d = tmp("nocadir");
-        let err = issue_client(&d, "zeiss", &d).unwrap_err();
+        let err = issue_client(&d, "machine-a", &d).unwrap_err();
         assert!(err.to_string().contains("pki init"), "{err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_signed_request_gets_the_name_the_hub_chose_not_the_one_it_asked_for() {
+        let d = tmp("csr");
+        init(&d, &["h".into()]).unwrap();
+        // A requester asks to be "admin"; the hub was told this code is "machine-a".
+        let key = KeyPair::generate().unwrap();
+        let mut p = CertificateParams::new(vec!["admin".to_string()]).unwrap();
+        p.distinguished_name.push(DnType::CommonName, "admin");
+        let csr = p.serialize_request(&key).unwrap().pem().unwrap();
+
+        let signed = sign_csr(&d, &csr, "machine-a").unwrap();
+        assert!(signed.starts_with("-----BEGIN CERTIFICATE-----"));
+        // Parse it back and check whose name it carries.
+        let parsed = CertificateParams::from_ca_cert_pem(&signed);
+        assert!(parsed.is_ok(), "the signed certificate should parse");
+        assert!(!signed.contains("admin"), "the requested name must not survive");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn rubbish_in_place_of_a_request_is_refused() {
+        let d = tmp("badcsr");
+        init(&d, &["h".into()]).unwrap();
+        assert!(sign_csr(&d, "hello", "machine-a").is_err());
+        assert!(sign_csr(&d, "-----BEGIN CERTIFICATE REQUEST-----\nnope\n", "machine-a").is_err());
         std::fs::remove_dir_all(&d).ok();
     }
 

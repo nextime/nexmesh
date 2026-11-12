@@ -21,6 +21,7 @@ mod dashboard;
 mod delivery;
 mod launch;
 mod nodes;
+mod pairing;
 mod pki;
 mod prompt;
 mod state;
@@ -59,6 +60,14 @@ struct Args {
     /// the caller also needs a private key that never leaves its machine.
     #[arg(long, env = "NEXMESH_CLIENT_CA")]
     client_ca: Option<String>,
+    /// Where the fleet CA lives, for pairing.
+    #[arg(long, env = "NEXMESH_PKI", default_value = "~/.nexmesh/pki")]
+    pki_dir: String,
+    /// Address for the pairing listener. A machine being paired has no
+    /// certificate yet, so it cannot use the mutual-TLS port; pairing gets its
+    /// own, serving ONLY the claim endpoint. Omit it and pairing is off.
+    #[arg(long, env = "NEXMESH_PAIR_LISTEN")]
+    pair_listen: Option<String>,
     /// Serve the operator API with NO authentication on a non-loopback
     /// address. Only for a hub already behind its own authenticating proxy.
     #[arg(long, env = "NEXMESH_ALLOW_ANONYMOUS")]
@@ -86,8 +95,8 @@ enum Cmd {
     Pki(PkiCmd),
     /// Generate a self-signed TLS certificate and key for this hub.
     GenCert {
-        /// Hostnames and IPs the certificate should cover, e.g. --host zeiss
-        /// --host 192.168.42.3. Nodes must reach the hub by one of these.
+        /// Hostnames and IPs the certificate should cover, e.g. --host machine-a
+        /// --host 10.0.0.2. Nodes must reach the hub by one of these.
         #[arg(long = "host", required = true)]
         hosts: Vec<String>,
         /// Where to write cert.pem and key.pem.
@@ -180,7 +189,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let st = AppState::open(&args.db)?;
+    let st = AppState::open(&args.db)?
+        .with_pki_dir(&args.pki_dir)
+        .with_pair_listen(args.pair_listen.clone());
 
     match args.cmd {
         Some(Cmd::Enrol { node_name }) => {
@@ -292,7 +303,7 @@ async fn main() -> Result<()> {
             println!("              --tls-key  {}/server-key.pem \\", dir.display());
             println!("              --client-ca {}/ca-cert.pem --listen 0.0.0.0:7870", dir.display());
             println!("\nThen issue a certificate per node:");
-            println!("  nexmesh-hub pki issue zeiss --out /tmp/zeiss");
+            println!("  nexmesh-hub pki issue machine-a --out /tmp/machine-a");
             println!("\nThe CA key never needs to leave this machine. Copy only ca-cert.pem");
             println!("and that node's own cert and key.");
             return Ok(());
@@ -392,6 +403,8 @@ async fn main() -> Result<()> {
         .route("/v1/slots/:id/spawn", post(api::spawn_slot))
         .route("/v1/attach/ws", get(attach::attach_ws))
         .route("/v1/dashboard/state", get(dashboard::snapshot))
+        .route("/v1/pair/codes", get(pairing::list).post(pairing::mint))
+        .route("/v1/pair/codes/:id/revoke", post(pairing::revoke))
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
             auth::require_operator,
@@ -414,6 +427,52 @@ async fn main() -> Result<()> {
         .route("/v1/node/ws", get(nodes::node_ws));
 
     let app = operator.merge(other).with_state(st.clone());
+
+    // The pairing listener, if asked for: its own address, no client
+    // certificate required, and only the claim endpoint on it.
+    if let Some(pair) = &args.pair_listen {
+        let paddr: SocketAddr = pair.parse().context("parsing --pair-listen")?;
+        let papp = Router::new()
+            .route("/healthz", get(api::health))
+            .route("/v1/pair/claim", post(pairing::claim))
+            .with_state(st.clone());
+        let ptls = match (&args.tls_cert, &args.tls_key) {
+            (Some(c), Some(k)) => Some((state::expand(c), state::expand(k))),
+            _ => None,
+        };
+        tokio::spawn(async move {
+            match ptls {
+                Some((cert, key)) => {
+                    // Server certificate only: whoever is pairing has none yet.
+                    match tls_config(&cert, &key, None) {
+                        Ok(cfg) => {
+                            tracing::info!(%paddr, "pairing listener (https, no client certificate required)");
+                            if let Err(e) = axum_server::bind_rustls(paddr, cfg)
+                                .serve(papp.into_make_service())
+                                .await
+                            {
+                                tracing::error!(error = %e, "pairing listener stopped");
+                            }
+                        }
+                        Err(e) => tracing::error!(error = %e, "pairing listener could not start"),
+                    }
+                }
+                None => {
+                    tracing::warn!(%paddr,
+                        "pairing listener on PLAIN HTTP: a pairing code and a freshly issued \
+                         token would cross the network in cleartext. Configure TLS.");
+                    match tokio::net::TcpListener::bind(paddr).await {
+                        Ok(l) => {
+                            if let Err(e) = axum::serve(l, papp).await {
+                                tracing::error!(error = %e, "pairing listener stopped");
+                            }
+                        }
+                        Err(e) => tracing::error!(error = %e, "pairing listener could not bind"),
+                    }
+                }
+            }
+        });
+    }
 
     let addr: SocketAddr = args.listen.parse().context("parsing --listen")?;
     let tls = match (&args.tls_cert, &args.tls_key) {

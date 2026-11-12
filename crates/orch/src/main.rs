@@ -48,6 +48,9 @@ struct Args {
     /// Private key for --client-cert.
     #[arg(long, env = "NEXMESH_CLIENT_KEY", requires = "client_cert")]
     client_key: Option<String>,
+    /// Directory holding a paired identity.
+    #[arg(long, env = "NEXMESH_IDENTITY", default_value = nexmesh_proto::identity::DEFAULT_DIR)]
+    identity_dir: String,
 }
 
 struct Hub {
@@ -446,7 +449,24 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Pairing provisions the orchestrator too: one `nexmesh pair` and the
+    // orchestrator in every CLI starts working.
+    if let Some(id) = nexmesh_proto::identity::load(&args.identity_dir) {
+        if args.token.is_none() {
+            args.token = Some(id.identity.token.clone());
+        }
+        if args.ca_cert.is_none() {
+            args.ca_cert = Some(id.ca_cert_path());
+        }
+        if args.client_cert.is_none() && args.client_key.is_none() {
+            args.client_cert = Some(id.cert_path());
+            args.client_key = Some(id.key_path());
+        }
+        if let (Some(h), true) = (&id.identity.hub, args.hub == "http://127.0.0.1:7870") {
+            args.hub = h.clone();
+        }
+    }
     let hub = Hub::new(&args)?;
     tracing::info!(hub = %hub.base, authenticated = hub.token.is_some(), "orchestrator ready");
 

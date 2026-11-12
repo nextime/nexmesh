@@ -16,7 +16,7 @@
 //! thing, and it is the ONLY component permitted to signal a process.
 //!
 //! It always dials OUT to the hub. The hub never connects to a node, so a node
-//! works unchanged on a roaming laptop, behind NAT, or on a public host with no
+//! works unchanged on a roaming machine, behind NAT, or on a public host with no
 //! inbound port.
 
 mod cli_detect;
@@ -44,7 +44,7 @@ struct Args {
     #[arg(long, env = "NEXMESH_HUB", default_value = "ws://127.0.0.1:7870")]
     hub: String,
     #[arg(long, env = "NEXMESH_TOKEN")]
-    token: String,
+    token: Option<String>,
     #[arg(long, env = "NEXMESH_NODE_NAME", default_value_t = default_hostname())]
     name: String,
     #[arg(long = "label")]
@@ -57,9 +57,16 @@ struct Args {
     /// Path to the nexmesh-mcpd shim. Defaults to a sibling of this binary.
     #[arg(long, env = "NEXMESH_MCPD")]
     mcpd: Option<String>,
+    /// Directory holding a paired identity. Anything not passed explicitly is
+    /// taken from here, so after `nexmesh-node pair` there is nothing to wire
+    /// up by hand.
+    #[arg(long, env = "NEXMESH_IDENTITY", default_value = nexmesh_proto::identity::DEFAULT_DIR)]
+    identity_dir: String,
     /// Print the detected CLI inventory and exit.
     #[arg(long)]
     detect_only: bool,
+    #[command(subcommand)]
+    cmd: Option<NodeCmd>,
     /// PEM file with the hub's certificate (or its CA), for a self-signed hub.
     #[arg(long, env = "NEXMESH_CA_CERT")]
     ca_cert: Option<String>,
@@ -122,6 +129,31 @@ fn check_transport(hub: &str, insecure: bool) -> Result<()> {
          Either use wss:// (terminate TLS in front of the hub), or pass --insecure \
          if the path is already encrypted, e.g. a WireGuard/OpenVPN tunnel."
     )
+}
+
+#[derive(clap::Subcommand)]
+enum NodeCmd {
+    /// Join a fleet using a one-time code from the dashboard. Generates this
+    /// machine's key locally -- it never leaves -- and stores the certificate
+    /// and token it gets back.
+    Pair {
+        /// The hub's pairing address, e.g. https://machine-a:7871
+        #[arg(long)]
+        hub: String,
+        /// The code shown in the dashboard.
+        #[arg(long)]
+        code: String,
+        /// The address this node will use afterwards, e.g. wss://machine-a:7870
+        #[arg(long)]
+        connect: Option<String>,
+        /// Trust this PEM when contacting the pairing endpoint.
+        #[arg(long)]
+        ca_cert: Option<String>,
+        /// Accept the hub's certificate without verifying it, for a first
+        /// contact you have decided to trust.
+        #[arg(long)]
+        insecure: bool,
+    },
 }
 
 fn default_hostname() -> String {
@@ -194,7 +226,61 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    if let Some(NodeCmd::Pair { hub, code, connect, ca_cert, insecure }) = &args.cmd {
+        let p = nexmesh_proto::pair_client::pair(
+            hub,
+            code,
+            &args.identity_dir,
+            connect.as_deref(),
+            ca_cert.as_deref(),
+            *insecure,
+        )
+        .await?;
+        println!("Paired as {} '{}'.", p.kind, p.name);
+        println!("Identity written to {}", p.identity_file.display());
+        println!("\nStart this node with:");
+        match connect {
+            Some(c) => println!("  nexmesh-node --hub {c}"),
+            None => println!("  nexmesh-node --hub wss://<hub>:7870"),
+        }
+        println!("(the certificate, key and token are read from the identity directory)");
+        return Ok(());
+    }
+
+    // Fill anything not given explicitly from the paired identity.
+    let identity = nexmesh_proto::identity::load(&args.identity_dir);
+    if let Some(id) = &identity {
+        if args.token.is_none() {
+            args.token = Some(id.identity.token.clone());
+        }
+        if args.ca_cert.is_none() {
+            args.ca_cert = Some(id.ca_cert_path());
+        }
+        if args.client_cert.is_none() && args.client_key.is_none() {
+            args.client_cert = Some(id.cert_path());
+            args.client_key = Some(id.key_path());
+        }
+        if std::env::var("NEXMESH_NODE_NAME").is_err()
+            && args.name == default_hostname()
+            && id.identity.kind == "node"
+        {
+            // The certificate asserts this name; disagreeing with it would
+            // only produce a confusing rejection later.
+            args.name = id.identity.name.clone();
+        }
+        if let (Some(h), true) = (&id.identity.hub, args.hub == "ws://127.0.0.1:7870") {
+            args.hub = h.clone();
+        }
+        tracing::info!(name = %args.name, dir = %args.identity_dir, "using a paired identity");
+    }
+    if args.token.is_none() && !args.detect_only {
+        anyhow::bail!(
+            "no enrolment token: pass --token, or pair this machine with \
+             `nexmesh-node pair --hub https://<hub>:7871 --code <code>`"
+        );
+    }
 
     let descriptors = cli_detect::load_descriptors(&args.clis)
         .with_context(|| format!("loading CLI descriptors from {}", args.clis))?;
@@ -288,7 +374,7 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
 
     let hello = NodeToHub::Hello {
         protocol: proto::PROTOCOL_VERSION,
-        token: args.token.clone(),
+        token: args.token.clone().unwrap_or_default(),
         name: args.name.clone(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -522,7 +608,7 @@ mod tests {
 
     #[test]
     fn plaintext_to_a_remote_host_is_refused() {
-        let err = check_transport("ws://zeiss:7870", false).unwrap_err();
+        let err = check_transport("ws://machine-a:7870", false).unwrap_err();
         assert!(err.to_string().contains("cleartext"), "{err}");
         let err = check_transport("ws://10.0.0.5:7870", false).unwrap_err();
         assert!(err.to_string().contains("cleartext"), "{err}");
@@ -546,7 +632,7 @@ mod tests {
 
     #[test]
     fn insecure_is_an_explicit_opt_in_for_a_vpn_path() {
-        assert!(check_transport("ws://zeiss:7870", true).is_ok());
+        assert!(check_transport("ws://machine-a:7870", true).is_ok());
     }
 
     #[test]

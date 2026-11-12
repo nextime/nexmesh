@@ -76,7 +76,7 @@ class Term:
         self.p.send_signal(signal.SIGWINCH)
 
 def main():
-    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+    tok = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
                          capture_output=True, text=True).stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
@@ -88,7 +88,7 @@ def main():
         except Exception: pass
         time.sleep(0.2)
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
     ok = False
@@ -100,10 +100,10 @@ def main():
     check("node online with the interactive test CLI", ok)
 
     sid = http("POST", "/v1/sessions", {"name": "attachtest", "workspaces": [
-        {"name": "local", "kind": "node_local", "node": "sissy", "mounts": {"sissy": WS}}]})[1]["session_id"]
+        {"name": "local", "kind": "node_local", "node": "machine-b", "mounts": {"machine-b": WS}}]})[1]["session_id"]
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "faketui",
         "mode": "interactive", "display_name": "Max", "role": "engineer",
-        "workspace": "local", "task": "be attachable", "placement": {"node": "sissy"}})
+        "workspace": "local", "task": "be attachable", "placement": {"node": "machine-b"}})
     slot = j["slot_id"]
     s, j = http("POST", f"/v1/slots/{slot}/spawn")
     check("interactive agent spawned", s == 200, str(j))
@@ -164,7 +164,7 @@ def main():
 
     print("\n=== attaching to something that has no terminal ===")
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "faketui",
-        "mode": "interactive", "display_name": "Ghost", "placement": {"node": "sissy"}})
+        "mode": "interactive", "display_name": "Ghost", "placement": {"node": "machine-b"}})
     t3 = Term([f"{BIN}/nexmesh", "--hub", HUB, "attach", sid, "Ghost"])
     check("attaching to a never-spawned agent fails cleanly",
           t3.expect("no agent matching") or t3.expect("Error"), t3.buf[-300:])

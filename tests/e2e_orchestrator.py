@@ -85,14 +85,14 @@ def main():
         [f"{BIN}/nexmesh-hub", "--db", DB, "operator-token", "orch"],
         capture_output=True, text=True).stdout.splitlines() if l.startswith("token:")][0]
     tok = [l.split()[1] for l in subprocess.run(
-        [f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "sissy"],
+        [f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
         capture_output=True, text=True).stdout.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
         f"127.0.0.1:{PORT}", "serve"], stdout=open(f"{T}/hub.log","w"),
         stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
     until(lambda: http("GET", "/healthz")[1].get("ok"))
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
     until(lambda: (http("GET","/v1/nodes",tok=optok)[1].get("nodes") or [{}])[0].get("connected"))
@@ -113,21 +113,21 @@ def main():
     print("\n=== it can see the fleet ===")
     out = o.tool("list_nodes")
     check("list_nodes finds the node and its CLIs",
-          "sissy" in out and "fakestream" in out, out[:300])
+          "machine-b" in out and "fakestream" in out, out[:300])
 
     print("\n=== one call spins up a whole team ===")
     out = o.tool("create_team", {
         "name": "login feature",
-        "workspace": {"name": "app", "kind": "node_local", "node": "sissy", "path": WS},
+        "workspace": {"name": "app", "kind": "node_local", "node": "machine-b", "path": WS},
         "plan": ["design", "implement", "review"],
         "agents": [
             {"name": "Max", "role": "engineer", "cli": "fakestream",
-             "task": "Implement the login flow.", "node": "sissy", "owns": ["src/**"]},
+             "task": "Implement the login flow.", "node": "machine-b", "owns": ["src/**"]},
             {"name": "Iris", "role": "code reviewer", "cli": "fakestream",
-             "task": "Review Max's work.", "node": "sissy"},
+             "task": "Review Max's work.", "node": "machine-b"},
         ]})
     check("create_team reports a session", "Created session" in out, out[:300])
-    check("both agents were started", out.count("Started on sissy") == 2, out[:400])
+    check("both agents were started", out.count("Started on machine-b") == 2, out[:400])
     sid = q("SELECT id FROM sessions")[0]["id"]
     slots = q("SELECT display_name, role FROM slots WHERE session_id=?", (sid,))
     check("two slots exist with the right names",
@@ -144,7 +144,7 @@ def main():
     out = o.tool("team_status")
     check("team_status lists both, with no session id needed",
           "Max" in out and "Iris" in out, out[:300])
-    check("it says where each one runs", out.count("on sissy") == 2, out[:300])
+    check("it says where each one runs", out.count("on machine-b") == 2, out[:300])
 
     o.tool("message_team", {"to": "Max", "text": "focus on the refresh path"})
     out = until(lambda: ("focus on the refresh path" in o.tool("read_log")) or None, seconds=20)

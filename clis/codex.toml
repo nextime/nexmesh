@@ -1,4 +1,4 @@
-# Codex CLI. Not installed on sissy -- descriptor shipped so a node that has it
+# Codex CLI. Not installed on machine-b -- descriptor shipped so a node that has it
 # is picked up automatically, with no hub change.
 [cli]
 id = "codex"

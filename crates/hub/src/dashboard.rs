@@ -46,7 +46,34 @@ pub struct StateQuery {
 pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Json<Value> {
     let authed = st.operator_auth_configured();
     let nodes = st.nodes_json();
+    let pair_listen = st.pair_listen();
+    let pki_ready = st.pki_ready();
     let db = st.db.lock().unwrap();
+
+    // Outstanding pairing codes, never the codes themselves.
+    let now = nexmesh_proto::now_ms();
+    let pairing: Vec<Value> = db
+        .prepare(
+            "SELECT id, kind, name, expires_at_ms, used_at_ms, revoked_at_ms
+             FROM pairing_codes ORDER BY issued_at_ms DESC LIMIT 25",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| {
+                let used: Option<i64> = r.get(4)?;
+                let revoked: Option<i64> = r.get(5)?;
+                let expires: i64 = r.get(3)?;
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?,
+                    "name": r.get::<_, String>(2)?, "expires_at_ms": expires,
+                    "state": if revoked.is_some() { "revoked" }
+                             else if used.is_some() { "used" }
+                             else if expires < now { "expired" }
+                             else { "open" },
+                }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .unwrap_or_default();
 
     let sessions: Vec<Value> = db
         .prepare(
@@ -287,7 +314,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
 
     Json(json!({
         "hub": { "version": env!("CARGO_PKG_VERSION"), "authenticated": authed,
-                 "now_ms": nexmesh_proto::now_ms() },
+                 "now_ms": now, "pair_listen": pair_listen, "pki_ready": pki_ready },
+        "pairing": pairing,
         "nodes": nodes["nodes"],
         "sessions": sessions,
         "detail": detail,

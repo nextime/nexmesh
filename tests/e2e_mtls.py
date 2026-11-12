@@ -48,7 +48,7 @@ def until(fn, seconds=30.0):
 def main():
     print("=== 1. the hub becomes a CA ===")
     r = hub_cli("pki", "init", "--host", "127.0.0.1", "--host", "localhost",
-                "--host", "sissy", "--dir", PKI)
+                "--host", "machine-b", "--dir", PKI)
     for f in ("ca-cert.pem", "ca-key.pem", "server-cert.pem", "server-key.pem"):
         check(f"pki init wrote {f}", os.path.exists(f"{PKI}/{f}"), r.stdout + r.stderr)
     check("the CA key is not world-readable",
@@ -56,9 +56,9 @@ def main():
     check("it explains how to issue node certificates", "pki issue" in r.stdout, r.stdout[-200:])
 
     print("\n=== 2. issue a client certificate per node ===")
-    r = hub_cli("pki", "issue", "sissy", "--dir", PKI, "--out", f"{T}/sissy")
+    r = hub_cli("pki", "issue", "machine-b", "--dir", PKI, "--out", f"{T}/machine-b")
     check("a node certificate was issued",
-          os.path.exists(f"{T}/sissy/sissy-cert.pem") and os.path.exists(f"{T}/sissy/sissy-key.pem"),
+          os.path.exists(f"{T}/machine-b/machine-b-cert.pem") and os.path.exists(f"{T}/machine-b/machine-b-key.pem"),
           r.stdout + r.stderr)
     hub_cli("pki", "issue", "operator", "--dir", PKI, "--out", f"{T}/op")
     check("and one for the operator", os.path.exists(f"{T}/op/operator-cert.pem"))
@@ -75,7 +75,7 @@ def main():
     print("\n=== 4. start the hub requiring client certificates ===")
     optok = [l.split()[1] for l in hub_cli("operator-token", "op").stdout.splitlines()
              if l.startswith("token:")][0]
-    nodetok = [l.split()[1] for l in hub_cli("enrol", "sissy").stdout.splitlines()
+    nodetok = [l.split()[1] for l in hub_cli("enrol", "machine-b").stdout.splitlines()
                if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
         f"127.0.0.1:{PORT}", "--tls-cert", f"{PKI}/server-cert.pem",
@@ -113,9 +113,9 @@ def main():
 
     print("\n=== 6. a node connects over mutual TLS ===")
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"wss://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", f"{ROOT}/clis", "--sock", SOCK,
+        "--name", "machine-b", "--clis", f"{ROOT}/clis", "--sock", SOCK,
         "--mcpd", f"{BIN}/nexmesh-mcpd", "--ca-cert", f"{PKI}/ca-cert.pem",
-        "--client-cert", f"{T}/sissy/sissy-cert.pem", "--client-key", f"{T}/sissy/sissy-key.pem"],
+        "--client-cert", f"{T}/machine-b/machine-b-cert.pem", "--client-key", f"{T}/machine-b/machine-b-key.pem"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=nodetok, RUST_LOG="info", NO_COLOR="1")))
     online = until(lambda: (https("/v1/nodes", optok,
@@ -127,7 +127,7 @@ def main():
     print("\n=== 7. a node with the right token but no certificate is locked out ===")
     logf = f"{T}/nocert.log"
     p2 = subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"wss://127.0.0.1:{PORT}",
-        "--name", "sissy", "--clis", f"{ROOT}/clis", "--sock", f"{T}/n2.sock",
+        "--name", "machine-b", "--clis", f"{ROOT}/clis", "--sock", f"{T}/n2.sock",
         "--mcpd", f"{BIN}/nexmesh-mcpd", "--ca-cert", f"{PKI}/ca-cert.pem"],
         stdout=open(logf, "w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=nodetok, RUST_LOG="info", NO_COLOR="1"))
@@ -149,7 +149,7 @@ def main():
     r = subprocess.run([f"{BIN}/nexmesh", "--hub", HUB, "nodes"],
                        capture_output=True, text=True, env=env, cwd=ROOT)
     check("nexmesh nodes works with a client certificate",
-          r.returncode == 0 and "sissy" in r.stdout, r.stdout + r.stderr)
+          r.returncode == 0 and "machine-b" in r.stdout, r.stdout + r.stderr)
     env2 = dict(env); env2.pop("NEXMESH_CLIENT_CERT"); env2.pop("NEXMESH_CLIENT_KEY")
     r = subprocess.run([f"{BIN}/nexmesh", "--hub", HUB, "nodes"],
                        capture_output=True, text=True, env=env2, cwd=ROOT)
