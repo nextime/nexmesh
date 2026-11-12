@@ -351,7 +351,8 @@ function viewAgents(d, now) {
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}</td>
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
             <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
-        <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span></td>
+        <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span>
+            ${a.paused ? ' <span class="badge warn">paused</span>' : ""}</td>
         <td class="num hide tiny">${a.input_tokens || a.output_tokens
             ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}</td>
         <td class="muted">${esc(a.summary) || "<span class=tiny>—</span>"}</td>

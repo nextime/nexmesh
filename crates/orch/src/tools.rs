@@ -134,6 +134,38 @@ pub fn tools() -> Vec<Tool> {
             }, "required": ["node", "tmux_target", "name"], "additionalProperties": false }),
         },
         Tool {
+            name: "pause_agents",
+            description: "Stop sending work to one agent, or to the whole team. Reversible. A \
+                          turn already running finishes -- this means 'take on nothing further', \
+                          not 'stop this instant'.",
+            schema: json!({ "type": "object", "properties": {
+                "session": s("Session id; omitted means the most recent"),
+                "who": s("Agent name or role; omitted means everyone"),
+                "reason": s("Why, so the agents can be told")
+            }, "additionalProperties": false }),
+        },
+        Tool {
+            name: "resume_agents",
+            description: "Start sending work again, to one agent or the whole team. Anything \
+                          queued while they were paused is delivered.",
+            schema: json!({ "type": "object", "properties": {
+                "session": s("Session id; omitted means the most recent"),
+                "who": s("Agent name or role; omitted means everyone")
+            }, "additionalProperties": false }),
+        },
+        Tool {
+            name: "release_agents",
+            description: "Accept an agent's work and let it stop. Agents cannot disconnect on \
+                          their own -- that is what stops one wandering off before review -- so \
+                          this is how that hold is lifted. Omit the name to release the team and \
+                          end the session's work.",
+            schema: json!({ "type": "object", "properties": {
+                "session": s("Session id; omitted means the most recent"),
+                "who": s("Agent name or role; omitted means everyone"),
+                "note": s("A word to the agent about why")
+            }, "additionalProperties": false }),
+        },
+        Tool {
             name: "read_transcript",
             description: "What one agent's process actually printed. Use this when an agent is \
                           behaving oddly or died: it outlives the process.",

@@ -364,6 +364,67 @@ pub async fn sync_workspaces(
     Ok(Json(json!({ "workspaces": out })))
 }
 
+#[derive(Deserialize)]
+pub struct PauseRequest {
+    /// true to pause, false to resume.
+    pub paused: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Agent name, role or slot id; omitted means the whole team.
+    #[serde(default)]
+    pub who: Option<String>,
+}
+
+pub async fn pause(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<PauseRequest>,
+) -> ApiResult {
+    let r = match req.who.as_deref().filter(|w| !w.trim().is_empty()) {
+        Some(who) => {
+            crate::control::set_paused(&st, &session_id, who, req.paused, req.reason.as_deref()).await
+        }
+        None => {
+            crate::control::set_session_paused(&st, &session_id, req.paused, req.reason.as_deref())
+                .await
+        }
+    };
+    match r {
+        Ok(detail) => Ok(Json(json!({ "ok": true, "detail": detail }))),
+        Err(e) => Err(bad(format!("{e:#}"))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ReleaseRequest {
+    /// Agent name, role or slot id; omitted means everyone.
+    #[serde(default)]
+    pub who: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// How long to let it finish before terminating it.
+    #[serde(default)]
+    pub grace_ms: Option<u64>,
+}
+
+pub async fn release(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<ReleaseRequest>,
+) -> ApiResult {
+    let grace = req.grace_ms.unwrap_or(15_000).clamp(0, 600_000);
+    let r = match req.who.as_deref().filter(|w| !w.trim().is_empty()) {
+        Some(who) => {
+            crate::control::release(&st, &session_id, who, req.note.as_deref(), grace).await
+        }
+        None => crate::control::release_all(&st, &session_id, req.note.as_deref(), grace).await,
+    };
+    match r {
+        Ok(detail) => Ok(Json(json!({ "ok": true, "detail": detail }))),
+        Err(e) => Err(bad(format!("{e:#}"))),
+    }
+}
+
 pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<String>) -> Json<Value> {
     let db = st.db.lock().unwrap();
     let Ok(mut stmt) = db.prepare(
@@ -371,7 +432,7 @@ pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<S
                 s.participant_kind, COALESCE(s.cli_id, '-'), s.task_state,
                 s.summary, COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
                 COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external' ELSE '-' END),
-                COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0)
+                COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0), s.paused
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
@@ -390,6 +451,7 @@ pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<S
                 "summary": r.get::<_, String>(6)?, "provenance": r.get::<_, String>(7)?,
                 "status": r.get::<_, String>(8)?, "host": r.get::<_, String>(9)?,
                 "input_tokens": r.get::<_, i64>(10)?, "output_tokens": r.get::<_, i64>(11)?,
+                "paused": r.get::<_, i64>(12)? == 1,
             }))
         })
         .and_then(|m| m.collect())

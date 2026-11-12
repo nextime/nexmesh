@@ -352,6 +352,18 @@ pub enum HubToNode {
         reason: String,
     },
     Spawn(SpawnSpec),
+    /// Let an agent finish and go.
+    ///
+    /// Distinct from `Kill`: the node closes the agent's input first, which is
+    /// how a stdio-driven CLI learns there is no more work and exits of its own
+    /// accord, and only terminates it if it is still there after the grace
+    /// period. A released agent has done its job; killing it outright would
+    /// lose whatever it was in the middle of writing.
+    CloseAgent {
+        agent_id: String,
+        proc: ProcIdentity,
+        grace_ms: u64,
+    },
     /// Ask the node to stop an agent. Only the owning node ever signals a
     /// process, and only after verifying the identity triple.
     Kill {

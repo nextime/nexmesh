@@ -40,6 +40,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("agents", "lease_expires_ms", "INTEGER"),
         ("agents", "push_capable", "INTEGER NOT NULL DEFAULT 0"),
         ("slots", "tmux_target", "TEXT"),
+        ("sessions", "paused_at", "INTEGER"),
+        ("slots", "paused_at", "INTEGER"),
         ("agents", "kind_hint", "TEXT"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
@@ -54,6 +56,11 @@ fn migrate(conn: &Connection) -> Result<()> {
          )",
     )?;
     for (table, column, decl) in wanted {
+        // A database old enough to lack the table entirely gets it from the
+        // schema's CREATE TABLE IF NOT EXISTS; there is nothing to alter.
+        if !table_exists(conn, table)? {
+            continue;
+        }
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
                 .with_context(|| format!("adding {table}.{column}"))?;
@@ -61,6 +68,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -576,6 +592,17 @@ mod tests {
         assert!(has_column(&conn, "agents", "lease_expires_ms").unwrap());
         // Idempotent: running it again must not fail.
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_skips_tables_a_database_does_not_have_yet() {
+        // Altering a table that is not there is an error, and would stop the
+        // hub starting against an older database.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE slots (id TEXT PRIMARY KEY);").unwrap();
+        assert!(!table_exists(&conn, "sessions").unwrap());
+        migrate(&conn).unwrap();
+        assert!(has_column(&conn, "slots", "status").unwrap());
     }
 
     #[test]

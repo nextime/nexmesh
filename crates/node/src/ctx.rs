@@ -37,7 +37,7 @@ pub struct AgentIo {
     /// terminal to type into, so such an attach is view-only.
     pub input: Option<mpsc::Sender<Vec<u8>>>,
     /// The pty master, for window resizes. `None` for a pipe-run agent.
-    pub master: Option<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    pub master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     pub kind: IoKind,
     /// Drivers that are not byte streams -- Codex's JSON-RPC, opencode's HTTP
     /// server -- take whole messages rather than bytes on stdin.
@@ -73,7 +73,7 @@ impl AgentIo {
     ) -> Arc<Self> {
         Arc::new(Self {
             input,
-            master: master.map(Mutex::new),
+            master: Mutex::new(master),
             kind,
             push,
             server: Mutex::new(None),
@@ -85,6 +85,26 @@ impl AgentIo {
 
     /// Whether an ATTACHED VIEWER may type. Pipes are writable by a driver but
     /// are not a terminal, so a human attaching to them can only watch.
+    /// The same agent, minus anything that can write to it. Scrollback and
+    /// attach state are kept so a viewer watching it finish is not cut off.
+    pub fn without_input(&self) -> Arc<Self> {
+        Arc::new(Self {
+            input: None,
+            master: Mutex::new(None),
+            kind: self.kind,
+            push: None,
+            server: Mutex::new(self.server.lock().unwrap().clone()),
+            ring: Mutex::new(self.ring.lock().unwrap().clone()),
+            attaches: Mutex::new(self.attaches.lock().unwrap().clone()),
+            pending: Mutex::new(Default::default()),
+        })
+    }
+
+    /// Does this agent have a pty of its own?
+    pub fn has_pty(&self) -> bool {
+        self.master.lock().unwrap().is_some()
+    }
+
     pub fn read_only(&self) -> bool {
         // An agent that runs its own server can have a terminal opened onto it
         // on demand, so it is not read-only even though it has no pty of its
@@ -176,8 +196,8 @@ impl AgentIo {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Some(m) = &self.master {
-            let _ = m.lock().unwrap().resize(portable_pty::PtySize {
+        if let Some(m) = self.master.lock().unwrap().as_ref() {
+            let _ = m.resize(portable_pty::PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
@@ -317,6 +337,18 @@ impl NodeCtx {
 
     pub fn remove_viewer(&self, attach_id: &str) -> Option<Arc<crate::viewer::Viewer>> {
         self.viewers.lock().unwrap().remove(attach_id)
+    }
+
+    /// Drop an agent's input channels, so a CLI reading stdin sees EOF.
+    ///
+    /// The `AgentIo` is replaced rather than mutated: the writer task holding
+    /// the other end exits when the last sender goes, and that is what closes
+    /// the pipe.
+    pub fn close_agent_input(&self, agent_id: &str) {
+        let mut map = self.io.lock().unwrap();
+        if let Some(old) = map.remove(agent_id) {
+            map.insert(agent_id.to_string(), old.without_input());
+        }
     }
 
     pub fn agent_io(&self, agent_id: &str) -> Option<Arc<AgentIo>> {

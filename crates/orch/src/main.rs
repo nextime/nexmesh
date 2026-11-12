@@ -285,6 +285,24 @@ async fn call_tool(hub: &Hub, name: &str, a: &Value) -> Result<String> {
             })
         }
 
+        "pause_agents" | "resume_agents" => {
+            let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
+            let mut body = json!({ "paused": name == "pause_agents" });
+            if let Some(w) = arg_str(a, "who") { body["who"] = json!(w); }
+            if let Some(r) = arg_str(a, "reason") { body["reason"] = json!(r); }
+            let v = hub.post(&format!("/v1/sessions/{sid}/pause"), body).await?;
+            Ok(v["detail"].as_str().unwrap_or("done").to_string())
+        }
+
+        "release_agents" => {
+            let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
+            let mut body = json!({});
+            if let Some(w) = arg_str(a, "who") { body["who"] = json!(w); }
+            if let Some(n) = arg_str(a, "note") { body["note"] = json!(n); }
+            let v = hub.post(&format!("/v1/sessions/{sid}/release"), body).await?;
+            Ok(v["detail"].as_str().unwrap_or("done").to_string())
+        }
+
         "adopt_terminal" => {
             let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
             let v = hub

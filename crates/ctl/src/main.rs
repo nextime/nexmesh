@@ -113,6 +113,32 @@ enum Cmd {
     },
     /// Live status of every agent in a session.
     Status { session: String },
+    /// Stop sending work to an agent, or to the whole team. Reversible; a
+    /// turn already running finishes.
+    Pause {
+        session: String,
+        /// Agent name or role; omitted means everyone.
+        who: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Start sending work again.
+    Resume {
+        session: String,
+        /// Agent name or role; omitted means everyone.
+        who: Option<String>,
+    },
+    /// Accept an agent's work and let it stop. Omit the name to release the
+    /// whole team.
+    Release {
+        session: String,
+        who: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// How long to let it finish before terminating it.
+        #[arg(long, default_value_t = 15000)]
+        grace_ms: u64,
+    },
     /// Publish, pull or report on a shared workspace, on every machine at once.
     Sync {
         session: String,
@@ -654,12 +680,42 @@ async fn main() -> Result<()> {
                     a["role"].as_str().unwrap_or("-"),
                     a["host"].as_str().unwrap_or("-"),
                     a["provenance"].as_str().unwrap_or("-"),
-                    a["task_state"].as_str().unwrap_or("-"),
+                    if a["paused"].as_bool() == Some(true) {
+                        format!("{} (paused)", a["task_state"].as_str().unwrap_or("-"))
+                    } else {
+                        a["task_state"].as_str().unwrap_or("-").to_string()
+                    },
                     tokens,
                     a["summary"].as_str().unwrap_or(""),
                 );
             }
             println!("\n  (TOKENS = input/output)");
+        }
+
+        Cmd::Pause { session, who, reason } => {
+            let mut body = json!({ "paused": true });
+            if let Some(w) = who { body["who"] = json!(w); }
+            if let Some(r) = reason { body["reason"] = json!(r); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/pause"), body).await?;
+            bail_on_error(&v)?;
+            println!("{}", v["detail"].as_str().unwrap_or("paused"));
+        }
+
+        Cmd::Resume { session, who } => {
+            let mut body = json!({ "paused": false });
+            if let Some(w) = who { body["who"] = json!(w); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/pause"), body).await?;
+            bail_on_error(&v)?;
+            println!("{}", v["detail"].as_str().unwrap_or("resumed"));
+        }
+
+        Cmd::Release { session, who, note, grace_ms } => {
+            let mut body = json!({ "grace_ms": grace_ms });
+            if let Some(w) = who { body["who"] = json!(w); }
+            if let Some(n) = note { body["note"] = json!(n); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/release"), body).await?;
+            bail_on_error(&v)?;
+            println!("{}", v["detail"].as_str().unwrap_or("released"));
         }
 
         Cmd::Sync { session, op, workspace } => {

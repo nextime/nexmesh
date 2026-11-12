@@ -135,6 +135,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "push_capable": r.get::<_, i64>(15)? == 1,
                             "agent_id": r.get::<_, Option<String>>(16)?,
                             "mode": r.get::<_, String>(17)?,
+                            "paused": r.get::<_, i64>(18)? == 1,
                         }))
                     })
                     .and_then(|m| m.collect())

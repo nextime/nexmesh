@@ -385,6 +385,35 @@ There is deliberately **no send-keys message delivery**. Typing a teammate's
 message into a pane that happens to be sitting at a shell prompt would execute
 it. Delivery belongs to the MCP path, which knows it is talking to an agent.
 
+## Pausing and releasing
+
+Two different things, often confused.
+
+**Pause** is reversible and leaves the agent alive. Work stops reaching it and
+it is told to stand by; messages queue and arrive when it resumes. A turn
+already in flight finishes — nothing here reaches into a model mid-thought — so
+pause means *take on nothing further*, not *stop this instant*. A paused agent
+is also not respawned if it dies: bringing back something you deliberately
+stopped would be the opposite of what you asked for.
+
+**Release** is the end of the review loop. Agents deliberately cannot
+disconnect on their own, which is what stops one wandering off before its work
+is reviewed; release lifts that hold. Its input is closed — which is how a
+stdio-driven CLI learns there is no more work and exits of its own accord — and
+it is terminated only if still there after a grace period. Killing it outright
+would lose whatever it was in the middle of writing.
+
+```bash
+nexmesh pause   se-1234abcd Max --reason "checking something"
+nexmesh resume  se-1234abcd Max
+nexmesh pause   se-1234abcd            # the whole team
+nexmesh release se-1234abcd Max --note "nice work"
+nexmesh release se-1234abcd            # everyone; the session's work is done
+```
+
+From a CLI, the orchestrator offers `pause_agents`, `resume_agents` and
+`release_agents`.
+
 ## Shared workspaces
 
 A `node_local` workspace is files on one machine. A `repo` workspace is the
@@ -570,18 +599,18 @@ reconnect-with-backoff and identity-checked signalling.
   (`nexmesh log --follow`), and per-agent transcripts of process output that
   outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
-  `status`, `send`, `log`, `transcript`, `attach`, `adopt`,
-  `install-orchestrator`.
+  `status`, `send`, `log`, `transcript`, `attach`, `adopt`, `pause`, `resume`,
+  `release`, `sync`, `pair`, `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-129 unit tests, plus thirteen end-to-end suites that drive real processes
+130 unit tests, plus fourteen end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt codex opencode \
-         workspace dashboard orchestrator mtls pairing; do
+for t in team spawn attach secure driver adopt codex opencode workspace \
+         control dashboard orchestrator mtls pairing; do
   python3 -I tests/e2e_$t.py || break
 done
 
@@ -615,8 +644,7 @@ tmux adoption.
 **Done since.** The web dashboard, and the orchestrator as an MCP server so any
 CLI can run the fleet.
 
-**Next** -- releasing and pausing agents from the orchestrator; binding
-certificate names to identities; certificate revocation.
+**Next** -- binding certificate names to identities; certificate revocation.
 
 Throughout this document, machines are called *machine A*, *machine B* and so
 on; substitute your own.

@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   name           TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'active',  -- active|paused|ended|archived
   pause_reason   TEXT,
+  paused_at      INTEGER,
   config         TEXT NOT NULL DEFAULT '{}',
   created_at_ms  INTEGER NOT NULL,
   last_active_ms INTEGER NOT NULL
@@ -135,6 +136,7 @@ CREATE TABLE IF NOT EXISTS slots (
   -- task_state, which is about the WORK and survives a reconnect.
   status            TEXT NOT NULL DEFAULT 'disconnected',  -- connected|disconnected
   paused            INTEGER NOT NULL DEFAULT 0,
+  paused_at         INTEGER,
   restarts          INTEGER NOT NULL DEFAULT 0,
   last_crash_ms     INTEGER,
   resume_handle     TEXT,                            -- CLI-specific resume id

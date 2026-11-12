@@ -479,6 +479,28 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             }
         }
 
+        HubToNode::CloseAgent { agent_id, proc: id, grace_ms } => {
+            if id.node_id != ctx.node_name {
+                tracing::error!(%agent_id, "close names another node; ignoring");
+                return;
+            }
+            // Closing the input is the polite signal: a stdio-driven CLI sees
+            // EOF and shuts down cleanly, finishing whatever it was writing.
+            ctx.close_agent_input(&agent_id);
+            tracing::info!(%agent_id, grace_ms, "released; closed its input");
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                // Still there after the grace period: it is not going to leave
+                // on its own.
+                if proc::is_same_process(id.pid, id.start_ticks) {
+                    tracing::info!(%agent_id, "still running after the grace period; terminating");
+                    let _ = proc::signal_if_same(
+                        id.pid, id.start_ticks, nix::sys::signal::Signal::SIGTERM);
+                }
+            });
+        }
+
         HubToNode::Kill { agent_id, proc: id, grace_ms } => {
             // Identity-checked, and only ever for a pid on THIS machine.
             if id.node_id != ctx.node_name {
@@ -521,7 +543,7 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             };
             // An agent with no pty of its own but a server to connect to gets
             // a terminal client started just for this viewer.
-            if let (true, Some((bin, args))) = (io.read_only() == false && io.master.is_none(),
+            if let (true, Some((bin, args))) = (!io.read_only() && !io.has_pty(),
                                                 io.attach_command()) {
                 let cwd = ctx
                     .agent(&agent_id)

@@ -17,6 +17,7 @@
 mod api;
 mod attach;
 mod auth;
+mod control;
 mod dashboard;
 mod delivery;
 mod launch;
@@ -397,6 +398,8 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/slots", post(api::create_slot))
         .route("/v1/sessions/:id/adopt", post(api::adopt_slot))
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
+        .route("/v1/sessions/:id/pause", post(api::pause))
+        .route("/v1/sessions/:id/release", post(api::release))
         .route("/v1/sessions/:id/status", get(api::session_status))
         .route("/v1/sessions/:id/messages", post(api::operator_message))
         .route("/v1/sessions/:id/log", get(api::session_log))

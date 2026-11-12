@@ -19,10 +19,15 @@ pub async fn push_tick(st: &AppState) {
     let targets: Vec<(String, String, String, String)> = {
         let db = st.db.lock().unwrap();
         let Ok(mut stmt) = db.prepare(
+            // A paused agent is deliberately left alone: messages queue up
+            // and arrive when it is resumed, which is what pause means.
             "SELECT a.id, a.node_id, s.id, s.session_id
-             FROM agents a JOIN slots s ON s.id = a.slot_id
+             FROM agents a
+             JOIN slots s ON s.id = a.slot_id
+             JOIN sessions se ON se.id = s.session_id
              WHERE a.exited_at_ms IS NULL AND a.push_capable = 1 AND a.node_id IS NOT NULL
-               AND s.task_state NOT IN ('released')",
+               AND s.task_state NOT IN ('released')
+               AND s.paused = 0 AND se.status = 'active'",
         ) else {
             return;
         };
