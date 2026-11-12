@@ -1,0 +1,28 @@
+# Test-only descriptor exercising the PLUGIN driver: a CLI whose protocol
+# nexmesh knows nothing about, driven entirely by an external helper.
+[cli]
+id = "quirkdies"
+display_name = "Fake quirky agent (quirkdies)"
+command = "fakequirk"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[mcp]
+style = "inline_flag"
+flag = "--mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["--mcp-config", "{mcp_config}"]
+resume_args = ["--resume", "{resume}"]
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "plugin"
+command = "quirkdies"

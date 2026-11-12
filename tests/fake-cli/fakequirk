@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""A CLI with a protocol no built-in driver understands.
+
+Deliberately unlike the three shapes nexmesh handles natively: not Claude's
+stream-json, not Codex's JSON-RPC, not an HTTP server. Sigil-prefixed lines,
+an opaque correlation tag the caller chooses and this CLI only echoes, and
+token counts in a format of its own. Exactly the situation a plugin exists
+for, so the plugin driver is tested against a protocol it has to translate
+rather than one it already knows.
+
+  stdin   MSG <tag> <text, newlines as \\x01>   a prompt or a teammate message
+          QUIT                                  exit
+  stdout  ~~ session=<id> resumed=<0|1> ~~      banner, carries the resume handle
+          .. working <tag>
+          >> <text>                             what it was asked, for the transcript
+          == done <tag>                         this message reached the model
+          $$ tokens in=<n> out=<n> cached=<n>
+"""
+import os, sys, uuid
+
+if "--version" in sys.argv:
+    print("fakequirk 1.0.0"); sys.exit(0)
+
+resume = None
+if "--resume" in sys.argv:
+    resume = sys.argv[sys.argv.index("--resume") + 1]
+session = resume or f"qk-{uuid.uuid4().hex[:12]}"
+
+def out(line):
+    print(line, flush=True)
+
+out(f"~~ session={session} resumed={1 if resume else 0} ~~")
+print(f"[fakequirk] up, session={session}", file=sys.stderr, flush=True)
+
+if os.environ.get("FAKEQUIRK_CRASH_ON_START"):
+    print("[fakequirk] crashing on purpose", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+turns = 0
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    if line == "QUIT":
+        break
+    if not line.startswith("MSG "):
+        print(f"[fakequirk] ignoring: {line[:60]}", file=sys.stderr, flush=True)
+        continue
+    rest = line[4:]
+    tag, _, text = rest.partition(" ")
+    turns += 1
+    out(f".. working {tag}")
+    for part in text.split("\x01"):
+        out(f">> {part}")
+    # The tag is opaque here: this CLI never looks inside it, which is why a
+    # plugin can use it to carry whatever it needs to correlate an ack.
+    out(f"== done {tag}")
+    out(f"$$ tokens in={11 * turns} out={3 * turns} cached={2 * turns}")

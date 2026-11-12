@@ -149,6 +149,25 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     let bin = crate::cli_detect::resolve(&d.cli.command, &d.cli.extra_paths)
         .ok_or_else(|| anyhow::anyhow!("'{}' is not installed on {}", d.cli.command, ctx.node_name))?;
 
+    // A plugin driver's helper is resolved here, before the CLI is started:
+    // finding out afterwards would leave an agent running with no driver and
+    // no obvious reason why its messages are slow.
+    let mut d = d;
+    if let DriverSpec::Plugin { command, .. } = &d.driver {
+        let found = crate::cli_detect::resolve(command, &d.cli.extra_paths).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the driver plugin '{command}' for '{}' is not on PATH or in any of its \
+                 extra_paths on {}; install it or correct the descriptor",
+                spec.cli_id,
+                ctx.node_name
+            )
+        })?;
+        if let DriverSpec::Plugin { command, .. } = &mut d.driver {
+            *command = found;
+        }
+    }
+    let d = d;
+
     let mode_name = match spec.mode {
         RunMode::Headless => "headless",
         RunMode::Interactive => "interactive",
@@ -606,6 +625,76 @@ async fn spawn_on_pipes(
             spec.prompt.clone(),
             spec.cwd.clone(),
             spec.resume_handle.clone(),
+        ));
+        return Ok(());
+    }
+
+    // A plugin-driven CLI: the node still owns the process, and an external
+    // helper does the talking. See `nexmesh_proto::plugin`.
+    if let DriverSpec::Plugin { command, args } = &driver {
+        if prompt_on_stdin {
+            tracing::warn!(cli = %spec.cli_id,
+                "prompt_on_stdin is ignored for a plugin driver: the plugin receives the \
+                 prompt in its hello frame and decides how this CLI wants it");
+        }
+        let cli_stdout = match child.stdout.take() {
+            Some(o) => o,
+            None => anyhow::bail!("a plugin-driven CLI must give us its stdout"),
+        };
+        // The CLI's stdin stays open behind a channel, exactly as for a
+        // stream-json agent: closing it would end the session.
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        if let Some(mut stdin) = child.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Some(bytes) = in_rx.recv().await {
+                    if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let (inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<proto::Envelope>>(64);
+        let io = crate::ctx::AgentIo::new_push(inject_tx);
+        register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+        if let Some(err) = child.stderr.take() {
+            let ctx2 = ctx.clone();
+            let agent_id = spec.agent_id.clone();
+            let io2 = io.clone();
+            tokio::spawn(async move { pump_stderr(ctx2, agent_id, io2, err).await });
+        }
+        {
+            let ctx2 = ctx.clone();
+            let agent_id = spec.agent_id.clone();
+            // This clone keeps the CLI's stdin channel open for as long as the
+            // CLI itself is alive, and NOT merely as long as the plugin is.
+            // Without it, a plugin that exits drops the last sender, the
+            // writer task closes stdin, the CLI reads EOF and ends -- so a
+            // crashing plugin would take a working agent with it instead of
+            // degrading to MCP delivery.
+            let keep_stdin_open = in_tx.clone();
+            tokio::spawn(async move {
+                let code = child.wait().await.ok().and_then(|s| s.code());
+                drop(keep_stdin_open);
+                announce_exit(&ctx2, &agent_id, code).await;
+            });
+        }
+        tokio::spawn(crate::plugin::run(
+            ctx.clone(),
+            crate::plugin::PluginRun {
+                agent_id: spec.agent_id.clone(),
+                slot_id: spec.slot_id.clone(),
+                cli_id: spec.cli_id.clone(),
+                command: command.clone(),
+                args: args.clone(),
+                cwd: spec.cwd.clone(),
+                prompt: spec.prompt.clone(),
+                resume: spec.resume_handle.clone(),
+            },
+            io,
+            in_tx,
+            cli_stdout,
+            inject_rx,
         ));
         return Ok(());
     }

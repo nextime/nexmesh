@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""A deliberately badly behaved plugin, for the failure paths.
+
+It does two things wrong, on purpose, and nexmesh must survive both:
+  1. prints a line of noise on stdout, where only protocol frames belong
+  2. exits while the agent is still running and messages are outstanding
+
+Neither may take the agent down or lose a message: the node ignores the bad
+line, releases anything undelivered back to the hub's queue, and the agent
+carries on at the MCP floor.
+"""
+import json, os, sys
+
+hello = json.loads(sys.stdin.readline())
+print("Listening on http://localhost:9999   <- not a protocol frame", flush=True)
+print(json.dumps({"type": "stdin",
+                  "data": f"MSG t0 {hello['prompt']}\n"}), flush=True)
+print("[quirkdies] leaving early, on purpose", file=sys.stderr, flush=True)
+# Wait for a delivery before dying, so there is something outstanding to lose.
+if os.environ.get("QUIRKDIES_WAIT_FOR_DELIVERY"):
+    for raw in sys.stdin:
+        if json.loads(raw).get("type") == "deliver":
+            break
+sys.exit(0)

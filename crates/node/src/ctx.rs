@@ -156,6 +156,30 @@ impl AgentIo {
         }
     }
 
+    /// Retire pending injections by the ids a driver says it delivered.
+    ///
+    /// A plugin names the message ids it got through, so unlike a stream-json
+    /// replay there is nothing to correlate -- but only ids we are actually
+    /// holding are returned, so a plugin cannot ack a message twice, ack one
+    /// belonging to another agent, or invent one. An entry is dropped once
+    /// every id in it has been claimed.
+    pub fn ack_ids(&self, ids: &[i64]) -> Vec<i64> {
+        let mut pending = self.pending.lock().unwrap();
+        let mut acked = Vec::new();
+        for entry in pending.iter_mut() {
+            entry.message_ids.retain(|id| {
+                if ids.contains(id) {
+                    acked.push(*id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        pending.retain(|e| !e.message_ids.is_empty());
+        acked
+    }
+
     /// Injections still outstanding, for release when the agent dies.
     pub fn drain_pending(&self) -> Vec<i64> {
         self.pending

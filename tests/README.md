@@ -20,6 +20,7 @@ python3 -I tests/e2e_workspace.py     # two machines sharing one repo; conflicts
 python3 -I tests/e2e_control.py       # pause really withholds work; release really lets go
 python3 -I tests/e2e_revoke.py        # a revoked certificate fails at the handshake
 python3 -I tests/e2e_bind.py          # a certificate must name the identity its token claims
+python3 -I tests/e2e_plugin.py        # a CLI nexmesh knows nothing about, driven by an external plugin
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

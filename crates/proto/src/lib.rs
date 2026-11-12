@@ -22,6 +22,7 @@ pub mod identity;
 #[cfg(feature = "pair-client")]
 pub mod pair_client;
 pub mod localsock;
+pub mod plugin;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};
@@ -153,7 +154,7 @@ impl LockScope {
 
 // ------------------------------------------------------------ messages ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: i64,
     pub from_slot: Option<String>,

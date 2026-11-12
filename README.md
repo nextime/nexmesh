@@ -95,9 +95,11 @@ A CLI is a descriptor in `clis/`, not Rust. Delivery has three tiers:
 - **`mcp_only`** — the universal floor. Any CLI that speaks MCP works with zero
   bespoke code: messages ride in on the next tool result. This is what makes
   "and any other we can support" true rather than aspirational.
-- **built-in fast paths** — `stream_json` (Claude Code), `app_server` (Codex):
-  mid-turn injection and exact token accounting.
-- **`plugin`** — an external helper binary, for a CLI with its own quirks.
+- **built-in fast paths** — `stream_json` (Claude Code), `app_server` (Codex),
+  `http_server` (opencode): mid-turn injection and exact token accounting.
+- **`plugin`** — an external helper binary, for a CLI with its own quirks. Same
+  guarantees as a built-in driver, in any language, with no nexmesh release in
+  between.
 
 Shipped and verified against the real binaries: `claude`, `opencode`, `qwen`,
 `codex`, `gemini`. A malformed descriptor is skipped loudly rather than taking
@@ -105,8 +107,60 @@ the node down, and `cargo test` validates every shipped descriptor.
 
 > **opencode is a special case worth exploiting.** It already has a client/server
 > split of its own — `opencode serve --port N --hostname H` plus `opencode attach
-> <url>`. For opencode, remote access needs no pty multiplexing from us at all.
-> Planned as driver kind `http_server`.
+> <url>`. For opencode, remote access needs no pty multiplexing from us at all,
+> which is what driver kind `http_server` does.
+
+## Writing a driver plugin
+
+The built-in fast paths exist because particular CLIs speak particular
+protocols. Every further CLI with a shape of its own would otherwise mean
+another module in `nexmesh-node` — and a release of nexmesh before anyone
+could use it. A plugin moves that work outside:
+
+```toml
+[driver]
+kind = "plugin"
+command = "my-cli-plugin"      # resolved on PATH, or in cli.extra_paths
+args = []
+```
+
+It is an ordinary executable in any language, exchanging one JSON object per
+line on stdin and stdout. The node sends it four kinds of frame and accepts
+five:
+
+| node → plugin | |
+|---|---|
+| `hello` | protocol version, agent, slot, cwd, the **prompt**, and a `resume` handle when restarting |
+| `stdout` | a chunk of the CLI's output — not necessarily a whole line |
+| `deliver` | teammate messages, both rendered and as envelopes |
+| `exit` | the CLI has gone |
+
+| plugin → node | |
+|---|---|
+| `stdin` | bytes to write to the CLI |
+| `ack` | the message ids that reached the model |
+| `tokens` | cumulative `input` / `output` / `cache_read` |
+| `resume` | the CLI's own handle for continuing this conversation |
+| `log` | a line for the node's log (stderr works too) |
+
+That is the whole contract, and it buys a new CLI everything a built-in driver
+has: mid-turn delivery, acknowledgement, token accounting and crash recovery.
+`tests/fake-cli/quirkplugin` is a complete worked example in under a hundred
+lines of Python, driving a CLI (`tests/fake-cli/fakequirk`) whose protocol
+nexmesh knows nothing about.
+
+**A plugin is a parser, not a privilege.** The node spawns the CLI, owns its
+pid and remains the only component that may signal it; a plugin only ever sees
+output and asks for input. It cannot kill an agent, spawn anything, or reach
+another machine. Nor can it lie about delivery: an `ack` only retires message
+ids that were actually handed to that agent, so inventing one marks nothing
+delivered.
+
+**A plugin that dies is not an outage.** Injection then fails, the hub puts
+those messages back in its queue, and the agent collects them through MCP at
+its next tool call — the universal floor. Slower, never silent. The agent
+itself keeps running: its stdin is tied to the lifetime of the CLI, not of the
+plugin.
 
 ## An agent does not have to be a CLI
 
@@ -667,15 +721,22 @@ two refusals described above.
 accounting, resume handles, crash recovery with handoff and flap detection, and
 tmux adoption.
 
-**Done since.** The web dashboard, and the orchestrator as an MCP server so any
-CLI can run the fleet.
+**Milestone 5 -- done.** Workspace sync for shared-repo sessions, the web
+dashboard, and the orchestrator as an MCP server so any CLI can run the fleet.
 
-**Next** -- binding certificate names to identities; certificate revocation.
+**Done since.** Pausing and releasing agents; pairing with one-time codes;
+mutual TLS; certificate revocation that takes effect during the handshake;
+binding a certificate to the credential sent with it; and the `plugin` driver,
+so a CLI nexmesh has never heard of gets the fast path without a nexmesh
+release.
+
+**Known gaps**, each deliberate and none of them silent: the participant API
+has no MCP-over-HTTP front door, so an external agent uses the HTTP participant
+API rather than MCP; and `sync = "shared_fs"` is a no-op by design, because a
+shared filesystem already does that job.
 
 Throughout this document, machines are called *machine A*, *machine B* and so
 on; substitute your own.
-**Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
-MCP orchestrator server so a Claude Code session can drive the fleet.
 
 ## Deployment notes
 

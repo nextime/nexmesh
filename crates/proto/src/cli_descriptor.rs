@@ -264,6 +264,8 @@ pub enum DescriptorError {
     Toml(#[from] toml::de::Error),
     #[error("descriptor {0} declares no launch modes")]
     NoModes(String),
+    #[error("descriptor {0}: a plugin driver needs a command to run")]
+    NoPluginCommand(String),
     #[error("descriptor {0}: headless mode '{1}' has no way to deliver the prompt \
 (needs a {{prompt}} placeholder, prompt_on_stdin, or a driver with its own prompt channel)")]
     NoPromptPath(String, String),
@@ -274,6 +276,13 @@ impl CliDescriptor {
         let d: CliDescriptor = toml::from_str(text)?;
         if d.modes.is_empty() {
             return Err(DescriptorError::NoModes(d.cli.id.clone()));
+        }
+        // Caught here rather than at spawn time, where the symptom would be an
+        // agent that starts and then quietly has no driver.
+        if let DriverSpec::Plugin { command, .. } = &d.driver {
+            if command.trim().is_empty() {
+                return Err(DescriptorError::NoPluginCommand(d.cli.id.clone()));
+            }
         }
         // An interactive mode may legitimately take no arguments at all --
         // bare `codex` or `gemini` opens the TUI. Only a HEADLESS mode has to
@@ -447,6 +456,76 @@ kind = "app_server"
         )
         .unwrap();
         assert_eq!(d.driver, DriverSpec::AppServer);
+    }
+
+    #[test]
+    fn a_plugin_driver_must_name_its_helper() {
+        let err = CliDescriptor::parse(
+            r#"
+[cli]
+id = "hollow"
+display_name = "Hollow"
+command = "hollow"
+[modes.interactive]
+args = []
+attachable = true
+[driver]
+kind = "plugin"
+command = "  "
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DescriptorError::NoPluginCommand(_)), "got {err}");
+    }
+
+    #[test]
+    fn a_plugin_driver_parses_with_its_command_and_args() {
+        let d = CliDescriptor::parse(
+            r#"
+[cli]
+id = "quirky"
+display_name = "Quirky"
+command = "quirky"
+[modes.headless]
+args = ["--serve"]
+[modes.interactive]
+args = []
+attachable = true
+[driver]
+kind = "plugin"
+command = "quirky-plugin"
+args = ["--verbose"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            d.driver,
+            DriverSpec::Plugin {
+                command: "quirky-plugin".into(),
+                args: vec!["--verbose".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_plugin_headless_mode_needs_no_prompt_placeholder() {
+        // The prompt reaches the CLI through the plugin's hello frame, so
+        // requiring {prompt} on argv would reject every plugin descriptor.
+        let d = CliDescriptor::parse(
+            r#"
+[cli]
+id = "viaplugin"
+display_name = "Via Plugin"
+command = "viaplugin"
+[modes.headless]
+args = []
+[driver]
+kind = "plugin"
+command = "viaplugin-driver"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(d.driver, DriverSpec::Plugin { .. }));
     }
 
     #[test]

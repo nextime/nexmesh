@@ -26,6 +26,7 @@ mod driver;
 mod gitsync;
 mod localsock;
 mod opencode;
+mod plugin;
 mod proc;
 mod viewer;
 mod spawn;

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""A nexmesh driver plugin for `fakequirk`.
+
+An example as much as a test fixture: this is the whole job of a plugin, in
+one file and under a hundred lines of Python.
+
+  - the node spawns the CLI and hands us its output; we never see the process
+  - we decide how the first prompt goes in, because only we know this CLI's
+    input shape
+  - we choose the correlation tag, so an ack names exact message ids rather
+    than a guess
+  - token counts and the resume handle are pulled out of lines only this CLI
+    emits
+
+Diagnostics go to stderr, which the node logs. Anything printed to stdout
+that is not a protocol frame is a bug, and the node will say so.
+"""
+import json, re, sys
+
+PROTOCOL = 1
+BANNER = re.compile(r"~~ session=(\S+) resumed=(\d) ~~")
+DONE = re.compile(r"^== done (\S+)")
+TOKENS = re.compile(r"^\$\$ tokens in=(\d+) out=(\d+) cached=(\d+)")
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+def log(text, level="info"):
+    print(f"[quirkplugin] {text}", file=sys.stderr, flush=True)
+    send({"type": "log", "level": level, "text": text})
+
+def to_cli(tag, text):
+    # One line, so newlines in a teammate's message become this CLI's own
+    # separator rather than desyncing its reader.
+    send({"type": "stdin", "data": f"MSG {tag} {text.replace(chr(10), chr(1))}\n"})
+
+def main():
+    first = sys.stdin.readline()
+    if not first:
+        return 0
+    hello = json.loads(first)
+    if hello.get("type") != "hello":
+        log(f"expected hello, got {hello.get('type')!r}", "error")
+        return 1
+    if hello.get("protocol") != PROTOCOL:
+        # Refusing beats guessing at frames from a version we do not know.
+        log(f"unsupported protocol {hello.get('protocol')}", "error")
+        return 1
+    log(f"driving {hello['cli_id']} for {hello['agent_id']}"
+        + (f", resuming {hello['resume']}" if hello.get("resume") else ""))
+
+    # The prompt arrives here, not on the CLI's command line.
+    to_cli("t0", hello["prompt"])
+
+    pending = {}      # tag -> message ids awaiting this CLI's confirmation
+    n = 0
+    buf = ""
+    reported_resume = False
+
+    for raw in sys.stdin:
+        frame = json.loads(raw)
+        kind = frame.get("type")
+
+        if kind == "deliver":
+            n += 1
+            tag = f"t{n}"
+            pending[tag] = [m["id"] for m in frame.get("messages", [])]
+            to_cli(tag, frame["text"])
+
+        elif kind == "stdout":
+            # Chunks, not lines: buffer and only act on complete ones.
+            buf += frame["data"]
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if not reported_resume and (m := BANNER.search(line)):
+                    reported_resume = True
+                    send({"type": "resume", "handle": m.group(1)})
+                elif m := DONE.match(line):
+                    ids = pending.pop(m.group(1), [])
+                    if ids:
+                        send({"type": "ack", "message_ids": ids})
+                elif m := TOKENS.match(line):
+                    send({"type": "tokens", "input": int(m.group(1)),
+                          "output": int(m.group(2)), "cache_read": int(m.group(3))})
+
+        elif kind == "exit":
+            if pending:
+                log(f"the CLI exited still owing {sum(len(v) for v in pending.values())} "
+                    "confirmations", "warn")
+            return 0
+
+    return 0
+
+try:
+    sys.exit(main())
+except Exception as e:
+    print(f"[quirkplugin] fatal: {e}", file=sys.stderr, flush=True)
+    sys.exit(1)

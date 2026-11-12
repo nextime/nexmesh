@@ -255,6 +255,48 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_acks_by_exact_id() {
+        // Unlike a stream-json replay there is nothing to correlate: the
+        // plugin says which ids got through.
+        let io = io();
+        io.push_pending(Injected { text: "a".into(), message_ids: vec![1, 2] });
+        io.push_pending(Injected { text: "b".into(), message_ids: vec![3] });
+        assert_eq!(io.ack_ids(&[3]), vec![3]);
+        assert_eq!(io.ack_ids(&[1, 2]), vec![1, 2]);
+        assert!(io.ack_ids(&[1, 2, 3]).is_empty(), "nothing left to ack");
+    }
+
+    #[test]
+    fn a_plugin_cannot_ack_a_message_it_was_never_given() {
+        // A plugin is an external binary. Inventing an id must not mark
+        // somebody else's message delivered.
+        let io = io();
+        io.push_pending(Injected { text: "mine".into(), message_ids: vec![10] });
+        assert!(io.ack_ids(&[999]).is_empty(), "an unknown id must ack nothing");
+        assert_eq!(io.drain_pending(), vec![10], "and must not retire what is pending");
+    }
+
+    #[test]
+    fn acking_the_same_id_twice_only_counts_once() {
+        let io = io();
+        io.push_pending(Injected { text: "a".into(), message_ids: vec![5] });
+        assert_eq!(io.ack_ids(&[5]), vec![5]);
+        assert!(io.ack_ids(&[5]).is_empty());
+    }
+
+    #[test]
+    fn a_partly_acked_batch_keeps_the_rest_pending() {
+        // Half-delivered must not count as delivered, or the remainder is
+        // never redelivered.
+        let io = io();
+        io.push_pending(Injected { text: "batch".into(), message_ids: vec![1, 2, 3] });
+        assert_eq!(io.ack_ids(&[2]), vec![2]);
+        let mut left = io.drain_pending();
+        left.sort();
+        assert_eq!(left, vec![1, 3]);
+    }
+
+    #[test]
     fn a_replay_with_nothing_pending_acks_nothing() {
         assert!(io().ack_replay("anything").is_empty());
     }
