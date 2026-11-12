@@ -1,15 +1,50 @@
 # nexmesh
 
-Multi-agent orchestration for agent CLIs **across machines**. A Rust
-reimplementation of the ideas in [zetbrush/multiagents](https://github.com/zetbrush/multiagents),
-which is single-host by construction.
+Multi-agent orchestration for agent CLIs **across machines**.
 
-## Why not just port the JS
+## Credits
 
-The original's good ideas are in its data model, not its code: the slot/peer
-split, the review state machine, delivery-with-ack, the shared knowledge store,
-file locks plus ownership zones. Those are kept. Four things make it
-single-host, and none is a port away:
+**nexmesh is a reimplementation of
+[multiagents](https://github.com/zetbrush/multiagents) by Arman Andreasyan
+([@zetbrush](https://github.com/zetbrush)).** That project worked out what a
+team of agent CLIs actually needs in order to function as a team, and nexmesh
+would not exist without it. If you want this on a single machine, use the
+original — it is the more mature tool, and it is where these ideas come from.
+
+The design nexmesh inherits from it, essentially unchanged:
+
+- **The slot/peer split** — a *slot* is a seat on the team with a stable
+  identity; an *agent* is whatever process is currently filling it. This is the
+  idea that makes crash recovery and respawning coherent, and everything else
+  here is built on it.
+- **The task state machine** — `idle → working → done_pending_review →
+  addressing_feedback → approved → released`, with reviewer roles
+  self-approving, and agents unable to disconnect until the loop completes.
+- **Delivery with acknowledgement** — a message counts as delivered only once
+  it has actually been surfaced to the model, so a dropped hand-off is retried
+  instead of lost.
+- **Piggybacking delivery on MCP tool results** — prepending unread messages to
+  an agent's next tool result, under a `[PENDING MESSAGES]` header. This is the
+  trick that makes an arbitrary MCP-speaking CLI usable with no bespoke code,
+  and it is the floor the whole plugin model here stands on.
+- **The shared knowledge store** — a persistent key-value store of decisions,
+  conventions and discoveries, on the diagnosis that context drift between
+  agents is the main way these systems fail.
+- **File locks plus ownership zones** — static zones for cheap separation,
+  dynamic locks for genuinely shared files.
+- **Driving a headless CLI through its stdin** — writing teammate messages into
+  `claude -p --input-format stream-json` so they are read mid-turn rather than
+  at the end of it, and using Codex's `turn/steer` for the same purpose.
+
+Rediscovering any one of those would have taken weeks. The credit for the
+system design belongs upstream; what follows is only about running it on more
+than one machine.
+
+## What nexmesh changes
+
+multiagents is single-host by construction — a reasonable choice for its
+purpose, and not a flaw. But a fleet breaks four of its assumptions, and none
+of the four is a port away:
 
 | Original | Problem across machines | Here |
 |---|---|---|
@@ -18,8 +53,9 @@ single-host, and none is a port away:
 | `Bun.spawn` + stdio pipes in the orchestrator | A pipe does not cross a machine boundary, so the driver must live where the CLI does. | A `node` daemon per machine owns spawning and driving. This component has no equivalent in the original. |
 | Locks keyed `(session_id, file_path)` | `src/**` on zeiss is not `src/**` on lisa. | Locks are keyed by **scope**: `node:<id>` for local work, `ws:<id>` for a tree several machines hold. |
 
-Plus: hardcoded CLI support (three bespoke drivers) becomes declarative
-descriptors, so adding a CLI is a TOML file.
+Plus: its three bespoke CLI drivers become declarative descriptors, so adding
+a CLI is a TOML file rather than a Rust change — and an agent no longer has to
+be a CLI at all.
 
 ## Shape
 
@@ -183,7 +219,11 @@ MCP orchestrator server so a Claude Code session can drive the fleet.
 
 GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
 
-This is a clean-room reimplementation: it takes the *ideas* of
-zetbrush/multiagents (slot/peer split, review state machine,
-delivery-with-ack, shared knowledge, locks plus ownership zones) and none of
-its code, which is MIT-licensed TypeScript.
+On the relationship to the upstream project: nexmesh is an independent
+implementation in Rust. It reuses the *design* credited above and **none of the
+source code** of [multiagents](https://github.com/zetbrush/multiagents), which
+is TypeScript/Bun and declares MIT in its `package.json` and README (that
+repository carries no `LICENSE` file). No upstream file was copied, adapted or
+translated; the schema, wire protocol and every line here were written from
+scratch. The GPLv3 therefore covers this work only, and takes nothing away from
+the original.
