@@ -75,6 +75,9 @@ async fn session(socket: WebSocket, st: AppState) {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(512);
     st.attach_node(&node_id, tx.clone());
+    // A revoked machine must lose the connection it already has, not just be
+    // refused the next one.
+    let kick = st.kick_handle(&issued);
     tracing::info!(node = %issued, id = %node_id, "online");
 
     let writer = tokio::spawn(async move {
@@ -93,7 +96,18 @@ async fn session(socket: WebSocket, st: AppState) {
     };
     let _ = tx.send(serde_json::to_string(&welcome).unwrap()).await;
 
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = kick.notified() => {
+                tracing::warn!(node = %issued, "credentials revoked; closing the connection");
+                break;
+            }
+            m = stream.next() => match m {
+                Some(Ok(m)) => m,
+                _ => break,
+            },
+        };
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -130,6 +144,7 @@ async fn session(socket: WebSocket, st: AppState) {
     }
 
     st.detach_node(&node_id);
+    st.drop_kick_handle(&issued);
     st.mark_node_offline(&node_id);
     writer.abort();
     tracing::info!(node = %issued, "offline");

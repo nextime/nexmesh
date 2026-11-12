@@ -18,6 +18,7 @@ python3 -I tests/e2e_pairing.py       # joining with a one-time code; the key ne
 python3 -I tests/e2e_opencode.py      # the http_server driver, and a TUI opened on demand
 python3 -I tests/e2e_workspace.py     # two machines sharing one repo; conflicts preserved
 python3 -I tests/e2e_control.py       # pause really withholds work; release really lets go
+python3 -I tests/e2e_revoke.py        # a revoked certificate fails at the handshake
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

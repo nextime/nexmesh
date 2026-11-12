@@ -114,6 +114,15 @@ struct AttachSink {
     node_id: String,
 }
 
+/// What is needed to rebuild the server's TLS configuration in place.
+#[derive(Clone)]
+pub struct TlsHandle {
+    pub config: axum_server::tls_rustls::RustlsConfig,
+    pub cert: String,
+    pub key: String,
+    pub client_ca: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
@@ -126,6 +135,11 @@ pub struct AppState {
     /// Outstanding workspace-sync requests, awaiting the node's answer.
     sync_waiters: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     sync_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// How to rebuild and swap the live TLS configuration, so revoking a
+    /// certificate does not have to wait for a restart.
+    tls: Arc<Mutex<Option<TlsHandle>>>,
+    /// Per node name, a way to end its connection right now.
+    kicks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Where per-agent transcripts live, beside the database.
     pub transcripts: Arc<std::path::PathBuf>,
     /// Where the fleet CA lives, for signing pairing requests.
@@ -162,6 +176,8 @@ impl AppState {
             respawning: Arc::new(Mutex::new(Default::default())),
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            tls: Arc::new(Mutex::new(None)),
+            kicks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -180,6 +196,8 @@ impl AppState {
             respawning: Arc::new(Mutex::new(Default::default())),
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            tls: Arc::new(Mutex::new(None)),
+            kicks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -196,6 +214,51 @@ impl AppState {
     pub fn complete_sync(&self, req_id: u64, value: serde_json::Value) {
         if let Some(tx) = self.sync_waiters.lock().unwrap().remove(&req_id) {
             let _ = tx.send(value);
+        }
+    }
+
+    pub fn set_tls(&self, handle: TlsHandle) {
+        *self.tls.lock().unwrap() = Some(handle);
+    }
+
+    /// Rebuild the TLS configuration, picking up the current revocation list,
+    /// and swap it into the running server. False when TLS is not in use.
+    pub async fn reload_tls(&self) -> bool {
+        let handle = { self.tls.lock().unwrap().clone() };
+        let Some(h) = handle else { return false };
+        match crate::build_tls(&h.cert, &h.key, h.client_ca.as_deref(), &self.pki_dir()) {
+            Ok(cfg) => {
+                h.config.reload_from_config(cfg);
+                true
+            }
+            Err(e) => {
+                // Keep serving with the old configuration rather than fall
+                // over; the caller reports that the reload did not happen.
+                tracing::error!(error = %format!("{e:#}"), "could not reload TLS after revocation");
+                false
+            }
+        }
+    }
+
+    /// Register a way to end a node's connection, and return it.
+    pub fn kick_handle(&self, name: &str) -> Arc<tokio::sync::Notify> {
+        let n = Arc::new(tokio::sync::Notify::new());
+        self.kicks.lock().unwrap().insert(name.to_string(), n.clone());
+        n
+    }
+
+    pub fn drop_kick_handle(&self, name: &str) {
+        self.kicks.lock().unwrap().remove(name);
+    }
+
+    /// End a node's connection now. False if it was not connected.
+    pub fn kick_node(&self, name: &str) -> bool {
+        match self.kicks.lock().unwrap().get(name) {
+            Some(n) => {
+                n.notify_waiters();
+                true
+            }
+            None => false,
         }
     }
 

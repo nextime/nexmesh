@@ -113,6 +113,15 @@ enum Cmd {
     },
     /// Live status of every agent in a session.
     Status { session: String },
+    /// List the certificates the fleet CA has issued.
+    Certs,
+    /// Revoke a machine or operator: its certificate stops working at the TLS
+    /// handshake, its token is revoked, and any connection it holds is closed.
+    Revoke {
+        name: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Stop sending work to an agent, or to the whole team. Reversible; a
     /// turn already running finishes.
     Pause {
@@ -690,6 +699,37 @@ async fn main() -> Result<()> {
                 );
             }
             println!("\n  (TOKENS = input/output)");
+        }
+
+        Cmd::Certs => {
+            let v = get(&c, format!("{base}/v1/certs")).await?;
+            bail_on_error(&v)?;
+            let empty = vec![];
+            let rows = v["certificates"].as_array().unwrap_or(&empty);
+            if rows.is_empty() {
+                println!("no certificates issued yet");
+                return Ok(());
+            }
+            println!("{:<22} {:<10} {:<9} {}", "NAME", "KIND", "STATE", "SERIAL");
+            for x in rows {
+                println!("{:<22} {:<10} {:<9} {}",
+                    x["name"].as_str().unwrap_or("?"), x["kind"].as_str().unwrap_or("?"),
+                    x["state"].as_str().unwrap_or("?"), x["serial"].as_str().unwrap_or("?"));
+            }
+        }
+
+        Cmd::Revoke { name, reason } => {
+            let mut body = json!({ "name": name });
+            if let Some(r) = reason { body["reason"] = json!(r); }
+            let v = post(&c, format!("{base}/v1/certs/revoke"), body).await?;
+            bail_on_error(&v)?;
+            println!("revoked {} certificate(s) and {} token(s) for {}",
+                     v["certs"].as_i64().unwrap_or(0), v["tokens"].as_i64().unwrap_or(0),
+                     v["name"].as_str().unwrap_or("?"));
+            println!("{} on the revocation list; connection closed: {}; TLS reloaded: {}",
+                     v["on_crl"].as_i64().unwrap_or(0),
+                     v["kicked"].as_bool().unwrap_or(false),
+                     v["tls_reloaded"].as_bool().unwrap_or(false));
         }
 
         Cmd::Pause { session, who, reason } => {

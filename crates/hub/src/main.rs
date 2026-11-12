@@ -17,6 +17,7 @@
 mod api;
 mod attach;
 mod auth;
+mod certs;
 mod control;
 mod dashboard;
 mod delivery;
@@ -127,6 +128,15 @@ enum PkiCmd {
         #[arg(long, default_value = "~/.nexmesh/pki")]
         dir: String,
     },
+    /// Revoke everything belonging to a name: its certificate, its token, and
+    /// the connection it holds right now.
+    Revoke {
+        name: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List the certificates this CA has issued.
+    Certs,
     /// Issue a client certificate for a node or an operator.
     Issue {
         /// Name it asserts, e.g. the node name.
@@ -141,9 +151,15 @@ enum PkiCmd {
 
 /// Build the TLS configuration, requiring client certificates when a client CA
 /// is given.
-fn tls_config(cert: &str, key: &str, client_ca: Option<&str>)
-    -> Result<axum_server::tls_rustls::RustlsConfig>
-{
+/// Build the rustls server configuration, including the current revocation
+/// list if there is one. Public so the running server can be reloaded after a
+/// certificate is revoked.
+pub fn build_tls(
+    cert: &str,
+    key: &str,
+    client_ca: Option<&str>,
+    pki_dir: &std::path::Path,
+) -> Result<std::sync::Arc<rustls::ServerConfig>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -169,9 +185,25 @@ fn tls_config(cert: &str, key: &str, client_ca: Option<&str>)
             for c in read_certs(ca)? {
                 roots.add(c).with_context(|| format!("adding a CA from {ca}"))?;
             }
-            let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
-                .build()
-                .context("building the client certificate verifier")?;
+            let mut v = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots));
+            // The revocation list is checked during the handshake, so a
+            // revoked machine cannot connect at all.
+            let crl_path = pki_dir.join("crl.pem");
+            if crl_path.exists() {
+                let data = std::fs::read(&crl_path)
+                    .with_context(|| format!("reading {}", crl_path.display()))?;
+                let crls: Vec<_> = rustls_pemfile::crls(&mut &data[..])
+                    .collect::<std::result::Result<_, _>>()
+                    .with_context(|| format!("parsing {}", crl_path.display()))?;
+                if !crls.is_empty() {
+                    tracing::info!(path = %crl_path.display(), lists = crls.len(),
+                        "enforcing certificate revocation");
+                    // Only leaf certificates: the CA itself is not on its own
+                    // list, and demanding status for it would reject everyone.
+                    v = v.with_crls(crls).only_check_end_entity_revocation();
+                }
+            }
+            let verifier = v.build().context("building the client certificate verifier")?;
             rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
         }
         None => rustls::ServerConfig::builder().with_no_client_auth(),
@@ -179,7 +211,7 @@ fn tls_config(cert: &str, key: &str, client_ca: Option<&str>)
     let cfg = builder
         .with_single_cert(certs, private)
         .context("the certificate and key do not match")?;
-    Ok(axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(cfg)))
+    Ok(std::sync::Arc::new(cfg))
 }
 
 #[tokio::main]
@@ -310,12 +342,50 @@ async fn main() -> Result<()> {
             println!("and that node's own cert and key.");
             return Ok(());
         }
+        Some(Cmd::Pki(PkiCmd::Revoke { name, reason })) => {
+            // A hub process started for this one command cannot reload the TLS
+            // of the one that is serving, so say so rather than imply it.
+            let r = certs::revoke(&st, &name, reason.as_deref()).await?;
+            println!("revoked {} certificate(s) for {name}", r.certs);
+            println!("revoked {} token(s)", r.tokens);
+            println!("{} certificate(s) now on the revocation list", r.on_crl);
+            if !r.reloaded {
+                println!(
+                    "\nThe revocation list has been written, but a RUNNING hub keeps the TLS \
+                     configuration it started with.\nRestart it, or revoke through the API, for \
+                     this to take effect on live connections."
+                );
+            }
+            return Ok(());
+        }
+        Some(Cmd::Pki(PkiCmd::Certs)) => {
+            let v = certs::list(&st);
+            let empty = vec![];
+            let rows = v["certificates"].as_array().unwrap_or(&empty);
+            if rows.is_empty() {
+                println!("no certificates issued yet");
+                return Ok(());
+            }
+            println!("{:<22} {:<10} {:<9} {}", "NAME", "KIND", "STATE", "SERIAL");
+            for c in rows {
+                println!(
+                    "{:<22} {:<10} {:<9} {}",
+                    c["name"].as_str().unwrap_or("?"),
+                    c["kind"].as_str().unwrap_or("?"),
+                    c["state"].as_str().unwrap_or("?"),
+                    c["serial"].as_str().unwrap_or("?")
+                );
+            }
+            return Ok(());
+        }
         Some(Cmd::Pki(PkiCmd::Issue { name, dir, out })) => {
             let dir = std::path::PathBuf::from(state::expand(&dir));
             let out = std::path::PathBuf::from(state::expand(
                 &out.unwrap_or_else(|| dir.to_string_lossy().to_string()),
             ));
-            let (cert, key) = pki::issue_client(&dir, &name, &out)?;
+            let serial = pki::new_serial();
+            let (cert, key) = pki::issue_client(&dir, &name, &out, serial)?;
+            certs::record_issued(&st, serial, &name, "node");
             println!("certificate: {}", cert.display());
             println!("private key: {}  (mode 0600)", key.display());
             println!("\nCopy those two files and {}/ca-cert.pem to {name}, then:", dir.display());
@@ -408,6 +478,8 @@ async fn main() -> Result<()> {
         .route("/v1/slots/:id/spawn", post(api::spawn_slot))
         .route("/v1/attach/ws", get(attach::attach_ws))
         .route("/v1/dashboard/state", get(dashboard::snapshot))
+        .route("/v1/certs", get(api::list_certs))
+        .route("/v1/certs/revoke", post(api::revoke_cert))
         .route("/v1/pair/codes", get(pairing::list).post(pairing::mint))
         .route("/v1/pair/codes/:id/revoke", post(pairing::revoke))
         .layer(axum::middleware::from_fn_with_state(
@@ -449,7 +521,9 @@ async fn main() -> Result<()> {
             match ptls {
                 Some((cert, key)) => {
                     // Server certificate only: whoever is pairing has none yet.
-                    match tls_config(&cert, &key, None) {
+                    match build_tls(&cert, &key, None, std::path::Path::new("/nonexistent"))
+                        .map(axum_server::tls_rustls::RustlsConfig::from_config)
+                    {
                         Ok(cfg) => {
                             tracing::info!(%paddr, "pairing listener (https, no client certificate required)");
                             if let Err(e) = axum_server::bind_rustls(paddr, cfg)
@@ -521,8 +595,17 @@ async fn main() -> Result<()> {
     match tls {
         Some((cert, key)) => {
             let client_ca = args.client_ca.as_deref().map(state::expand);
-            let config = tls_config(&cert, &key, client_ca.as_deref())
+            let pki = std::path::PathBuf::from(state::expand(&args.pki_dir));
+            let server_cfg = build_tls(&cert, &key, client_ca.as_deref(), &pki)
                 .with_context(|| format!("loading TLS material from {cert} and {key}"))?;
+            let config = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
+            // Remember how to rebuild it, so a revocation takes effect at once.
+            st.set_tls(state::TlsHandle {
+                config: config.clone(),
+                cert: cert.clone(),
+                key: key.clone(),
+                client_ca: client_ca.clone(),
+            });
             drop(listener);
             tracing::info!(%addr, version = VERSION, tls = true, authenticated = authed,
                 mutual_tls = client_ca.is_some(),

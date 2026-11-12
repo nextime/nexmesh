@@ -92,8 +92,61 @@ pub fn init(dir: &Path, hosts: &[String]) -> Result<Vec<(String, PathBuf)>> {
     ])
 }
 
+/// A serial number nobody can guess, so a certificate cannot be impersonated
+/// in a revocation list by someone predicting the next one.
+pub fn new_serial() -> u64 {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut b);
+    }
+    // Keep it positive and non-zero: a zero serial is not valid.
+    (u64::from_be_bytes(b) >> 1).max(1)
+}
+
+/// Build a certificate revocation list naming every revoked serial.
+///
+/// This is what makes revocation real: rustls checks it during the TLS
+/// handshake, so a revoked machine cannot connect at all -- as opposed to an
+/// application-level deny list, which would only take effect after the
+/// connection it is meant to prevent.
+pub fn build_crl(
+    dir: &Path,
+    revoked: &[(u64, i64)],
+    crl_number: u64,
+) -> Result<String> {
+    use rcgen::{CertificateRevocationListParams, RevocationReason, RevokedCertParams};
+    use time::{Duration, OffsetDateTime};
+
+    let ca = Ca::load(dir)?;
+    let now = OffsetDateTime::now_utc();
+    let params = CertificateRevocationListParams {
+        this_update: now,
+        // Generous, because the list is rewritten on every revocation; a CRL
+        // that expires would start rejecting everyone.
+        next_update: now + Duration::days(365),
+        crl_number: rcgen::SerialNumber::from(crl_number),
+        issuing_distribution_point: None,
+        revoked_certs: revoked
+            .iter()
+            .map(|(serial, at_ms)| RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from(*serial),
+                revocation_time: OffsetDateTime::from_unix_timestamp(at_ms / 1000)
+                    .unwrap_or(now),
+                reason_code: Some(RevocationReason::CessationOfOperation),
+                invalidity_date: None,
+            })
+            .collect(),
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let crl = params
+        .signed_by(&ca.cert, &ca.key)
+        .context("signing the revocation list")?;
+    crl.pem().context("encoding the revocation list")
+}
+
 /// Issue a client certificate for a node or an operator.
-pub fn issue_client(dir: &Path, name: &str, out: &Path) -> Result<(PathBuf, PathBuf)> {
+pub fn issue_client(dir: &Path, name: &str, out: &Path, serial: u64) -> Result<(PathBuf, PathBuf)> {
     anyhow::ensure!(
         !name.is_empty()
             && name.len() <= 64
@@ -104,6 +157,8 @@ pub fn issue_client(dir: &Path, name: &str, out: &Path) -> Result<(PathBuf, Path
     std::fs::create_dir_all(out)?;
 
     let mut p = CertificateParams::new(vec![name.to_string()])?;
+    // An explicit serial, because a certificate can only be revoked by one.
+    p.serial_number = Some(rcgen::SerialNumber::from(serial));
     // The common name is the identity this certificate asserts.
     p.distinguished_name.push(DnType::CommonName, name.to_string());
     p.use_authority_key_identifier_extension = true;
@@ -125,7 +180,7 @@ pub fn issue_client(dir: &Path, name: &str, out: &Path) -> Result<(PathBuf, Path
 /// requester does not get to choose the identity it is issued, only to prove
 /// it holds the matching private key. Everything else in the request is
 /// discarded for the same reason.
-pub fn sign_csr(dir: &Path, csr_pem: &str, name: &str) -> Result<String> {
+pub fn sign_csr(dir: &Path, csr_pem: &str, name: &str, serial: u64) -> Result<String> {
     anyhow::ensure!(
         csr_pem.contains("CERTIFICATE REQUEST"),
         "that does not look like a PEM certificate request"
@@ -134,6 +189,7 @@ pub fn sign_csr(dir: &Path, csr_pem: &str, name: &str) -> Result<String> {
     let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem)
         .context("parsing the certificate request")?;
 
+    csr.params.serial_number = Some(rcgen::SerialNumber::from(serial));
     csr.params.distinguished_name = rcgen::DistinguishedName::new();
     csr.params
         .distinguished_name
@@ -192,7 +248,7 @@ mod tests {
             let m = std::fs::metadata(d.join(f)).unwrap().permissions().mode();
             assert_eq!(m & 0o777, 0o600, "{f} is {:o}", m & 0o777);
         }
-        let (_, key) = issue_client(&d, "machine-a", &d).unwrap();
+        let (_, key) = issue_client(&d, "machine-a", &d, 42).unwrap();
         let m = std::fs::metadata(&key).unwrap().permissions().mode();
         assert_eq!(m & 0o777, 0o600, "client key is {:o}", m & 0o777);
         std::fs::remove_dir_all(&d).ok();
@@ -205,11 +261,11 @@ mod tests {
         let d = tmp("issue");
         init(&d, &["h".into()]).unwrap();
         let out = tmp("issue-out");
-        let (cert, key) = issue_client(&d, "machine-a", &out).unwrap();
+        let (cert, key) = issue_client(&d, "machine-a", &out, 7).unwrap();
         assert!(cert.exists() && key.exists());
         assert!(std::fs::read_to_string(&cert).unwrap().contains("BEGIN CERTIFICATE"));
         // And again, for a second node.
-        assert!(issue_client(&d, "machine-c", &out).is_ok());
+        assert!(issue_client(&d, "machine-c", &out, 8).is_ok());
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -217,7 +273,7 @@ mod tests {
     #[test]
     fn issuing_without_a_ca_says_what_to_do() {
         let d = tmp("nocadir");
-        let err = issue_client(&d, "machine-a", &d).unwrap_err();
+        let err = issue_client(&d, "machine-a", &d, 1).unwrap_err();
         assert!(err.to_string().contains("pki init"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -232,7 +288,7 @@ mod tests {
         p.distinguished_name.push(DnType::CommonName, "admin");
         let csr = p.serialize_request(&key).unwrap().pem().unwrap();
 
-        let signed = sign_csr(&d, &csr, "machine-a").unwrap();
+        let signed = sign_csr(&d, &csr, "machine-a", 11).unwrap();
         assert!(signed.starts_with("-----BEGIN CERTIFICATE-----"));
         // Parse it back and check whose name it carries.
         let parsed = CertificateParams::from_ca_cert_pem(&signed);
@@ -245,9 +301,34 @@ mod tests {
     fn rubbish_in_place_of_a_request_is_refused() {
         let d = tmp("badcsr");
         init(&d, &["h".into()]).unwrap();
-        assert!(sign_csr(&d, "hello", "machine-a").is_err());
-        assert!(sign_csr(&d, "-----BEGIN CERTIFICATE REQUEST-----\nnope\n", "machine-a").is_err());
+        assert!(sign_csr(&d, "hello", "machine-a", 12).is_err());
+        assert!(sign_csr(&d, "-----BEGIN CERTIFICATE REQUEST-----\nnope\n", "machine-a", 13).is_err());
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_revocation_list_is_produced_and_names_the_serial() {
+        let d = tmp("crl");
+        init(&d, &["h".into()]).unwrap();
+        issue_client(&d, "machine-a", &d, 4242).unwrap();
+        let pem = build_crl(&d, &[(4242, 1_700_000_000_000)], 1).unwrap();
+        assert!(pem.starts_with("-----BEGIN X509 CRL-----"), "{}", &pem[..40.min(pem.len())]);
+        // An empty list is still a valid list: that is how revocation is
+        // undone for everybody, and it must not fail.
+        let empty = build_crl(&d, &[], 2).unwrap();
+        assert!(empty.starts_with("-----BEGIN X509 CRL-----"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn serials_are_unpredictable_and_never_zero() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let s = new_serial();
+            assert!(s > 0, "a zero serial is not valid");
+            seen.insert(s);
+        }
+        assert_eq!(seen.len(), 200, "serials repeated");
     }
 
     #[test]
@@ -255,7 +336,7 @@ mod tests {
         let d = tmp("badname");
         init(&d, &["h".into()]).unwrap();
         for bad in ["../../etc/passwd", "a/b", "", "name with spaces"] {
-            assert!(issue_client(&d, bad, &d).is_err(), "{bad:?} should be refused");
+            assert!(issue_client(&d, bad, &d, 9).is_err(), "{bad:?} should be refused");
         }
         std::fs::remove_dir_all(&d).ok();
     }

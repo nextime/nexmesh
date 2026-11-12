@@ -600,10 +600,10 @@ reconnect-with-backoff and identity-checked signalling.
   outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
   `status`, `send`, `log`, `transcript`, `attach`, `adopt`, `pause`, `resume`,
-  `release`, `sync`, `pair`, `install-orchestrator`.
+  `release`, `sync`, `pair`, `certs`, `revoke`, `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-130 unit tests, plus fourteen end-to-end suites that drive real processes
+132 unit tests, plus fifteen end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash

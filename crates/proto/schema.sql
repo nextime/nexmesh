@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
   revoked_at_ms INTEGER
 );
 
+-- Every client certificate this CA has issued, so one can be revoked without
+-- re-issuing the CA and starting the fleet again.
+CREATE TABLE IF NOT EXISTS issued_certs (
+  serial        TEXT PRIMARY KEY,         -- decimal, as it appears in the cert
+  name          TEXT NOT NULL,            -- the identity it asserts
+  kind          TEXT NOT NULL,            -- node | operator
+  issued_at_ms  INTEGER NOT NULL,
+  revoked_at_ms INTEGER,
+  reason        TEXT
+);
+
 -- Credentials for operators: the people (and scripts) that drive the fleet.
 -- An operator token is the most powerful credential here -- it can create
 -- sessions, spawn processes on any node and attach to any agent's terminal --

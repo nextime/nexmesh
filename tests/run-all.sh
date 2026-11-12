@@ -8,7 +8,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
-        control dashboard orchestrator mtls pairing)
+        control dashboard orchestrator mtls pairing revoke)
 TIMEOUT=${TIMEOUT:-420}
 failed=()
 

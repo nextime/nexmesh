@@ -315,6 +315,32 @@ pub async fn adopt_slot(
 }
 
 #[derive(Deserialize)]
+pub struct RevokeRequest {
+    /// The identity to revoke: a node or operator name.
+    pub name: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Revoke a name's certificate, its token, and the connection it holds.
+pub async fn revoke_cert(
+    State(st): State<AppState>,
+    Json(req): Json<RevokeRequest>,
+) -> ApiResult {
+    match crate::certs::revoke(&st, &req.name, req.reason.as_deref()).await {
+        Ok(r) => Ok(Json(json!({
+            "ok": true, "name": req.name, "certs": r.certs, "tokens": r.tokens,
+            "kicked": r.kicked, "on_crl": r.on_crl, "tls_reloaded": r.reloaded,
+        }))),
+        Err(e) => Err(bad(format!("{e:#}"))),
+    }
+}
+
+pub async fn list_certs(State(st): State<AppState>) -> Json<Value> {
+    Json(crate::certs::list(&st))
+}
+
+#[derive(Deserialize)]
 pub struct SyncRequest {
     /// publish | refresh | status. Default: status.
     #[serde(default)]

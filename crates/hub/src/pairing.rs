@@ -193,7 +193,8 @@ pub async fn claim(
         (id, kind, name)
     };
 
-    let cert = crate::pki::sign_csr(&pki_dir, &req.csr_pem, &name).map_err(|e| {
+    let serial = crate::pki::new_serial();
+    let cert = crate::pki::sign_csr(&pki_dir, &req.csr_pem, &name, serial).map_err(|e| {
         // Give the code back: the failure was ours or the request's shape, not
         // an attempt to use it twice.
         let db = st.db.lock().unwrap();
@@ -203,6 +204,7 @@ pub async fn claim(
         );
         err(StatusCode::BAD_REQUEST, format!("{e:#}"))
     })?;
+    crate::certs::record_issued(&st, serial, &name, &kind);
     let ca = crate::pki::ca_cert_pem(&pki_dir)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
 

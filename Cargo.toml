@@ -38,6 +38,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+time = { version = "0.3", default-features = false, features = ["std"] }
 webpki-roots = "0.26"
 
 # node
