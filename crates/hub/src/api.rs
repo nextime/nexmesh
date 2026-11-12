@@ -521,7 +521,13 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 /// any. A participant token can call team tools for its own slot and nothing
 /// else -- it can never cause a process to be spawned on anyone's machine.
 fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::result::Result<Option<String>, (StatusCode, Json<Value>)> {
-    let token = bearer(headers).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+    let token = bearer(headers).ok_or_else(|| {
+        err(
+            StatusCode::UNAUTHORIZED,
+            "missing participant bearer token; mint one with \
+             `nexmesh-hub participant-token <label>` (an operator token will not work here)",
+        )
+    })?;
     let db = st.db.lock().unwrap();
     let row: Option<Option<String>> = db
         .query_row(
@@ -532,7 +538,7 @@ fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::result::Result<O
         )
         .optional()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    row.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad participant token"))
+    row.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or revoked participant token"))
 }
 
 #[derive(Deserialize)]

@@ -24,6 +24,7 @@ mod ctx;
 mod localsock;
 mod proc;
 mod spawn;
+mod tlstrust;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -57,6 +58,9 @@ struct Args {
     /// Print the detected CLI inventory and exit.
     #[arg(long)]
     detect_only: bool,
+    /// PEM file with the hub's certificate (or its CA), for a self-signed hub.
+    #[arg(long, env = "NEXMESH_CA_CERT")]
+    ca_cert: Option<String>,
     /// Allow sending the enrolment token over plaintext ws:// to a remote hub.
     /// Only reasonable when the path is already encrypted, e.g. a WireGuard or
     /// OpenVPN tunnel.
@@ -237,7 +241,10 @@ async fn main() -> Result<()> {
                 tracing::warn!("hub closed the connection");
                 backoff = 1;
             }
-            Err(e) => tracing::warn!(error = %e, "session ended"),
+            // `{:#}` prints the whole anyhow chain. With plain Display a TLS
+            // trust failure read as "connecting to wss://..." with no cause,
+            // which is the least useful possible message.
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "session ended"),
         }
         *ctx.hub_tx.lock().unwrap() = None;
         ctx.fail_all_waiters();
@@ -249,9 +256,21 @@ async fn main() -> Result<()> {
 
 async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>) -> Result<()> {
     let url = format!("{}/v1/node/ws", args.hub.trim_end_matches('/'));
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
+    let (ws, _) = if url.starts_with("wss://") {
+        let tls = tlstrust::client_config(args.ca_cert.as_deref())?;
+        tokio_tungstenite::connect_async_tls_with_config(
+            url.as_str(),
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
         .await
-        .with_context(|| format!("connecting to {url}"))?;
+        .with_context(|| format!("connecting to {url}"))?
+    } else {
+        tokio_tungstenite::connect_async(&url)
+            .await
+            .with_context(|| format!("connecting to {url}"))?
+    };
     let (mut sink, mut stream) = ws.split();
 
     let hello = NodeToHub::Hello {

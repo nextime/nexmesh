@@ -16,6 +16,7 @@
 
 mod api;
 mod attach;
+mod auth;
 mod nodes;
 mod prompt;
 mod state;
@@ -43,6 +44,16 @@ struct Args {
     /// without TLS in front, since this API can start processes.
     #[arg(long, env = "NEXMESH_LISTEN", default_value = "127.0.0.1:7870")]
     listen: String,
+    /// Serve HTTPS/WSS with this certificate chain (PEM). Needs --tls-key.
+    #[arg(long, env = "NEXMESH_TLS_CERT")]
+    tls_cert: Option<String>,
+    /// Private key for --tls-cert (PEM).
+    #[arg(long, env = "NEXMESH_TLS_KEY")]
+    tls_key: Option<String>,
+    /// Serve the operator API with NO authentication on a non-loopback
+    /// address. Only for a hub already behind its own authenticating proxy.
+    #[arg(long, env = "NEXMESH_ALLOW_ANONYMOUS")]
+    allow_anonymous: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -55,6 +66,22 @@ enum Cmd {
     Enrol { node_name: String },
     /// Revoke a node's tokens.
     Revoke { node_name: String },
+    /// Mint an operator token: full control of the fleet. Printed once.
+    OperatorToken { label: String },
+    /// Revoke operator tokens by label.
+    RevokeOperator { label: String },
+    /// List operator tokens (labels and last use, never the tokens).
+    Operators,
+    /// Generate a self-signed TLS certificate and key for this hub.
+    GenCert {
+        /// Hostnames and IPs the certificate should cover, e.g. --host zeiss
+        /// --host 192.168.42.3. Nodes must reach the hub by one of these.
+        #[arg(long = "host", required = true)]
+        hosts: Vec<String>,
+        /// Where to write cert.pem and key.pem.
+        #[arg(long, default_value = "~/.nexmesh")]
+        out: String,
+    },
     /// Mint a token for an external participant (a hermes agent, a script, ...).
     /// It can call team tools but can never spawn a process.
     ParticipantToken {
@@ -127,6 +154,79 @@ async fn main() -> Result<()> {
             println!("\nShown once. This token may call team tools; it cannot spawn processes.");
             return Ok(());
         }
+        Some(Cmd::OperatorToken { label }) => {
+            let token = random_token(48);
+            let db = st.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO operator_tokens (token_sha256, label, issued_at_ms) VALUES (?,?,?)",
+                params![sha256_hex(&token), label, now_ms()],
+            )?;
+            println!("operator: {label}");
+            println!("token:    {token}");
+            println!("\nShown once; the hub stores only its SHA-256.");
+            println!("Use it with:  export NEXMESH_OPERATOR_TOKEN={token}");
+            println!("\nThis token can spawn processes on every node and attach to any");
+            println!("agent's terminal. Treat it like an ssh key.");
+            return Ok(());
+        }
+        Some(Cmd::RevokeOperator { label }) => {
+            let db = st.db.lock().unwrap();
+            let n = db.execute(
+                "UPDATE operator_tokens SET revoked_at_ms = ? WHERE label = ? AND revoked_at_ms IS NULL",
+                params![now_ms(), label],
+            )?;
+            println!("revoked {n} operator token(s) for {label}");
+            return Ok(());
+        }
+        Some(Cmd::Operators) => {
+            let db = st.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT label, issued_at_ms, last_used_ms, revoked_at_ms FROM operator_tokens
+                 ORDER BY issued_at_ms",
+            )?;
+            let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            if rows.is_empty() {
+                println!("no operator tokens: the operator API is UNAUTHENTICATED");
+                println!("mint one with: nexmesh-hub operator-token <label>");
+            } else {
+                println!("{:<20} {:<10} {}", "LABEL", "STATE", "LAST USED");
+                for (label, _issued, used, revoked) in rows {
+                    println!(
+                        "{:<20} {:<10} {}",
+                        label,
+                        if revoked.is_some() { "revoked" } else { "active" },
+                        used.map(|_| "yes").unwrap_or("never")
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Some(Cmd::GenCert { hosts, out }) => {
+            let dir = state::expand(&out);
+            std::fs::create_dir_all(&dir)?;
+            let cert = rcgen::generate_simple_self_signed(hosts.clone())
+                .context("generating a self-signed certificate")?;
+            let cert_path = format!("{dir}/cert.pem");
+            let key_path = format!("{dir}/key.pem");
+            std::fs::write(&cert_path, cert.cert.pem())?;
+            std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
+            // The key must not be world-readable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            println!("certificate: {cert_path}");
+            println!("private key: {key_path}  (mode 0600)");
+            println!("covers:      {}", hosts.join(", "));
+            println!("\nStart the hub with:");
+            println!("  nexmesh-hub --tls-cert {cert_path} --tls-key {key_path} --listen 0.0.0.0:7870");
+            println!("\nThis certificate is self-signed, so each node needs it as a trust anchor:");
+            println!("  copy {cert_path} to the node and pass --ca-cert <path>");
+            return Ok(());
+        }
         Some(Cmd::Nodes) => {
             println!("{:#}", st.nodes_json());
             return Ok(());
@@ -155,8 +255,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    let app = Router::new()
-        .route("/healthz", get(api::health))
+    // Operator routes sit behind the auth middleware as a GROUP, so a route
+    // added later is protected by default rather than by remembering to check.
+    let operator = Router::new()
         .route("/v1/nodes", get(api::list_nodes))
         .route("/v1/sessions", get(api::list_sessions).post(api::create_session))
         .route("/v1/sessions/:id/slots", post(api::create_slot))
@@ -166,29 +267,82 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:sid/resolve/:who", get(api::resolve_agent))
         .route("/v1/agents/:id/transcript", get(api::agent_transcript))
         .route("/v1/slots/:id/spawn", post(api::spawn_slot))
+        .route("/v1/attach/ws", get(attach::attach_ws))
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            auth::require_operator,
+        ));
+
+    // These carry their own credentials: a node authenticates in its first
+    // frame, a participant with a participant token.
+    let other = Router::new()
+        .route("/healthz", get(api::health))
         .route("/v1/participant/join", post(api::participant_join))
         .route("/v1/participant/tool", post(api::participant_tool))
         .route("/v1/participant/ack", post(api::participant_ack))
         .route("/v1/participant/messages", get(api::participant_messages))
         .route("/v1/participant/heartbeat", post(api::participant_heartbeat))
-        .route("/v1/attach/ws", get(attach::attach_ws))
-        .route("/v1/node/ws", get(nodes::node_ws))
-        .with_state(st);
+        .route("/v1/node/ws", get(nodes::node_ws));
+
+    let app = operator.merge(other).with_state(st.clone());
 
     let addr: SocketAddr = args.listen.parse().context("parsing --listen")?;
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(c), Some(k)) => Some((state::expand(c), state::expand(k))),
+        (None, None) => None,
+        _ => anyhow::bail!("--tls-cert and --tls-key must be given together"),
+    };
+
+    // Refuse the one combination that cannot be made safe by accident: a fleet
+    // API that can spawn processes, reachable off-box, with nobody checking.
+    let authed = st.operator_auth_configured();
+    if !addr.ip().is_loopback() && !authed && !args.allow_anonymous {
+        anyhow::bail!(
+            "refusing to serve an UNAUTHENTICATED operator API on {addr}.\n\
+             That API can spawn processes on every node and attach to any agent's terminal.\n\
+             Either mint a token:   nexmesh-hub operator-token <label>\n\
+             or bind loopback:      --listen 127.0.0.1:7870\n\
+             or, if something in front already authenticates, pass --allow-anonymous."
+        );
+    }
+    if !authed {
+        tracing::warn!(
+            "no operator tokens exist: the operator API is UNAUTHENTICATED. \
+             Mint one with `nexmesh-hub operator-token <label>`."
+        );
+    }
+    if tls.is_none() && !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "serving PLAIN HTTP off-box: tokens and agent terminals cross the network in \
+             cleartext. Pass --tls-cert/--tls-key, or keep this inside a VPN."
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            %addr,
-            "the hub is bound to a NON-LOOPBACK address and serves plain HTTP with no \
-             operator authentication: the operator API can spawn processes and attach to \
-             agent terminals. Put TLS in front of it and restrict access to a trusted \
-             network, or bind 127.0.0.1 and reach it through a tunnel."
-        );
+    match tls {
+        Some((cert, key)) => {
+            // rustls 0.23 refuses to guess a crypto provider when the feature
+            // flags in the dependency graph are ambiguous, and panics deep
+            // inside TLS setup. Choose one explicitly, up front.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| format!("loading TLS material from {cert} and {key}"))?;
+            drop(listener);
+            tracing::info!(%addr, version = VERSION, tls = true, authenticated = authed,
+                "hub listening (https/wss)");
+            axum_server::bind_rustls(addr, config)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            tracing::info!(%addr, version = VERSION, tls = false, authenticated = authed,
+                "hub listening (http/ws)");
+            axum::serve(listener, app).await?;
+        }
     }
-    tracing::info!(%addr, version = VERSION, "hub listening");
-    axum::serve(listener, app).await?;
     Ok(())
 }

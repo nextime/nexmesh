@@ -7,6 +7,7 @@ cargo build
 python3 -I tests/e2e_team.py     # attached CLI agent + external (hermes-style) agent
 python3 -I tests/e2e_spawn.py    # hub places a slot, node spawns the CLI, shim registers
 python3 -I tests/e2e_attach.py   # pty takeover of an agent through the hub
+python3 -I tests/e2e_secure.py   # TLS + operator auth, and every way of getting it wrong
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

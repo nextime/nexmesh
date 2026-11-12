@@ -40,6 +40,17 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("agents", "lease_expires_ms", "INTEGER"),
         ("agents", "kind_hint", "TEXT"),
     ];
+    // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
+    // covers this, but be explicit so an old database is definitely usable.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operator_tokens (
+            token_sha256  TEXT PRIMARY KEY,
+            label         TEXT NOT NULL,
+            issued_at_ms  INTEGER NOT NULL,
+            revoked_at_ms INTEGER,
+            last_used_ms  INTEGER
+         )",
+    )?;
     for (table, column, decl) in wanted {
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
@@ -242,6 +253,42 @@ impl AppState {
     }
 
     // ------------------------------------------------------------- nodes ----
+
+    /// Has operator authentication EVER been set up on this hub?
+    ///
+    /// Deliberately counts revoked tokens too. If it only counted live ones,
+    /// revoking your last token -- the thing you do the moment one leaks --
+    /// would turn authentication off and leave the fleet wide open. Once auth
+    /// exists, it stays required; revoking locks everyone out, which is the
+    /// safe direction to fail.
+    pub fn operator_auth_configured(&self) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row("SELECT 1 FROM operator_tokens LIMIT 1", [], |r| r.get::<_, i64>(0))
+            .optional()
+            .unwrap_or(None)
+            .is_some()
+    }
+
+    /// Resolve an operator token to its label, recording the use.
+    pub fn authenticate_operator(&self, token: &str) -> Option<String> {
+        let hash = sha256_hex(token);
+        let db = self.db.lock().unwrap();
+        let label: Option<String> = db
+            .query_row(
+                "SELECT label FROM operator_tokens WHERE token_sha256 = ? AND revoked_at_ms IS NULL",
+                [&hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if label.is_some() {
+            let _ = db.execute(
+                "UPDATE operator_tokens SET last_used_ms = ? WHERE token_sha256 = ?",
+                params![now_ms(), hash],
+            );
+        }
+        label
+    }
 
     pub fn authenticate_node(&self, token: &str) -> Option<String> {
         let db = self.db.lock().unwrap();

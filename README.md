@@ -215,30 +215,69 @@ so there is no encoding on the hot path.
   point of a takeover — so Ctrl-] is the detach key, as in telnet.
 - The terminal is restored on any exit path, including a panic.
 
+## What attach can and cannot reach
+
+Attach relays a pty **the node created**. That distinction decides what works:
+
+| The agent | Attach gives you |
+|---|---|
+| launched by nexmesh, `mode = "interactive"` | the real TUI: watch **and type**. Several viewers at once. |
+| launched by nexmesh, `mode = "headless"` | view-only — it is a protocol on a pipe, not a terminal |
+| joined by itself via `mcpd` (an *attached* agent) | nothing. It is a full team member for messages, tools and review, but its terminal belongs to whoever started it |
+| an external participant (a hermes agent) | nothing — there is no terminal at all |
+
+So a `claude` agent that nexmesh launched on zeiss in interactive mode is fully
+drivable from the laptop. A `claude` you started yourself in your own ssh
+session on zeiss is **not**: that pty belongs to your shell, and nexmesh has no
+handle on it. Run it through nexmesh in interactive mode instead and you can
+attach from zeiss *and* the laptop at once, since multiple viewers are
+supported. (A `tmux` bridge, to adopt an already-running session, is a plausible
+future descriptor kind — it is not implemented.)
+
 ## Security
 
-Worth being precise about, because the answer differs per link.
+**Authenticated: yes, three separate credentials, none of which substitutes for
+another.** Only SHA-256 hashes are stored.
 
-**Authenticated: yes.** A node enrols with a token (only its SHA-256 is
-stored), and nothing it sends is honoured before that is verified. The *token*
-decides which node it is, not the name in the frame, so a node cannot claim
-another machine's identity or slot history. External participants get tokens
-from a separate table that can call team tools but can never spawn a process.
+| Credential | Mint with | Can |
+|---|---|---|
+| node | `nexmesh-hub enrol <node>` | run agents on that one machine. The *token* decides which node it is, so a node cannot claim another machine's identity or slot history |
+| operator | `nexmesh-hub operator-token <label>` | everything: create sessions, spawn on any node, attach to any terminal. Treat it like an ssh key |
+| participant | `nexmesh-hub participant-token <label>` | call team tools for its own slot. **Never** spawn a process |
 
-**Encrypted: not by nexmesh.** There is no TLS in the hub itself. The node
-speaks `wss://` happily if you terminate TLS in front of the hub (nginx, a
-tunnel), and that is the recommended deployment. Because the enrolment token is
-worth a shell on that machine, a node **refuses to send it in cleartext to a
-remote host**: plaintext `ws://` is allowed to loopback, or to anywhere with an
-explicit `--insecure` for a path you know is already encrypted, such as a
-WireGuard or OpenVPN tunnel. The hub also warns loudly at startup if it is
-bound to a non-loopback address.
+Operator routes sit behind a middleware as a group, so a route added later is
+protected by default rather than by remembering. Revoking the last operator
+token does **not** turn authentication off — that would open the fleet at the
+exact moment you are reacting to a leak.
 
-**The operator API is not authenticated at all yet.** It can create sessions,
-spawn processes and attach to agent terminals, so treat the hub's port as
-privileged: bind it to `127.0.0.1` and reach it over a tunnel, or keep it on a
-trusted network. Native TLS and an operator token are the next two security
-items; until then, **run it inside your VPN.**
+**Encrypted: yes, natively.**
+
+```bash
+nexmesh-hub gen-cert --host zeiss --host 192.168.42.3     # self-signed, key mode 0600
+nexmesh-hub --tls-cert ~/.nexmesh/cert.pem --tls-key ~/.nexmesh/key.pem \
+            --listen 0.0.0.0:7870 serve
+# each node and operator trusts that certificate explicitly
+nexmesh-node --hub wss://zeiss:7870 --ca-cert /etc/nexmesh/hub-cert.pem
+export NEXMESH_OPERATOR_TOKEN=...  NEXMESH_CA_CERT=/etc/nexmesh/hub-cert.pem
+```
+
+Public CAs still work, so a hub behind a real certificate needs no `--ca-cert`.
+There is deliberately **no "skip verification" switch**: an attacker who can
+redirect the connection is precisely who the token must be protected from.
+
+Two refusals rather than warnings, because both failure modes are silent:
+
+- A node **will not send its enrolment token in cleartext to a remote host**.
+  That token is worth a shell on the machine. Loopback is fine, `wss://` is
+  fine; anything else needs an explicit `--insecure` for a path you know is
+  already encrypted, such as your WireGuard or OpenVPN tunnel.
+- The hub **will not serve an unauthenticated operator API off-box**. Binding a
+  non-loopback address with no operator token minted is a startup error telling
+  you to mint one, bind loopback, or pass `--allow-anonymous` if something in
+  front already authenticates.
+
+Still open: mutual TLS (client certificates) for node identity, so a stolen
+token alone is not enough. The token model is the current boundary.
 
 ## Status
 
@@ -266,13 +305,13 @@ reconnect-with-backoff and identity-checked signalling.
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
   `status`, `send`, `log`, `transcript`, `attach`.
 
-76 unit tests, plus three end-to-end suites that drive real processes
+87 unit tests, plus four end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-python3 -I tests/e2e_team.py && python3 -I tests/e2e_spawn.py && python3 -I tests/e2e_attach.py
+for t in team spawn attach secure; do python3 -I tests/e2e_$t.py || break; done
 
 # a two-machine team, by hand
 nexmesh-hub enrol zeiss                     # on the hub, once per node
@@ -291,8 +330,13 @@ scrollback; attach is multiplexed over the node's existing outbound socket, with
 resize, multiple simultaneous viewers, read-only for headless agents, and
 detach that leaves the agent running. Plus the transport guard above.
 
+**Security hardening -- done.** Native TLS on the hub with self-signed cert
+generation, explicit trust anchors on nodes and the operator CLI, three
+separate credential types, operator auth as a route-group middleware, and the
+two refusals described above.
+
 **Milestone 4** -- driver fast paths (`stream_json`, `app_server`), token
-accounting, respawn with handoff. Then: native TLS and operator-API auth.
+accounting, respawn with handoff. Then mutual TLS.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 

@@ -10,6 +10,8 @@
 //! `nexmesh` -- the operator CLI. Runs on any machine and talks to the hub over
 //! HTTP, so it works from the laptop whether or not the laptop hosts anything.
 
+mod tlstrust;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -19,6 +21,12 @@ use serde_json::{json, Value};
 struct Args {
     #[arg(long, env = "NEXMESH_HUB_HTTP", default_value = "http://127.0.0.1:7870")]
     hub: String,
+    /// Operator token. Mint one with `nexmesh-hub operator-token <label>`.
+    #[arg(long, env = "NEXMESH_OPERATOR_TOKEN")]
+    token: Option<String>,
+    /// PEM file with the hub's certificate (or its CA), for a self-signed hub.
+    #[arg(long, env = "NEXMESH_CA_CERT")]
+    ca_cert: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -117,20 +125,62 @@ enum Cmd {
     },
 }
 
-fn client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?)
+/// The operator token, read once from args/env and attached to every request.
+/// Kept in a process-local rather than threaded through every call site, so a
+/// new subcommand cannot forget to authenticate.
+static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn token() -> Option<&'static String> {
+    TOKEN.get().and_then(|t| t.as_ref())
+}
+
+fn client(ca_cert: Option<&str>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+    if let Some(path) = ca_cert {
+        let pem = std::fs::read(path).with_context(|| format!("reading CA file {path}"))?;
+        b = b.add_root_certificate(
+            reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("parsing {path} as a PEM certificate"))?,
+        );
+    }
+    Ok(b.build()?)
+}
+
+fn authed(r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match token() {
+        Some(t) => r.bearer_auth(t),
+        None => r,
+    }
+}
+
+/// Turn an HTTP error into the hub's own message, so an auth failure says what
+/// to do instead of surfacing as a JSON parse error.
+async fn body_or_error(r: reqwest::Response, what: &str) -> Result<Value> {
+    let status = r.status();
+    let text = r.text().await.unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if status.is_success() {
+        return Ok(v);
+    }
+    let msg = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| text.chars().take(200).collect());
+    anyhow::bail!("{what} failed ({status}): {msg}")
 }
 
 async fn get(c: &reqwest::Client, url: String) -> Result<Value> {
-    let r = c.get(&url).send().await.with_context(|| format!("GET {url}"))?;
-    Ok(r.json().await?)
+    let r = authed(c.get(&url)).send().await.with_context(|| format!("GET {url}"))?;
+    body_or_error(r, "request").await
 }
 
 async fn post(c: &reqwest::Client, url: String, body: Value) -> Result<Value> {
-    let r = c.post(&url).json(&body).send().await.with_context(|| format!("POST {url}"))?;
-    Ok(r.json().await?)
+    let r = authed(c.post(&url).json(&body))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    body_or_error(r, "request").await
 }
 
 fn bail_on_error(v: &Value) -> Result<()> {
@@ -194,7 +244,14 @@ impl Drop for RawGuard {
 /// to the agent, which is the whole point of a takeover.
 const DETACH_BYTE: u8 = 0x1d;
 
-async fn attach(base: &str, c: &reqwest::Client, session: &str, who: &str, replay: usize) -> Result<()> {
+async fn attach(
+    base: &str,
+    c: &reqwest::Client,
+    session: &str,
+    who: &str,
+    replay: usize,
+    ca_cert: Option<&str>,
+) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -207,9 +264,31 @@ async fn attach(base: &str, c: &reqwest::Client, session: &str, who: &str, repla
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
     let url = format!("{ws_base}/v1/attach/ws?agent={agent}&cols={cols}&rows={rows}&replay={replay}");
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
+    // The attach upgrade needs the operator token too. It goes in a header,
+    // never the query string: URLs land in proxy logs and shell history.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.as_str().into_client_request().context("building the attach request")?;
+    if let Some(t) = token() {
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {t}").parse().context("building the auth header")?,
+        );
+    }
+    let (ws, _) = if url.starts_with("wss://") {
+        let tls = tlstrust::client_config(ca_cert)?;
+        tokio_tungstenite::connect_async_tls_with_config(
+            req,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
         .await
-        .with_context(|| format!("attaching to {name}"))?;
+        .with_context(|| format!("attaching to {name}"))?
+    } else {
+        tokio_tungstenite::connect_async(req)
+            .await
+            .with_context(|| format!("attaching to {name}"))?
+    };
     let (mut sink, mut stream) = ws.split();
 
     println!("attached to {name} ({agent}) -- Ctrl-] to detach");
@@ -314,7 +393,8 @@ async fn attach(base: &str, c: &reqwest::Client, session: &str, who: &str, repla
 async fn main() -> Result<()> {
     let args = Args::parse();
     let base = args.hub.trim_end_matches('/').to_string();
-    let c = client()?;
+    let _ = TOKEN.set(args.token.clone());
+    let c = client(args.ca_cert.as_deref())?;
 
     match args.cmd {
         Cmd::Health => println!("{:#}", get(&c, format!("{base}/healthz")).await?),
@@ -486,7 +566,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Attach { session, who, replay } => {
-            attach(&base, &c, &session, &who, replay).await?;
+            attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref()).await?;
         }
 
         Cmd::Send { session, text, to } => {

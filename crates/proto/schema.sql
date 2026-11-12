@@ -35,6 +35,18 @@ CREATE TABLE IF NOT EXISTS node_tokens (
   revoked_at_ms INTEGER
 );
 
+-- Credentials for operators: the people (and scripts) that drive the fleet.
+-- An operator token is the most powerful credential here -- it can create
+-- sessions, spawn processes on any node and attach to any agent's terminal --
+-- so like the others only its hash is stored.
+CREATE TABLE IF NOT EXISTS operator_tokens (
+  token_sha256  TEXT PRIMARY KEY,
+  label         TEXT NOT NULL,
+  issued_at_ms  INTEGER NOT NULL,
+  revoked_at_ms INTEGER,
+  last_used_ms  INTEGER
+);
+
 -- Credentials for external (non-CLI, non-node) participants. Deliberately a
 -- different table from node_tokens: a participant token may call team tools
 -- for its own slot and nothing else -- in particular it can never spawn a
