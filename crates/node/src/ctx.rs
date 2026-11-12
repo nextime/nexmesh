@@ -39,6 +39,9 @@ pub struct AgentIo {
     /// The pty master, for window resizes. `None` for a pipe-run agent.
     pub master: Option<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     pub kind: IoKind,
+    /// Codex is driven by JSON-RPC, not by bytes on stdin, so its injections
+    /// go down a channel of messages rather than the `input` byte channel.
+    pub codex: Option<mpsc::Sender<Vec<Envelope>>>,
     ring: Mutex<VecDeque<u8>>,
     attaches: Mutex<HashSet<String>>,
     /// Injections written to the CLI but not yet echoed back, oldest first.
@@ -51,10 +54,25 @@ impl AgentIo {
         input: Option<mpsc::Sender<Vec<u8>>>,
         master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     ) -> Arc<Self> {
+        Self::build(kind, input, master, None)
+    }
+
+    /// Codex's injector is an RPC channel; it has no writable byte stream.
+    pub fn new_codex(codex: mpsc::Sender<Vec<Envelope>>) -> Arc<Self> {
+        Self::build(IoKind::Pipes, None, None, Some(codex))
+    }
+
+    fn build(
+        kind: IoKind,
+        input: Option<mpsc::Sender<Vec<u8>>>,
+        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+        codex: Option<mpsc::Sender<Vec<Envelope>>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             input,
             master: master.map(Mutex::new),
             kind,
+            codex,
             ring: Mutex::new(VecDeque::new()),
             attaches: Mutex::new(HashSet::new()),
             pending: Mutex::new(VecDeque::new()),

@@ -10,6 +10,7 @@ python3 -I tests/e2e_attach.py   # pty takeover of an agent through the hub
 python3 -I tests/e2e_secure.py   # TLS + operator auth, and every way of getting it wrong
 python3 -I tests/e2e_driver.py   # mid-turn injection, acks, tokens, resume, flap detection
 python3 -I tests/e2e_adopt.py    # adopting a tmux session that was already running
+python3 -I tests/e2e_codex.py    # the Codex app-server driver, incl. a real-binary handshake
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP
@@ -31,6 +32,14 @@ so the driver is tested against the protocol it will meet. `fakecrash` always
 dies, for flap detection.
 
 `e2e_adopt.py` needs `tmux`; it skips cleanly without it.
+
+`e2e_codex.py` drives `tests/fake-cli/fakecodex`, which implements the real
+app-server protocol (shapes from `codex app-server generate-json-schema`),
+including notifications without a `jsonrpc` field and a blocking approval
+request. Its last two checks run the **real** `codex app-server` and confirm it
+still answers `initialize` and `thread/start` the way the driver expects; they
+skip if codex is not installed, and need no API credits because no turn is
+started.
 
 To exercise a real CLI instead, point a slot at `claude`, `opencode` or `qwen`;
 that does cost credits, which is why it is not the default.

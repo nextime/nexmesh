@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""A fake `codex app-server`, speaking the real protocol.
+
+Shapes taken from `codex app-server generate-json-schema` (codex-cli 0.167.2)
+and a live handshake, so the driver is tested against what it will actually
+meet. Records what it received in $FAKECODEX_LOG for the test to assert on.
+"""
+import json, os, sys, threading, time, uuid
+
+if "--version" in sys.argv:
+    print("fakecodex 1.0.0"); sys.exit(0)
+
+LOG = os.environ.get("FAKECODEX_LOG", "/dev/null")
+thread_id = None
+active_turn = None
+lock = threading.Lock()
+
+def log(kind, detail=""):
+    with open(LOG, "a") as f:
+        f.write(f"{kind} {detail}\n".strip() + "\n")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+def notify(method, params):
+    # Notifications carry no "jsonrpc" field and add emittedAtMs, exactly as
+    # the real server does.
+    send({"method": method, "params": params, "emittedAtMs": int(time.time() * 1000)})
+
+def result(rid, res):
+    send({"jsonrpc": "2.0", "id": rid, "result": res})
+
+def make_turn(status="inProgress"):
+    return {"id": "turn_" + str(uuid.uuid4())[:8], "status": status, "items": []}
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    rid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+
+    # A reply to a request WE made (an approval).
+    if method is None and rid is not None:
+        log("approval_answer", json.dumps(msg.get("result") or msg.get("error")))
+        continue
+
+    log("call", method)
+    if method == "initialize":
+        log("client", json.dumps(params.get("clientInfo")))
+        result(rid, {"userAgent": "fakecodex", "codexHome": "/tmp",
+                     "platformFamily": "unix", "platformOs": "linux"})
+    elif method == "thread/start":
+        with lock:
+            thread_id = "01a1d15d-" + str(uuid.uuid4())[:8]
+        log("cwd", params.get("cwd", ""))
+        log("approvalPolicy", str(params.get("approvalPolicy")))
+        result(rid, {"thread": {"id": thread_id, "cwd": params.get("cwd"),
+                                "turns": [], "sessionId": thread_id}})
+        notify("thread/started", {"thread": {"id": thread_id}})
+    elif method == "thread/resume":
+        with lock:
+            thread_id = params["threadId"]
+        log("resumed", thread_id)
+        result(rid, {"thread": {"id": thread_id, "turns": []}})
+    elif method == "turn/start":
+        text = "".join(i.get("text", "") for i in params.get("input", []))
+        log("turn_start_text", text.replace("\n", " / ")[:300])
+        with lock:
+            active_turn = make_turn()
+        result(rid, {"turn": active_turn})
+        notify("turn/started", {"threadId": thread_id, "turn": active_turn})
+        notify("thread/tokenUsage/updated", {
+            "threadId": thread_id, "turnId": active_turn["id"],
+            "tokenUsage": {"total": {"inputTokens": 1200, "outputTokens": 340,
+                                     "cachedInputTokens": 900, "reasoningOutputTokens": 0,
+                                     "totalTokens": 2440},
+                           "last": {"inputTokens": 1200, "outputTokens": 340,
+                                    "cachedInputTokens": 900, "reasoningOutputTokens": 0,
+                                    "totalTokens": 2440}}})
+        # Ask for an approval, which the driver must answer or we block.
+        send({"jsonrpc": "2.0", "id": 9001, "method": "execCommandApproval",
+              "params": {"threadId": thread_id, "turnId": active_turn["id"],
+                         "command": ["ls"], "cwd": params.get("cwd") or "/tmp"}})
+    elif method == "turn/steer":
+        text = "".join(i.get("text", "") for i in params.get("input", []))
+        log("steer_expected_turn", str(params.get("expectedTurnId")))
+        log("steer_text", text.replace("\n", " / ")[:300])
+        result(rid, {"turnId": params.get("expectedTurnId")})
+    elif method == "turn/interrupt":
+        result(rid, {})
+    else:
+        send({"jsonrpc": "2.0", "id": rid,
+              "error": {"code": -32601, "message": f"unknown method {method}"}})

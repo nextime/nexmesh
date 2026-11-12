@@ -14,6 +14,8 @@ env_key = "env"
 entry = { command = "{mcpd}", args = [] }
 
 [modes.headless]
+# The prompt is NOT passed here or on stdin: it becomes the first
+# `turn/start`, which the app_server driver issues after the handshake.
 args = ["app-server"]
 attachable = false
 

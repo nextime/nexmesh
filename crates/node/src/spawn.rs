@@ -412,6 +412,45 @@ async fn spawn_on_pipes(
         .id()
         .ok_or_else(|| anyhow::anyhow!("child exited before reporting a pid"))? as i32;
 
+    // Codex is a JSON-RPC peer, not a text stream: hand its stdio to the
+    // app-server driver, which owns the handshake, threads and turns.
+    if matches!(driver, DriverSpec::AppServer) {
+        let (cstdin, cstdout) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(i), Some(o)) => (i, o),
+            _ => anyhow::bail!("codex app-server gave us no stdio"),
+        };
+        let (inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<proto::Envelope>>(64);
+        let io = crate::ctx::AgentIo::new_codex(inject_tx);
+        register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+        if let Some(err) = child.stderr.take() {
+            let ctx2 = ctx.clone();
+            let agent_id = spec.agent_id.clone();
+            let io2 = io.clone();
+            tokio::spawn(async move { pump_stderr(ctx2, agent_id, io2, err).await });
+        }
+        {
+            let ctx2 = ctx.clone();
+            let agent_id = spec.agent_id.clone();
+            tokio::spawn(async move {
+                let code = child.wait().await.ok().and_then(|s| s.code());
+                announce_exit(&ctx2, &agent_id, code).await;
+            });
+        }
+        tokio::spawn(crate::codex::run(
+            ctx.clone(),
+            spec.agent_id.clone(),
+            spec.slot_id.clone(),
+            io,
+            cstdin,
+            cstdout,
+            inject_rx,
+            spec.prompt.clone(),
+            spec.cwd.clone(),
+            spec.resume_handle.clone(),
+        ));
+        return Ok(());
+    }
+
     // Keep stdin OPEN behind a channel. Writing the prompt and then dropping
     // it would send EOF, which ends a stream-json session immediately -- and
     // with it any chance of injecting a teammate's message mid-turn.

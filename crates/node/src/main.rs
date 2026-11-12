@@ -20,6 +20,7 @@
 //! inbound port.
 
 mod cli_detect;
+mod codex;
 mod ctx;
 mod driver;
 mod localsock;

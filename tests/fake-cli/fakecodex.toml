@@ -1,0 +1,18 @@
+# Test-only descriptor for the app_server (Codex) driver.
+[cli]
+id = "fakecodex"
+display_name = "Fake codex app-server"
+command = "fakecodex"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.headless]
+args = []
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "app_server"

@@ -242,9 +242,33 @@ The same stream carries token usage (`assistant` events meter each API call,
 the turn's `result` gives totals) and the session id from `system`/`init`,
 which becomes the `--resume` handle.
 
-Codex's `app-server` is the other fast path and is **not implemented**: its
-JSON-RPC surface needs verifying against the real binary the way the above was,
-and guessing it would be worse than leaving Codex on the floor, which works.
+**Codex's `app-server`** is the other fast path, and it works differently
+enough to be worth describing. It is JSON-RPC over stdio with threads and
+turns, so there is no "write a line of text": a message is either steered into
+the turn that is already running (`turn/steer`) or starts a new one
+(`turn/start`). Every shape came from `codex app-server generate-json-schema
+--out` plus a live handshake against codex-cli 0.167.2, and three details would
+have been easy to get wrong:
+
+- **Notifications omit the `jsonrpc` field** and add `emittedAtMs`. A parser
+  that insists on `jsonrpc: "2.0"` silently drops every one of them, including
+  all token usage and turn state.
+- The server **asks the client questions and blocks until answered**. An
+  unattended agent has nobody to ask, so command and file-change approvals are
+  accepted and anything needing a human's words is declined — leaving them
+  unanswered wedges the turn.
+- The approval vocabularies **differ per method**: `execCommandApproval` wants
+  `approved`, while `item/commandExecution/requestApproval` wants `accept` /
+  `acceptForSession`. The wrong word for the method leaves the agent stuck.
+
+The resume handle is `thread.id`, replayed through `thread/resume`. Token usage
+comes from `thread/tokenUsage/updated` (`inputTokens`, `outputTokens`,
+`cachedInputTokens`).
+
+One honesty note on acknowledgement: Claude's replay echo proves a message
+reached the model, whereas a successful `turn/steer` only proves the Codex
+runtime accepted it. That is the strongest signal the protocol offers, and the
+code says so where it acks.
 
 ## Crash recovery
 
@@ -374,13 +398,13 @@ reconnect-with-backoff and identity-checked signalling.
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
   `status`, `send`, `log`, `transcript`, `attach`, `adopt`.
 
-94 unit tests, plus six end-to-end suites that drive real processes
+98 unit tests, plus seven end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt; do python3 -I tests/e2e_$t.py || break; done
+for t in team spawn attach secure driver adopt codex; do python3 -I tests/e2e_$t.py || break; done
 
 # a two-machine team, by hand
 nexmesh-hub enrol zeiss                     # on the hub, once per node
@@ -404,14 +428,14 @@ generation, explicit trust anchors on nodes and the operator CLI, three
 separate credential types, operator auth as a route-group middleware, and the
 two refusals described above.
 
-**Milestone 4 -- done** (except Codex). The `stream_json` driver with mid-turn
-injection and echo-based acknowledgement, token accounting, resume handles,
-crash recovery with handoff and flap detection, and tmux adoption. Codex's
-`app_server` is outstanding, as explained above.
+**Milestone 4 -- done.** Both driver fast paths (`stream_json` for Claude Code,
+`app_server` for Codex) with mid-turn injection and acknowledgement, token
+accounting, resume handles, crash recovery with handoff and flap detection, and
+tmux adoption.
 
-**Next** -- mutual TLS; Codex `app_server`; a web dashboard; workspace sync for
-shared-repo sessions; an MCP orchestrator server so a Claude Code session can
-drive the fleet conversationally.
+**Next** -- mutual TLS; a web dashboard; workspace sync for shared-repo
+sessions; an MCP orchestrator server so a Claude Code session can drive the
+fleet conversationally.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 
