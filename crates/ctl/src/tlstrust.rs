@@ -66,3 +66,31 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 }
+
+/// Find a command on PATH, or in the descriptor's extra paths.
+///
+/// Lives here because the operator CLI has no other place for small path
+/// helpers; it is the same logic the node uses to find an agent CLI.
+pub fn noop_resolve(command: &str, extra: &[String]) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let expand = |p: &str| match (p.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => p.to_string(),
+    };
+    let executable = |path: &str| {
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if command.contains('/') {
+        let p = expand(command);
+        return executable(&p).then_some(p);
+    }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var.split(':').map(|s| s.to_string()).chain(extra.iter().map(|e| expand(e))) {
+        if dir.is_empty() { continue; }
+        let c = format!("{}/{}", dir.trim_end_matches('/'), command);
+        if executable(&c) { return Some(c); }
+    }
+    None
+}

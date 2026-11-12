@@ -10,6 +10,7 @@
 //! `nexmesh` -- the operator CLI. Runs on any machine and talks to the hub over
 //! HTTP, so it works from the laptop whether or not the laptop hosts anything.
 
+mod install;
 mod tlstrust;
 
 use anyhow::{Context, Result};
@@ -132,6 +133,25 @@ enum Cmd {
         /// Bytes of scrollback to replay first.
         #[arg(long, default_value_t = 16384)]
         replay: usize,
+    },
+    /// Register the orchestrator as an MCP server in one of your agent CLIs,
+    /// so you can spin up teams from whatever session you are in.
+    InstallOrchestrator {
+        /// CLI to install into: claude, opencode, qwen, codex, gemini.
+        #[arg(long = "cli")]
+        cli_id: String,
+        /// Directory of CLI descriptors.
+        #[arg(long, env = "NEXMESH_CLIS", default_value = "/etc/nexmesh/clis")]
+        clis: String,
+        /// Name the server appears under inside that CLI.
+        #[arg(long, default_value = "nexmesh")]
+        name: String,
+        /// Path to nexmesh-orch; defaults to a sibling of this binary.
+        #[arg(long)]
+        orch: Option<String>,
+        /// Print what would be done without doing it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Send a message to the team or one agent, as the operator.
     Send {
@@ -620,6 +640,29 @@ async fn main() -> Result<()> {
 
         Cmd::Attach { session, who, replay } => {
             attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref()).await?;
+        }
+
+        Cmd::InstallOrchestrator { cli_id, clis, name, orch, dry_run } => {
+            let msg = install::install(install::Opts {
+                cli_id: &cli_id,
+                clis_dir: &clis,
+                server_name: &name,
+                orch: orch.as_deref(),
+                hub: &base,
+                token: args.token.as_deref(),
+                ca_cert: args.ca_cert.as_deref(),
+                dry_run,
+            })?;
+            println!("{msg}");
+            if !dry_run {
+                println!("Restart {cli_id} to pick it up, then ask it to list your nodes.");
+                if args.token.is_none() {
+                    println!(
+                        "NOTE: no operator token was passed, so the orchestrator will only work \
+                         against a hub that has none. Re-run with --token once you mint one."
+                    );
+                }
+            }
         }
 
         Cmd::Send { session, text, to } => {

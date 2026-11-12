@@ -86,6 +86,7 @@ port — so starting with two machines does not paint us into a corner.
 | `nexmesh-node` | every machine | Spawns local CLIs, drives them, reports health. The only component that may signal. |
 | `nexmesh-mcpd` | per agent, stdio | The MCP shim the CLI loads. Talks to its local node over a unix socket; holds no credentials. |
 | `nexmesh` | anywhere | Operator CLI. |
+| `nexmesh-orch` | wherever you work | The orchestrator, as an MCP server, so **any** MCP-capable CLI can run the fleet. |
 
 ## Supporting any agent CLI
 
@@ -158,6 +159,57 @@ Messages are addressed **slot to slot**, not process to process, so a message
 queued for a slot is still there for whatever agent next occupies it, on
 whatever machine. The original keys the inbox on the peer and has to graft it
 onto a respawned agent.
+
+## Running the fleet from whatever CLI you use
+
+Driving a fleet should not require one particular CLI. `nexmesh-orch` is a
+plain MCP stdio server, so Claude Code, Codex, opencode, qwen, Gemini — or a
+program of your own — can load it and spin up teams from the session you are
+already in.
+
+```bash
+nexmesh install-orchestrator --cli claude   --token <operator-token>
+nexmesh install-orchestrator --cli opencode --token <operator-token>
+# then, in that CLI:
+#   "list my nodes"
+#   "start a team on zeiss: a claude engineer to build the login flow and an
+#    opencode reviewer; the repo is at /srv/app"
+```
+
+Its tools are the operator's verbs, not an agent's: `list_nodes`,
+`create_team`, `add_agent`, `team_status`, `read_log`, `message_team`,
+`adopt_terminal`, `read_transcript`, `list_sessions`. `create_team` is one
+call — session, workspace, plan, and every agent placed and started.
+
+Unlike `nexmesh-mcpd`, which deliberately holds no credentials, this one holds
+an **operator token**: its tools start processes on every machine in the fleet.
+Install it only into a CLI you trust with that.
+
+`install-orchestrator` uses each CLI's own `mcp add` where one exists, rather
+than editing a config format that may change underneath us; for opencode, whose
+`mcp add` is interactive and so unscriptable, it writes the documented config
+instead. Either way the token never appears in the output, including `--dry-run`.
+
+## The web dashboard
+
+```bash
+nexmesh-hub --listen 127.0.0.1:7870 serve   # then open http://127.0.0.1:7870/
+```
+
+Served by the hub itself rather than a second daemon on a second port: one
+process to run, one address to reach, one credential to hold. Tabs for agents,
+the conversation, the plan, shared knowledge, files and the fleet, with stat
+tiles for what is working, what awaits review, what nobody has seen, and what
+is flapping.
+
+It refreshes once a second and pauses when the tab is hidden. The page itself
+carries no data, so it is served without a token and asks for one in the
+browser, keeping it in `localStorage`; the snapshot it fetches sits behind the
+same operator middleware as everything else.
+
+There are **no external fonts, scripts or stylesheets**. A fleet hub may sit on
+a network with no route to the internet, and a dashboard that needs a CDN to
+render is a dashboard that fails exactly when you need it.
 
 ## Watching the team
 
@@ -396,15 +448,19 @@ reconnect-with-backoff and identity-checked signalling.
   (`nexmesh log --follow`), and per-agent transcripts of process output that
   outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
-  `status`, `send`, `log`, `transcript`, `attach`, `adopt`.
+  `status`, `send`, `log`, `transcript`, `attach`, `adopt`,
+  `install-orchestrator`.
+- A web dashboard and an MCP orchestrator server (above).
 
-98 unit tests, plus seven end-to-end suites that drive real processes
+102 unit tests, plus nine end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt codex; do python3 -I tests/e2e_$t.py || break; done
+for t in team spawn attach secure driver adopt codex dashboard orchestrator; do
+  python3 -I tests/e2e_$t.py || break
+done
 
 # a two-machine team, by hand
 nexmesh-hub enrol zeiss                     # on the hub, once per node
@@ -433,9 +489,11 @@ two refusals described above.
 accounting, resume handles, crash recovery with handoff and flap detection, and
 tmux adoption.
 
-**Next** -- mutual TLS; a web dashboard; workspace sync for shared-repo
-sessions; an MCP orchestrator server so a Claude Code session can drive the
-fleet conversationally.
+**Done since.** The web dashboard, and the orchestrator as an MCP server so any
+CLI can run the fleet.
+
+**Next** -- mutual TLS; workspace sync for shared-repo sessions; releasing and
+pausing agents from the orchestrator.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 

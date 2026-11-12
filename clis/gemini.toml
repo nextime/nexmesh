@@ -22,3 +22,8 @@ attachable = true
 
 [driver]
 kind = "mcp_only"
+
+[user_install]
+style = "command"
+argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
+env_flag = "-e"

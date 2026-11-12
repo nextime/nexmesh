@@ -36,3 +36,13 @@ attachable = true
 
 [driver]
 kind = "mcp_only"
+
+[user_install]
+# `opencode mcp add` is interactive, so it cannot be driven from a script;
+# write the documented config instead. Shape verified against
+# https://opencode.ai/config.json.
+style = "json_file"
+path = "~/.config/opencode/opencode.json"
+pointer = "/mcp/servers/{name}"
+env_key = "environment"
+entry = { type = "local", command = ["{command}"], enabled = true }

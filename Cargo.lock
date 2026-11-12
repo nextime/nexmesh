@@ -1112,6 +1112,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "webpki-roots 0.26.11",
 ]
 
@@ -1174,6 +1175,21 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "nexmesh-orch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nexmesh-proto",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

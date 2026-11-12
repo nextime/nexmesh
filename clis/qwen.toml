@@ -27,3 +27,9 @@ attachable = true
 
 [driver]
 kind = "mcp_only"
+
+[user_install]
+# Same shape as Claude's: `qwen mcp add [-s scope] <name> -- <command>`.
+style = "command"
+argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
+env_flag = "-e"

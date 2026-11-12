@@ -32,3 +32,11 @@ attachable = true
 [driver]
 kind = "stream_json"
 replay_user_messages = true
+
+[user_install]
+# Verified: `claude mcp add [-s scope] [-e K=V]... <name> -- <command>`.
+# Using the CLI's own command rather than editing ~/.claude.json by hand, so a
+# change to that file's layout cannot break us.
+style = "command"
+argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
+env_flag = "-e"

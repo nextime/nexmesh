@@ -17,6 +17,7 @@
 mod api;
 mod attach;
 mod auth;
+mod dashboard;
 mod delivery;
 mod launch;
 mod nodes;
@@ -286,6 +287,7 @@ async fn main() -> Result<()> {
         .route("/v1/agents/:id/transcript", get(api::agent_transcript))
         .route("/v1/slots/:id/spawn", post(api::spawn_slot))
         .route("/v1/attach/ws", get(attach::attach_ws))
+        .route("/v1/dashboard/state", get(dashboard::snapshot))
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
             auth::require_operator,
@@ -293,7 +295,12 @@ async fn main() -> Result<()> {
 
     // These carry their own credentials: a node authenticates in its first
     // frame, a participant with a participant token.
+    // The page itself carries no data, so it is served without a token and
+    // asks for one in the browser; the snapshot it fetches is authenticated.
     let other = Router::new()
+        .route("/", get(dashboard::page))
+        .route("/dashboard", get(dashboard::page))
+        .route("/favicon.ico", get(dashboard::favicon))
         .route("/healthz", get(api::health))
         .route("/v1/participant/join", post(api::participant_join))
         .route("/v1/participant/tool", post(api::participant_tool))
@@ -351,14 +358,14 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("loading TLS material from {cert} and {key}"))?;
             drop(listener);
             tracing::info!(%addr, version = VERSION, tls = true, authenticated = authed,
-                "hub listening (https/wss)");
+                "hub listening (https/wss); dashboard at https://{addr}/");
             axum_server::bind_rustls(addr, config)
                 .serve(app.into_make_service())
                 .await?;
         }
         None => {
             tracing::info!(%addr, version = VERSION, tls = false, authenticated = authed,
-                "hub listening (http/ws)");
+                "hub listening (http/ws); dashboard at http://{addr}/");
             axum::serve(listener, app).await?;
         }
     }

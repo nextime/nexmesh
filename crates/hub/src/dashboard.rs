@@ -1,0 +1,295 @@
+//! The web dashboard: one snapshot endpoint and one static page.
+//!
+//! Served by the hub rather than a second daemon on a second port, so there is
+//! one process to run, one address to reach and one credential to hold. The
+//! snapshot sits behind the same operator middleware as everything else; the
+//! page itself carries no data, so it is served without a token and asks for
+//! one in the browser.
+
+use crate::state::AppState;
+use axum::{
+    extract::{Query, State},
+    http::header,
+    response::{Html, IntoResponse, Response},
+    Json,
+};
+use rusqlite::OptionalExtension;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+const PAGE: &str = include_str!("../static/dashboard.html");
+
+pub async fn page() -> Html<&'static str> {
+    Html(PAGE)
+}
+
+/// Tiny inline favicon so the browser stops asking for one.
+pub async fn favicon() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#111827"/><circle cx="16" cy="9" r="3.2" fill="#6ee7b7"/><circle cx="8" cy="23" r="3.2" fill="#93c5fd"/><circle cx="24" cy="23" r="3.2" fill="#fcd34d"/><path d="M16 12v4m0 0-6 5m6-5 6 5" stroke="#4b5563" stroke-width="1.6" fill="none"/></svg>"##,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct StateQuery {
+    /// Which session to detail. Omitted: just the fleet and the session list.
+    pub session: Option<String>,
+}
+
+/// Everything the page draws, in one request.
+///
+/// Deliberately one round trip rather than a dozen: the page polls this, so a
+/// single query keeps the view internally consistent — agents and the messages
+/// between them always come from the same instant.
+pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -> Json<Value> {
+    let authed = st.operator_auth_configured();
+    let nodes = st.nodes_json();
+    let db = st.db.lock().unwrap();
+
+    let sessions: Vec<Value> = db
+        .prepare(
+            "SELECT s.id, s.name, s.status, s.created_at_ms, s.last_active_ms,
+                    (SELECT COUNT(*) FROM slots WHERE session_id = s.id)
+             FROM sessions s ORDER BY s.last_active_ms DESC",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
+                    "status": r.get::<_, String>(2)?, "created_at_ms": r.get::<_, i64>(3)?,
+                    "last_active_ms": r.get::<_, i64>(4)?, "slots": r.get::<_, i64>(5)?,
+                }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .unwrap_or_default();
+
+    // Default to the most recently active session so the page is useful with
+    // no query string at all.
+    let sid = q
+        .session
+        .filter(|s| !s.is_empty())
+        .or_else(|| sessions.first().and_then(|s| s["id"].as_str().map(String::from)));
+
+    let detail = match &sid {
+        None => Value::Null,
+        Some(sid) => {
+            let agents: Vec<Value> = db
+                .prepare(
+                    "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id),
+                            COALESCE(s.role, '-'), s.participant_kind, COALESCE(s.cli_id, '-'),
+                            s.task_state, s.summary, s.status, s.restarts,
+                            COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
+                            COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external'
+                                                  ELSE '-' END),
+                            COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0),
+                            COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
+                            a.id, s.mode
+                     FROM slots s
+                     LEFT JOIN agents a ON a.id = (
+                        SELECT id FROM agents WHERE slot_id = s.id
+                        ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                     LEFT JOIN nodes n ON n.id = a.node_id
+                     WHERE s.session_id = ? ORDER BY 2",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "slot_id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
+                            "role": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
+                            "cli": r.get::<_, String>(4)?, "task_state": r.get::<_, String>(5)?,
+                            "summary": r.get::<_, String>(6)?, "slot_status": r.get::<_, String>(7)?,
+                            "restarts": r.get::<_, i64>(8)?, "provenance": r.get::<_, String>(9)?,
+                            "status": r.get::<_, String>(10)?, "host": r.get::<_, String>(11)?,
+                            "input_tokens": r.get::<_, i64>(12)?, "output_tokens": r.get::<_, i64>(13)?,
+                            "cache_read_tokens": r.get::<_, i64>(14)?,
+                            "push_capable": r.get::<_, i64>(15)? == 1,
+                            "agent_id": r.get::<_, Option<String>>(16)?,
+                            "mode": r.get::<_, String>(17)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let messages: Vec<Value> = db
+                .prepare(
+                    "SELECT m.id, m.sent_at_ms, m.kind, m.body,
+                            COALESCE(sf.display_name, sf.role, 'operator'),
+                            CASE WHEN m.to_slot IS NULL THEN '(team)'
+                                 ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
+                            m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL
+                     FROM messages m
+                     LEFT JOIN slots sf ON sf.id = m.from_slot
+                     LEFT JOIN slots st2 ON st2.id = m.to_slot
+                     WHERE m.session_id = ? ORDER BY m.id DESC LIMIT 120",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "id": r.get::<_, i64>(0)?, "at_ms": r.get::<_, i64>(1)?,
+                            "kind": r.get::<_, String>(2)?, "body": r.get::<_, String>(3)?,
+                            "from": r.get::<_, String>(4)?, "to": r.get::<_, String>(5)?,
+                            "delivered": r.get::<_, bool>(6)?, "in_flight": r.get::<_, bool>(7)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let plan: Vec<Value> = db
+                .prepare(
+                    "SELECT p.ord, p.label, p.status,
+                            COALESCE(s.display_name, s.role, '')
+                     FROM plan_items p LEFT JOIN slots s ON s.id = p.assignee_slot
+                     WHERE p.session_id = ? ORDER BY p.ord",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "ord": r.get::<_, i64>(0)?, "label": r.get::<_, String>(1)?,
+                            "status": r.get::<_, String>(2)?, "who": r.get::<_, String>(3)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let knowledge: Vec<Value> = db
+                .prepare(
+                    "SELECT k.key, k.category, k.value,
+                            COALESCE(s.display_name, s.role, '?'), k.updated_at_ms
+                     FROM knowledge k LEFT JOIN slots s ON s.id = k.author_slot
+                     WHERE k.session_id = ? ORDER BY k.category, k.key",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "key": r.get::<_, String>(0)?, "category": r.get::<_, String>(1)?,
+                            "value": r.get::<_, String>(2)?, "who": r.get::<_, String>(3)?,
+                            "at_ms": r.get::<_, i64>(4)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let locks: Vec<Value> = db
+                .prepare(
+                    "SELECT l.scope, l.path, COALESCE(s.display_name, s.role, l.held_by_slot),
+                            COALESCE(l.purpose, ''), l.expires_at_ms
+                     FROM locks l LEFT JOIN slots s ON s.id = l.held_by_slot
+                     WHERE l.session_id = ? ORDER BY l.scope, l.path",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "scope": r.get::<_, String>(0)?, "path": r.get::<_, String>(1)?,
+                            "who": r.get::<_, String>(2)?, "purpose": r.get::<_, String>(3)?,
+                            "expires_at_ms": r.get::<_, i64>(4)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let zones: Vec<Value> = db
+                .prepare(
+                    "SELECT w.name, o.pattern, COALESCE(s.display_name, s.role, o.slot_id)
+                     FROM ownership o
+                     JOIN workspaces w ON w.id = o.workspace_id
+                     LEFT JOIN slots s ON s.id = o.slot_id
+                     WHERE w.session_id = ? ORDER BY w.name, o.pattern",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "workspace": r.get::<_, String>(0)?, "pattern": r.get::<_, String>(1)?,
+                            "who": r.get::<_, String>(2)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let workspaces: Vec<Value> = db
+                .prepare(
+                    "SELECT w.name, w.kind, COALESCE(w.repo_url, ''), COALESCE(n.name, '-'),
+                            (SELECT GROUP_CONCAT(nn.name || ':' || m.path, '  ')
+                             FROM workspace_mounts m JOIN nodes nn ON nn.id = m.node_id
+                             WHERE m.workspace_id = w.id)
+                     FROM workspaces w LEFT JOIN nodes n ON n.id = w.node_id
+                     WHERE w.session_id = ? ORDER BY w.name",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([sid], |r| {
+                        Ok(json!({
+                            "name": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?,
+                            "repo": r.get::<_, String>(2)?, "node": r.get::<_, String>(3)?,
+                            "mounts": r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+
+            let session = db
+                .query_row(
+                    "SELECT id, name, status, created_at_ms FROM sessions WHERE id = ?",
+                    [sid],
+                    |r| {
+                        Ok(json!({
+                            "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
+                            "status": r.get::<_, String>(2)?, "created_at_ms": r.get::<_, i64>(3)?,
+                        }))
+                    },
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or(Value::Null);
+
+            // The numbers worth a glance: who is working, and what is stuck.
+            let working = agents.iter().filter(|a| a["task_state"] == "working").count();
+            let approved = agents.iter().filter(|a| a["task_state"] == "approved").count();
+            let awaiting = agents
+                .iter()
+                .filter(|a| a["task_state"] == "done_pending_review")
+                .count();
+            let live = agents.iter().filter(|a| a["status"] == "running").count();
+            let undelivered = messages
+                .iter()
+                .filter(|m| m["delivered"] == false && m["in_flight"] == false)
+                .count();
+            let tin: i64 = agents.iter().filter_map(|a| a["input_tokens"].as_i64()).sum();
+            let tout: i64 = agents.iter().filter_map(|a| a["output_tokens"].as_i64()).sum();
+            let flapping = agents.iter().filter(|a| a["slot_status"] == "flapping").count();
+
+            json!({
+                "session": session,
+                "agents": agents,
+                "messages": messages,
+                "plan": plan,
+                "knowledge": knowledge,
+                "locks": locks,
+                "zones": zones,
+                "workspaces": workspaces,
+                "stats": {
+                    "slots": agents.len(), "live": live, "working": working,
+                    "awaiting_review": awaiting, "approved": approved,
+                    "undelivered": undelivered, "flapping": flapping,
+                    "input_tokens": tin, "output_tokens": tout,
+                },
+            })
+        }
+    };
+
+    Json(json!({
+        "hub": { "version": env!("CARGO_PKG_VERSION"), "authenticated": authed,
+                 "now_ms": nexmesh_proto::now_ms() },
+        "nodes": nodes["nodes"],
+        "sessions": sessions,
+        "detail": detail,
+    }))
+}

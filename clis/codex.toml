@@ -25,3 +25,10 @@ attachable = true
 
 [driver]
 kind = "app_server"
+
+[user_install]
+style = "toml_file"
+path = "~/.codex/config.toml"
+key = "mcp_servers.{name}"
+env_key = "env"
+entry = { command = "{command}", args = [] }

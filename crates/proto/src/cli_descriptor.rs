@@ -26,6 +26,10 @@ pub struct CliDescriptor {
     pub modes: BTreeMap<String, ModeSpec>,
     #[serde(default)]
     pub driver: DriverSpec,
+    /// How to add a server to this CLI's own configuration, for the
+    /// orchestrator. Absent means nexmesh cannot install itself there.
+    #[serde(default)]
+    pub user_install: Option<UserInstall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +168,43 @@ pub fn set_pointer(
     Ok(())
 }
 
+/// How to register a server in the USER's own CLI configuration, so it is
+/// there every time they start that CLI by hand.
+///
+/// Distinct from `McpRegistration`, which is about the throwaway config a node
+/// writes for an agent it is about to spawn. This one edits something the user
+/// owns, so where a CLI offers its own command we use it rather than guess at
+/// a file format that may change under us.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "style", rename_all = "snake_case")]
+pub enum UserInstall {
+    /// Let the CLI do it: `<cli> mcp add --scope user <name> -- <command>`.
+    Command {
+        argv: Vec<String>,
+        /// Flag used to pass one environment variable, repeated per variable
+        /// (`-e KEY=value`). Absent means the CLI takes no env.
+        #[serde(default)]
+        env_flag: Option<String>,
+    },
+    /// Merge into a JSON config ourselves, for a CLI whose `mcp add` is
+    /// interactive and so unusable from a script.
+    JsonFile {
+        path: String,
+        pointer: String,
+        entry: toml::Value,
+        #[serde(default)]
+        env_key: Option<String>,
+    },
+    /// Same, for TOML.
+    TomlFile {
+        path: String,
+        key: String,
+        entry: toml::Value,
+        #[serde(default)]
+        env_key: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModeSpec {
     /// Argv after the command. `{prompt}`, `{cwd}`, `{session}`, `{resume}`
@@ -235,6 +276,10 @@ impl CliDescriptor {
     /// The MCP registration for this CLI, if any.
     pub fn mcp(&self) -> &McpRegistration {
         &self.mcp
+    }
+
+    pub fn user_install(&self) -> Option<&UserInstall> {
+        self.user_install.as_ref()
     }
 
     /// Can a human take over a session in this mode, or only watch it?

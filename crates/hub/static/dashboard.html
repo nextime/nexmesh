@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nexmesh</title>
+<!--
+  Served by the hub itself. No external fonts, scripts or stylesheets: a fleet
+  hub may sit on a network with no route to the internet, and a dashboard that
+  needs a CDN to render is a dashboard that fails exactly when you need it.
+-->
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #121820; --panel2: #171f29; --line: #243041;
+    --fg: #e6edf3; --dim: #8b9cb0; --faint: #5d6b7d;
+    --ok: #6ee7b7; --warn: #fcd34d; --bad: #fca5a5; --info: #93c5fd; --accent: #a78bfa;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d4dae1;
+      --fg: #1d242c; --dim: #5a6673; --faint: #8794a1;
+      --ok: #047857; --warn: #92610a; --bad: #b91c1c; --info: #1d4ed8; --accent: #6d28d9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .brand { font-weight: 650; letter-spacing: .2px; }
+  .brand span { color: var(--accent); }
+  select, input, button {
+    font: inherit; color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--faint); }
+  .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); display: inline-block; }
+  .dot.live { background: var(--ok); }
+  .dot.stale { background: var(--bad); }
+  .muted { color: var(--dim); }
+  .tiny { font-size: 12px; }
+
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; padding: 14px 16px 0; }
+  .tile {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+    padding: 9px 13px; min-width: 96px;
+  }
+  .tile .n { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .tile .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .6px; }
+  .tile.alert .n { color: var(--bad); }
+  .tile.warn .n { color: var(--warn); }
+
+  nav { display: flex; gap: 2px; padding: 14px 16px 0; flex-wrap: wrap; }
+  nav button {
+    background: transparent; border: 1px solid transparent; border-bottom: 2px solid transparent;
+    border-radius: 6px 6px 0 0; color: var(--dim); padding: 6px 12px;
+  }
+  nav button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  nav .count { color: var(--faint); font-size: 12px; }
+
+  main { padding: 12px 16px 40px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  td.mono, .mono { font-family: var(--mono); font-size: 13px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+    border: 1px solid var(--line); color: var(--dim); white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  .badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+  .badge.info { color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, transparent); }
+
+  .feed { max-height: 68vh; overflow-y: auto; padding: 4px 0; }
+  .msg {
+    display: grid; grid-template-columns: 62px 16px minmax(0, 1fr); gap: 10px;
+    padding: 5px 12px; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+  }
+  .msg:last-child { border-bottom: none; }
+  .msg .t { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+  .msg .who { font-weight: 600; }
+  .msg .arrow { color: var(--faint); }
+  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg .mark { text-align: center; font-family: var(--mono); color: var(--faint); }
+  .msg.undelivered .mark { color: var(--bad); font-weight: 700; }
+  .msg.inflight .mark { color: var(--warn); }
+
+  .bar { height: 7px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--ok); }
+
+  .empty { padding: 26px 16px; color: var(--dim); text-align: center; }
+  .err {
+    margin: 12px 16px 0; padding: 10px 13px; border-radius: 8px;
+    background: color-mix(in srgb, var(--bad) 14%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--bad) 45%, transparent);
+  }
+  .gate { max-width: 460px; margin: 60px auto; padding: 22px; }
+  .gate h1 { font-size: 17px; margin: 0 0 6px; }
+  .gate p { color: var(--dim); }
+  .gate form { display: flex; gap: 8px; margin-top: 14px; }
+  .gate input { flex: 1; font-family: var(--mono); }
+  code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+  @media (max-width: 620px) {
+    .msg { grid-template-columns: 52px 14px minmax(0, 1fr); }
+    th.hide, td.hide { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="gate" class="gate panel" hidden>
+  <h1>Operator token required</h1>
+  <p class="tiny">This hub has operator authentication enabled. Mint a token on the hub with
+     <code>nexmesh-hub operator-token &lt;label&gt;</code>. It is kept in this browser only.</p>
+  <form id="gateForm">
+    <input id="tokenInput" type="password" placeholder="operator token" autocomplete="off" spellcheck="false">
+    <button type="submit">Connect</button>
+  </form>
+  <p id="gateErr" class="tiny" style="color:var(--bad)"></p>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="brand">nex<span>mesh</span></div>
+    <select id="sessionSel" title="Session"></select>
+    <span class="spacer"></span>
+    <span class="tiny muted" id="hubInfo"></span>
+    <span class="dot" id="liveDot" title="polling"></span>
+    <button id="forget" class="tiny" title="Remove the stored token from this browser">sign out</button>
+  </header>
+
+  <div id="err" class="err" hidden></div>
+  <div class="stats" id="stats"></div>
+  <nav id="tabs"></nav>
+  <main><div id="view"></div></main>
+</div>
+
+<script>
+"use strict";
+const TABS = ["agents", "messages", "plan", "knowledge", "files", "fleet"];
+const KEY = "nexmesh.operator.token";
+let token = localStorage.getItem(KEY) || "";
+let tab = location.hash.replace("#", "") || "agents";
+if (!TABS.includes(tab)) tab = "agents";
+let session = new URLSearchParams(location.search).get("session") || "";
+let snap = null, failures = 0, timer = null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const hhmmss = (ms) => {
+  const d = new Date(ms);
+  return isNaN(d) ? "--:--:--" : d.toTimeString().slice(0, 8);
+};
+const human = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+  : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n ?? 0);
+const ago = (ms, now) => {
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  return s < 60 ? s + "s" : s < 3600 ? Math.round(s / 60) + "m" : Math.round(s / 3600) + "h";
+};
+
+function stateClass(s) {
+  if (s === "approved" || s === "released") return "ok";
+  if (s === "working" || s === "addressing_feedback") return "info";
+  if (s === "done_pending_review") return "warn";
+  return "";
+}
+
+async function fetchSnapshot() {
+  const url = "/v1/dashboard/state" + (session ? "?session=" + encodeURIComponent(session) : "");
+  const headers = token ? { authorization: "Bearer " + token } : {};
+  const r = await fetch(url, { headers, cache: "no-store" });
+  if (r.status === 401) { const e = new Error("unauthorized"); e.code = 401; throw e; }
+  if (!r.ok) throw new Error("hub returned " + r.status);
+  return r.json();
+}
+
+async function tick() {
+  try {
+    snap = await fetchSnapshot();
+    failures = 0;
+    $("err").hidden = true;
+    $("liveDot").className = "dot live";
+    render();
+  } catch (e) {
+    if (e.code === 401) { showGate("That token was not accepted."); return; }
+    failures++;
+    $("liveDot").className = "dot stale";
+    // One blip is normal during a hub restart; say something only if it persists.
+    if (failures > 2) {
+      $("err").hidden = false;
+      $("err").textContent = "Cannot reach the hub: " + e.message + " (retrying)";
+    }
+  }
+}
+
+function showGate(msg) {
+  clearInterval(timer); timer = null;
+  $("app").hidden = true; $("gate").hidden = false;
+  $("gateErr").textContent = msg || "";
+  $("tokenInput").focus();
+}
+
+function start() {
+  $("gate").hidden = true; $("app").hidden = false;
+  tick();
+  if (!timer) timer = setInterval(() => { if (!document.hidden) tick(); }, 1000);
+}
+
+$("gateForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  token = $("tokenInput").value.trim();
+  localStorage.setItem(KEY, token);
+  start();
+});
+$("forget").addEventListener("click", () => {
+  localStorage.removeItem(KEY); token = "";
+  showGate("Token removed from this browser.");
+});
+$("sessionSel").addEventListener("change", (e) => {
+  session = e.target.value;
+  const u = new URL(location);
+  u.searchParams.set("session", session);
+  history.replaceState(null, "", u);
+  tick();
+});
+window.addEventListener("hashchange", () => {
+  const t = location.hash.replace("#", "");
+  if (TABS.includes(t)) { tab = t; render(); }
+});
+
+function render() {
+  if (!snap) return;
+  const d = snap.detail, now = snap.hub.now_ms;
+  $("hubInfo").textContent = "hub " + snap.hub.version +
+    (snap.hub.authenticated ? " · authenticated" : " · no auth");
+
+  const sel = $("sessionSel");
+  const want = (snap.sessions || []).map((s) => s.id).join("|");
+  if (sel.dataset.sig !== want) {
+    sel.dataset.sig = want;
+    sel.innerHTML = (snap.sessions || [])
+      .map((s) => `<option value="${esc(s.id)}">${esc(s.name)} — ${esc(s.id)}</option>`).join("")
+      || `<option value="">no sessions</option>`;
+  }
+  if (d && d.session) sel.value = d.session.id;
+
+  const st = (d && d.stats) || {};
+  $("stats").innerHTML = [
+    tile(st.live ?? 0, "live agents"),
+    tile(st.working ?? 0, "working"),
+    tile(st.awaiting_review ?? 0, "awaiting review", st.awaiting_review ? "warn" : ""),
+    tile(st.approved ?? 0, "approved"),
+    tile(st.undelivered ?? 0, "unseen msgs", st.undelivered ? "alert" : ""),
+    tile(st.flapping ?? 0, "flapping", st.flapping ? "alert" : ""),
+    tile(human(st.input_tokens ?? 0) + " / " + human(st.output_tokens ?? 0), "tokens in/out"),
+    tile((snap.nodes || []).filter((n) => n.connected).length + "/" + (snap.nodes || []).length, "nodes"),
+  ].join("");
+
+  const counts = {
+    agents: (d && d.agents || []).length, messages: (d && d.messages || []).length,
+    plan: (d && d.plan || []).length, knowledge: (d && d.knowledge || []).length,
+    files: ((d && d.locks || []).length + (d && d.zones || []).length),
+    fleet: (snap.nodes || []).length,
+  };
+  $("tabs").innerHTML = TABS.map((t) =>
+    `<button aria-selected="${t === tab}" onclick="location.hash='${t}'">${t}` +
+    `<span class="count"> ${counts[t] || 0}</span></button>`).join("");
+
+  $("view").innerHTML = !d
+    ? `<div class="panel"><div class="empty">No sessions yet. Create one with
+         <code>nexmesh new-session &lt;name&gt;</code>.</div></div>`
+    : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
+         knowledge: viewKnowledge, files: viewFiles, fleet: viewFleet })[tab](d, now);
+
+  if (tab === "messages") {
+    const f = document.querySelector(".feed");
+    if (f && f.dataset.stick !== "0") f.scrollTop = f.scrollHeight;
+  }
+}
+
+const tile = (n, k, cls = "") =>
+  `<div class="tile ${cls}"><div class="n">${esc(n)}</div><div class="k">${esc(k)}</div></div>`;
+const panel = (inner) => `<div class="panel">${inner}</div>`;
+const empty = (msg) => panel(`<div class="empty">${esc(msg)}</div>`);
+
+function viewAgents(d, now) {
+  if (!d.agents.length) return empty("No agents in this session yet.");
+  return panel(`<table><thead><tr>
+      <th>Agent</th><th>Role</th><th>Where</th><th class="hide">How</th>
+      <th>State</th><th class="num hide">Tokens</th><th>Summary</th></tr></thead><tbody>` +
+    d.agents.map((a) => {
+      const flap = a.slot_status === "flapping";
+      const dead = a.status !== "running";
+      return `<tr>
+        <td><span class="mono">${esc(a.name)}</span>
+            ${flap ? ' <span class="badge bad">flapping</span>' : ""}
+            ${a.restarts ? ` <span class="badge warn" title="restarts">↻${a.restarts}</span>` : ""}</td>
+        <td class="muted">${esc(a.role)}</td>
+        <td><span class="mono">${esc(a.host)}</span>
+            ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}</td>
+        <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
+            <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
+        <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span></td>
+        <td class="num hide tiny">${a.input_tokens || a.output_tokens
+            ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}</td>
+        <td class="muted">${esc(a.summary) || "<span class=tiny>—</span>"}</td>
+      </tr>`;
+    }).join("") + "</tbody></table>");
+}
+
+function viewMessages(d, now) {
+  if (!d.messages.length) return empty("No messages yet.");
+  // The snapshot is newest-first; read it oldest-first like a conversation.
+  const rows = d.messages.slice().reverse().map((m) => {
+    const cls = m.delivered ? "" : (m.in_flight ? "inflight" : "undelivered");
+    const mark = m.delivered ? "" : (m.in_flight ? "~" : "!");
+    const title = m.delivered ? "delivered to the model"
+      : (m.in_flight ? "handed over, not yet confirmed" : "the recipient has not seen this yet");
+    const kind = m.kind === "text" ? "" : `<span class="badge tiny">${esc(m.kind)}</span> `;
+    return `<div class="msg ${cls}">
+      <div class="t">${hhmmss(m.at_ms)}</div>
+      <div class="mark" title="${esc(title)}">${mark}</div>
+      <div><span class="who">${esc(m.from)}</span> <span class="arrow">→</span>
+           <span class="who">${esc(m.to)}</span><br>
+           <span class="body">${kind}${esc(m.body)}</span></div>
+    </div>`;
+  }).join("");
+  return panel(`<div class="feed" onscroll="this.dataset.stick=
+      (this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'">${rows}</div>`) +
+    `<p class="tiny muted" style="margin:8px 2px">
+       <b>!</b> the recipient has not seen it yet · <b>~</b> delivery in flight</p>`;
+}
+
+function viewPlan(d) {
+  if (!d.plan.length) return empty("No plan set for this session.");
+  const done = d.plan.filter((p) => p.status === "done").length;
+  const pct = Math.round((done / d.plan.length) * 100);
+  return panel(
+    `<div style="padding:12px"><div class="tiny muted">${done} of ${d.plan.length} done · ${pct}%</div>
+       <div class="bar" style="margin-top:7px"><i style="width:${pct}%"></i></div></div>` +
+    `<table><tbody>` + d.plan.map((p) => `<tr>
+        <td class="num muted" style="width:34px">${p.ord}</td>
+        <td><span class="badge ${p.status === "done" ? "ok" : p.status === "blocked" ? "bad"
+            : p.status === "in_progress" ? "info" : ""}">${esc(p.status)}</span></td>
+        <td>${esc(p.label)}</td>
+        <td class="muted tiny">${esc(p.who)}</td></tr>`).join("") + `</tbody></table>`);
+}
+
+function viewKnowledge(d, now) {
+  if (!d.knowledge.length)
+    return empty("Nothing recorded yet. Agents call store_knowledge as they decide things.");
+  return panel(`<table><thead><tr><th>Category</th><th>Key</th><th>Value</th>
+      <th class="hide">By</th><th class="num hide">Age</th></tr></thead><tbody>` +
+    d.knowledge.map((k) => `<tr>
+      <td><span class="badge ${k.category === "decision" ? "info"
+          : k.category === "blocker" ? "bad" : ""}">${esc(k.category)}</span></td>
+      <td class="mono">${esc(k.key)}</td>
+      <td>${esc(k.value)}</td>
+      <td class="hide muted tiny">${esc(k.who)}</td>
+      <td class="num hide muted tiny">${ago(k.at_ms, now)}</td></tr>`).join("") + "</tbody></table>");
+}
+
+function viewFiles(d, now) {
+  let out = "";
+  if (d.workspaces.length) {
+    out += `<h3 class="tiny muted" style="margin:4px 2px">Workspaces</h3>` + panel(
+      `<table><thead><tr><th>Name</th><th>Kind</th><th>Where</th></tr></thead><tbody>` +
+      d.workspaces.map((w) => `<tr><td class="mono">${esc(w.name)}</td>
+        <td><span class="badge ${w.kind === "repo" ? "info" : ""}">${esc(w.kind)}</span></td>
+        <td class="mono tiny muted">${esc(w.mounts || w.repo || w.node)}</td></tr>`).join("") +
+      `</tbody></table>`);
+  }
+  out += `<h3 class="tiny muted" style="margin:14px 2px 4px">Active locks</h3>`;
+  out += d.locks.length ? panel(`<table><thead><tr><th>Path</th><th>Held by</th>
+      <th class="hide">Domain</th><th class="num">Expires</th></tr></thead><tbody>` +
+      d.locks.map((l) => `<tr><td class="mono">${esc(l.path)}</td>
+        <td>${esc(l.who)} <span class="muted tiny">${esc(l.purpose)}</span></td>
+        <td class="hide mono tiny muted">${esc(l.scope)}</td>
+        <td class="num tiny muted">in ${ago(2 * now - l.expires_at_ms, now)}</td></tr>`).join("") +
+      `</tbody></table>`)
+    : empty("No files are locked.");
+  out += `<h3 class="tiny muted" style="margin:14px 2px 4px">Ownership zones</h3>`;
+  out += d.zones.length ? panel(`<table><thead><tr><th>Pattern</th><th>Owner</th>
+      <th class="hide">Workspace</th></tr></thead><tbody>` +
+      d.zones.map((z) => `<tr><td class="mono">${esc(z.pattern)}</td><td>${esc(z.who)}</td>
+        <td class="hide muted tiny">${esc(z.workspace)}</td></tr>`).join("") + `</tbody></table>`)
+    : empty("No ownership zones declared.");
+  return out;
+}
+
+function viewFleet() {
+  const n = snap.nodes || [];
+  if (!n.length) return empty("No nodes enrolled. Run nexmesh-hub enrol <name> and start a node.");
+  return panel(`<table><thead><tr><th>Node</th><th>State</th><th class="hide">Platform</th>
+      <th>Agent CLIs</th></tr></thead><tbody>` +
+    n.map((x) => `<tr>
+      <td class="mono">${esc(x.name)}</td>
+      <td><span class="badge ${x.connected ? "ok" : "bad"}">${x.connected ? "connected" : esc(x.status)}</span></td>
+      <td class="hide muted tiny">${esc(x.os)}/${esc(x.arch)}</td>
+      <td class="mono tiny">${(x.clis || []).map(esc).join(" · ") || "<span class=muted>none</span>"}</td>
+    </tr>`).join("") + "</tbody></table>");
+}
+
+// Try without a token first: a hub with no operator tokens is open, and asking
+// for one that does not exist would be a dead end.
+(async () => {
+  try { snap = await fetchSnapshot(); start(); }
+  catch (e) { e.code === 401 ? showGate("") : start(); }
+})();
+</script>
+</body>
+</html>
