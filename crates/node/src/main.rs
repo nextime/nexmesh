@@ -24,7 +24,9 @@ mod codex;
 mod ctx;
 mod driver;
 mod localsock;
+mod opencode;
 mod proc;
+mod viewer;
 mod spawn;
 mod tlstrust;
 
@@ -516,6 +518,42 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                     .await;
                 return;
             };
+            // An agent with no pty of its own but a server to connect to gets
+            // a terminal client started just for this viewer.
+            if let (true, Some((bin, args))) = (io.read_only() == false && io.master.is_none(),
+                                                io.attach_command()) {
+                let cwd = ctx
+                    .agent(&agent_id)
+                    .and_then(|_| std::env::var("PWD").ok())
+                    .unwrap_or_else(|| "/".into());
+                match viewer::open(ctx.clone(), attach_id.clone(), agent_id.clone(),
+                                   bin, args, cwd, cols, rows).await
+                {
+                    Ok(()) => {
+                        io.add_attach(&attach_id);
+                        let _ = ctx
+                            .send_hub(&NodeToHub::AttachOpened {
+                                attach_id,
+                                agent_id,
+                                read_only: false,
+                                cols,
+                                rows,
+                            })
+                            .await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = ctx
+                            .send_hub(&NodeToHub::AttachRejected {
+                                attach_id,
+                                reason: format!("could not open a terminal: {e:#}"),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+
             // Size the pty to the viewer's terminal before replaying, so a TUI
             // redraws at the right dimensions rather than wrapping oddly.
             io.resize(cols, rows);
@@ -540,6 +578,11 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
         }
 
         HubToNode::AttachData { attach_id, data } => {
+            // A terminal client opened for this viewer takes the keystrokes.
+            if let Some(v) = ctx.viewer(&attach_id) {
+                let _ = v.input.send(data).await;
+                return;
+            }
             let Some(io) = ctx.io_for_attach(&attach_id) else { return };
             match &io.input {
                 Some(tx) => {
@@ -560,12 +603,18 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
         }
 
         HubToNode::AttachResize { attach_id, cols, rows } => {
-            if let Some(io) = ctx.io_for_attach(&attach_id) {
+            if let Some(v) = ctx.viewer(&attach_id) {
+                v.resize(cols, rows);
+            } else if let Some(io) = ctx.io_for_attach(&attach_id) {
                 io.resize(cols, rows);
             }
         }
 
         HubToNode::AttachClose { attach_id } => {
+            // Closing a window onto a server leaves the agent running.
+            if let Some(v) = ctx.remove_viewer(&attach_id) {
+                v.close();
+            }
             if let Some(io) = ctx.io_for_attach(&attach_id) {
                 io.remove_attach(&attach_id);
                 tracing::info!(%attach_id, "viewer detached");

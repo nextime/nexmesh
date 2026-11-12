@@ -1,0 +1,21 @@
+# Test-only descriptor for the http_server driver.
+[cli]
+id = "fakeopencode"
+display_name = "Fake opencode server"
+command = "fakeopencode"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.headless]
+args = ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+attachable = true
+
+[modes.interactive]
+args = ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+attachable = true
+
+[driver]
+kind = "http_server"
+basic_auth_user = "opencode"
+password_env = "OPENCODE_SERVER_PASSWORD"
+attach_args = ["attach", "{url}"]

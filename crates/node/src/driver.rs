@@ -48,13 +48,14 @@ pub fn render_injection(messages: &[Envelope]) -> String {
 
 /// Write a batch to the CLI's stdin and remember it until it is echoed back.
 pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<()> {
-    // Codex takes a JSON-RPC turn/steer, not a line on stdin. It acks itself
-    // when the call returns, so there is nothing pending to record here.
-    if let Some(codex) = &io.codex {
-        return codex
+    // Codex (JSON-RPC) and opencode (HTTP) take whole messages, not bytes on
+    // stdin, and each acks itself once its call returns, so there is nothing
+    // pending to record here.
+    if let Some(push) = &io.push {
+        return push
             .send(messages.to_vec())
             .await
-            .map_err(|_| anyhow::anyhow!("the codex driver has stopped"));
+            .map_err(|_| anyhow::anyhow!("this agent's driver has stopped"));
     }
     let Some(tx) = &io.input else {
         anyhow::bail!("this agent has no input channel");

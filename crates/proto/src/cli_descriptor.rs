@@ -235,6 +235,25 @@ pub enum DriverSpec {
     },
     /// JSON-RPC app-server with threads and turns, Codex's shape.
     AppServer,
+    /// The CLI runs its own HTTP server and we drive it over that.
+    ///
+    /// opencode works this way: `opencode serve` exposes a documented API with
+    /// native mid-turn steering, so there is no stdio protocol to parse and no
+    /// pty to hold. It also means the same agent can be attached to as a real
+    /// TUI on demand, which a stdio-driven agent cannot offer.
+    HttpServer {
+        /// Username for HTTP Basic auth on that server.
+        #[serde(default)]
+        basic_auth_user: Option<String>,
+        /// Environment variable through which to hand it a password. A
+        /// per-agent secret stops anyone else with a shell on the machine
+        /// driving the agent through its own loopback port.
+        #[serde(default)]
+        password_env: Option<String>,
+        /// Command that opens a terminal onto a running server, for attach.
+        #[serde(default)]
+        attach_args: Vec<String>,
+    },
     /// External helper binary speaking the driver protocol on stdio.
     Plugin { command: String, #[serde(default)] args: Vec<String> },
 }

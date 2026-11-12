@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""A fake `opencode`, implementing the parts of its server API nexmesh uses.
+
+Shapes taken from the real server's OpenAPI document (/doc) and live calls
+against opencode 1.19.5, including HTTP Basic auth with the username
+"opencode", `delivery: steer|queue`, and the text/event-stream at /api/event.
+
+  fakeopencode serve --port N --hostname H   -> the server
+  fakeopencode attach <url>                  -> a terminal client
+"""
+import base64, json, os, sys, threading, time, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LOG = os.environ.get("FAKEOPENCODE_LOG", "/dev/null")
+PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD")
+
+def log(kind, detail=""):
+    with open(LOG, "a") as f:
+        f.write(f"{kind} {detail}".strip() + "\n")
+
+if "--version" in sys.argv:
+    print("fakeopencode 1.19.5"); sys.exit(0)
+
+# ---- the terminal client half -------------------------------------------
+if len(sys.argv) > 1 and sys.argv[1] == "attach":
+    url = sys.argv[2] if len(sys.argv) > 2 else "?"
+    log("attach_url", url)
+    print(f"OPENCODE TUI attached to {url} tty={sys.stdin.isatty()}", flush=True)
+    print("opencode> ", end="", flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if line in ("quit", "exit"):
+            print("\nbye", flush=True); break
+        print(f"\nyou typed: {line}", flush=True)
+        print("opencode> ", end="", flush=True)
+    sys.exit(0)
+
+# ---- the server half ------------------------------------------------------
+PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 0
+HOST = sys.argv[sys.argv.index("--hostname") + 1] if "--hostname" in sys.argv else "127.0.0.1"
+SESSIONS = {}
+LOCK = threading.Lock()
+EVENTS = []          # (type, data) queued for subscribers
+EV_LOCK = threading.Condition()
+
+def push_event(t, data):
+    with EV_LOCK:
+        EVENTS.append({"id": "evt_" + uuid.uuid4().hex[:12], "type": t, "data": data})
+        EV_LOCK.notify_all()
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+
+    def authed(self):
+        if not PASSWORD: return True
+        h = self.headers.get("authorization", "")
+        if not h.startswith("Basic "): return False
+        try:
+            user, _, pw = base64.b64decode(h[6:]).decode().partition(":")
+        except Exception:
+            return False
+        # The real server accepts the username "opencode".
+        return user == "opencode" and pw == PASSWORD
+
+    def send_json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if not self.authed():
+            log("unauthorised", self.path)
+            return self.send_json(401, {"_tag": "UnauthorizedError", "message": "Authentication required"})
+        if self.path == "/api/health":
+            return self.send_json(200, {"healthy": True})
+        if self.path.startswith("/api/event"):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.end_headers()
+            self.wfile.write(b'data: {"id":"evt_0","type":"server.connected","data":{}}\n\n')
+            self.wfile.flush()
+            log("event_stream_opened")
+            seen = 0
+            try:
+                while True:
+                    with EV_LOCK:
+                        EV_LOCK.wait(timeout=1.0)
+                        pending = EVENTS[seen:]
+                        seen = len(EVENTS)
+                    for e in pending:
+                        self.wfile.write(f"data: {json.dumps(e)}\n\n".encode())
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+            except Exception:
+                return
+        if self.path.startswith("/api/session/"):
+            sid = self.path.split("/")[3]
+            s = SESSIONS.get(sid)
+            if s: return self.send_json(200, {"data": s})
+        return self.send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.authed():
+            log("unauthorised", self.path)
+            return self.send_json(401, {"_tag": "UnauthorizedError", "message": "Authentication required"})
+        n = int(self.headers.get("content-length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        parts = self.path.strip("/").split("/")
+
+        if self.path == "/api/session":
+            sid = body.get("id") or ("ses_" + uuid.uuid4().hex[:20])
+            with LOCK:
+                SESSIONS[sid] = {"id": sid, "title": "fake", "cost": 0,
+                                 "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                                            "cache": {"read": 0, "write": 0}},
+                                 "location": body.get("location", {})}
+            log("session_created", sid + (" resumed" if body.get("id") else ""))
+            log("cwd", json.dumps(body.get("location", {}).get("directory", "")))
+            return self.send_json(200, {"data": SESSIONS[sid]})
+
+        if len(parts) == 4 and parts[1] == "session" and parts[3] == "prompt":
+            sid = parts[2]
+            text = (body.get("prompt") or {}).get("text", "")
+            delivery = body.get("delivery")
+            log("prompt", f"{delivery} :: " + text.replace("\n", " / ")[:300])
+            with LOCK:
+                t = SESSIONS.setdefault(sid, {"tokens": {}})["tokens"]
+                t["input"] = t.get("input", 0) + 1500
+                t["output"] = t.get("output", 0) + 250
+                t.setdefault("cache", {})["read"] = t.get("cache", {}).get("read", 0) + 800
+            # A turn finishing is what prompts nexmesh to re-read the totals.
+            push_event("session.idle", {"sessionID": sid})
+            if "FIRST" in text:
+                # Ask for a permission, which must be answered or we stall.
+                push_event("permission.v2.asked",
+                           {"sessionID": sid, "id": "perm_1", "title": "run ls"})
+            return self.send_json(200, {"data": {"admittedSeq": 1, "id": "inp_1",
+                                                 "sessionID": sid, "delivery": delivery,
+                                                 "timeCreated": time.time()}})
+
+        if len(parts) == 6 and parts[4] and parts[5] == "reply":
+            log("permission_reply", json.dumps(body))
+            return self.send_json(200, {"data": {}})
+
+        return self.send_json(404, {"error": "not found"})
+
+srv = ThreadingHTTPServer((HOST, PORT), H)
+port = srv.server_address[1]
+# The real server prints this warning FIRST when no password is set, which is
+# exactly the line a naive URL parser trips over.
+if not PASSWORD:
+    print("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.", flush=True)
+print(f"opencode server listening on http://{HOST}:{port}", flush=True)
+log("listening", f"http://{HOST}:{port}")
+srv.serve_forever()

@@ -294,6 +294,30 @@ The same stream carries token usage (`assistant` events meter each API call,
 the turn's `result` gives totals) and the session id from `system`/`init`,
 which becomes the `--resume` handle.
 
+**opencode is the best of the three to drive**, because it already has a
+client/server split. `opencode serve` exposes a documented API (OpenAPI at
+`/doc`) whose prompt endpoint takes `delivery: "steer" | "queue"` — mid-turn
+steering is a first-class operation there, not something bolted on. So that
+driver holds no pty and parses no stdio protocol: it starts the server, reads
+the URL it prints, and makes HTTP calls. Verified against opencode 1.19.5 by
+reading `/doc` and calling a running server.
+
+Two details that matter:
+
+- The server is given a **per-agent password** (`OPENCODE_SERVER_PASSWORD`,
+  HTTP Basic, username `opencode`). Without one it says it is unsecured, and
+  anyone with a shell on that machine could drive the agent through its
+  loopback port.
+- The first line it prints is that warning, not the URL. A parser that grabs
+  the first line, or the first thing resembling a URL, starts the agent against
+  nothing.
+
+It also gives something neither stdio-driven CLI can: because `opencode attach
+<url>` exists, a **headless** opencode agent can still be opened as a real TUI.
+Attach to one and the node starts a terminal client against its server just for
+that viewer; detach and the client goes away while the agent carries on. Best
+delivery and exact token accounting, *and* take-over on demand.
+
 **Codex's `app-server`** is the other fast path, and it works differently
 enough to be worth describing. It is JSON-RPC over stdio with threads and
 turns, so there is no "write a line of text": a message is either steered into
@@ -371,6 +395,7 @@ Attach relays a pty **the node created**. That distinction decides what works:
 | launched by nexmesh, `mode = "headless"` | view-only — it is a protocol on a pipe, not a terminal |
 | joined by itself via `mcpd` (an *attached* agent) | nothing. It is a full team member for messages, tools and review, but its terminal belongs to whoever started it — unless you also `adopt` its tmux session |
 | adopted with `nexmesh adopt` | the real terminal: watch **and type**, alongside your own client |
+| headless on a CLI that has its own client (opencode) | a real TUI, started on demand for each viewer and closed when they leave |
 | an external participant (a hermes agent) | nothing — there is no terminal at all |
 
 So a `claude` agent that nexmesh launched on machine-a in interactive mode is fully
@@ -514,13 +539,14 @@ reconnect-with-backoff and identity-checked signalling.
   `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-116 unit tests, plus eleven end-to-end suites that drive real processes
+122 unit tests, plus twelve end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt codex dashboard orchestrator mtls pairing; do
+for t in team spawn attach secure driver adopt codex opencode \
+         dashboard orchestrator mtls pairing; do
   python3 -I tests/e2e_$t.py || break
 done
 

@@ -30,7 +30,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 crossterm = "0.28"
 
 # hub
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["trace", "fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,11 +1,19 @@
 # opencode. Verified against 'opencode --help' / 'run --help' / 'serve --help'.
 #
-# NOTE: opencode is the one CLI here that already has a client/server split of
-# its own -- 'opencode serve --port N --hostname H' plus 'opencode attach
-# <url>'. For opencode, remote access needs no pty multiplexing from us at all;
-# the node can run 'serve' and hand out the URL. That is the planned fast path
-# (driver kind "http_server"); until its HTTP API is pinned down here, delivery
-# uses the universal MCP floor, which works today.
+# opencode already has a client/server split of its own, and that turns out to
+# be the best driver of the three. `opencode serve` exposes a documented API
+# (OpenAPI at /doc) whose prompt endpoint takes delivery = "steer" | "queue" --
+# native mid-turn steering, no stdio protocol to parse and no pty to hold.
+#
+# Verified against opencode 1.19.5 by reading /doc and calling the server:
+#   POST /api/session                      -> { data: { id, tokens, cost } }
+#   POST /api/session/{id}/prompt          { prompt: { text }, delivery }
+#   GET  /api/event                        text/event-stream, 88 event types
+#   POST /api/session/{id}/permission/{r}/reply  { reply: once|always|reject }
+#   GET  /api/health                       -> { healthy }
+# Auth is HTTP Basic with the username "opencode" and OPENCODE_SERVER_PASSWORD;
+# without it the server warns that it is unsecured, and anyone with a shell on
+# the machine could drive the agent through its loopback port.
 [cli]
 id = "opencode"
 display_name = "opencode"
@@ -25,9 +33,9 @@ env_key = "environment"
 entry = { type = "local", command = ["{mcpd}"], enabled = true }
 
 [modes.headless]
-args = ["run", "--format", "json", "{prompt}"]
-resume_args = ["--session", "{resume}"]
-attachable = false
+# Not `run`: a one-shot run cannot be steered. The server can.
+args = ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+attachable = true   # `opencode attach` opens a real TUI onto the same session
 
 [modes.interactive]
 args = ["{cwd}"]
@@ -35,7 +43,10 @@ resume_args = ["--session", "{resume}"]
 attachable = true
 
 [driver]
-kind = "mcp_only"
+kind = "http_server"
+basic_auth_user = "opencode"
+password_env = "OPENCODE_SERVER_PASSWORD"
+attach_args = ["attach", "{url}"]
 
 [user_install]
 # `opencode mcp add` is interactive, so it cannot be driven from a script;

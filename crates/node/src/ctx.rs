@@ -39,9 +39,12 @@ pub struct AgentIo {
     /// The pty master, for window resizes. `None` for a pipe-run agent.
     pub master: Option<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     pub kind: IoKind,
-    /// Codex is driven by JSON-RPC, not by bytes on stdin, so its injections
-    /// go down a channel of messages rather than the `input` byte channel.
-    pub codex: Option<mpsc::Sender<Vec<Envelope>>>,
+    /// Drivers that are not byte streams -- Codex's JSON-RPC, opencode's HTTP
+    /// server -- take whole messages rather than bytes on stdin.
+    pub push: Option<mpsc::Sender<Vec<Envelope>>>,
+    /// For an agent that runs its own server: where it is, and how to open a
+    /// terminal onto it. Learned after startup, hence the lock.
+    server: Mutex<Option<(String, Option<(String, Vec<String>)>)>>,
     ring: Mutex<VecDeque<u8>>,
     attaches: Mutex<HashSet<String>>,
     /// Injections written to the CLI but not yet echoed back, oldest first.
@@ -57,22 +60,23 @@ impl AgentIo {
         Self::build(kind, input, master, None)
     }
 
-    /// Codex's injector is an RPC channel; it has no writable byte stream.
-    pub fn new_codex(codex: mpsc::Sender<Vec<Envelope>>) -> Arc<Self> {
-        Self::build(IoKind::Pipes, None, None, Some(codex))
+    /// A driver whose injector takes messages, not bytes.
+    pub fn new_push(push: mpsc::Sender<Vec<Envelope>>) -> Arc<Self> {
+        Self::build(IoKind::Pipes, None, None, Some(push))
     }
 
     fn build(
         kind: IoKind,
         input: Option<mpsc::Sender<Vec<u8>>>,
         master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-        codex: Option<mpsc::Sender<Vec<Envelope>>>,
+        push: Option<mpsc::Sender<Vec<Envelope>>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             input,
             master: master.map(Mutex::new),
             kind,
-            codex,
+            push,
+            server: Mutex::new(None),
             ring: Mutex::new(VecDeque::new()),
             attaches: Mutex::new(HashSet::new()),
             pending: Mutex::new(VecDeque::new()),
@@ -82,7 +86,26 @@ impl AgentIo {
     /// Whether an ATTACHED VIEWER may type. Pipes are writable by a driver but
     /// are not a terminal, so a human attaching to them can only watch.
     pub fn read_only(&self) -> bool {
-        self.kind != IoKind::Pty
+        // An agent that runs its own server can have a terminal opened onto it
+        // on demand, so it is not read-only even though it has no pty of its
+        // own.
+        self.kind != IoKind::Pty && self.attach_command().is_none()
+    }
+
+    pub fn set_server(&self, url: String, attach_cmd: Option<(String, Vec<String>)>) {
+        *self.server.lock().unwrap() = Some((url, attach_cmd));
+    }
+
+    /// The command that opens a terminal onto this agent's server, with the
+    /// URL filled in. `None` when there is no server, or no way to view it.
+    pub fn attach_command(&self) -> Option<(String, Vec<String>)> {
+        let g = self.server.lock().unwrap();
+        let (url, cmd) = g.as_ref()?;
+        let (bin, args) = cmd.as_ref()?;
+        Some((
+            bin.clone(),
+            args.iter().map(|a| a.replace("{url}", url)).collect(),
+        ))
     }
 
     pub fn push_pending(&self, injected: Injected) {
@@ -197,6 +220,9 @@ pub struct NodeCtx {
     /// Live I/O per agent, keyed by agent id. Separate from `agents` so the
     /// metadata can be cloned cheaply without the pty handles.
     pub io: Mutex<HashMap<String, Arc<AgentIo>>>,
+    /// Terminal clients opened on demand for agents that have no pty of their
+    /// own, keyed by attach id.
+    viewers: Mutex<HashMap<String, Arc<crate::viewer::Viewer>>>,
     tool_waiters: Mutex<HashMap<String, oneshot::Sender<ToolOutcome>>>,
     join_waiters: Mutex<HashMap<u64, oneshot::Sender<JoinOutcome>>>,
     seq: AtomicU64,
@@ -218,6 +244,7 @@ impl NodeCtx {
             hub_tx: Mutex::new(None),
             agents: Mutex::new(HashMap::new()),
             io: Mutex::new(HashMap::new()),
+            viewers: Mutex::new(HashMap::new()),
             tool_waiters: Mutex::new(HashMap::new()),
             join_waiters: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
@@ -278,6 +305,18 @@ impl NodeCtx {
 
     pub fn agent(&self, agent_id: &str) -> Option<AgentRec> {
         self.agents.lock().unwrap().get(agent_id).cloned()
+    }
+
+    pub fn add_viewer(&self, attach_id: &str, v: crate::viewer::Viewer) {
+        self.viewers.lock().unwrap().insert(attach_id.to_string(), Arc::new(v));
+    }
+
+    pub fn viewer(&self, attach_id: &str) -> Option<Arc<crate::viewer::Viewer>> {
+        self.viewers.lock().unwrap().get(attach_id).cloned()
+    }
+
+    pub fn remove_viewer(&self, attach_id: &str) -> Option<Arc<crate::viewer::Viewer>> {
+        self.viewers.lock().unwrap().remove(attach_id)
     }
 
     pub fn agent_io(&self, agent_id: &str) -> Option<Arc<AgentIo>> {
