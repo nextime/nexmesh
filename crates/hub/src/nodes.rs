@@ -106,6 +106,24 @@ async fn session(socket: WebSocket, st: AppState) {
                 continue;
             }
         };
+        // A tool call may itself have to ask this same node something -- a
+        // workspace sync, say -- and the answer arrives as another frame on
+        // this connection. Handling it inline would block the very loop that
+        // must read that answer, so tool calls run concurrently. They are
+        // independent of each other (each carries its own call id), and this
+        // also stops one slow tool holding up heartbeats.
+        if matches!(frame, NodeToHub::ToolCall { .. }) {
+            let st = st.clone();
+            let node_id = node_id.clone();
+            let issued = issued.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle(&st, &node_id, &issued, frame, &tx).await {
+                    tracing::warn!(node = %issued, error = %e, "handling a tool call");
+                }
+            });
+            continue;
+        }
         if let Err(e) = handle(&st, &node_id, &issued, frame, &tx).await {
             tracing::warn!(node = %issued, error = %e, "handling frame");
         }
@@ -206,6 +224,17 @@ async fn handle(
             }
         }
 
+        NodeToHub::SyncResult {
+            req_id, workspace_id, ok, conflict, head, detail, changed,
+        } => {
+            let v = serde_json::json!({
+                "ok": ok, "conflict": conflict, "head": head,
+                "detail": detail, "changed": changed,
+            });
+            crate::sync::record(st, &workspace_id, node_id, &v);
+            st.complete_sync(req_id, v);
+        }
+
         NodeToHub::TokenUsage { agent_id, input, output, cache_read } => {
             let db = st.db.lock().unwrap();
             db.execute(
@@ -235,7 +264,7 @@ async fn handle(
         }
 
         NodeToHub::ToolCall { agent_id, call_id, tool, args } => {
-            let reply = run_tool(st, &agent_id, &tool, &args);
+            let reply = run_tool_async(st, &agent_id, &tool, &args).await;
             let frame = match reply {
                 Ok((text, deliver)) => HubToNode::ToolResult {
                     agent_id,
@@ -290,6 +319,138 @@ async fn handle(
         NodeToHub::Hello { .. } => tracing::warn!(node = %node_name, "duplicate hello ignored"),
     }
     Ok(())
+}
+
+/// Tools that have to talk to a node, so cannot run inside the synchronous
+/// dispatcher.
+fn is_workspace_tool(tool: &str) -> bool {
+    matches!(tool, "publish_work" | "sync_workspace" | "workspace_status")
+}
+
+/// Run a tool, including the ones that need a round trip to a machine.
+pub async fn run_tool_async(
+    st: &AppState,
+    agent_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Result<(String, Vec<proto::Envelope>)> {
+    if is_workspace_tool(tool) {
+        return workspace_tool(st, agent_id, tool, args).await;
+    }
+    let out = run_tool(st, agent_id, tool, args)?;
+    // Finishing a piece of work is exactly the moment teammates need to see
+    // it, so do not make the agent remember a second call.
+    if tool == "signal_done" {
+        if let Some(extra) = auto_publish(st, agent_id).await {
+            return Ok((format!("{}\n\n{extra}", out.0), out.1));
+        }
+    }
+    Ok(out)
+}
+
+fn slot_and_name(st: &AppState, agent_id: &str) -> Option<(String, String)> {
+    let db = st.db.lock().unwrap();
+    db.query_row(
+        "SELECT s.id, COALESCE(s.display_name, s.role, s.id)
+         FROM agents a JOIN slots s ON s.id = a.slot_id WHERE a.id = ?",
+        [agent_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+async fn workspace_tool(
+    st: &AppState,
+    agent_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Result<(String, Vec<proto::Envelope>)> {
+    let (slot_id, who) = slot_and_name(st, agent_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent '{agent_id}'"))?;
+    let Some((ws_id, node_id, path)) = crate::sync::slot_workspace(st, &slot_id) else {
+        return Ok((
+            "You are not in a shared workspace: your files are local to this machine, so there \
+             is nothing to publish or pull. Tell teammates what you found with send_message and \
+             store_knowledge instead."
+                .into(),
+            vec![],
+        ));
+    };
+    let ws = crate::sync::load(st, &ws_id)?;
+    let op = match tool {
+        "publish_work" => proto::SyncOp::Publish,
+        "sync_workspace" => proto::SyncOp::Refresh,
+        _ => proto::SyncOp::Status,
+    };
+    let message = args
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("{who}: {s}"))
+        .unwrap_or_else(|| format!("{who}: work in progress"));
+
+    let v = crate::sync::run_on(st, &ws, &node_id, &path, op, &who, &message).await?;
+    crate::sync::record(st, &ws_id, &node_id, &v);
+
+    let detail = v["detail"].as_str().unwrap_or("done").to_string();
+    if v["conflict"].as_bool() == Some(true) {
+        // A conflict is the agent's to resolve; say so plainly rather than
+        // reporting a vague failure.
+        return Ok((format!("CONFLICT: {detail}"), vec![]));
+    }
+    if v["ok"].as_bool() != Some(true) {
+        return Ok((format!("Could not {tool}: {detail}"), vec![]));
+    }
+    // When work is shared, the team should hear about it.
+    if op == proto::SyncOp::Publish && detail.starts_with("published") {
+        let db = st.db.lock().unwrap();
+        let session: Option<String> = db
+            .query_row("SELECT session_id FROM slots WHERE id = ?", [&slot_id], |r| r.get(0))
+            .optional()?;
+        if let Some(session) = session {
+            let _ = db.execute(
+                "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+                 VALUES (?, ?, NULL, 'system', ?, ?)",
+                rusqlite::params![
+                    session,
+                    slot_id,
+                    format!("{who} published work to {}. Call sync_workspace to pull it in.", ws.branch),
+                    now_ms()
+                ],
+            );
+        }
+    }
+    Ok((detail, vec![]))
+}
+
+/// Publish on the agent's behalf when it signals done, reporting what happened
+/// but never failing the signal itself.
+async fn auto_publish(st: &AppState, agent_id: &str) -> Option<String> {
+    let (slot_id, who) = slot_and_name(st, agent_id)?;
+    let (ws_id, node_id, path) = crate::sync::slot_workspace(st, &slot_id)?;
+    let ws = crate::sync::load(st, &ws_id).ok()?;
+    let v = crate::sync::run_on(
+        st,
+        &ws,
+        &node_id,
+        &path,
+        proto::SyncOp::Publish,
+        &who,
+        &format!("{who}: finished work"),
+    )
+    .await
+    .ok()?;
+    crate::sync::record(st, &ws_id, &node_id, &v);
+    let detail = v["detail"].as_str().unwrap_or("").to_string();
+    Some(if v["conflict"].as_bool() == Some(true) {
+        format!("Your work could NOT be shared: {detail}")
+    } else if v["ok"].as_bool() == Some(true) {
+        format!("Your work was shared with the team ({detail}).")
+    } else {
+        format!("Your work could not be shared: {detail}")
+    })
 }
 
 /// Run a tool for an agent and collect any messages to ride back with the

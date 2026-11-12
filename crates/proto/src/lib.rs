@@ -105,6 +105,20 @@ pub enum MessageKind {
     System,
 }
 
+/// What to do to a shared workspace on one machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncOp {
+    /// Make sure the checkout exists and is on the right branch.
+    Ensure,
+    /// Bring it up to date, keeping uncommitted work.
+    Refresh,
+    /// Commit what is here and share it.
+    Publish,
+    /// Report only; change nothing.
+    Status,
+}
+
 /// Where a slot may run. Resolved by the hub against online nodes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Placement {
@@ -257,6 +271,17 @@ pub enum NodeToHub {
         cwd: Option<String>,
         proc: Option<ProcIdentity>,
     },
+    SyncResult {
+        req_id: u64,
+        workspace_id: String,
+        ok: bool,
+        /// True when the work could not be shared because it collides with
+        /// what is already on the branch. Nothing was changed.
+        conflict: bool,
+        head: Option<String>,
+        detail: String,
+        changed: Vec<String>,
+    },
     /// Messages handed to a driver that the agent died before confirming.
     /// They must go back in the queue: in flight forever means never
     /// redelivered and never seen.
@@ -375,6 +400,18 @@ pub enum HubToNode {
         attach_id: String,
         #[serde(with = "b64")]
         data: Vec<u8>,
+    },
+    /// Act on a shared workspace's checkout on this node.
+    SyncWorkspace {
+        req_id: u64,
+        workspace_id: String,
+        path: String,
+        repo_url: String,
+        branch: String,
+        op: SyncOp,
+        /// Who to attribute a commit to.
+        author: String,
+        message: String,
     },
     AttachResize { attach_id: String, cols: u16, rows: u16 },
     AttachClose { attach_id: String },

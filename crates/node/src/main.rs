@@ -23,6 +23,7 @@ mod cli_detect;
 mod codex;
 mod ctx;
 mod driver;
+mod gitsync;
 mod localsock;
 mod opencode;
 mod proc;
@@ -600,6 +601,36 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                         .await;
                 }
             }
+        }
+
+        HubToNode::SyncWorkspace {
+            req_id, workspace_id, path, repo_url, branch, op, author, message,
+        } => {
+            // git on a large repository can take a while, and this loop also
+            // carries spawns, injections and attach traffic for the machine.
+            // Run it to one side so one slow fetch does not stall everything.
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+            use nexmesh_proto::SyncOp;
+            let r = match op {
+                SyncOp::Ensure => gitsync::ensure(&path, &repo_url, &branch).await,
+                SyncOp::Refresh => gitsync::refresh(&path, &branch).await,
+                SyncOp::Publish => gitsync::publish(&path, &branch, &author, &message).await,
+                SyncOp::Status => gitsync::status(&path, &branch).await,
+            };
+            tracing::info!(%workspace_id, ?op, ok = r.ok, conflict = r.conflict, "{}", r.detail);
+            let _ = ctx
+                .send_hub(&NodeToHub::SyncResult {
+                    req_id,
+                    workspace_id,
+                    ok: r.ok,
+                    conflict: r.conflict,
+                    head: r.head,
+                    detail: r.detail,
+                    changed: r.changed,
+                })
+                .await;
+            });
         }
 
         HubToNode::AttachResize { attach_id, cols, rows } => {

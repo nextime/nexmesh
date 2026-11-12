@@ -233,6 +233,19 @@ CREATE TABLE IF NOT EXISTS plan_items (
   updated_at_ms INTEGER NOT NULL
 );
 
+-- What happened the last time each machine's checkout was synced, so the
+-- state of a shared workspace is visible without asking every node.
+CREATE TABLE IF NOT EXISTS workspace_sync (
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  node_id      TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  at_ms        INTEGER NOT NULL,
+  ok           INTEGER NOT NULL DEFAULT 0,
+  conflict     INTEGER NOT NULL DEFAULT 0,
+  head         TEXT,
+  detail       TEXT,
+  PRIMARY KEY (workspace_id, node_id)
+);
+
 -- ------------------------------------------------------------ knowledge ----
 
 CREATE TABLE IF NOT EXISTS knowledge (

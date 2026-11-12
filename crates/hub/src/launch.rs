@@ -116,6 +116,7 @@ pub async fn launch_slot(
     }
     drop(brief);
 
+    let workspace_path = cwd.clone();
     let spec = SpawnSpec {
         slot_id: slot_id.to_string(),
         agent_id: agent_id.clone(),
@@ -144,6 +145,31 @@ pub async fn launch_slot(
             ],
         );
     }
+    // A machine joining a shared workspace needs the checkout before the agent
+    // starts, or its first act is to look at an empty directory. Failing to
+    // sync is reported but does not block the launch: an agent that cannot
+    // reach the remote can still talk to its team.
+    if let Some(ws_id) = &row.workspace_id {
+        if let Ok(ws) = crate::sync::load(st, ws_id) {
+            if ws.kind == "repo" && ws.sync == "git" {
+                match crate::sync::run_on(
+                    st, &ws, &node_id, &workspace_path, nexmesh_proto::SyncOp::Ensure,
+                    "nexmesh", "prepare workspace",
+                )
+                .await
+                {
+                    Ok(v) => {
+                        crate::sync::record(st, ws_id, &node_id, &v);
+                        tracing::info!(workspace = %ws.name, node = %node_name,
+                            detail = %v["detail"].as_str().unwrap_or(""), "prepared workspace");
+                    }
+                    Err(e) => tracing::warn!(workspace = %ws.name, node = %node_name,
+                        error = %format!("{e:#}"), "could not prepare the workspace"),
+                }
+            }
+        }
+    }
+
     st.send_to_node(&node_id, &HubToNode::Spawn(spec)).await?;
     Ok((agent_id, node_name))
 }

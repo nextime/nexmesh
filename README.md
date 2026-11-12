@@ -385,6 +385,41 @@ There is deliberately **no send-keys message delivery**. Typing a teammate's
 message into a pane that happens to be sitting at a shell prompt would execute
 it. Delivery belongs to the MCP path, which knows it is talking to an agent.
 
+## Shared workspaces
+
+A `node_local` workspace is files on one machine. A `repo` workspace is the
+same tree checked out on several, and that is where work has to actually
+travel between machines.
+
+```bash
+nexmesh sync se-1234abcd --op status     # what is unshared, and what is unpulled
+nexmesh sync se-1234abcd --op publish    # push everyone's work
+nexmesh sync se-1234abcd --op refresh    # pull it everywhere
+```
+
+Agents get `publish_work`, `sync_workspace` and `workspace_status`, and two
+moments happen without being asked: a machine is given a checkout **before its
+agent starts**, and `signal_done` **publishes automatically** — finishing is
+exactly when teammates need to see the work, and an agent should not have to
+remember a second call. A publish also messages the team, so nobody has to
+guess that there is something to pull.
+
+Three decisions worth stating:
+
+- **Git is the transport; the declared remote is the authority.** The hub
+  coordinates but is not a git server. Making it one would mean implementing
+  smart HTTP and holding everybody's code, when every machine already has git
+  and a remote it can reach.
+- **Ownership zones are the conflict-avoidance strategy.** Agents are given
+  disjoint globs, so in normal running two of them never touch the same file.
+- **A conflict is reported, never resolved.** Guessing at a merge would
+  silently destroy somebody's work. The publish is rolled back, the agent is
+  told which files collided, and its own files are left exactly as they were —
+  there is a test asserting precisely that.
+
+`sync = "shared_fs"` means the filesystem already does this and nexmesh stays
+out of the way.
+
 ## What attach can and cannot reach
 
 Attach relays a pty **the node created**. That distinction decides what works:
@@ -539,14 +574,14 @@ reconnect-with-backoff and identity-checked signalling.
   `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-122 unit tests, plus twelve end-to-end suites that drive real processes
+129 unit tests, plus thirteen end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
 for t in team spawn attach secure driver adopt codex opencode \
-         dashboard orchestrator mtls pairing; do
+         workspace dashboard orchestrator mtls pairing; do
   python3 -I tests/e2e_$t.py || break
 done
 
@@ -580,8 +615,8 @@ tmux adoption.
 **Done since.** The web dashboard, and the orchestrator as an MCP server so any
 CLI can run the fleet.
 
-**Next** -- workspace sync for shared-repo sessions; releasing and pausing
-agents from the orchestrator; binding certificate names to identities.
+**Next** -- releasing and pausing agents from the orchestrator; binding
+certificate names to identities; certificate revocation.
 
 Throughout this document, machines are called *machine A*, *machine B* and so
 on; substitute your own.

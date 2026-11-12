@@ -107,6 +107,9 @@ pub struct AppState {
     /// Slots currently being respawned. One at a time per slot, or a slow node
     /// would get two agents for the same seat.
     respawning: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Outstanding workspace-sync requests, awaiting the node's answer.
+    sync_waiters: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    sync_seq: Arc<std::sync::atomic::AtomicU64>,
     /// Where per-agent transcripts live, beside the database.
     pub transcripts: Arc<std::path::PathBuf>,
     /// Where the fleet CA lives, for signing pairing requests.
@@ -141,6 +144,8 @@ impl AppState {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
+            sync_waiters: Arc::new(Mutex::new(HashMap::new())),
+            sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
 
@@ -157,7 +162,25 @@ impl AppState {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
+            sync_waiters: Arc::new(Mutex::new(HashMap::new())),
+            sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
+    }
+
+    /// Start a sync request and get the channel its answer will arrive on.
+    pub fn new_sync_request(&self) -> (u64, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let id = self
+            .sync_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sync_waiters.lock().unwrap().insert(id, tx);
+        (id, rx)
+    }
+
+    pub fn complete_sync(&self, req_id: u64, value: serde_json::Value) {
+        if let Some(tx) = self.sync_waiters.lock().unwrap().remove(&req_id) {
+            let _ = tx.send(value);
+        }
     }
 
     /// Claim the right to respawn a slot. False means somebody already has it.

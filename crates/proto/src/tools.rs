@@ -92,6 +92,20 @@ pub fn team_tools() -> Vec<ToolDef> {
         tool("query_knowledge",
             "Read shared knowledge. Call this when you start.",
             json!({ "key": s("Exact key"), "category": s("Filter by category") }), &[]),
+        tool("publish_work",
+            "Share what you have done with the rest of the team. Commits your changes in the \
+             shared workspace and pushes them, then everyone else can pull them. Call this when \
+             you finish a piece of work -- teammates on other machines cannot see your files \
+             until you do.",
+            json!({ "summary": s("One line describing what you are sharing") }), &[]),
+        tool("sync_workspace",
+            "Pull in what your teammates have published. Your uncommitted work is kept. Call \
+             this before starting something that depends on someone else's changes.",
+            json!({}), &[]),
+        tool("workspace_status",
+            "What is in your workspace that has not been shared, and what others have shared \
+             that you have not taken. Changes nothing.",
+            json!({}), &[]),
         tool("get_history",
             "Query the session's message history.",
             json!({ "limit": json!({ "type": "integer", "description": "Most recent N messages" }) }), &[]),

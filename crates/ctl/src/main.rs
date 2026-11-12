@@ -113,6 +113,16 @@ enum Cmd {
     },
     /// Live status of every agent in a session.
     Status { session: String },
+    /// Publish, pull or report on a shared workspace, on every machine at once.
+    Sync {
+        session: String,
+        /// publish | refresh | status
+        #[arg(long, default_value = "status")]
+        op: String,
+        /// Workspace name; omitted means all shared ones in the session.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Read the conversation between the agents.
     Log {
         session: String,
@@ -650,6 +660,27 @@ async fn main() -> Result<()> {
                 );
             }
             println!("\n  (TOKENS = input/output)");
+        }
+
+        Cmd::Sync { session, op, workspace } => {
+            let mut body = json!({ "op": op });
+            if let Some(w) = workspace { body["workspace"] = json!(w); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/sync"), body).await?;
+            bail_on_error(&v)?;
+            let empty = vec![];
+            for ws in v["workspaces"].as_array().unwrap_or(&empty) {
+                if let Some(e) = ws["error"].as_str() {
+                    println!("{}: {e}", ws["workspace"].as_str().unwrap_or("?"));
+                    continue;
+                }
+                println!("{} ({})", ws["workspace"].as_str().unwrap_or("?"),
+                         ws["branch"].as_str().unwrap_or("?"));
+                for r in ws["results"].as_array().unwrap_or(&empty) {
+                    println!("  {:<12} {}{}", r["node"].as_str().unwrap_or("?"),
+                             r["detail"].as_str().unwrap_or(""),
+                             if r["conflict"].as_bool() == Some(true) { "   [CONFLICT]" } else { "" });
+                }
+            }
         }
 
         Cmd::Log { session, follow, limit } => {

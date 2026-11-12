@@ -25,6 +25,7 @@ mod pairing;
 mod pki;
 mod prompt;
 mod state;
+mod sync;
 mod tools;
 
 use anyhow::{Context, Result};
@@ -395,6 +396,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions", get(api::list_sessions).post(api::create_session))
         .route("/v1/sessions/:id/slots", post(api::create_slot))
         .route("/v1/sessions/:id/adopt", post(api::adopt_slot))
+        .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
         .route("/v1/sessions/:id/status", get(api::session_status))
         .route("/v1/sessions/:id/messages", post(api::operator_message))
         .route("/v1/sessions/:id/log", get(api::session_log))

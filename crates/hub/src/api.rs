@@ -6,7 +6,7 @@
 //! appears in `list_peers` like any other teammate. It needs no node, no pty
 //! and no MCP implementation.
 
-use crate::{nodes::run_tool, state::AppState, tools};
+use crate::{state::AppState, tools};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -312,6 +312,56 @@ pub async fn adopt_slot(
             Err(bad(e))
         }
     }
+}
+
+#[derive(Deserialize)]
+pub struct SyncRequest {
+    /// publish | refresh | status. Default: status.
+    #[serde(default)]
+    pub op: Option<String>,
+    /// Workspace name or id; omitted means every shared workspace in the session.
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// Publish, refresh or report on a shared workspace across every machine that
+/// holds it.
+pub async fn sync_workspaces(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SyncRequest>,
+) -> ApiResult {
+    let op = match req.op.as_deref().unwrap_or("status") {
+        "publish" => proto::SyncOp::Publish,
+        "refresh" => proto::SyncOp::Refresh,
+        "status" => proto::SyncOp::Status,
+        "ensure" => proto::SyncOp::Ensure,
+        other => return Err(bad(format!("op must be publish, refresh, ensure or status, not '{other}'"))),
+    };
+    let ids: Vec<String> = {
+        let db = st.db.lock().unwrap();
+        let mut stmt = db
+            .prepare(
+                "SELECT id FROM workspaces
+                 WHERE session_id = ?1 AND kind = 'repo'
+                   AND (?2 IS NULL OR name = ?2 OR id = ?2)",
+            )
+            .map_err(|e| bad(e))?;
+        stmt.query_map(params![session_id, req.workspace], |r| r.get(0))
+            .and_then(|m| m.collect())
+            .map_err(|e| bad(e))?
+    };
+    if ids.is_empty() {
+        return Err(bad("no shared workspace in this session to sync"));
+    }
+    let mut out = vec![];
+    for id in ids {
+        match crate::sync::run_everywhere(&st, &id, op, "operator", "operator sync").await {
+            Ok(v) => out.push(v),
+            Err(e) => out.push(json!({ "workspace": id, "error": format!("{e:#}") })),
+        }
+    }
+    Ok(Json(json!({ "workspaces": out })))
 }
 
 pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<String>) -> Json<Value> {
@@ -646,7 +696,7 @@ pub async fn participant_tool(
     let scoped = auth_participant(&st, &headers)?;
     verify_agent_scope(&st, &req.agent_id, &scoped)?;
     touch_participant(&st, &req.agent_id);
-    match run_tool(&st, &req.agent_id, &req.tool, &req.args) {
+    match crate::nodes::run_tool_async(&st, &req.agent_id, &req.tool, &req.args).await {
         Ok((text, deliver)) => Ok(Json(json!({ "ok": true, "text": text, "messages": deliver }))),
         Err(e) => Ok(Json(json!({ "ok": false, "error": e.to_string() }))),
     }
