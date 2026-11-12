@@ -213,7 +213,28 @@ def main():
     t = max_.tool("definitely_not_a_tool")
     check("unknown tool is rejected", "unknown tool" in t.lower() or "ERROR" in t, t)
 
-    print("\n=== 10. node death returns in-flight messages to the queue ===")
+    print("\n=== 10. the operator can read the conversation ===")
+    s, j = http("GET", f"/v1/sessions/{sid}/log?limit=100")
+    msgs = j.get("messages", [])
+    check("the message log is readable", len(msgs) >= 2, str(j)[:200])
+    check("it records who sent each message",
+          any(m["from"] == "Hermes" for m in msgs), str([m["from"] for m in msgs]))
+    check("it records the recipient", any(m["to"] == "Max" for m in msgs),
+          str([m["to"] for m in msgs]))
+    check("it distinguishes delivered from unseen",
+          any(m["delivered"] for m in msgs), str([(m["body"][:20], m["delivered"]) for m in msgs]))
+    check("a broadcast is shown as addressed to the team",
+          all(m["to"] != "" for m in msgs), str(msgs)[:120])
+    # Incremental follow must not repeat or skip.
+    last = max(m["id"] for m in msgs)
+    s, j2 = http("GET", f"/v1/sessions/{sid}/log?after={last}")
+    check("following from the last id yields nothing new yet", j2.get("messages") == [], str(j2)[:120])
+    http("POST", f"/v1/sessions/{sid}/messages", {"text": "follow-test"})
+    s, j3 = http("GET", f"/v1/sessions/{sid}/log?after={last}")
+    check("a new message appears exactly once when following",
+          [m["body"] for m in j3.get("messages", [])] == ["follow-test"], str(j3)[:200])
+
+    print("\n=== 11. node death returns in-flight messages to the queue ===")
     s, j = http("POST", f"/v1/sessions/{sid}/messages", {"to": "Max", "text": "operator ping"})
     check("operator can message a slot", j.get("sent"), str(j))
     # Kill mcpd before it can ack, then confirm the message is not lost.

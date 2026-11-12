@@ -227,7 +227,12 @@ async fn handle(
             tx.send(serde_json::to_string(&frame)?).await.ok();
         }
 
-        NodeToHub::Output { .. } | NodeToHub::AttachData { .. } | NodeToHub::AttachClosed { .. } => {
+        NodeToHub::Output { agent_id, data, .. } => {
+            // Persist it: this is the only record of what an agent actually did,
+            // and it is gone for good once the process exits.
+            st.append_transcript(&agent_id, &data);
+        }
+        NodeToHub::AttachData { .. } | NodeToHub::AttachClosed { .. } => {
             // Milestone 3: pty attach fan-out.
         }
         NodeToHub::Pong { .. } => {}

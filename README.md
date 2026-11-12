@@ -159,6 +159,38 @@ queued for a slot is still there for whatever agent next occupies it, on
 whatever machine. The original keys the inbox on the peer and has to graft it
 onto a respawned agent.
 
+## Watching the team
+
+Two different things, deliberately separate:
+
+```bash
+nexmesh log se-1234abcd --follow        # the conversation BETWEEN agents
+nexmesh transcript se-1234abcd Max      # what one agent's process printed
+```
+
+```
+TIME               FROM    TO           MESSAGE
+21:05:40         Hermes -> Max          Prior decision: JWT with refresh rotation.
+21:05:40            Max -> Iris         Login flow is in. Please review.
+21:05:40            Max -> (team)       [handoff] Max signalled done and is awaiting review.
+21:05:41           Iris -> Max          [feedback] (ACTION REQUIRED): Refresh tokens aren't rotated on reuse.
+21:05:41            Max -> Iris         Fixed: rotating on reuse now.
+21:05:41 !         Iris -> Max          [approval] Iris approved your work.
+21:05:41 !     operator -> (team)       [system] nice work both, ship it
+
+  ( ! = recipient has not seen it yet, ~ = delivery in flight )
+```
+
+That marker column is the useful part. Because delivery is acked separately
+from sending, the log distinguishes *sent* from *actually seen by the
+recipient's model* — so "why is this team stuck?" usually has a visible answer:
+somebody is sitting on an unread message. `--follow` streams forward by message
+id, so it never repeats or skips one.
+
+`transcript` is the agent's own stdout and stderr, which the node streams and
+the hub persists per agent. It survives the process exiting, which is the point:
+an agent's errors are most interesting precisely when it has died.
+
 ## Status
 
 **Milestone 1 -- done.** Wire protocol, schema, CLI descriptors and detection,
@@ -179,10 +211,13 @@ reconnect-with-backoff and identity-checked signalling.
   `[PENDING MESSAGES]`, and are marked delivered only once the shim has written
   them to its CLI. An agent that dies first releases them for the next agent in
   that slot rather than losing them.
+- Observability: the inter-agent message log with delivery state
+  (`nexmesh log --follow`), and per-agent transcripts of process output that
+  outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
-  `status`, `send`.
+  `status`, `send`, `log`, `transcript`.
 
-68 unit tests, plus two end-to-end suites that drive real processes
+72 unit tests, plus two end-to-end suites that drive real processes
 (`tests/README.md`). Neither spends API credits.
 
 ```bash

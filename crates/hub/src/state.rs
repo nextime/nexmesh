@@ -59,9 +59,24 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(found)
 }
 
+/// Cap per agent transcript before it rotates once to `.1`. Agent output is
+/// unbounded in principle, so it must not be able to fill the hub's disk.
+const TRANSCRIPT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// An agent id arrives over the wire and is used as a FILENAME, so it must be
+/// validated or a node could write outside the transcript directory.
+fn safe_id(id: &str) -> Option<&str> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then_some(id)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    /// Where per-agent transcripts live, beside the database.
+    pub transcripts: Arc<std::path::PathBuf>,
     /// Live node sockets, so the hub can push a spawn or a kill. A node absent
     /// from this map is unreachable, whatever the database says.
     nodes: Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>,
@@ -76,8 +91,14 @@ impl AppState {
         let conn = Connection::open(&path).with_context(|| format!("opening {path}"))?;
         conn.execute_batch(proto::SCHEMA_SQL).context("applying schema")?;
         migrate(&conn).context("migrating schema")?;
+        let transcripts = std::path::Path::new(&path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("transcripts");
+        std::fs::create_dir_all(&transcripts).ok();
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
+            transcripts: Arc::new(transcripts),
             nodes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -89,8 +110,49 @@ impl AppState {
         migrate(&conn)?;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
+            transcripts: Arc::new(std::env::temp_dir().join("nexmesh-test-transcripts")),
             nodes: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    // -------------------------------------------------------- transcripts ----
+
+    /// Append an agent's output so the operator can read what it actually did.
+    /// The node streams this; dropping it meant an agent's reasoning and errors
+    /// were unrecoverable the moment it exited.
+    pub fn append_transcript(&self, agent_id: &str, data: &[u8]) {
+        let Some(id) = safe_id(agent_id) else {
+            tracing::warn!(agent_id, "refusing transcript for an unsafe agent id");
+            return;
+        };
+        let path = self.transcripts.join(format!("{id}.log"));
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > TRANSCRIPT_MAX_BYTES {
+                let _ = std::fs::rename(&path, self.transcripts.join(format!("{id}.log.1")));
+            }
+        }
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(self.transcripts.as_path());
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                let _ = f.write_all(data);
+            }
+            Err(e) => tracing::warn!(agent_id, error = %e, "cannot write transcript"),
+        }
+    }
+
+    /// The last `tail_bytes` of an agent's transcript.
+    pub fn read_transcript(&self, agent_id: &str, tail_bytes: usize) -> Result<String> {
+        let id = safe_id(agent_id).context("invalid agent id")?;
+        let path = self.transcripts.join(format!("{id}.log"));
+        let data = std::fs::read(&path).unwrap_or_default();
+        let start = data.len().saturating_sub(tail_bytes);
+        // Slice on a char boundary so a cut multi-byte sequence cannot panic.
+        let mut s = start;
+        while s < data.len() && (data[s] & 0b1100_0000) == 0b1000_0000 {
+            s += 1;
+        }
+        Ok(String::from_utf8_lossy(&data[s..]).to_string())
     }
 
     // ------------------------------------------------------- connections ----
@@ -343,5 +405,52 @@ mod tests {
         conn.execute_batch(proto::SCHEMA_SQL).unwrap();
         assert!(has_column(&conn, "slots", "status").unwrap());
         migrate(&conn).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    fn fresh() -> AppState {
+        let st = AppState::in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("nexmesh-tr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        AppState { transcripts: Arc::new(dir), ..st }
+    }
+
+    #[test]
+    fn output_is_appended_and_read_back() {
+        let st = fresh();
+        st.append_transcript("ag-1", b"first line\n");
+        st.append_transcript("ag-1", b"second line\n");
+        let got = st.read_transcript("ag-1", 4096).unwrap();
+        assert_eq!(got, "first line\nsecond line\n");
+    }
+
+    #[test]
+    fn tailing_never_splits_a_utf8_character() {
+        // Cutting mid-sequence on a byte boundary would produce replacement
+        // characters or, with a naive slice, panic.
+        let st = fresh();
+        st.append_transcript("ag-2", "ααααα".as_bytes()); // 2 bytes each
+        let got = st.read_transcript("ag-2", 5).unwrap();
+        assert!(got.chars().all(|c| c == 'α'), "got {got:?}");
+    }
+
+    #[test]
+    fn an_unsafe_agent_id_cannot_escape_the_transcript_directory() {
+        // The id comes over the wire from a node and is used as a filename.
+        let st = fresh();
+        st.append_transcript("../../etc/nexmesh-pwned", b"nope");
+        assert!(!std::path::Path::new("/etc/nexmesh-pwned").exists());
+        assert!(st.read_transcript("../../etc/passwd", 10).is_err());
+        assert!(st.read_transcript("ag-1/../../x", 10).is_err());
+    }
+
+    #[test]
+    fn a_missing_transcript_reads_as_empty_rather_than_failing() {
+        let st = fresh();
+        assert_eq!(st.read_transcript("ag-never-ran", 100).unwrap(), "");
     }
 }

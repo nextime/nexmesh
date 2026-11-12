@@ -148,6 +148,24 @@ def main():
         time.sleep(0.2)
     check("the node noticed the agent exiting and told the hub", exited)
 
+    print("\n=== the spawned agent's output was captured ===")
+    # The node streams stdout+stderr to the hub, which persists it. Without
+    # this, an agent's reasoning and errors vanish when the process exits.
+    s, j = http("GET", f"/v1/sessions/{sid}/resolve/Max")
+    check("an agent can be resolved by name", s == 200 and "agent_id" in j, str(j))
+    aid = j.get("agent_id")
+    text = ""
+    for _ in range(60):
+        s, j = http("GET", f"/v1/agents/{aid}/transcript?tail=65536")
+        text = j.get("transcript", "")
+        if "fakecli" in text: break
+        time.sleep(0.2)
+    check("the transcript holds what the agent printed", "fakecli" in text, text[:200])
+    check("stderr is included, not just stdout", "set_summary" in text, text[:300])
+    s, j = http("GET", "/v1/agents/..%2F..%2Fetc%2Fpasswd/transcript")
+    check("a traversal attempt on the transcript path is refused",
+          "error" in j or j.get("transcript", "") == "", str(j)[:160])
+
     print("\n=== the generated MCP config ===")
     cfgs = [f for f in os.listdir(f"{WS}/.nexmesh")] if os.path.isdir(f"{WS}/.nexmesh") else []
     check("an inline MCP config was written into the workspace",

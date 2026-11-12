@@ -369,6 +369,103 @@ pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<S
 }
 
 #[derive(Deserialize)]
+pub struct LogQuery {
+    /// Only messages with a higher id. Makes `--follow` cheap and gap-free.
+    pub after: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+/// The conversation between agents, as the operator sees it.
+///
+/// Every message is here: who sent it, who it was addressed to (null means the
+/// whole team), what kind it was, and -- crucially -- whether it has actually
+/// reached the recipient's model yet. A message that is sent but unacked is a
+/// message the recipient has not seen, which is usually what you want to know
+/// when a team looks stuck.
+pub async fn session_log(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<LogQuery>,
+) -> Json<Value> {
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let after = q.after.unwrap_or(0);
+    let db = st.db.lock().unwrap();
+    let Ok(mut stmt) = db.prepare(
+        "SELECT m.id, m.sent_at_ms, m.kind, m.body,
+                COALESCE(sf.display_name, sf.role, 'operator'),
+                CASE WHEN m.to_slot IS NULL THEN '(team)'
+                     ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
+                m.acked_at_ms IS NOT NULL,
+                m.inflight_at_ms IS NOT NULL
+         FROM messages m
+         LEFT JOIN slots sf ON sf.id = m.from_slot
+         LEFT JOIN slots st2 ON st2.id = m.to_slot
+         WHERE m.session_id = ?1 AND m.id > ?2
+         ORDER BY m.id ASC LIMIT ?3",
+    ) else {
+        return Json(json!({ "messages": [] }));
+    };
+    let rows: Vec<Value> = stmt
+        .query_map(params![session_id, after, limit], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "at_ms": r.get::<_, i64>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "body": r.get::<_, String>(3)?,
+                "from": r.get::<_, String>(4)?,
+                "to": r.get::<_, String>(5)?,
+                "delivered": r.get::<_, bool>(6)?,
+                "in_flight": r.get::<_, bool>(7)?,
+            }))
+        })
+        .and_then(|m| m.collect())
+        .unwrap_or_default();
+    Json(json!({ "session_id": session_id, "messages": rows }))
+}
+
+#[derive(Deserialize)]
+pub struct TranscriptQuery {
+    pub tail: Option<usize>,
+}
+
+/// What an agent's process actually printed. Separate from the message log:
+/// this is the agent's own output, the message log is the team conversation.
+pub async fn agent_transcript(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> ApiResult {
+    let tail = q.tail.unwrap_or(64 * 1024).min(2 * 1024 * 1024);
+    let text = st.read_transcript(&agent_id, tail).map_err(|e| bad(e))?;
+    Ok(Json(json!({ "agent_id": agent_id, "transcript": text })))
+}
+
+/// Map a friendly name or slot id to the agent that last filled it, so the
+/// operator can say `nexmesh transcript Max` instead of hunting an agent id.
+pub async fn resolve_agent(
+    State(st): State<AppState>,
+    Path((session_id, who)): Path<(String, String)>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let found: Option<(String, String)> = db
+        .query_row(
+            "SELECT a.id, COALESCE(s.display_name, s.role, s.id)
+             FROM slots s JOIN agents a ON a.slot_id = s.id
+             WHERE s.session_id = ?1
+               AND (s.id = ?2 OR a.id = ?2
+                    OR LOWER(COALESCE(s.display_name,'')) = LOWER(?2)
+                    OR LOWER(COALESCE(s.role,'')) = LOWER(?2))
+             ORDER BY (a.exited_at_ms IS NULL) DESC, a.started_at_ms DESC LIMIT 1",
+            params![session_id, who],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| bad(e))?;
+    let (agent_id, name) = found.ok_or_else(|| bad(format!("no agent matching '{who}'")))?;
+    Ok(Json(json!({ "agent_id": agent_id, "name": name })))
+}
+
+#[derive(Deserialize)]
 pub struct OperatorMessage {
     pub to: Option<String>,
     pub text: String,

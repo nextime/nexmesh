@@ -77,6 +77,25 @@ enum Cmd {
     Spawn { slot: String },
     /// Live status of every agent in a session.
     Status { session: String },
+    /// Read the conversation between the agents.
+    Log {
+        session: String,
+        /// Keep printing new messages as they are sent.
+        #[arg(short, long)]
+        follow: bool,
+        /// How many past messages to show first.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Read what one agent's process actually printed.
+    Transcript {
+        session: String,
+        /// Agent name, role, slot id or agent id.
+        who: String,
+        /// Bytes from the end.
+        #[arg(long, default_value_t = 65536)]
+        tail: usize,
+    },
     /// Send a message to the team or one agent, as the operator.
     Send {
         session: String,
@@ -107,6 +126,38 @@ fn bail_on_error(v: &Value) -> Result<()> {
         anyhow::bail!("{e}");
     }
     Ok(())
+}
+
+fn hhmmss(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ms) {
+        chrono::offset::LocalResult::Single(t) => t.format("%H:%M:%S").to_string(),
+        _ => "--:--:--".to_string(),
+    }
+}
+
+/// One line per message. The delivery marker matters: a message that was sent
+/// but not acked is one the recipient's model has NOT seen yet, which is
+/// usually the answer to "why is this team stuck?".
+fn print_message(m: &Value) {
+    let mark = if m["delivered"].as_bool() == Some(true) {
+        " "
+    } else if m["in_flight"].as_bool() == Some(true) {
+        "~" // handed over, not yet confirmed
+    } else {
+        "!" // queued, recipient has not seen it
+    };
+    let kind = m["kind"].as_str().unwrap_or("text");
+    let kind = if kind == "text" { String::new() } else { format!("[{kind}] ") };
+    println!(
+        "{} {} {:>12} -> {:<12} {}{}",
+        hhmmss(m["at_ms"].as_i64().unwrap_or(0)),
+        mark,
+        m["from"].as_str().unwrap_or("?"),
+        m["to"].as_str().unwrap_or("?"),
+        kind,
+        m["body"].as_str().unwrap_or("").replace('\n', " / "),
+    );
 }
 
 #[tokio::main]
@@ -234,6 +285,53 @@ async fn main() -> Result<()> {
                     a["task_state"].as_str().unwrap_or("-"),
                     a["summary"].as_str().unwrap_or(""),
                 );
+            }
+        }
+
+        Cmd::Log { session, follow, limit } => {
+            // Seed with the tail of the history, then stream forward by id so
+            // nothing is missed or repeated between polls.
+            let v = get(&c, format!("{base}/v1/sessions/{session}/log?limit={limit}")).await?;
+            bail_on_error(&v)?;
+            let empty = vec![];
+            let msgs = v["messages"].as_array().unwrap_or(&empty).clone();
+            if msgs.is_empty() && !follow {
+                println!("no messages yet in {session}");
+                return Ok(());
+            }
+            println!("{:<8} {:<1} {:>12}    {:<12} {}", "TIME", "", "FROM", "TO", "MESSAGE");
+            let mut last = 0i64;
+            for m in &msgs {
+                print_message(m);
+                last = last.max(m["id"].as_i64().unwrap_or(0));
+            }
+            if !follow {
+                println!("\n  ( ! = recipient has not seen it yet, ~ = delivery in flight )");
+                return Ok(());
+            }
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let v = get(&c, format!("{base}/v1/sessions/{session}/log?after={last}")).await?;
+                for m in v["messages"].as_array().unwrap_or(&empty) {
+                    print_message(m);
+                    last = last.max(m["id"].as_i64().unwrap_or(0));
+                }
+            }
+        }
+
+        Cmd::Transcript { session, who, tail } => {
+            let r = get(&c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
+            bail_on_error(&r)?;
+            let agent = r["agent_id"].as_str().context("no agent id returned")?;
+            let name = r["name"].as_str().unwrap_or(&who);
+            let v = get(&c, format!("{base}/v1/agents/{agent}/transcript?tail={tail}")).await?;
+            bail_on_error(&v)?;
+            let text = v["transcript"].as_str().unwrap_or("");
+            if text.is_empty() {
+                println!("no output recorded for {name} ({agent})");
+            } else {
+                println!("--- {name} ({agent}) ---");
+                print!("{text}");
             }
         }
 
