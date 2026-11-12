@@ -3,13 +3,86 @@
 
 use nexmesh_proto::{self as proto, cli_descriptor::CliDescriptor, Envelope, ProcIdentity};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
 use tokio::sync::{mpsc, oneshot};
+
+/// Scrollback kept per agent so an attach can show what already happened
+/// instead of starting from a blank screen. Capped: agent output is unbounded.
+const RING_BYTES: usize = 256 * 1024;
+
+/// The live I/O of one running agent, and whoever is watching it.
+pub struct AgentIo {
+    /// Keystrokes in. `None` for a pipe-run (headless) agent: there is no
+    /// terminal to type into, so such an attach is view-only.
+    pub input: Option<mpsc::Sender<Vec<u8>>>,
+    /// The pty master, for window resizes. `None` for a pipe-run agent.
+    pub master: Option<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    ring: Mutex<VecDeque<u8>>,
+    attaches: Mutex<HashSet<String>>,
+}
+
+impl AgentIo {
+    pub fn new(
+        input: Option<mpsc::Sender<Vec<u8>>>,
+        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            input,
+            master: master.map(Mutex::new),
+            ring: Mutex::new(VecDeque::new()),
+            attaches: Mutex::new(HashSet::new()),
+        })
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.input.is_none()
+    }
+
+    pub fn push_output(&self, data: &[u8]) {
+        let mut ring = self.ring.lock().unwrap();
+        ring.extend(data.iter().copied());
+        // Drop from the front rather than clearing, so recent context survives.
+        let overflow = ring.len().saturating_sub(RING_BYTES);
+        if overflow > 0 {
+            ring.drain(..overflow);
+        }
+    }
+
+    /// The last `n` bytes of scrollback, for replay on attach.
+    pub fn scrollback(&self, n: usize) -> Vec<u8> {
+        let ring = self.ring.lock().unwrap();
+        let skip = ring.len().saturating_sub(n);
+        ring.iter().skip(skip).copied().collect()
+    }
+
+    pub fn add_attach(&self, attach_id: &str) {
+        self.attaches.lock().unwrap().insert(attach_id.to_string());
+    }
+
+    pub fn remove_attach(&self, attach_id: &str) {
+        self.attaches.lock().unwrap().remove(attach_id);
+    }
+
+    pub fn attach_ids(&self) -> Vec<String> {
+        self.attaches.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        if let Some(m) = &self.master {
+            let _ = m.lock().unwrap().resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRec {
@@ -38,6 +111,9 @@ pub struct NodeCtx {
     /// None while disconnected from the hub.
     pub hub_tx: Mutex<Option<mpsc::Sender<String>>>,
     pub agents: Mutex<HashMap<String, AgentRec>>,
+    /// Live I/O per agent, keyed by agent id. Separate from `agents` so the
+    /// metadata can be cloned cheaply without the pty handles.
+    pub io: Mutex<HashMap<String, Arc<AgentIo>>>,
     tool_waiters: Mutex<HashMap<String, oneshot::Sender<ToolOutcome>>>,
     join_waiters: Mutex<HashMap<u64, oneshot::Sender<JoinOutcome>>>,
     seq: AtomicU64,
@@ -58,6 +134,7 @@ impl NodeCtx {
             sock_path,
             hub_tx: Mutex::new(None),
             agents: Mutex::new(HashMap::new()),
+            io: Mutex::new(HashMap::new()),
             tool_waiters: Mutex::new(HashMap::new()),
             join_waiters: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
@@ -118,5 +195,20 @@ impl NodeCtx {
 
     pub fn agent(&self, agent_id: &str) -> Option<AgentRec> {
         self.agents.lock().unwrap().get(agent_id).cloned()
+    }
+
+    pub fn agent_io(&self, agent_id: &str) -> Option<Arc<AgentIo>> {
+        self.io.lock().unwrap().get(agent_id).cloned()
+    }
+
+    /// Find which agent an attach belongs to, so input and closes can be routed
+    /// without the caller having to remember.
+    pub fn io_for_attach(&self, attach_id: &str) -> Option<Arc<AgentIo>> {
+        self.io
+            .lock()
+            .unwrap()
+            .values()
+            .find(|io| io.attach_ids().iter().any(|a| a == attach_id))
+            .cloned()
     }
 }

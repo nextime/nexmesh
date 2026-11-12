@@ -151,8 +151,7 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         vars.insert("resume", r.clone());
     }
     let mut args = d.render_args(mode_name, &vars);
-    if spec.resume_handle.is_some() && !mode.resume_args.is_empty() {
-        args.extend(d.render_args(mode_name, &vars).into_iter().take(0));
+    if spec.resume_handle.is_some() {
         for a in &mode.resume_args {
             let mut s = a.clone();
             for (k, v) in &vars {
@@ -163,6 +162,198 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     }
 
     std::fs::create_dir_all(&state_dir).ok();
+    let env = shim_env(&spec, &ctx.sock_path);
+
+    tracing::info!(cli = %spec.cli_id, agent = %spec.agent_id, mode = mode_name,
+        cwd = %spec.cwd, "spawning: {} {}", bin, args.join(" "));
+
+    // An interactive agent runs under a pty so it can be WATCHED AND TAKEN OVER
+    // from any machine. A headless agent is a protocol on a pipe; there is no
+    // terminal to take over, so it gets pipes and its attach is view-only.
+    if matches!(spec.mode, RunMode::Interactive) {
+        spawn_on_pty(ctx, spec, bin, args, env, mode.prompt_on_stdin).await
+    } else {
+        spawn_on_pipes(ctx, spec, bin, args, env, mode.prompt_on_stdin).await
+    }
+}
+
+/// Everything both spawn paths do once the process exists: record the identity
+/// triple, register it, and tell the hub.
+async fn register_started(
+    ctx: &Arc<NodeCtx>,
+    spec: &SpawnSpec,
+    pid: i32,
+    io: Arc<crate::ctx::AgentIo>,
+) -> Result<ProcIdentity> {
+    // Capture the identity triple IMMEDIATELY: if we waited, the pid could be
+    // recycled and we would record an identity that is not this process.
+    let start_ticks = proc::start_ticks(pid).unwrap_or(0);
+    let identity = ProcIdentity { node_id: ctx.node_name.clone(), pid, start_ticks };
+
+    ctx.agents.lock().unwrap().insert(
+        spec.agent_id.clone(),
+        AgentRec {
+            agent_id: spec.agent_id.clone(),
+            slot_id: spec.slot_id.clone(),
+            session_id: spec.session_id.clone(),
+            cli_id: spec.cli_id.clone(),
+            proc: identity.clone(),
+        },
+    );
+    ctx.io.lock().unwrap().insert(spec.agent_id.clone(), io);
+
+    ctx.send_hub(&proto::NodeToHub::AgentUp {
+        agent_id: spec.agent_id.clone(),
+        slot_id: spec.slot_id.clone(),
+        proc: identity.clone(),
+        provenance: Provenance::Managed,
+        cwd: spec.cwd.clone(),
+        resume_handle: None,
+    })
+    .await?;
+    Ok(identity)
+}
+
+async fn announce_exit(ctx: &Arc<NodeCtx>, agent_id: &str, code: Option<i32>) {
+    tracing::info!(%agent_id, ?code, "agent exited");
+    ctx.agents.lock().unwrap().remove(agent_id);
+    // Collect the viewers BEFORE any await: holding a std MutexGuard across an
+    // await makes the future non-Send, and tokio::spawn then refuses it.
+    let attaches: Vec<String> = {
+        let removed = ctx.io.lock().unwrap().remove(agent_id);
+        removed.map(|io| io.attach_ids()).unwrap_or_default()
+    };
+    // Tell every viewer the session is over before forgetting the agent.
+    for attach_id in attaches {
+        let _ = ctx
+            .send_hub(&proto::NodeToHub::AttachClosed {
+                attach_id,
+                reason: "the agent exited".into(),
+            })
+            .await;
+    }
+    let _ = ctx
+        .send_hub(&proto::NodeToHub::AgentExited {
+            agent_id: agent_id.to_string(),
+            code,
+            signal: None,
+        })
+        .await;
+}
+
+async fn spawn_on_pty(
+    ctx: Arc<NodeCtx>,
+    spec: SpawnSpec,
+    bin: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    prompt_on_stdin: bool,
+) -> Result<()> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let pair = native_pty_system()
+        .openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .context("opening a pty")?;
+
+    let mut cmd = CommandBuilder::new(&bin);
+    for a in &args {
+        cmd.arg(a);
+    }
+    cmd.cwd(&spec.cwd);
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    // A TUI needs to know what terminal it is talking to.
+    if std::env::var("TERM").is_err() {
+        cmd.env("TERM", "xterm-256color");
+    }
+
+    let mut child = pair.slave.spawn_command(cmd).with_context(|| format!("spawning {bin} on a pty"))?;
+    // The slave fd must go, or the master never sees EOF when the child exits.
+    drop(pair.slave);
+
+    let pid = child
+        .process_id()
+        .ok_or_else(|| anyhow::anyhow!("child exited before reporting a pid"))? as i32;
+
+    let reader = pair.master.try_clone_reader().context("cloning the pty reader")?;
+    let mut writer = pair.master.take_writer().context("taking the pty writer")?;
+
+    // pty I/O is blocking, so it lives on threads and is bridged with channels.
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    std::thread::spawn(move || {
+        use std::io::Write;
+        while let Some(bytes) = in_rx.blocking_recv() {
+            if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    let io = crate::ctx::AgentIo::new(Some(in_tx.clone()), Some(pair.master));
+    register_started(&ctx, &spec, pid, io.clone()).await?;
+
+    if prompt_on_stdin {
+        let _ = in_tx.send(format!("{}\n", spec.prompt).into_bytes()).await;
+    }
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if out_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    {
+        let ctx = ctx.clone();
+        let agent_id = spec.agent_id.clone();
+        let io = io.clone();
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            while let Some(chunk) = out_rx.recv().await {
+                seq += 1;
+                emit_output(&ctx, &agent_id, &io, &chunk, seq).await;
+            }
+        });
+    }
+
+    {
+        let ctx = ctx.clone();
+        let agent_id = spec.agent_id.clone();
+        tokio::spawn(async move {
+            let code = tokio::task::spawn_blocking(move || {
+                child.wait().ok().map(|s| s.exit_code() as i32)
+            })
+            .await
+            .ok()
+            .flatten();
+            announce_exit(&ctx, &agent_id, code).await;
+        });
+    }
+    Ok(())
+}
+
+async fn spawn_on_pipes(
+    ctx: Arc<NodeCtx>,
+    spec: SpawnSpec,
+    bin: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    prompt_on_stdin: bool,
+) -> Result<()> {
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
         .current_dir(&spec.cwd)
@@ -170,24 +361,19 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for (k, v) in shim_env(&spec, &ctx.sock_path) {
+    for (k, v) in &env {
         cmd.env(k, v);
     }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
 
-    tracing::info!(cli = %spec.cli_id, agent = %spec.agent_id, mode = mode_name,
-        cwd = %spec.cwd, "spawning: {} {}", bin, args.join(" "));
     let mut child = cmd.spawn().with_context(|| format!("spawning {bin}"))?;
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("child exited before reporting a pid"))? as i32;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("child exited before reporting a pid"))? as i32;
 
-    // Capture the identity triple IMMEDIATELY: if we waited, the pid could be
-    // recycled and we would record an identity that is not this process.
-    let start_ticks = proc::start_ticks(pid).unwrap_or(0);
-    let identity = ProcIdentity { node_id: ctx.node_name.clone(), pid, start_ticks };
-
-    if mode.prompt_on_stdin {
+    if prompt_on_stdin {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             // Claude's stream-json input wants one JSON user message per line.
@@ -200,81 +386,63 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         }
     }
 
-    ctx.agents.lock().unwrap().insert(
-        spec.agent_id.clone(),
-        AgentRec {
-            agent_id: spec.agent_id.clone(),
-            slot_id: spec.slot_id.clone(),
-            session_id: spec.session_id.clone(),
-            cli_id: spec.cli_id.clone(),
-            proc: identity.clone(),
-        },
-    );
+    // No input channel: a pipe-run agent cannot be typed into, so its attach is
+    // view-only rather than pretending otherwise.
+    let io = crate::ctx::AgentIo::new(None, None);
+    register_started(&ctx, &spec, pid, io.clone()).await?;
 
-    ctx.send_hub(&proto::NodeToHub::AgentUp {
-        agent_id: spec.agent_id.clone(),
-        slot_id: spec.slot_id.clone(),
-        proc: identity,
-        provenance: Provenance::Managed,
-        cwd: spec.cwd.clone(),
-        resume_handle: None,
-    })
-    .await?;
-
-    // Stream output to the hub for live viewing, and report the exit.
     if let Some(out) = child.stdout.take() {
-        let ctx2 = ctx.clone();
+        let ctx = ctx.clone();
         let agent_id = spec.agent_id.clone();
-        tokio::spawn(async move { pump(ctx2, agent_id, out).await });
+        let io = io.clone();
+        tokio::spawn(async move { pump(ctx, agent_id, io, out).await });
     }
     // An agent CLI reports its failures on stderr. Piping it and never reading
     // it loses exactly the message needed to diagnose a spawn that dies, and
-    // risks the child blocking once the pipe buffer fills, so log every line.
+    // risks the child blocking once the pipe buffer fills.
     if let Some(err) = child.stderr.take() {
-        let ctx2 = ctx.clone();
+        let ctx = ctx.clone();
         let agent_id = spec.agent_id.clone();
-        tokio::spawn(async move { pump_stderr(ctx2, agent_id, err).await });
+        let io = io.clone();
+        tokio::spawn(async move { pump(ctx, agent_id, io, err).await });
     }
+
     {
-        let ctx2 = ctx.clone();
+        let ctx = ctx.clone();
         let agent_id = spec.agent_id.clone();
         tokio::spawn(async move {
-            let status = child.wait().await;
-            let (code, signal) = match &status {
-                Ok(s) => (s.code(), None),
-                Err(_) => (None, None),
-            };
-            tracing::info!(%agent_id, ?code, "agent exited");
-            ctx2.agents.lock().unwrap().remove(&agent_id);
-            let _ = ctx2
-                .send_hub(&proto::NodeToHub::AgentExited { agent_id, code, signal })
-                .await;
+            let code = child.wait().await.ok().and_then(|s| s.code());
+            announce_exit(&ctx, &agent_id, code).await;
         });
     }
     Ok(())
 }
 
-async fn pump_stderr<R>(ctx: Arc<NodeCtx>, agent_id: String, reader: R)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt;
-    let mut lines = tokio::io::BufReader::new(reader).lines();
-    let mut seq = 0u64;
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(agent = %agent_id, "stderr: {line}");
-        seq += 1;
+/// One place where agent output goes: into scrollback, to the hub for the
+/// transcript, and to every viewer currently attached.
+async fn emit_output(
+    ctx: &Arc<NodeCtx>,
+    agent_id: &str,
+    io: &Arc<crate::ctx::AgentIo>,
+    data: &[u8],
+    seq: u64,
+) {
+    io.push_output(data);
+    let _ = ctx
+        .send_hub(&proto::NodeToHub::Output {
+            agent_id: agent_id.to_string(),
+            seq,
+            data: data.to_vec(),
+        })
+        .await;
+    for attach_id in io.attach_ids() {
         let _ = ctx
-            .send_hub(&proto::NodeToHub::Output {
-                agent_id: agent_id.clone(),
-                seq,
-                data: format!("{line}\n").into_bytes(),
-            })
+            .send_hub(&proto::NodeToHub::AttachData { attach_id, data: data.to_vec() })
             .await;
     }
 }
 
-async fn pump<R>(ctx: Arc<NodeCtx>, agent_id: String, reader: R)
+async fn pump<R>(ctx: Arc<NodeCtx>, agent_id: String, io: Arc<crate::ctx::AgentIo>, reader: R)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -287,13 +455,7 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 seq += 1;
-                let _ = ctx
-                    .send_hub(&proto::NodeToHub::Output {
-                        agent_id: agent_id.clone(),
-                        seq,
-                        data: buf[..n].to_vec(),
-                    })
-                    .await;
+                emit_output(&ctx, &agent_id, &io, &buf[..n], seq).await;
             }
         }
     }

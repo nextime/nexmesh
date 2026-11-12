@@ -1,6 +1,9 @@
 //! The node WebSocket session: authentication, then frame handling.
 
-use crate::{state::AppState, tools};
+use crate::{
+    state::{AppState, AttachFrame},
+    tools,
+};
 use anyhow::Result;
 use axum::extract::{
     ws::{Message, WebSocket, WebSocketUpgrade},
@@ -232,8 +235,33 @@ async fn handle(
             // and it is gone for good once the process exits.
             st.append_transcript(&agent_id, &data);
         }
-        NodeToHub::AttachData { .. } | NodeToHub::AttachClosed { .. } => {
-            // Milestone 3: pty attach fan-out.
+        NodeToHub::AttachOpened { attach_id, read_only, .. } => {
+            let msg = serde_json::json!({ "t": "opened", "read_only": read_only });
+            st.send_attach(&attach_id, AttachFrame::Control(msg.to_string())).await;
+        }
+
+        NodeToHub::AttachRejected { attach_id, reason } => {
+            let msg = serde_json::json!({ "t": "error", "message": reason });
+            st.send_attach(&attach_id, AttachFrame::Control(msg.to_string())).await;
+            st.drop_attach(&attach_id);
+        }
+
+        NodeToHub::AttachData { attach_id, data } => {
+            // If nobody is listening any more, tell the node to stop sending.
+            if !st.send_attach(&attach_id, AttachFrame::Data(data)).await {
+                st.drop_attach(&attach_id);
+                let _ = tx
+                    .send(serde_json::to_string(&HubToNode::AttachClose {
+                        attach_id,
+                    })?)
+                    .await;
+            }
+        }
+
+        NodeToHub::AttachClosed { attach_id, reason } => {
+            let msg = serde_json::json!({ "t": "closed", "reason": reason });
+            st.send_attach(&attach_id, AttachFrame::Control(msg.to_string())).await;
+            st.drop_attach(&attach_id);
         }
         NodeToHub::Pong { .. } => {}
         NodeToHub::Hello { .. } => tracing::warn!(node = %node_name, "duplicate hello ignored"),

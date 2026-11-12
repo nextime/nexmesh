@@ -191,6 +191,55 @@ id, so it never repeats or skips one.
 the hub persists per agent. It survives the process exiting, which is the point:
 an agent's errors are most interesting precisely when it has died.
 
+## Attaching to an agent's terminal
+
+```bash
+nexmesh attach se-1234abcd Max      # Ctrl-] to detach
+```
+
+An agent launched in `interactive` mode runs under a **pty** on its node, so it
+can be watched *and typed into* from any machine. A `headless` agent is a
+protocol on a pipe, not a terminal — you can watch it, but there is nothing to
+take over, and the client says so rather than swallowing your keystrokes.
+
+The hub is only a relay: it never touches the pty, because only the agent's own
+node can. An attach is three hops — your terminal → hub → the node's existing
+*outbound* socket — which is why it works for a node behind NAT with no inbound
+port. Raw terminal bytes travel as binary frames and control messages as JSON,
+so there is no encoding on the hot path.
+
+- Scrollback is replayed on attach, so you do not start at a blank screen.
+- Your window size is sent on connect and on every `SIGWINCH`.
+- Several people can attach to the same agent and all see the same session.
+- Detaching leaves the agent working. Ctrl-C belongs to the agent — that is the
+  point of a takeover — so Ctrl-] is the detach key, as in telnet.
+- The terminal is restored on any exit path, including a panic.
+
+## Security
+
+Worth being precise about, because the answer differs per link.
+
+**Authenticated: yes.** A node enrols with a token (only its SHA-256 is
+stored), and nothing it sends is honoured before that is verified. The *token*
+decides which node it is, not the name in the frame, so a node cannot claim
+another machine's identity or slot history. External participants get tokens
+from a separate table that can call team tools but can never spawn a process.
+
+**Encrypted: not by nexmesh.** There is no TLS in the hub itself. The node
+speaks `wss://` happily if you terminate TLS in front of the hub (nginx, a
+tunnel), and that is the recommended deployment. Because the enrolment token is
+worth a shell on that machine, a node **refuses to send it in cleartext to a
+remote host**: plaintext `ws://` is allowed to loopback, or to anywhere with an
+explicit `--insecure` for a path you know is already encrypted, such as a
+WireGuard or OpenVPN tunnel. The hub also warns loudly at startup if it is
+bound to a non-loopback address.
+
+**The operator API is not authenticated at all yet.** It can create sessions,
+spawn processes and attach to agent terminals, so treat the hub's port as
+privileged: bind it to `127.0.0.1` and reach it over a tunnel, or keep it on a
+trusted network. Native TLS and an operator token are the next two security
+items; until then, **run it inside your VPN.**
+
 ## Status
 
 **Milestone 1 -- done.** Wire protocol, schema, CLI descriptors and detection,
@@ -215,14 +264,15 @@ reconnect-with-backoff and identity-checked signalling.
   (`nexmesh log --follow`), and per-agent transcripts of process output that
   outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
-  `status`, `send`, `log`, `transcript`.
+  `status`, `send`, `log`, `transcript`, `attach`.
 
-72 unit tests, plus two end-to-end suites that drive real processes
-(`tests/README.md`). Neither spends API credits.
+76 unit tests, plus three end-to-end suites that drive real processes
+(`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
-cargo build && python3 -I tests/e2e_team.py && python3 -I tests/e2e_spawn.py
+cargo build
+python3 -I tests/e2e_team.py && python3 -I tests/e2e_spawn.py && python3 -I tests/e2e_attach.py
 
 # a two-machine team, by hand
 nexmesh-hub enrol zeiss                     # on the hub, once per node
@@ -236,9 +286,13 @@ nexmesh spawn sl-xxxx
 nexmesh status se-xxxx
 ```
 
-**Milestone 3** -- pty attach multiplexed over the node socket; `nexmesh attach`.
+**Milestone 3 -- done.** Interactive agents run under a pty with per-agent
+scrollback; attach is multiplexed over the node's existing outbound socket, with
+resize, multiple simultaneous viewers, read-only for headless agents, and
+detach that leaves the agent running. Plus the transport guard above.
+
 **Milestone 4** -- driver fast paths (`stream_json`, `app_server`), token
-accounting, respawn with handoff.
+accounting, respawn with handoff. Then: native TLS and operator-API auth.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 

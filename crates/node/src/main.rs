@@ -57,6 +57,58 @@ struct Args {
     /// Print the detected CLI inventory and exit.
     #[arg(long)]
     detect_only: bool,
+    /// Allow sending the enrolment token over plaintext ws:// to a remote hub.
+    /// Only reasonable when the path is already encrypted, e.g. a WireGuard or
+    /// OpenVPN tunnel.
+    #[arg(long, env = "NEXMESH_INSECURE")]
+    insecure: bool,
+}
+
+/// Refuse to leak the enrolment token onto an unencrypted network path.
+///
+/// The token authenticates this node and is sent in the first frame. Over
+/// plaintext `ws://` to a remote host, anyone on the path can read it and
+/// replay it -- and a node may spawn processes, so that token is worth a shell.
+/// `wss://` is fine, loopback is fine, and a VPN is fine but we cannot detect
+/// one, so that case needs an explicit `--insecure`.
+fn check_transport(hub: &str, insecure: bool) -> Result<()> {
+    let lower = hub.to_ascii_lowercase();
+    if lower.starts_with("wss://") || lower.starts_with("https://") {
+        return Ok(());
+    }
+    let host = lower
+        .split("://")
+        .nth(1)
+        .unwrap_or(&lower)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| lower.split("://").nth(1).unwrap_or("").to_string());
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host == "127.0.0.1"
+        || host == "localhost"
+        || host == "::1"
+        || host.starts_with("127.")
+        || host.ends_with(".localhost");
+    if loopback || insecure {
+        if !loopback {
+            tracing::warn!(
+                hub,
+                "sending the enrolment token over PLAINTEXT ws:// because --insecure was given; \
+                 only do this inside a VPN or other encrypted tunnel"
+            );
+        }
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send the enrolment token in cleartext to '{host}'.\n\
+         The token authenticates this node and can spawn processes, so it must not \
+         cross an unencrypted network.\n\
+         Either use wss:// (terminate TLS in front of the hub), or pass --insecure \
+         if the path is already encrypted, e.g. a WireGuard/OpenVPN tunnel."
+    )
 }
 
 fn default_hostname() -> String {
@@ -155,6 +207,8 @@ async fn main() -> Result<()> {
     // The path must be ABSOLUTE: it is written into the agent's MCP config, and
     // the agent runs with cwd set to its workspace, not to the node's cwd. A
     // relative path silently resolves to nothing there.
+    check_transport(&args.hub, args.insecure)?;
+
     let mcpd = absolutize_mcpd(&args.mcpd.clone().unwrap_or_else(default_mcpd))
         .context("resolving the nexmesh-mcpd path")?;
     let ctx = NodeCtx::new(args.name.clone(), descriptors, mcpd.clone(), args.sock.clone());
@@ -334,13 +388,74 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             ctx.complete_join(req_id, JoinOutcome { granted: Err(reason) });
         }
 
-        // Milestone 4 (drivers) and milestone 3 (pty attach).
-        HubToNode::Inject { .. }
-        | HubToNode::Pending { .. }
-        | HubToNode::AttachOpen { .. }
-        | HubToNode::AttachData { .. }
-        | HubToNode::AttachResize { .. }
-        | HubToNode::AttachClose { .. } => {}
+        HubToNode::AttachOpen { attach_id, agent_id, cols, rows, replay_bytes } => {
+            let Some(io) = ctx.agent_io(&agent_id) else {
+                let _ = ctx
+                    .send_hub(&NodeToHub::AttachRejected {
+                        attach_id,
+                        reason: format!("agent {agent_id} is not running on this node"),
+                    })
+                    .await;
+                return;
+            };
+            // Size the pty to the viewer's terminal before replaying, so a TUI
+            // redraws at the right dimensions rather than wrapping oddly.
+            io.resize(cols, rows);
+            io.add_attach(&attach_id);
+            let _ = ctx
+                .send_hub(&NodeToHub::AttachOpened {
+                    attach_id: attach_id.clone(),
+                    agent_id: agent_id.clone(),
+                    read_only: io.read_only(),
+                    cols,
+                    rows,
+                })
+                .await;
+            // Replay scrollback so the viewer does not start at a blank screen.
+            let back = io.scrollback(replay_bytes.min(256 * 1024));
+            if !back.is_empty() {
+                let _ = ctx
+                    .send_hub(&NodeToHub::AttachData { attach_id, data: back })
+                    .await;
+            }
+            tracing::info!(%agent_id, read_only = io.read_only(), "viewer attached");
+        }
+
+        HubToNode::AttachData { attach_id, data } => {
+            let Some(io) = ctx.io_for_attach(&attach_id) else { return };
+            match &io.input {
+                Some(tx) => {
+                    let _ = tx.send(data).await;
+                }
+                // Typing at a headless agent would go nowhere; say so once
+                // rather than silently swallowing the keystrokes.
+                None => {
+                    let _ = ctx
+                        .send_hub(&NodeToHub::AttachData {
+                            attach_id,
+                            data: b"\r\n[nexmesh] this agent is headless: view-only, input ignored\r\n"
+                                .to_vec(),
+                        })
+                        .await;
+                }
+            }
+        }
+
+        HubToNode::AttachResize { attach_id, cols, rows } => {
+            if let Some(io) = ctx.io_for_attach(&attach_id) {
+                io.resize(cols, rows);
+            }
+        }
+
+        HubToNode::AttachClose { attach_id } => {
+            if let Some(io) = ctx.io_for_attach(&attach_id) {
+                io.remove_attach(&attach_id);
+                tracing::info!(%attach_id, "viewer detached");
+            }
+        }
+
+        // Milestone 4: driver fast paths.
+        HubToNode::Inject { .. } | HubToNode::Pending { .. } => {}
 
         HubToNode::Welcome { .. } | HubToNode::Rejected { .. } => {}
     }
@@ -348,7 +463,36 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
 
 #[cfg(test)]
 mod tests {
-    use super::absolutize_mcpd;
+    use super::{absolutize_mcpd, check_transport};
+
+    #[test]
+    fn plaintext_to_a_remote_host_is_refused() {
+        let err = check_transport("ws://zeiss:7870", false).unwrap_err();
+        assert!(err.to_string().contains("cleartext"), "{err}");
+        let err = check_transport("ws://10.0.0.5:7870", false).unwrap_err();
+        assert!(err.to_string().contains("cleartext"), "{err}");
+        // A public host is the case that actually matters.
+        assert!(check_transport("ws://hub.example.com/", false).is_err());
+    }
+
+    #[test]
+    fn loopback_plaintext_is_fine() {
+        for u in ["ws://127.0.0.1:7870", "ws://localhost:7870", "ws://[::1]:7870",
+                  "ws://127.0.0.53:7870", "ws://hub.localhost:7870"] {
+            assert!(check_transport(u, false).is_ok(), "{u} should be allowed");
+        }
+    }
+
+    #[test]
+    fn tls_is_always_fine() {
+        assert!(check_transport("wss://hub.example.com", false).is_ok());
+        assert!(check_transport("WSS://HUB.EXAMPLE.COM", false).is_ok());
+    }
+
+    #[test]
+    fn insecure_is_an_explicit_opt_in_for_a_vpn_path() {
+        assert!(check_transport("ws://zeiss:7870", true).is_ok());
+    }
 
     #[test]
     fn a_relative_path_becomes_absolute() {

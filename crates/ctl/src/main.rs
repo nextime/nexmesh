@@ -96,6 +96,18 @@ enum Cmd {
         #[arg(long, default_value_t = 65536)]
         tail: usize,
     },
+    /// Attach to an agent's terminal, wherever it is running.
+    ///
+    /// An interactive agent can be watched AND typed into; a headless one is
+    /// view-only. Detach with Ctrl-] -- the agent keeps working either way.
+    Attach {
+        session: String,
+        /// Agent name, role, slot id or agent id.
+        who: String,
+        /// Bytes of scrollback to replay first.
+        #[arg(long, default_value_t = 16384)]
+        replay: usize,
+    },
     /// Send a message to the team or one agent, as the operator.
     Send {
         session: String,
@@ -158,6 +170,144 @@ fn print_message(m: &Value) {
         kind,
         m["body"].as_str().unwrap_or("").replace('\n', " / "),
     );
+}
+
+/// Puts the terminal back the way we found it, even on an early return or a
+/// panic. Leaving a shell in raw mode is a genuinely hostile thing to do.
+struct RawGuard;
+
+impl RawGuard {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("entering raw mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        println!("\r");
+    }
+}
+
+/// Ctrl-] detaches, the way telnet does. Ctrl-C cannot: in raw mode it belongs
+/// to the agent, which is the whole point of a takeover.
+const DETACH_BYTE: u8 = 0x1d;
+
+async fn attach(base: &str, c: &reqwest::Client, session: &str, who: &str, replay: usize) -> Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let r = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
+    bail_on_error(&r)?;
+    let agent = r["agent_id"].as_str().context("no agent id returned")?.to_string();
+    let name = r["name"].as_str().unwrap_or(who).to_string();
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+    let url = format!("{ws_base}/v1/attach/ws?agent={agent}&cols={cols}&rows={rows}&replay={replay}");
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .with_context(|| format!("attaching to {name}"))?;
+    let (mut sink, mut stream) = ws.split();
+
+    println!("attached to {name} ({agent}) -- Ctrl-] to detach");
+
+    // Raw mode only after the connection is up, so a failure prints normally.
+    let _guard = RawGuard::enter()?;
+
+    let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
+
+    // Hub -> our terminal.
+    let reader = {
+        let quit_tx = quit_tx.clone();
+        tokio::spawn(async move {
+            let mut out = tokio::io::stdout();
+            while let Some(Ok(msg)) = stream.next().await {
+                match msg {
+                    WsMessage::Binary(data) => {
+                        if out.write_all(&data).await.is_err() || out.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    WsMessage::Text(t) => {
+                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                        match v["t"].as_str() {
+                            Some("opened") => {
+                                if v["read_only"].as_bool() == Some(true) {
+                                    let _ = out.write_all(
+                                        b"\r\n[nexmesh] headless agent: view-only.\r\n").await;
+                                    let _ = out.flush().await;
+                                }
+                            }
+                            Some("closed") | Some("error") => {
+                                let why = v["reason"].as_str()
+                                    .or(v["message"].as_str())
+                                    .unwrap_or("session ended");
+                                let _ = quit_tx.send(why.to_string()).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    WsMessage::Close(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = quit_tx.send("connection closed".into()).await;
+        })
+    };
+
+    // Window changes must reach the pty or a TUI redraws at the wrong size.
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+    tokio::spawn(async move {
+        let Ok(mut sigwinch) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        else {
+            return;
+        };
+        while sigwinch.recv().await.is_some() {
+            if let Ok((c, r)) = crossterm::terminal::size() {
+                if resize_tx.send((c, r)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Our keyboard -> hub.
+    let mut stdin = tokio::io::stdin();
+    let mut buf = vec![0u8; 4096];
+    let reason = loop {
+        tokio::select! {
+            n = stdin.read(&mut buf) => {
+                let n = match n { Ok(0) | Err(_) => break "input ended".to_string(), Ok(n) => n };
+                if let Some(pos) = buf[..n].iter().position(|b| *b == DETACH_BYTE) {
+                    // Send anything typed before the detach key, then leave.
+                    if pos > 0 {
+                        let _ = sink.send(WsMessage::Binary(buf[..pos].to_vec())).await;
+                    }
+                    break "detached".to_string();
+                }
+                if sink.send(WsMessage::Binary(buf[..n].to_vec())).await.is_err() {
+                    break "connection lost".to_string();
+                }
+            }
+            Some((c, r)) = resize_rx.recv() => {
+                let msg = json!({ "t": "resize", "cols": c, "rows": r }).to_string();
+                let _ = sink.send(WsMessage::Text(msg)).await;
+            }
+            Some(why) = quit_rx.recv() => break why,
+        }
+    };
+
+    let _ = sink.send(WsMessage::Text(json!({ "t": "close" }).to_string())).await;
+    let _ = sink.close().await;
+    reader.abort();
+    drop(_guard);
+    println!("{reason}. The agent is still running.");
+    Ok(())
 }
 
 #[tokio::main]
@@ -333,6 +483,10 @@ async fn main() -> Result<()> {
                 println!("--- {name} ({agent}) ---");
                 print!("{text}");
             }
+        }
+
+        Cmd::Attach { session, who, replay } => {
+            attach(&base, &c, &session, &who, replay).await?;
         }
 
         Cmd::Send { session, text, to } => {

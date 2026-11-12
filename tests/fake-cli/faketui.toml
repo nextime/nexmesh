@@ -1,0 +1,13 @@
+# Test-only descriptor for the attach tests: an interactive agent that can be
+# watched and typed into. No MCP registration -- these tests are about the
+# terminal path, not the tool path.
+[cli]
+id = "faketui"
+display_name = "Fake TUI"
+command = "faketui"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.interactive]
+args = []
+attachable = true

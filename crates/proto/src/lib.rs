@@ -244,6 +244,20 @@ pub enum NodeToHub {
         agent_id: String,
         message_ids: Vec<i64>,
     },
+    /// Confirms an attach and says whether the viewer can actually type.
+    /// A headless agent is a protocol on a pipe, not a terminal: you can watch
+    /// it, but there is nothing to take over.
+    AttachOpened {
+        attach_id: String,
+        agent_id: String,
+        read_only: bool,
+        cols: u16,
+        rows: u16,
+    },
+    AttachRejected {
+        attach_id: String,
+        reason: String,
+    },
     AttachData {
         attach_id: String,
         #[serde(with = "b64")]

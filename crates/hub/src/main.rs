@@ -15,6 +15,7 @@
 //! what makes a pid stored in this database harmless.
 
 mod api;
+mod attach;
 mod nodes;
 mod prompt;
 mod state;
@@ -170,6 +171,7 @@ async fn main() -> Result<()> {
         .route("/v1/participant/ack", post(api::participant_ack))
         .route("/v1/participant/messages", get(api::participant_messages))
         .route("/v1/participant/heartbeat", post(api::participant_heartbeat))
+        .route("/v1/attach/ws", get(attach::attach_ws))
         .route("/v1/node/ws", get(nodes::node_ws))
         .with_state(st);
 
@@ -177,6 +179,15 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "the hub is bound to a NON-LOOPBACK address and serves plain HTTP with no \
+             operator authentication: the operator API can spawn processes and attach to \
+             agent terminals. Put TLS in front of it and restrict access to a trusted \
+             network, or bind 127.0.0.1 and reach it through a tunnel."
+        );
+    }
     tracing::info!(%addr, version = VERSION, "hub listening");
     axum::serve(listener, app).await?;
     Ok(())

@@ -72,9 +72,25 @@ fn safe_id(id: &str) -> Option<&str> {
     ok.then_some(id)
 }
 
+/// What the hub pushes to an attached operator. Output is raw bytes; control
+/// messages are JSON. Keeping them distinct means no base64 on the hot path.
+#[derive(Debug, Clone)]
+pub enum AttachFrame {
+    Data(Vec<u8>),
+    Control(String),
+}
+
+struct AttachSink {
+    tx: mpsc::Sender<AttachFrame>,
+    node_id: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    /// Live attach sessions, keyed by attach id, so frames coming back from a
+    /// node can be routed to the right operator terminal.
+    attaches: Arc<Mutex<HashMap<String, AttachSink>>>,
     /// Where per-agent transcripts live, beside the database.
     pub transcripts: Arc<std::path::PathBuf>,
     /// Live node sockets, so the hub can push a spawn or a kill. A node absent
@@ -100,6 +116,7 @@ impl AppState {
             db: Arc::new(Mutex::new(conn)),
             transcripts: Arc::new(transcripts),
             nodes: Arc::new(Mutex::new(HashMap::new())),
+            attaches: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -112,7 +129,48 @@ impl AppState {
             db: Arc::new(Mutex::new(conn)),
             transcripts: Arc::new(std::env::temp_dir().join("nexmesh-test-transcripts")),
             nodes: Arc::new(Mutex::new(HashMap::new())),
+            attaches: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    // ------------------------------------------------------------ attach ----
+
+    pub fn register_attach(&self, attach_id: &str, node_id: &str, tx: mpsc::Sender<AttachFrame>) {
+        self.attaches.lock().unwrap().insert(
+            attach_id.to_string(),
+            AttachSink { tx, node_id: node_id.to_string() },
+        );
+    }
+
+    pub fn drop_attach(&self, attach_id: &str) -> Option<String> {
+        self.attaches.lock().unwrap().remove(attach_id).map(|s| s.node_id)
+    }
+
+    /// Which node owns an attach session.
+    pub fn attach_owner(&self, attach_id: &str) -> Option<String> {
+        self.attaches.lock().unwrap().get(attach_id).map(|s| s.node_id.clone())
+    }
+
+    /// Route a frame to an attached operator. Returns false if nobody is there,
+    /// which lets the caller tear the attach down rather than buffer forever.
+    pub async fn send_attach(&self, attach_id: &str, frame: AttachFrame) -> bool {
+        let tx = { self.attaches.lock().unwrap().get(attach_id).map(|s| s.tx.clone()) };
+        match tx {
+            Some(tx) => tx.send(frame).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Every attach on a node that just went away, so their terminals can be
+    /// told instead of silently freezing.
+    pub fn attaches_on_node(&self, node_id: &str) -> Vec<String> {
+        self.attaches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.node_id == node_id)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     // -------------------------------------------------------- transcripts ----
@@ -269,6 +327,14 @@ impl AppState {
     }
 
     pub fn mark_node_offline(&self, node_id: &str) {
+        // Attach sessions on a node that has gone are dead; the terminals
+        // holding them must be told rather than left hanging.
+        for attach_id in self.attaches_on_node(node_id) {
+            if let Some(sink) = self.attaches.lock().unwrap().remove(&attach_id) {
+                let msg = serde_json::json!({ "t": "closed", "reason": "the node disconnected" });
+                let _ = sink.tx.try_send(AttachFrame::Control(msg.to_string()));
+            }
+        }
         let db = self.db.lock().unwrap();
         let _ = db.execute("UPDATE nodes SET status = 'offline' WHERE id = ?", [node_id]);
         let _ = db.execute(
