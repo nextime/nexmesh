@@ -1,0 +1,29 @@
+# Qwen Code (gemini-cli lineage). Verified against 'qwen --help'.
+[cli]
+id = "qwen"
+display_name = "Qwen Code"
+command = "qwen"
+version_args = ["--version"]
+extra_paths = ["~/.npm-global/bin"]
+
+[mcp]
+style = "json_file"
+path = "~/.qwen/settings.json"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+# Positional prompt is one-shot. --approval-mode yolo because an unattended
+# agent cannot answer a confirmation prompt.
+args = ["--approval-mode", "yolo", "--session-id", "{session}", "{prompt}"]
+resume_args = ["--resume", "{resume}"]
+attachable = false
+
+[modes.interactive]
+args = ["--approval-mode", "auto-edit", "--prompt-interactive", "{prompt}"]
+resume_args = ["--resume", "{resume}"]
+attachable = true
+
+[driver]
+kind = "mcp_only"

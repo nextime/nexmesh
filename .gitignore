@@ -1,0 +1,8 @@
+/target/
+# Hub state and node sockets are runtime artefacts, never committed.
+*.db
+*.db-wal
+*.db-shm
+*.sock
+# Per-workspace agent state the node writes next to a project.
+.nexmesh/

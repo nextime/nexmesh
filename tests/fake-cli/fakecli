@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+cfgpath = args[args.index("--mcp-config") + 1] if "--mcp-config" in args else None
+prompt = next((a for a in args if a not in ("--mcp-config", cfgpath)), "")
+if "--version" in args:
+    print("fakecli 1.0.0"); sys.exit(0)
+cfg = json.load(open(cfgpath))
+srv = cfg["mcpServers"]["nexmesh"]
+env = dict(os.environ, **srv.get("env", {}))
+p = subprocess.Popen([srv["command"]] + srv.get("args", []), stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, stderr=sys.stderr, env=env, text=True, bufsize=1)
+n = 0
+def call(method, params=None):
+    global n
+    n += 1
+    m = {"jsonrpc": "2.0", "id": n, "method": method}
+    if params is not None: m["params"] = params
+    p.stdin.write(json.dumps(m) + "\n"); p.stdin.flush()
+    return json.loads(p.stdout.readline())
+call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "fakecli", "version": "1"}})
+tools = [t["name"] for t in call("tools/list")["result"]["tools"]]
+print(f"[fakecli] prompt={prompt[:40]!r} tools={len(tools)}", file=sys.stderr)
+r = call("tools/call", {"name": "set_summary", "arguments": {"summary": "spawned and reporting in"}})
+print("[fakecli] set_summary:", r["result"]["content"][0]["text"], file=sys.stderr)
+r = call("tools/call", {"name": "store_knowledge", "arguments":
+    {"key": "spawn-proof", "value": "managed spawn reached the hub", "category": "discovery"}})
+print("[fakecli] store_knowledge:", r["result"]["content"][0]["text"], file=sys.stderr)
+# Stay alive briefly so the test can observe a live agent, then exit cleanly.
+r = call("tools/call", {"name": "check_team_status", "arguments": {}})
+print("[fakecli] team:", r["result"]["content"][0]["text"].replace("\n", " | "), file=sys.stderr)
+p.stdin.close(); p.wait(timeout=10)

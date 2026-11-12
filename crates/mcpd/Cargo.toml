@@ -1,0 +1,19 @@
+[package]
+name = "nexmesh-mcpd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nexmesh-mcpd"
+path = "src/main.rs"
+
+[dependencies]
+nexmesh-proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,38 @@
+# opencode. Verified against 'opencode --help' / 'run --help' / 'serve --help'.
+#
+# NOTE: opencode is the one CLI here that already has a client/server split of
+# its own -- 'opencode serve --port N --hostname H' plus 'opencode attach
+# <url>'. For opencode, remote access needs no pty multiplexing from us at all;
+# the node can run 'serve' and hand out the URL. That is the planned fast path
+# (driver kind "http_server"); until its HTTP API is pinned down here, delivery
+# uses the universal MCP floor, which works today.
+[cli]
+id = "opencode"
+display_name = "opencode"
+command = "opencode"
+version_args = ["--version"]
+extra_paths = ["~/.opencode/bin"]
+
+[mcp]
+# Shape verified against https://opencode.ai/config.json: servers live under
+# mcp.servers.<name> (the flat mcp.<name> form is deprecated), `command` is an
+# ARRAY, and env goes under `environment`. A relative path makes this a project
+# file in the workspace, so the user's global config is left alone.
+style = "json_file"
+path = "opencode.json"
+pointer = "/mcp/servers/nexmesh"
+env_key = "environment"
+entry = { type = "local", command = ["{mcpd}"], enabled = true }
+
+[modes.headless]
+args = ["run", "--format", "json", "{prompt}"]
+resume_args = ["--session", "{resume}"]
+attachable = false
+
+[modes.interactive]
+args = ["{cwd}"]
+resume_args = ["--session", "{resume}"]
+attachable = true
+
+[driver]
+kind = "mcp_only"

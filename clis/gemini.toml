@@ -1,0 +1,24 @@
+# Gemini CLI. Not installed on sissy.
+[cli]
+id = "gemini"
+display_name = "Gemini CLI"
+command = "gemini"
+version_args = ["--version"]
+
+[mcp]
+style = "json_file"
+path = "~/.gemini/settings.json"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["--yolo", "--prompt", "{prompt}"]
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "mcp_only"

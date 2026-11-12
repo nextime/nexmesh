@@ -1,0 +1,32 @@
+# Claude Code. Verified against the binary on sissy.
+[cli]
+id = "claude"
+display_name = "Claude Code"
+command = "claude"
+version_args = ["--version"]
+extra_paths = ["~/.local/bin", "~/.npm-global/bin"]
+
+[mcp]
+# --mcp-config takes a file path, so we never touch ~/.claude.json. A session
+# the user starts by hand is unaffected by anything nexmesh does.
+style = "inline_flag"
+flag = "--mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
+        "--replay-user-messages", "--mcp-config", "{mcp_config}"]
+prompt_on_stdin = true
+resume_args = ["--resume", "{resume}"]
+attachable = false   # stream-json is a protocol, not a terminal
+
+[modes.interactive]
+args = ["--mcp-config", "{mcp_config}"]
+resume_args = ["--resume", "{resume}"]
+attachable = true
+
+[driver]
+kind = "stream_json"
+replay_user_messages = true

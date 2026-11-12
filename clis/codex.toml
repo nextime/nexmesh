@@ -1,0 +1,25 @@
+# Codex CLI. Not installed on sissy -- descriptor shipped so a node that has it
+# is picked up automatically, with no hub change.
+[cli]
+id = "codex"
+display_name = "Codex CLI"
+command = "codex"
+version_args = ["--version"]
+
+[mcp]
+style = "toml_file"
+path = "~/.codex/config.toml"
+key = "mcp_servers.nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["app-server"]
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "app_server"
