@@ -168,6 +168,9 @@ pub struct SpawnSpec {
     /// Resume handle from a previous incarnation of this slot, if any.
     #[serde(default)]
     pub resume_handle: Option<String>,
+    /// For an adopted slot: the tmux target whose terminal to mirror.
+    #[serde(default)]
+    pub tmux_target: Option<String>,
 }
 
 // --------------------------------------------------------- node -> hub ----
@@ -201,6 +204,19 @@ pub enum NodeToHub {
         provenance: Provenance,
         cwd: String,
         resume_handle: Option<String>,
+        /// True when this agent has a driver that can take a message MID-TURN
+        /// rather than at its next tool call. The hub uses it to decide
+        /// whether to push messages or let them ride on a tool result.
+        #[serde(default)]
+        push_capable: bool,
+    },
+    /// A handle that lets a respawned agent pick up where this one left off
+    /// (Claude's session id, Codex's thread id). Learned after startup, so it
+    /// cannot ride along with `AgentUp`.
+    ResumeHandle {
+        agent_id: String,
+        slot_id: String,
+        handle: String,
     },
     AgentExited {
         agent_id: String,
@@ -237,6 +253,13 @@ pub enum NodeToHub {
         name: Option<String>,
         cwd: Option<String>,
         proc: Option<ProcIdentity>,
+    },
+    /// Messages handed to a driver that the agent died before confirming.
+    /// They must go back in the queue: in flight forever means never
+    /// redelivered and never seen.
+    InjectionsLost {
+        agent_id: String,
+        message_ids: Vec<i64>,
     },
     /// Proof a message reached the model. Until this arrives the message stays
     /// in flight and is never handed to a second agent.

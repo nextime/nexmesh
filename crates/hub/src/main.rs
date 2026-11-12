@@ -17,6 +17,8 @@
 mod api;
 mod attach;
 mod auth;
+mod delivery;
+mod launch;
 mod nodes;
 mod prompt;
 mod state;
@@ -234,6 +236,21 @@ async fn main() -> Result<()> {
         Some(Cmd::Serve) | None => {}
     }
 
+    // Delivery and recovery. Driven agents get messages pushed to them within
+    // a tick instead of waiting for their next tool call; crashed agents come
+    // back with a handoff.
+    {
+        let st = st.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                tick.tick().await;
+                delivery::push_tick(&st).await;
+                delivery::recovery_tick(&st).await;
+            }
+        });
+    }
+
     // Lease sweeper: the only thing that ages a node or an external agent out,
     // and the only thing that returns their in-flight messages to the queue.
     {
@@ -261,6 +278,7 @@ async fn main() -> Result<()> {
         .route("/v1/nodes", get(api::list_nodes))
         .route("/v1/sessions", get(api::list_sessions).post(api::create_session))
         .route("/v1/sessions/:id/slots", post(api::create_slot))
+        .route("/v1/sessions/:id/adopt", post(api::adopt_slot))
         .route("/v1/sessions/:id/status", get(api::session_status))
         .route("/v1/sessions/:id/messages", post(api::operator_message))
         .route("/v1/sessions/:id/log", get(api::session_log))

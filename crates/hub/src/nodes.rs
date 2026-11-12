@@ -11,7 +11,7 @@ use axum::extract::{
 };
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
-use nexmesh_proto::{self as proto, now_ms, HubToNode, NodeToHub, Provenance};
+use nexmesh_proto::{self as proto, now_ms, HubToNode, NodeToHub};
 use rusqlite::{params, OptionalExtension};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -147,18 +147,20 @@ async fn handle(
             }
         }
 
-        NodeToHub::AgentUp { agent_id, slot_id, proc: id, provenance, cwd, resume_handle } => {
+        NodeToHub::AgentUp {
+            agent_id, slot_id, proc: id, provenance, cwd, resume_handle, push_capable,
+        } => {
             let db = st.db.lock().unwrap();
             let now = now_ms();
             db.execute(
                 "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance,
-                                     status, cwd, started_at_ms, last_seen_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8)
+                                     status, cwd, started_at_ms, last_seen_ms, push_capable)
+                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9)
                  ON CONFLICT(id) DO UPDATE SET status = 'running', last_seen_ms = ?8",
                 params![
                     agent_id, slot_id, node_id, id.pid, id.start_ticks,
                     serde_json::to_value(provenance)?.as_str().unwrap_or("managed"),
-                    cwd, now
+                    cwd, now, push_capable as i64
                 ],
             )?;
             db.execute("UPDATE slots SET status = 'connected' WHERE id = ?", [&slot_id])?;
@@ -181,6 +183,27 @@ async fn handle(
                 [&agent_id],
             )?;
             tracing::info!(node = %node_name, %agent_id, ?code, ?signal, "agent exited");
+        }
+
+        NodeToHub::ResumeHandle { slot_id, handle, .. } => {
+            let db = st.db.lock().unwrap();
+            db.execute(
+                "UPDATE slots SET resume_handle = ? WHERE id = ?",
+                params![handle, slot_id],
+            )?;
+            tracing::debug!(%slot_id, "stored a resume handle");
+        }
+
+        NodeToHub::InjectionsLost { message_ids, .. } => {
+            // Back in the queue, or they are never redelivered.
+            let db = st.db.lock().unwrap();
+            for id in message_ids {
+                db.execute(
+                    "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
+                     WHERE id = ? AND acked_at_ms IS NULL",
+                    [id],
+                )?;
+            }
         }
 
         NodeToHub::TokenUsage { agent_id, input, output, cache_read } => {
@@ -405,15 +428,6 @@ pub fn workspace_for_cwd(mounts: &[(String, String)], cwd: &str) -> Option<Strin
         }
     }
     best.map(|(id, _)| id.to_string())
-}
-
-/// Marks an agent's provenance for the dashboard and for `list_peers`.
-pub fn provenance_label(p: Provenance) -> &'static str {
-    match p {
-        Provenance::Managed => "managed",
-        Provenance::Attached => "attached",
-        Provenance::External => "external",
-    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,19 @@
+# Test-only: an agent that always dies, so flap detection can be verified.
+[cli]
+id = "fakecrash"
+display_name = "Always crashes"
+command = "fakecrash"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.headless]
+args = []
+prompt_on_stdin = true
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "stream_json"

@@ -215,6 +215,76 @@ so there is no encoding on the hot path.
   point of a takeover — so Ctrl-] is the detach key, as in telnet.
 - The terminal is restored on any exit path, including a panic.
 
+## Getting a message to a working agent
+
+Delivery has two tiers, and the difference is latency, not reliability.
+
+**The floor** works for every agent: unread messages ride back on its next MCP
+tool result. Always correct, but an agent deep in a long edit may not call a
+tool for minutes.
+
+**The driver fast path** writes into the CLI's own input stream, so a message
+is read at the next tool-call boundary instead — seconds, not minutes. For
+Claude Code that means `stream-json` on stdin, and the acknowledgement is not a
+guess: `--replay-user-messages` makes the CLI echo the message back, and only
+that echo marks it delivered. If the agent dies before echoing, the message
+returns to the queue for whoever fills the slot next.
+
+Everything in that path was verified against claude 2.1.322 rather than
+assumed, and two things were not what you would guess:
+
+- `--output-format=stream-json` **requires `--verbose`**, or the CLI exits
+  immediately. The descriptor shipped here would have failed on first use.
+- Custom fields added to an input message are **stripped** from the replay, so
+  acknowledgements correlate on the message text, not an id you attach.
+
+The same stream carries token usage (`assistant` events meter each API call,
+the turn's `result` gives totals) and the session id from `system`/`init`,
+which becomes the `--resume` handle.
+
+Codex's `app-server` is the other fast path and is **not implemented**: its
+JSON-RPC surface needs verifying against the real binary the way the above was,
+and guessing it would be worse than leaving Codex on the floor, which works.
+
+## Crash recovery
+
+A managed agent that dies with work outstanding is respawned on a placed node —
+possibly a different one, since recovery goes through the same placement path
+as a first launch — resuming its previous session and carrying a handoff note
+telling it to read the plan and knowledge before redoing anything.
+
+A slot that has *signalled done* is deliberately left alone unless feedback is
+waiting for it; restarting an agent with nothing to do only burns tokens. And
+after three crashes in five minutes a slot is marked `flapping` and left dead,
+with a message to the team saying so, rather than hammering a broken agent
+forever.
+
+## Adopting a session that is already running
+
+```bash
+nexmesh adopt se-1234abcd --node zeiss --tmux work --name Legacy
+nexmesh attach se-1234abcd Legacy
+```
+
+For a terminal you started yourself and want to reach from elsewhere. The
+obvious implementation is `pipe-pane` plus `send-keys`; this does something
+better. tmux is built for several clients at once, so the node runs
+`tmux new-session -t <target>` under a pty it owns. That is a *grouped*
+session: it shares the windows but keeps its own size, so a viewer on a small
+terminal does not shrink the session under your hands the way plain
+`attach-session` would. Your own terminal stays attached throughout, and the
+whole existing attach path — scrollback, resize, several viewers, takeover —
+works unchanged.
+
+Being honest about the limit: adoption gives you the **terminal**, not a team
+member. That session has no MCP shim, so it cannot call team tools or receive
+messages. Configure `nexmesh-mcpd` in the CLI running inside the pane and it
+joins as an `attached` agent too; the two are orthogonal and combine.
+
+There is deliberately **no send-keys message delivery**. Typing a teammate's
+message into a pane that happens to be sitting at a shell prompt would execute
+it. Delivery belongs to the MCP path, which knows it is talking to an agent.
+
 ## What attach can and cannot reach
 
 Attach relays a pty **the node created**. That distinction decides what works:
@@ -223,16 +293,14 @@ Attach relays a pty **the node created**. That distinction decides what works:
 |---|---|
 | launched by nexmesh, `mode = "interactive"` | the real TUI: watch **and type**. Several viewers at once. |
 | launched by nexmesh, `mode = "headless"` | view-only — it is a protocol on a pipe, not a terminal |
-| joined by itself via `mcpd` (an *attached* agent) | nothing. It is a full team member for messages, tools and review, but its terminal belongs to whoever started it |
+| joined by itself via `mcpd` (an *attached* agent) | nothing. It is a full team member for messages, tools and review, but its terminal belongs to whoever started it — unless you also `adopt` its tmux session |
+| adopted with `nexmesh adopt` | the real terminal: watch **and type**, alongside your own client |
 | an external participant (a hermes agent) | nothing — there is no terminal at all |
 
 So a `claude` agent that nexmesh launched on zeiss in interactive mode is fully
-drivable from the laptop. A `claude` you started yourself in your own ssh
-session on zeiss is **not**: that pty belongs to your shell, and nexmesh has no
-handle on it. Run it through nexmesh in interactive mode instead and you can
-attach from zeiss *and* the laptop at once, since multiple viewers are
-supported. (A `tmux` bridge, to adopt an already-running session, is a plausible
-future descriptor kind — it is not implemented.)
+drivable from the laptop. A `claude` you started yourself in a bare ssh session
+on zeiss is **not**: that pty belongs to your shell. Start it inside tmux and
+`nexmesh adopt` reaches it — see above.
 
 ## Security
 
@@ -299,19 +367,20 @@ reconnect-with-backoff and identity-checked signalling.
   `[PENDING MESSAGES]`, and are marked delivered only once the shim has written
   them to its CLI. An agent that dies first releases them for the next agent in
   that slot rather than losing them.
+- Driver fast path, token accounting, crash recovery, tmux adoption (above).
 - Observability: the inter-agent message log with delivery state
   (`nexmesh log --follow`), and per-agent transcripts of process output that
   outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
-  `status`, `send`, `log`, `transcript`, `attach`.
+  `status`, `send`, `log`, `transcript`, `attach`, `adopt`.
 
-87 unit tests, plus four end-to-end suites that drive real processes
+94 unit tests, plus six end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure; do python3 -I tests/e2e_$t.py || break; done
+for t in team spawn attach secure driver adopt; do python3 -I tests/e2e_$t.py || break; done
 
 # a two-machine team, by hand
 nexmesh-hub enrol zeiss                     # on the hub, once per node
@@ -335,8 +404,14 @@ generation, explicit trust anchors on nodes and the operator CLI, three
 separate credential types, operator auth as a route-group middleware, and the
 two refusals described above.
 
-**Milestone 4** -- driver fast paths (`stream_json`, `app_server`), token
-accounting, respawn with handoff. Then mutual TLS.
+**Milestone 4 -- done** (except Codex). The `stream_json` driver with mid-turn
+injection and echo-based acknowledgement, token accounting, resume handles,
+crash recovery with handoff and flap detection, and tmux adoption. Codex's
+`app_server` is outstanding, as explained above.
+
+**Next** -- mutual TLS; Codex `app_server`; a web dashboard; workspace sync for
+shared-repo sessions; an MCP orchestrator server so a Claude Code session can
+drive the fleet conversationally.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 

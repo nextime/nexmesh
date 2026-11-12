@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS slots (
   restarts          INTEGER NOT NULL DEFAULT 0,
   last_crash_ms     INTEGER,
   resume_handle     TEXT,                            -- CLI-specific resume id
+  -- For an ADOPTED slot: the tmux target (session, window or pane) whose
+  -- terminal this slot mirrors.
+  tmux_target       TEXT,
   created_at_ms     INTEGER NOT NULL
 );
 
@@ -139,6 +142,9 @@ CREATE TABLE IF NOT EXISTS agents (
   pid               INTEGER,
   proc_start_ticks  INTEGER,                   -- /proc/<pid>/stat field 22
   provenance        TEXT NOT NULL,             -- managed | attached | external
+  -- Whether this agent's driver can take a message mid-turn. Decides whether
+  -- the hub pushes to it or waits for its next tool result.
+  push_capable      INTEGER NOT NULL DEFAULT 0,
   status            TEXT NOT NULL,             -- starting|running|idle|exited|lost
   -- Liveness for agents with no process we can see: refreshed by the
   -- participant API, swept like a node lease.

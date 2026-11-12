@@ -228,6 +228,9 @@ async fn register(
                         pid,
                         start_ticks,
                     },
+                    // Nobody spawned it, so nobody drives it: delivery rides
+                    // on its tool results, which is the universal floor.
+                    driver: nexmesh_proto::cli_descriptor::DriverSpec::McpOnly,
                 },
             );
             tracing::info!(%agent_id, %slot_id, "attached agent joined the team");

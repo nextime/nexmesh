@@ -15,6 +15,22 @@ use tokio::sync::{mpsc, oneshot};
 /// instead of starting from a blank screen. Capped: agent output is unbounded.
 const RING_BYTES: usize = 256 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoKind {
+    /// A real terminal: attachable and take-over-able.
+    Pty,
+    /// Pipes. Still writable -- a driver injects through stdin -- but there is
+    /// no terminal, so an attach to it is view-only.
+    Pipes,
+}
+
+/// A message handed to a driver, waiting for the CLI to confirm it.
+#[derive(Debug, Clone)]
+pub struct Injected {
+    pub text: String,
+    pub message_ids: Vec<i64>,
+}
+
 /// The live I/O of one running agent, and whoever is watching it.
 pub struct AgentIo {
     /// Keystrokes in. `None` for a pipe-run (headless) agent: there is no
@@ -22,25 +38,71 @@ pub struct AgentIo {
     pub input: Option<mpsc::Sender<Vec<u8>>>,
     /// The pty master, for window resizes. `None` for a pipe-run agent.
     pub master: Option<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    pub kind: IoKind,
     ring: Mutex<VecDeque<u8>>,
     attaches: Mutex<HashSet<String>>,
+    /// Injections written to the CLI but not yet echoed back, oldest first.
+    pending: Mutex<VecDeque<Injected>>,
 }
 
 impl AgentIo {
     pub fn new(
+        kind: IoKind,
         input: Option<mpsc::Sender<Vec<u8>>>,
         master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             input,
             master: master.map(Mutex::new),
+            kind,
             ring: Mutex::new(VecDeque::new()),
             attaches: Mutex::new(HashSet::new()),
+            pending: Mutex::new(VecDeque::new()),
         })
     }
 
+    /// Whether an ATTACHED VIEWER may type. Pipes are writable by a driver but
+    /// are not a terminal, so a human attaching to them can only watch.
     pub fn read_only(&self) -> bool {
-        self.input.is_none()
+        self.kind != IoKind::Pty
+    }
+
+    pub fn push_pending(&self, injected: Injected) {
+        self.pending.lock().unwrap().push_back(injected);
+    }
+
+    /// Match a replayed message back to what we injected.
+    ///
+    /// The CLI strips any custom field we add, so the echoed text is the only
+    /// correlator (verified against claude 2.1.322). Replays arrive in order,
+    /// so an exact text match is taken oldest-first; if the text does not
+    /// match anything we still retire the oldest entry rather than leak it,
+    /// because a message stuck "in flight" forever is never redelivered.
+    pub fn ack_replay(&self, text: &str) -> Vec<i64> {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(idx) = pending.iter().position(|p| p.text == text) {
+            return pending.remove(idx).map(|p| p.message_ids).unwrap_or_default();
+        }
+        match pending.pop_front() {
+            Some(p) => {
+                tracing::warn!(
+                    "a replayed message did not match what was injected; \
+                     retiring the oldest injection anyway so it is not stuck"
+                );
+                p.message_ids
+            }
+            None => vec![],
+        }
+    }
+
+    /// Injections still outstanding, for release when the agent dies.
+    pub fn drain_pending(&self) -> Vec<i64> {
+        self.pending
+            .lock()
+            .unwrap()
+            .drain(..)
+            .flat_map(|p| p.message_ids)
+            .collect()
     }
 
     pub fn push_output(&self, data: &[u8]) {
@@ -91,6 +153,9 @@ pub struct AgentRec {
     pub session_id: String,
     pub cli_id: String,
     pub proc: ProcIdentity,
+    /// How this agent is driven, which decides whether the hub pushes messages
+    /// to it or lets them ride on its next tool result.
+    pub driver: nexmesh_proto::cli_descriptor::DriverSpec,
 }
 
 pub struct ToolOutcome {

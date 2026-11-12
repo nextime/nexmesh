@@ -16,8 +16,10 @@ env_key = "env"
 entry = { command = "{mcpd}", args = [] }
 
 [modes.headless]
+# --verbose is REQUIRED with --output-format=stream-json: without it claude
+# exits with "requires --verbose" before doing anything. Verified against 2.1.322.
 args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
-        "--replay-user-messages", "--mcp-config", "{mcp_config}"]
+        "--verbose", "--replay-user-messages", "--mcp-config", "{mcp_config}"]
 prompt_on_stdin = true
 resume_args = ["--resume", "{resume}"]
 attachable = false   # stream-json is a protocol, not a terminal

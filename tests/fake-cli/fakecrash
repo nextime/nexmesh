@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""An agent that always dies, for testing flap detection."""
+import json, sys, uuid
+if "--version" in sys.argv:
+    print("fakecrash 1.0.0"); sys.exit(0)
+print(json.dumps({"type": "system", "subtype": "init",
+                  "session_id": str(uuid.uuid4()), "uuid": str(uuid.uuid4())}), flush=True)
+print("[fakecrash] dying immediately", file=sys.stderr, flush=True)
+sys.exit(1)

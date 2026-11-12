@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result};
 use nexmesh_proto::{
     self as proto,
-    cli_descriptor::{render_entry, set_pointer, CliDescriptor, McpRegistration},
+    cli_descriptor::{render_entry, set_pointer, CliDescriptor, DriverSpec, McpRegistration},
     ProcIdentity, Provenance, RunMode, SpawnSpec,
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -150,6 +150,10 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     if let Some(r) = &spec.resume_handle {
         vars.insert("resume", r.clone());
     }
+    if let Some(t) = &spec.tmux_target {
+        vars.insert("tmux_target", t.clone());
+    }
+    vars.insert("slot", spec.slot_id.clone());
     let mut args = d.render_args(mode_name, &vars);
     if spec.resume_handle.is_some() {
         for a in &mode.resume_args {
@@ -171,10 +175,17 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     // from any machine. A headless agent is a protocol on a pipe; there is no
     // terminal to take over, so it gets pipes and its attach is view-only.
     if matches!(spec.mode, RunMode::Interactive) {
-        spawn_on_pty(ctx, spec, bin, args, env, mode.prompt_on_stdin).await
+        spawn_on_pty(ctx, spec, bin, args, env, d.cli.env_unset.clone(),
+                     mode.prompt_on_stdin, d.driver.clone()).await
     } else {
-        spawn_on_pipes(ctx, spec, bin, args, env, mode.prompt_on_stdin).await
+        spawn_on_pipes(ctx, spec, bin, args, env, d.cli.env_unset.clone(),
+                       mode.prompt_on_stdin, d.driver.clone()).await
     }
+}
+
+/// Can this driver take a message mid-turn, or must it wait for a tool call?
+pub fn push_capable(driver: &DriverSpec) -> bool {
+    matches!(driver, DriverSpec::StreamJson { .. } | DriverSpec::AppServer)
 }
 
 /// Everything both spawn paths do once the process exists: record the identity
@@ -184,6 +195,7 @@ async fn register_started(
     spec: &SpawnSpec,
     pid: i32,
     io: Arc<crate::ctx::AgentIo>,
+    driver: DriverSpec,
 ) -> Result<ProcIdentity> {
     // Capture the identity triple IMMEDIATELY: if we waited, the pid could be
     // recycled and we would record an identity that is not this process.
@@ -198,6 +210,7 @@ async fn register_started(
             session_id: spec.session_id.clone(),
             cli_id: spec.cli_id.clone(),
             proc: identity.clone(),
+            driver: driver.clone(),
         },
     );
     ctx.io.lock().unwrap().insert(spec.agent_id.clone(), io);
@@ -209,6 +222,7 @@ async fn register_started(
         provenance: Provenance::Managed,
         cwd: spec.cwd.clone(),
         resume_handle: None,
+        push_capable: push_capable(&driver),
     })
     .await?;
     Ok(identity)
@@ -219,10 +233,25 @@ async fn announce_exit(ctx: &Arc<NodeCtx>, agent_id: &str, code: Option<i32>) {
     ctx.agents.lock().unwrap().remove(agent_id);
     // Collect the viewers BEFORE any await: holding a std MutexGuard across an
     // await makes the future non-Send, and tokio::spawn then refuses it.
-    let attaches: Vec<String> = {
+    let (attaches, stranded): (Vec<String>, Vec<i64>) = {
         let removed = ctx.io.lock().unwrap().remove(agent_id);
-        removed.map(|io| io.attach_ids()).unwrap_or_default()
+        match removed {
+            Some(io) => (io.attach_ids(), io.drain_pending()),
+            None => (vec![], vec![]),
+        }
     };
+    // Anything injected but never echoed never reached a model. Say so, or the
+    // hub leaves it in flight forever and nobody ever sees it.
+    if !stranded.is_empty() {
+        tracing::info!(%agent_id, count = stranded.len(),
+            "releasing injected messages the agent never confirmed");
+        let _ = ctx
+            .send_hub(&proto::NodeToHub::InjectionsLost {
+                agent_id: agent_id.to_string(),
+                message_ids: stranded,
+            })
+            .await;
+    }
     // Tell every viewer the session is over before forgetting the agent.
     for attach_id in attaches {
         let _ = ctx
@@ -247,7 +276,9 @@ async fn spawn_on_pty(
     bin: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    env_unset: Vec<String>,
     prompt_on_stdin: bool,
+    driver: DriverSpec,
 ) -> Result<()> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -260,6 +291,9 @@ async fn spawn_on_pty(
         cmd.arg(a);
     }
     cmd.cwd(&spec.cwd);
+    for k in &env_unset {
+        cmd.env_remove(k);
+    }
     for (k, v) in &env {
         cmd.env(k, v);
     }
@@ -293,8 +327,8 @@ async fn spawn_on_pty(
         }
     });
 
-    let io = crate::ctx::AgentIo::new(Some(in_tx.clone()), Some(pair.master));
-    register_started(&ctx, &spec, pid, io.clone()).await?;
+    let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pty, Some(in_tx.clone()), Some(pair.master));
+    register_started(&ctx, &spec, pid, io.clone(), driver).await?;
 
     if prompt_on_stdin {
         let _ = in_tx.send(format!("{}\n", spec.prompt).into_bytes()).await;
@@ -352,7 +386,9 @@ async fn spawn_on_pipes(
     bin: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    env_unset: Vec<String>,
     prompt_on_stdin: bool,
+    driver: DriverSpec,
 ) -> Result<()> {
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
@@ -361,6 +397,9 @@ async fn spawn_on_pipes(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    for k in &env_unset {
+        cmd.env_remove(k);
+    }
     for (k, v) in &env {
         cmd.env(k, v);
     }
@@ -373,38 +412,63 @@ async fn spawn_on_pipes(
         .id()
         .ok_or_else(|| anyhow::anyhow!("child exited before reporting a pid"))? as i32;
 
-    if prompt_on_stdin {
-        if let Some(mut stdin) = child.stdin.take() {
+    // Keep stdin OPEN behind a channel. Writing the prompt and then dropping
+    // it would send EOF, which ends a stream-json session immediately -- and
+    // with it any chance of injecting a teammate's message mid-turn.
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            // Claude's stream-json input wants one JSON user message per line.
-            let line = serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": [{ "type": "text", "text": spec.prompt }] }
-            });
-            let _ = stdin.write_all(format!("{line}\n").as_bytes()).await;
-            let _ = stdin.flush().await;
-        }
+            while let Some(bytes) = in_rx.recv().await {
+                if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+            // Dropping stdin here closes it, ending the session cleanly.
+        });
     }
 
-    // No input channel: a pipe-run agent cannot be typed into, so its attach is
-    // view-only rather than pretending otherwise.
-    let io = crate::ctx::AgentIo::new(None, None);
-    register_started(&ctx, &spec, pid, io.clone()).await?;
+    let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pipes, Some(in_tx.clone()), None);
+    register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+
+    if prompt_on_stdin {
+        let line = match &driver {
+            // Claude's stream-json input wants one JSON user message per line.
+            DriverSpec::StreamJson { .. } => {
+                format!("{}\n", crate::driver::user_message(&spec.prompt))
+            }
+            _ => format!("{}\n", spec.prompt),
+        };
+        let _ = in_tx.send(line.into_bytes()).await;
+    }
 
     if let Some(out) = child.stdout.take() {
         let ctx = ctx.clone();
         let agent_id = spec.agent_id.clone();
+        let slot_id = spec.slot_id.clone();
         let io = io.clone();
-        tokio::spawn(async move { pump(ctx, agent_id, io, out).await });
+        match &driver {
+            // A driven CLI's stdout is a protocol, so parse it: acks, token
+            // usage and the resume handle all come from there.
+            DriverSpec::StreamJson { .. } => {
+                tokio::spawn(async move {
+                    crate::driver::run_stream_json(ctx, agent_id, slot_id, io, out).await
+                });
+            }
+            _ => {
+                tokio::spawn(async move { pump(ctx, agent_id, io, out).await });
+            }
+        }
     }
-    // An agent CLI reports its failures on stderr. Piping it and never reading
-    // it loses exactly the message needed to diagnose a spawn that dies, and
-    // risks the child blocking once the pipe buffer fills.
+    // An agent CLI reports its failures on stderr. It goes to the transcript
+    // AND to this node's log: when a spawn dies early, the node log is where
+    // someone will look first, and a transcript they have to go fetch is one
+    // step too far.
     if let Some(err) = child.stderr.take() {
         let ctx = ctx.clone();
         let agent_id = spec.agent_id.clone();
         let io = io.clone();
-        tokio::spawn(async move { pump(ctx, agent_id, io, err).await });
+        tokio::spawn(async move { pump_stderr(ctx, agent_id, io, err).await });
     }
 
     {
@@ -420,7 +484,7 @@ async fn spawn_on_pipes(
 
 /// One place where agent output goes: into scrollback, to the hub for the
 /// transcript, and to every viewer currently attached.
-async fn emit_output(
+pub(crate) async fn emit_output(
     ctx: &Arc<NodeCtx>,
     agent_id: &str,
     io: &Arc<crate::ctx::AgentIo>,
@@ -439,6 +503,25 @@ async fn emit_output(
         let _ = ctx
             .send_hub(&proto::NodeToHub::AttachData { attach_id, data: data.to_vec() })
             .await;
+    }
+}
+
+/// stderr: logged line by line here, and kept in the transcript.
+async fn pump_stderr<R>(
+    ctx: Arc<NodeCtx>,
+    agent_id: String,
+    io: Arc<crate::ctx::AgentIo>,
+    reader: R,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let mut seq = 0u64;
+    while let Ok(Some(line)) = lines.next_line().await {
+        tracing::info!(agent = %agent_id, "stderr: {line}");
+        seq += 1;
+        emit_output(&ctx, &agent_id, &io, format!("{line}\n").as_bytes(), seq).await;
     }
 }
 
@@ -479,6 +562,7 @@ mod tests {
             prompt: "do the thing".into(),
             env: vec![],
             resume_handle: None,
+            tmux_target: None,
         }
     }
 

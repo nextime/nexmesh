@@ -83,6 +83,23 @@ enum Cmd {
     },
     /// Ask the placed node to start a slot's agent.
     Spawn { slot: String },
+    /// Adopt an already-running tmux session so you can watch and drive it
+    /// from anywhere. Your own terminal stays attached.
+    Adopt {
+        session: String,
+        /// Node whose tmux server holds it.
+        #[arg(long)]
+        node: String,
+        /// tmux target: session, window or pane (e.g. work, work:1.0, %3).
+        #[arg(long = "tmux")]
+        tmux_target: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Live status of every agent in a session.
     Status { session: String },
     /// Read the conversation between the agents.
@@ -188,6 +205,15 @@ fn bail_on_error(v: &Value) -> Result<()> {
         anyhow::bail!("{e}");
     }
     Ok(())
+}
+
+/// Token counts get large; 12400 reads better as 12.4k in a table.
+fn human(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
+        n => n.to_string(),
+    }
 }
 
 fn hhmmss(ms: i64) -> String {
@@ -492,6 +518,24 @@ async fn main() -> Result<()> {
             );
         }
 
+        Cmd::Adopt { session, node, tmux_target, name, role, workspace } => {
+            let mut body = json!({ "node": node, "tmux_target": tmux_target, "name": name });
+            if let Some(r) = role { body["role"] = json!(r); }
+            if let Some(w) = workspace { body["workspace"] = json!(w); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/adopt"), body).await?;
+            bail_on_error(&v)?;
+            println!(
+                "adopted {} on {} as slot {}",
+                v["tmux_target"].as_str().unwrap_or("?"),
+                v["node"].as_str().unwrap_or("?"),
+                v["slot_id"].as_str().unwrap_or("?")
+            );
+            println!("attach with:  nexmesh attach {session} {name}");
+            if let Some(n) = v["note"].as_str() {
+                println!("note: {n}");
+            }
+        }
+
         Cmd::Status { session } => {
             let v = get(&c, format!("{base}/v1/sessions/{session}/status")).await?;
             bail_on_error(&v)?;
@@ -502,20 +546,29 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<12} {:<16} {:<10} {:<10} {:<20} {}",
-                "NAME", "ROLE", "HOST", "KIND", "STATE", "SUMMARY"
+                "{:<12} {:<14} {:<9} {:<9} {:<20} {:>9} {}",
+                "NAME", "ROLE", "HOST", "KIND", "STATE", "TOKENS", "SUMMARY"
             );
             for a in rows {
+                let tin = a["input_tokens"].as_i64().unwrap_or(0);
+                let tout = a["output_tokens"].as_i64().unwrap_or(0);
+                let tokens = if tin + tout == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{}/{}", human(tin), human(tout))
+                };
                 println!(
-                    "{:<12} {:<16} {:<10} {:<10} {:<20} {}",
+                    "{:<12} {:<14} {:<9} {:<9} {:<20} {:>9} {}",
                     a["name"].as_str().unwrap_or("?"),
                     a["role"].as_str().unwrap_or("-"),
                     a["host"].as_str().unwrap_or("-"),
                     a["provenance"].as_str().unwrap_or("-"),
                     a["task_state"].as_str().unwrap_or("-"),
+                    tokens,
                     a["summary"].as_str().unwrap_or(""),
                 );
             }
+            println!("\n  (TOKENS = input/output)");
         }
 
         Cmd::Log { session, follow, limit } => {

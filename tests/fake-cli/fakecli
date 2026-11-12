@@ -30,4 +30,7 @@ print("[fakecli] store_knowledge:", r["result"]["content"][0]["text"], file=sys.
 # Stay alive briefly so the test can observe a live agent, then exit cleanly.
 r = call("tools/call", {"name": "check_team_status", "arguments": {}})
 print("[fakecli] team:", r["result"]["content"][0]["text"].replace("\n", " | "), file=sys.stderr)
+# Signal completion, so the hub does not treat the exit as a crash.
+r = call("tools/call", {"name": "signal_done", "arguments": {"notes": "spawn proof complete"}})
+print("[fakecli] signal_done:", r["result"]["content"][0]["text"], file=sys.stderr)
 p.stdin.close(); p.wait(timeout=10)

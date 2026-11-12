@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""A fake agent speaking Claude Code's stream-json protocol.
+
+Shapes copied from a real `claude -p --output-format stream-json --verbose
+--replay-user-messages` run, so the driver is tested against the protocol it
+will actually meet: system/init carrying session_id, user events with
+isReplay, assistant events with message.usage, and a result with totals.
+"""
+import json, os, sys, uuid
+
+if "--version" in sys.argv:
+    print("fakestream 1.0.0"); sys.exit(0)
+
+resume = None
+if "--resume" in sys.argv:
+    resume = sys.argv[sys.argv.index("--resume") + 1]
+session = resume or str(uuid.uuid4())
+
+def emit(obj):
+    obj.setdefault("session_id", session)
+    obj.setdefault("uuid", str(uuid.uuid4()))
+    print(json.dumps(obj), flush=True)
+
+emit({"type": "system", "subtype": "init", "model": "fake",
+      "resumed_from": resume, "tools": []})
+print(f"[fakestream] session={session} resumed={bool(resume)}", file=sys.stderr, flush=True)
+
+if os.environ.get("FAKESTREAM_CRASH_ON_START"):
+    print("[fakestream] crashing on purpose", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    text = "".join(b.get("text", "") for b in msg.get("message", {}).get("content", []))
+    # Echo it back exactly as --replay-user-messages does: this is the ack.
+    emit({"type": "user", "message": msg.get("message"), "parent_tool_use_id": None,
+          "isReplay": True, "timestamp": "2026-01-01T00:00:00Z"})
+    emit({"type": "assistant", "request_id": "req_" + str(uuid.uuid4())[:8],
+          "message": {"role": "assistant", "content": [{"type": "text", "text": "ack"}],
+                      "usage": {"input_tokens": 11, "cache_read_input_tokens": 100,
+                                "cache_creation_input_tokens": 0, "output_tokens": 7}}})
+    emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1,
+          "result": "ok", "total_cost_usd": 0.0,
+          "usage": {"input_tokens": 11, "cache_read_input_tokens": 100, "output_tokens": 7}})
+    if "CRASH" in text:
+        print("[fakestream] crashing as instructed", file=sys.stderr, flush=True)
+        sys.exit(1)

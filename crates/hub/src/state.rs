@@ -38,6 +38,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("slots", "summary", "TEXT NOT NULL DEFAULT ''"),
         ("slots", "participant_kind", "TEXT NOT NULL DEFAULT 'cli'"),
         ("agents", "lease_expires_ms", "INTEGER"),
+        ("agents", "push_capable", "INTEGER NOT NULL DEFAULT 0"),
+        ("slots", "tmux_target", "TEXT"),
         ("agents", "kind_hint", "TEXT"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
@@ -102,6 +104,9 @@ pub struct AppState {
     /// Live attach sessions, keyed by attach id, so frames coming back from a
     /// node can be routed to the right operator terminal.
     attaches: Arc<Mutex<HashMap<String, AttachSink>>>,
+    /// Slots currently being respawned. One at a time per slot, or a slow node
+    /// would get two agents for the same seat.
+    respawning: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Where per-agent transcripts live, beside the database.
     pub transcripts: Arc<std::path::PathBuf>,
     /// Live node sockets, so the hub can push a spawn or a kill. A node absent
@@ -128,6 +133,7 @@ impl AppState {
             transcripts: Arc::new(transcripts),
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
+            respawning: Arc::new(Mutex::new(Default::default())),
         })
     }
 
@@ -141,7 +147,17 @@ impl AppState {
             transcripts: Arc::new(std::env::temp_dir().join("nexmesh-test-transcripts")),
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
+            respawning: Arc::new(Mutex::new(Default::default())),
         })
+    }
+
+    /// Claim the right to respawn a slot. False means somebody already has it.
+    pub fn begin_respawn(&self, slot_id: &str) -> bool {
+        self.respawning.lock().unwrap().insert(slot_id.to_string())
+    }
+
+    pub fn end_respawn(&self, slot_id: &str) {
+        self.respawning.lock().unwrap().remove(slot_id);
     }
 
     // ------------------------------------------------------------ attach ----
@@ -155,11 +171,6 @@ impl AppState {
 
     pub fn drop_attach(&self, attach_id: &str) -> Option<String> {
         self.attaches.lock().unwrap().remove(attach_id).map(|s| s.node_id)
-    }
-
-    /// Which node owns an attach session.
-    pub fn attach_owner(&self, attach_id: &str) -> Option<String> {
-        self.attaches.lock().unwrap().get(attach_id).map(|s| s.node_id.clone())
     }
 
     /// Route a frame to an attached operator. Returns false if nobody is there,

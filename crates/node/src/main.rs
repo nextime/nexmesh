@@ -21,6 +21,7 @@
 
 mod cli_detect;
 mod ctx;
+mod driver;
 mod localsock;
 mod proc;
 mod spawn;
@@ -473,8 +474,31 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             }
         }
 
-        // Milestone 4: driver fast paths.
-        HubToNode::Inject { .. } | HubToNode::Pending { .. } => {}
+        HubToNode::Inject { agent_id, messages } => {
+            let Some(io) = ctx.agent_io(&agent_id) else {
+                tracing::warn!(%agent_id, "inject for an agent this node does not have");
+                let _ = ctx
+                    .send_hub(&NodeToHub::InjectionsLost {
+                        agent_id,
+                        message_ids: messages.iter().map(|m| m.id).collect(),
+                    })
+                    .await;
+                return;
+            };
+            if let Err(e) = driver::inject(&io, &messages).await {
+                tracing::warn!(%agent_id, error = %e, "injection failed");
+                let _ = ctx
+                    .send_hub(&NodeToHub::InjectionsLost {
+                        agent_id,
+                        message_ids: messages.iter().map(|m| m.id).collect(),
+                    })
+                    .await;
+            } else {
+                tracing::info!(%agent_id, count = messages.len(), "injected mid-turn");
+            }
+        }
+
+        HubToNode::Pending { .. } => {}
 
         HubToNode::Welcome { .. } | HubToNode::Rejected { .. } => {}
     }

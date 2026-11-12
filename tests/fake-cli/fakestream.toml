@@ -1,0 +1,29 @@
+# Test-only descriptor exercising the stream_json driver: mid-turn injection,
+# acknowledgement by replay, token accounting and resume handles.
+[cli]
+id = "fakestream"
+display_name = "Fake stream-json agent"
+command = "fakestream"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[mcp]
+style = "inline_flag"
+flag = "--mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["--mcp-config", "{mcp_config}"]
+prompt_on_stdin = true
+resume_args = ["--resume", "{resume}"]
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "stream_json"
+replay_user_messages = true

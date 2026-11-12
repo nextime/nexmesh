@@ -40,6 +40,12 @@ pub struct CliMeta {
     /// (npm-global, ~/.local/bin, ~/.opencode/bin -- all real cases here).
     #[serde(default)]
     pub extra_paths: Vec<String>,
+    /// Environment variables to CLEAR for this CLI. A node started from inside
+    /// tmux inherits `$TMUX`, and a tmux client that sees it refuses to run
+    /// ("sessions should be nested with care"), so adoption would fail
+    /// depending on how the node happened to be launched.
+    #[serde(default)]
+    pub env_unset: Vec<String>,
 }
 
 /// How to make this CLI load our MCP shim.

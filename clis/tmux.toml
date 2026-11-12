@@ -1,0 +1,38 @@
+# Adopting an already-running terminal.
+#
+# The obvious implementation is `pipe-pane` to capture output and `send-keys`
+# to type, but there is something better: tmux can attach a SECOND client to an
+# existing session, so the node simply runs `tmux new-session -t <target>` under
+# a pty it owns. That gives:
+#
+#   - a real pty, so the existing attach path works unchanged: scrollback,
+#     resize, several viewers, full takeover
+#   - your own terminal stays attached the whole time -- tmux is built for
+#     multiple clients
+#   - `new-session -t` creates a GROUPED session sharing the same windows but
+#     with its OWN size, so a viewer on a small terminal does not shrink the
+#     session under your hands (plain `attach-session` would)
+#
+# What adoption does NOT do is make that session a team member. It has no MCP
+# shim, so it cannot call team tools or receive messages. Configure
+# nexmesh-mcpd in the CLI running inside the pane and it joins as an `attached`
+# agent as well; the two are orthogonal and combine.
+#
+# Deliberately no send-keys driver: typing a teammate's message into a pane
+# that happens to be sitting at a shell prompt would EXECUTE it. Message
+# delivery belongs to the MCP path, which knows it is talking to an agent.
+[cli]
+id = "tmux"
+display_name = "Adopted tmux session"
+command = "tmux"
+version_args = ["-V"]
+# A node launched from inside tmux would otherwise pass $TMUX down, and the
+# client refuses to nest.
+env_unset = ["TMUX"]
+
+[modes.interactive]
+args = ["new-session", "-t", "{tmux_target}"]
+attachable = true
+
+[driver]
+kind = "mcp_only"

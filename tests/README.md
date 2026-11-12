@@ -8,6 +8,8 @@ python3 -I tests/e2e_team.py     # attached CLI agent + external (hermes-style) 
 python3 -I tests/e2e_spawn.py    # hub places a slot, node spawns the CLI, shim registers
 python3 -I tests/e2e_attach.py   # pty takeover of an agent through the hub
 python3 -I tests/e2e_secure.py   # TLS + operator auth, and every way of getting it wrong
+python3 -I tests/e2e_driver.py   # mid-turn injection, acks, tokens, resume, flap detection
+python3 -I tests/e2e_adopt.py    # adopting a tmux session that was already running
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP
@@ -21,6 +23,14 @@ directory and clean up their processes.
 reports whether it is on a tty) and then drives the **real `nexmesh attach`
 client** through a local pty, so raw mode, keystroke relay, `SIGWINCH` and the
 Ctrl-] detach are exercised rather than simulated.
+
+`e2e_driver.py` uses `tests/fake-cli/fakestream`, which speaks Claude Code's
+real stream-json protocol -- the event shapes were copied from an actual
+`claude -p --output-format stream-json --verbose --replay-user-messages` run,
+so the driver is tested against the protocol it will meet. `fakecrash` always
+dies, for flap detection.
+
+`e2e_adopt.py` needs `tmux`; it skips cleanly without it.
 
 To exercise a real CLI instead, point a slot at `claude`, `opencode` or `qwen`;
 that does cost credits, which is why it is not the default.

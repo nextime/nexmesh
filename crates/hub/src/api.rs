@@ -6,13 +6,13 @@
 //! appears in `list_peers` like any other teammate. It needs no node, no pty
 //! and no MCP implementation.
 
-use crate::{nodes::run_tool, prompt, state::AppState, tools};
+use crate::{nodes::run_tool, state::AppState, tools};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
-use nexmesh_proto::{self as proto, now_ms, HubToNode, Placement, RunMode, SpawnSpec};
+use nexmesh_proto::{self as proto, now_ms, Placement};
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -228,111 +228,90 @@ pub async fn create_slot(
 
 /// Place a slot on a node and ask that node to start it.
 pub async fn spawn_slot(State(st): State<AppState>, Path(slot_id): Path<String>) -> ApiResult {
-    #[allow(clippy::type_complexity)]
-    let (session_id, session_name, cli_id, mode, placement_json, display_name, role,
-         role_desc, ws_id, resume): (String, String, Option<String>, String, String,
-         Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) = {
-        let db = st.db.lock().unwrap();
-        db.query_row(
-            "SELECT s.session_id, se.name, s.cli_id, s.mode, s.placement, s.display_name,
-                    s.role, s.role_description, s.workspace_id, s.resume_handle
-             FROM slots s JOIN sessions se ON se.id = s.session_id WHERE s.id = ?",
-            [&slot_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                    r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
-        )
-        .optional()
-        .map_err(|e| bad(e))?
-        .ok_or_else(|| bad(format!("no slot '{slot_id}'")))?
-    };
+    match crate::launch::launch_slot(&st, &slot_id, None).await {
+        Ok((agent_id, node)) => Ok(Json(json!({
+            "slot_id": slot_id, "agent_id": agent_id, "node": node
+        }))),
+        Err(e) => Err(bad(e)),
+    }
+}
 
-    let placement: Placement = serde_json::from_str(&placement_json).unwrap_or_default();
-    let node_id = st.place(cli_id.as_deref(), &placement).map_err(|e| bad(e))?;
+#[derive(Deserialize)]
+pub struct AdoptRequest {
+    /// Node whose tmux server holds the session.
+    pub node: String,
+    /// tmux target: a session, window or pane (`mysession`, `work:1.0`, `%3`).
+    pub tmux_target: String,
+    pub name: String,
+    pub role: Option<String>,
+    pub workspace: Option<String>,
+}
 
-    let (node_name, cwd, shared) = {
-        let db = st.db.lock().unwrap();
-        let node_name: String = db
-            .query_row("SELECT name FROM nodes WHERE id = ?", [&node_id], |r| r.get(0))
-            .map_err(|e| bad(e))?;
-        let (cwd, shared) = match &ws_id {
-            Some(w) => {
-                let path: Option<String> = db
-                    .query_row(
-                        "SELECT path FROM workspace_mounts WHERE workspace_id = ? AND node_id = ?",
-                        params![w, node_id],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| bad(e))?;
-                let path = path.ok_or_else(|| {
-                    bad(format!(
-                        "workspace has no mount on node '{node_name}': add one so the agent knows \
-                         where to work on that machine"
-                    ))
-                })?;
-                let kind: String = db
-                    .query_row("SELECT kind FROM workspaces WHERE id = ?", [w], |r| r.get(0))
-                    .map_err(|e| bad(e))?;
-                (path, kind == "repo")
-            }
-            None => (
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-                false,
-            ),
-        };
-        (node_name, cwd, shared)
-    };
-
-    let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let name = display_name.clone().unwrap_or_else(|| "agent".into());
-    let role_s = role.clone().unwrap_or_else(|| "team member".into());
-    let desc = role_desc.unwrap_or_default();
-    let task = desc
-        .split("TASK: ")
-        .nth(1)
-        .unwrap_or("Coordinate with your team.")
-        .to_string();
-    let brief = prompt::AgentBrief {
-        display_name: &name,
-        role: &role_s,
-        role_description: desc.split("\n\nTASK: ").next().unwrap_or(""),
-        session_name: &session_name,
-        node_name: &node_name,
-        workspace_path: &cwd,
-        shared_workspace: shared,
-        task: &task,
-    };
-
-    // Render the prompt before building the spec: the brief borrows `cwd`,
-    // which the spec then takes ownership of.
-    let prompt_text = prompt::first_prompt(&brief);
-    drop(brief);
-
-    let spec = SpawnSpec {
-        slot_id: slot_id.clone(),
-        agent_id: agent_id.clone(),
-        session_id,
-        cli_id: cli_id.unwrap_or_default(),
-        mode: if mode == "interactive" { RunMode::Interactive } else { RunMode::Headless },
-        cwd,
-        role,
-        display_name,
-        prompt: prompt_text,
-        env: vec![],
-        resume_handle: resume,
-    };
-
+/// Adopt an already-running terminal so it can be watched and driven from
+/// anywhere. See clis/tmux.toml for why this attaches a second tmux client
+/// rather than plumbing pipe-pane and send-keys.
+pub async fn adopt_slot(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<AdoptRequest>,
+) -> ApiResult {
+    if req.tmux_target.trim().is_empty() {
+        return Err(bad("tmux_target must not be empty"));
+    }
+    let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     {
         let db = st.db.lock().unwrap();
-        let _ = db.execute(
-            "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?, 'operator', ?, 'spawn', ?)",
-            params![now_ms(), node_id, json!({ "slot": slot_id, "agent": agent_id }).to_string()],
-        );
+        let exists: Option<i64> = db
+            .query_row("SELECT 1 FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
+            .optional()
+            .map_err(|e| bad(e))?;
+        if exists.is_none() {
+            return Err(bad(format!("no session '{session_id}'")));
+        }
+        let ws_id: Option<String> = match &req.workspace {
+            Some(w) => db
+                .query_row(
+                    "SELECT id FROM workspaces WHERE session_id = ? AND (name = ? OR id = ?)",
+                    params![session_id, w, w],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| bad(e))?,
+            None => None,
+        };
+        db.execute(
+            "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
+                                placement, display_name, role, role_description, tmux_target,
+                                created_at_ms)
+             VALUES (?,?,?, 'tmux', 'cli', 'interactive', ?,?,?,?,?,?)",
+            params![
+                slot_id,
+                session_id,
+                ws_id,
+                serde_json::json!({ "node": req.node }).to_string(),
+                req.name,
+                req.role,
+                format!("You are an adopted terminal session.\n\nTASK: continue what you were doing."),
+                req.tmux_target,
+                now_ms()
+            ],
+        )
+        .map_err(|e| bad(e))?;
     }
-    st.send_to_node(&node_id, &HubToNode::Spawn(spec))
-        .await
-        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e))?;
-    Ok(Json(json!({ "slot_id": slot_id, "agent_id": agent_id, "node": node_name })))
+    match crate::launch::launch_slot(&st, &slot_id, None).await {
+        Ok((agent_id, node)) => Ok(Json(json!({
+            "slot_id": slot_id, "agent_id": agent_id, "node": node,
+            "tmux_target": req.tmux_target,
+            "note": "the terminal is now attachable; it is NOT a team member unless the CLI \
+                     inside it loads nexmesh-mcpd"
+        }))),
+        Err(e) => {
+            // Do not leave a slot behind pointing at something we failed to open.
+            let db = st.db.lock().unwrap();
+            let _ = db.execute("DELETE FROM slots WHERE id = ?", [&slot_id]);
+            Err(bad(e))
+        }
+    }
 }
 
 pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<String>) -> Json<Value> {
