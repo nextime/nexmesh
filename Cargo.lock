@@ -1204,9 +1204,12 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "tokio-rustls",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

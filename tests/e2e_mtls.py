@@ -73,7 +73,7 @@ def main():
           r.returncode != 0 and "without TLS" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-200:])
 
     print("\n=== 4. start the hub requiring client certificates ===")
-    optok = [l.split()[1] for l in hub_cli("operator-token", "op").stdout.splitlines()
+    optok = [l.split()[1] for l in hub_cli("operator-token", "operator").stdout.splitlines()
              if l.startswith("token:")][0]
     nodetok = [l.split()[1] for l in hub_cli("enrol", "machine-b").stdout.splitlines()
                if l.startswith("token:")][0]

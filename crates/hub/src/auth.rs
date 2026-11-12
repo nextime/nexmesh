@@ -7,8 +7,11 @@
 //!
 //! Node and participant credentials are deliberately separate. A node token
 //! cannot drive the fleet, and a participant token cannot spawn anything.
+//!
+//! Where mutual TLS is in use the token is checked against the certificate
+//! that carried it, so the two must name the same operator. See `peer.rs`.
 
-use crate::state::AppState;
+use crate::{peer::PeerIdentity, state::AppState};
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
@@ -34,6 +37,12 @@ pub async fn require_operator(
     req: Request,
     next: Next,
 ) -> Response {
+    // The certificate that carried this request, where there was one.
+    let peer = req
+        .extensions()
+        .get::<std::sync::Arc<PeerIdentity>>()
+        .cloned()
+        .unwrap_or_default();
     // With no operator tokens minted, the API is open. That is only allowed on
     // loopback, which `main` enforces at startup, so this cannot silently
     // expose a fleet.
@@ -52,6 +61,18 @@ pub async fn require_operator(
     };
     match st.authenticate_operator(&token) {
         Some(label) => {
+            // A valid token is not enough under mutual TLS: it has to have
+            // arrived on that operator's own connection.
+            if st.identity_binding() {
+                if let Err(why) = peer.agrees_with(&label) {
+                    tracing::warn!(
+                        operator = %label, certificate = ?peer.common_name,
+                        path = %req.uri().path(), "rejected: certificate does not match the token"
+                    );
+                    return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": why })))
+                        .into_response();
+                }
+            }
             tracing::debug!(operator = %label, path = %req.uri().path(), "authorised");
             next.run(req).await
         }
@@ -64,6 +85,47 @@ pub async fn require_operator(
                 .into_response()
         }
     }
+}
+
+/// Bind a participant's certificate to the token it sent, the same way the
+/// operator middleware does.
+///
+/// A group middleware rather than a check inside each handler, for the reason
+/// given above: a participant route added later is covered without anyone
+/// having to remember. It settles identity only -- what the token is *allowed*
+/// to do, and which session it is scoped to, stays with `auth_participant`.
+pub async fn bind_participant(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !st.identity_binding() {
+        return next.run(req).await;
+    }
+    let peer = req
+        .extensions()
+        .get::<std::sync::Arc<PeerIdentity>>()
+        .cloned()
+        .unwrap_or_default();
+    // No certificate, or no token yet: nothing to bind. An absent or invalid
+    // token is the handler's business, and it gives the better message.
+    if !peer.presented {
+        return next.run(req).await;
+    }
+    if let Some(token) = bearer(&headers) {
+        if let Some(label) = st.participant_label(&token) {
+            if let Err(why) = peer.agrees_with(&label) {
+                tracing::warn!(
+                    participant = %label, certificate = ?peer.common_name,
+                    path = %req.uri().path(), "rejected: certificate does not match the token"
+                );
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": why })))
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]

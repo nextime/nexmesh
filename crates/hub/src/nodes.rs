@@ -7,7 +7,7 @@ use crate::{
 use anyhow::Result;
 use axum::extract::{
     ws::{Message, WebSocket, WebSocketUpgrade},
-    State,
+    Extension, State,
 };
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
@@ -16,15 +16,26 @@ use rusqlite::{params, OptionalExtension};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub async fn node_ws(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
-    ws.on_upgrade(move |sock| session(sock, st))
+pub async fn node_ws(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    peer: Option<Extension<std::sync::Arc<crate::peer::PeerIdentity>>>,
+) -> Response {
+    // Captured before the upgrade: once this is a socket, the handshake that
+    // produced it -- and the certificate presented during it -- is out of reach.
+    let peer = peer.map(|Extension(p)| p).unwrap_or_default();
+    ws.on_upgrade(move |sock| session(sock, st, peer))
 }
 
 fn reject(reason: impl Into<String>) -> String {
     serde_json::to_string(&HubToNode::Rejected { reason: reason.into() }).unwrap()
 }
 
-async fn session(socket: WebSocket, st: AppState) {
+async fn session(
+    socket: WebSocket,
+    st: AppState,
+    peer: std::sync::Arc<crate::peer::PeerIdentity>,
+) {
     let (mut sink, mut stream) = socket.split();
 
     // Nothing is honoured before authentication -- in particular, no frame
@@ -63,6 +74,16 @@ async fn session(socket: WebSocket, st: AppState) {
             .send(Message::Text(reject(format!("token was issued for node '{issued}'"))))
             .await;
         return;
+    }
+    // Nor can one machine's token be used from another machine's connection:
+    // under mutual TLS the certificate has to name the same node.
+    if st.identity_binding() {
+        if let Err(why) = peer.agrees_with(&issued) {
+            tracing::warn!(node = %issued, certificate = ?peer.common_name,
+                "rejected: certificate does not match the token");
+            let _ = sink.send(Message::Text(reject(why))).await;
+            return;
+        }
     }
     let node_id = match st.register_node(&issued, &hello) {
         Ok(id) => id,

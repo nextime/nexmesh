@@ -150,6 +150,9 @@ pub struct AppState {
     /// Live node sockets, so the hub can push a spawn or a kill. A node absent
     /// from this map is unreachable, whatever the database says.
     nodes: Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>,
+    /// Whether a client certificate must agree with the credential presented
+    /// alongside it. On by default; see `AppState::identity_binding`.
+    bind_identity: Arc<bool>,
 }
 
 impl AppState {
@@ -178,6 +181,7 @@ impl AppState {
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tls: Arc::new(Mutex::new(None)),
             kicks: Arc::new(Mutex::new(HashMap::new())),
+            bind_identity: Arc::new(true),
         })
     }
 
@@ -198,6 +202,7 @@ impl AppState {
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tls: Arc::new(Mutex::new(None)),
             kicks: Arc::new(Mutex::new(HashMap::new())),
+            bind_identity: Arc::new(true),
         })
     }
 
@@ -273,6 +278,19 @@ impl AppState {
 
     pub fn pki_dir(&self) -> std::path::PathBuf {
         self.pki.as_ref().clone()
+    }
+
+    /// Must a client certificate name the same identity as the token sent with
+    /// it? Normally yes: see the note in `peer.rs`. It can be turned off for a
+    /// fleet whose certificates and tokens were issued separately, under
+    /// different names, before this check existed.
+    pub fn identity_binding(&self) -> bool {
+        *self.bind_identity
+    }
+
+    pub fn with_identity_binding(mut self, on: bool) -> Self {
+        self.bind_identity = Arc::new(on);
+        self
     }
 
     pub fn with_pki_dir(mut self, dir: &str) -> Self {
@@ -433,6 +451,20 @@ impl AppState {
             );
         }
         label
+    }
+
+    /// The label a live participant token was minted under, if it is one.
+    pub fn participant_label(&self, token: &str) -> Option<String> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT label FROM participant_tokens
+             WHERE token_sha256 = ? AND revoked_at_ms IS NULL",
+            [sha256_hex(token)],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     pub fn authenticate_node(&self, token: &str) -> Option<String> {

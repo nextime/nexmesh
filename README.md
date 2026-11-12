@@ -540,9 +540,34 @@ The two credentials answer different questions, and both are checked:
 - the **certificate** says *you belong to this fleet* — the CA is the boundary
 - the **token** says *which node or operator you are*
 
-What is not yet enforced is binding a certificate's common name to the identity
-the token claims, so any certificate the CA issued can be paired with any token
-the hub issued. That is a narrowing worth having and it is not done.
+**And the two are bound together.** Checked separately they leave a gap: every
+machine in the fleet holds a certificate the CA issued, so a token lifted from
+one machine could be presented from another, and an operator's certificate
+could carry a node's token. So the hub also requires that they agree — the
+common name on the certificate must be the identity the token was issued to:
+
+```
+$ nexmesh --hub https://machine-a:7870 nodes     # the operator's token, somebody else's certificate
+Error: request failed (403 Forbidden): this connection's certificate was issued to
+'intruder', but the credential claims to be 'operator'. A certificate and a token
+must belong to the same identity.
+```
+
+All three credential types are bound, each where it is checked: an operator on
+the route group, a node in its first frame — before it is registered, so one
+machine cannot take another's place in the fleet even holding its token — and
+an external participant on its own route group. An absent or invalid token
+still gets its own clearer error; binding decides *who*, not *whether*.
+
+Pairing issues both under one name, so a machine paired with `nexmesh pair`
+satisfies this without you doing anything. A fleet whose certificates and
+tokens were minted separately, under names that do not match, can start the hub
+with `--no-bind-identity` while they are brought into line; the hub says in its
+log that the check is off. With no `--client-ca` there is no certificate to
+compare against, and the token stands alone.
+
+A certificate presented without a common name is refused rather than waved
+through, and the comparison is exact — not a prefix, not case-insensitive.
 
 **Encrypted: yes, natively.**
 
@@ -570,9 +595,13 @@ Two refusals rather than warnings, because both failure modes are silent:
   you to mint one, bind loopback, or pass `--allow-anonymous` if something in
   front already authenticates.
 
-Still open: binding a client certificate's common name to the identity its
-token claims (see above), and certificate revocation — today a compromised node
-certificate means re-issuing the CA.
+**Revocable: yes.** A compromised certificate does not mean re-issuing the CA.
+`nexmesh revoke <name>` does three things at once, because any one of them
+alone leaves a door open: the serial goes onto a CRL the hub signs and checks
+*during the handshake*, the running hub reloads its TLS configuration so this
+takes effect without a restart, and that name's token is revoked and its live
+connection dropped. `nexmesh certs` lists what has been issued and what has
+been revoked.
 
 ## Status
 

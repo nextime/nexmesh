@@ -24,6 +24,7 @@ mod delivery;
 mod launch;
 mod nodes;
 mod pairing;
+mod peer;
 mod pki;
 mod prompt;
 mod state;
@@ -63,6 +64,12 @@ struct Args {
     /// the caller also needs a private key that never leaves its machine.
     #[arg(long, env = "NEXMESH_CLIENT_CA")]
     client_ca: Option<String>,
+    /// Stop requiring a client certificate to name the same identity as the
+    /// token sent with it. Only for a fleet whose certificates and tokens were
+    /// issued under different names before that check existed: with this on, a
+    /// stolen token can be used from any machine holding any valid certificate.
+    #[arg(long)]
+    no_bind_identity: bool,
     /// Where the fleet CA lives, for pairing.
     #[arg(long, env = "NEXMESH_PKI", default_value = "~/.nexmesh/pki")]
     pki_dir: String,
@@ -225,7 +232,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let st = AppState::open(&args.db)?
         .with_pki_dir(&args.pki_dir)
-        .with_pair_listen(args.pair_listen.clone());
+        .with_pair_listen(args.pair_listen.clone())
+        .with_identity_binding(!args.no_bind_identity);
 
     match args.cmd {
         Some(Cmd::Enrol { node_name }) => {
@@ -496,14 +504,23 @@ async fn main() -> Result<()> {
         .route("/dashboard", get(dashboard::page))
         .route("/favicon.ico", get(dashboard::favicon))
         .route("/healthz", get(api::health))
+        .route("/v1/node/ws", get(nodes::node_ws));
+
+    // Participants are a group too, so the certificate check covers a route
+    // added here later. The token itself is still checked per handler, which
+    // is where the session scoping lives.
+    let participant = Router::new()
         .route("/v1/participant/join", post(api::participant_join))
         .route("/v1/participant/tool", post(api::participant_tool))
         .route("/v1/participant/ack", post(api::participant_ack))
         .route("/v1/participant/messages", get(api::participant_messages))
         .route("/v1/participant/heartbeat", post(api::participant_heartbeat))
-        .route("/v1/node/ws", get(nodes::node_ws));
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            auth::bind_participant,
+        ));
 
-    let app = operator.merge(other).with_state(st.clone());
+    let app = operator.merge(participant).merge(other).with_state(st.clone());
 
     // The pairing listener, if asked for: its own address, no client
     // certificate required, and only the claim endpoint on it.
@@ -616,7 +633,20 @@ async fn main() -> Result<()> {
                      Run `nexmesh-hub pki init` to require client certificates."
                 );
             }
-            axum_server::bind_rustls(addr, config)
+            if args.no_bind_identity && client_ca.is_some() {
+                tracing::warn!(
+                    "--no-bind-identity: a certificate is no longer checked against the token \
+                     sent with it, so any valid certificate will carry any valid token"
+                );
+            }
+            // Not `bind_rustls`: the plain acceptor discards the handshake, and
+            // with it the peer's certificate. This one keeps the certificate's
+            // name on every request of the connection.
+            let acceptor = peer::IdentityAcceptor::new(
+                axum_server::tls_rustls::RustlsAcceptor::new(config),
+            );
+            axum_server::bind(addr)
+                .acceptor(acceptor)
                 .serve(app.into_make_service())
                 .await?;
         }
