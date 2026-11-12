@@ -21,6 +21,7 @@ mod dashboard;
 mod delivery;
 mod launch;
 mod nodes;
+mod pki;
 mod prompt;
 mod state;
 mod tools;
@@ -53,6 +54,11 @@ struct Args {
     /// Private key for --tls-cert (PEM).
     #[arg(long, env = "NEXMESH_TLS_KEY")]
     tls_key: Option<String>,
+    /// Require every client to present a certificate signed by this CA
+    /// (mutual TLS). With it, a stolen token is not enough to reach the hub:
+    /// the caller also needs a private key that never leaves its machine.
+    #[arg(long, env = "NEXMESH_CLIENT_CA")]
+    client_ca: Option<String>,
     /// Serve the operator API with NO authentication on a non-loopback
     /// address. Only for a hub already behind its own authenticating proxy.
     #[arg(long, env = "NEXMESH_ALLOW_ANONYMOUS")]
@@ -75,6 +81,9 @@ enum Cmd {
     RevokeOperator { label: String },
     /// List operator tokens (labels and last use, never the tokens).
     Operators,
+    /// Fleet certificate authority: mutual TLS.
+    #[command(subcommand)]
+    Pki(PkiCmd),
     /// Generate a self-signed TLS certificate and key for this hub.
     GenCert {
         /// Hostnames and IPs the certificate should cover, e.g. --host zeiss
@@ -95,6 +104,71 @@ enum Cmd {
     },
     /// List known nodes.
     Nodes,
+}
+
+#[derive(Subcommand)]
+enum PkiCmd {
+    /// Create the fleet CA and the hub's own server certificate.
+    Init {
+        /// Names and addresses nodes will use to reach this hub.
+        #[arg(long = "host", required = true)]
+        hosts: Vec<String>,
+        #[arg(long, default_value = "~/.nexmesh/pki")]
+        dir: String,
+    },
+    /// Issue a client certificate for a node or an operator.
+    Issue {
+        /// Name it asserts, e.g. the node name.
+        name: String,
+        #[arg(long, default_value = "~/.nexmesh/pki")]
+        dir: String,
+        /// Where to write the certificate and key.
+        #[arg(long)]
+        out: Option<String>,
+    },
+}
+
+/// Build the TLS configuration, requiring client certificates when a client CA
+/// is given.
+fn tls_config(cert: &str, key: &str, client_ca: Option<&str>)
+    -> Result<axum_server::tls_rustls::RustlsConfig>
+{
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let read_certs = |p: &str| -> Result<Vec<CertificateDer<'static>>> {
+        let data = std::fs::read(p).with_context(|| format!("reading {p}"))?;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &data[..])
+            .collect::<std::result::Result<_, _>>()
+            .with_context(|| format!("parsing certificates in {p}"))?;
+        anyhow::ensure!(!certs.is_empty(), "{p} contains no certificates");
+        Ok(certs)
+    };
+
+    let certs = read_certs(cert)?;
+    let data = std::fs::read(key).with_context(|| format!("reading {key}"))?;
+    let private: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &data[..])
+        .with_context(|| format!("parsing the key in {key}"))?
+        .with_context(|| format!("{key} contains no private key"))?;
+
+    let builder = match client_ca {
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for c in read_certs(ca)? {
+                roots.add(c).with_context(|| format!("adding a CA from {ca}"))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+                .build()
+                .context("building the client certificate verifier")?;
+            rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
+        }
+        None => rustls::ServerConfig::builder().with_no_client_auth(),
+    };
+    let cfg = builder
+        .with_single_cert(certs, private)
+        .context("the certificate and key do not match")?;
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(cfg)))
 }
 
 #[tokio::main]
@@ -204,6 +278,36 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            return Ok(());
+        }
+        Some(Cmd::Pki(PkiCmd::Init { hosts, dir })) => {
+            let dir = std::path::PathBuf::from(state::expand(&dir));
+            let files = pki::init(&dir, &hosts)?;
+            println!("fleet CA created in {}", dir.display());
+            for (what, p) in &files {
+                println!("  {what:<22} {}", p.display());
+            }
+            println!("\nStart the hub with mutual TLS:");
+            println!("  nexmesh-hub --tls-cert {}/server-cert.pem \\", dir.display());
+            println!("              --tls-key  {}/server-key.pem \\", dir.display());
+            println!("              --client-ca {}/ca-cert.pem --listen 0.0.0.0:7870", dir.display());
+            println!("\nThen issue a certificate per node:");
+            println!("  nexmesh-hub pki issue zeiss --out /tmp/zeiss");
+            println!("\nThe CA key never needs to leave this machine. Copy only ca-cert.pem");
+            println!("and that node's own cert and key.");
+            return Ok(());
+        }
+        Some(Cmd::Pki(PkiCmd::Issue { name, dir, out })) => {
+            let dir = std::path::PathBuf::from(state::expand(&dir));
+            let out = std::path::PathBuf::from(state::expand(
+                &out.unwrap_or_else(|| dir.to_string_lossy().to_string()),
+            ));
+            let (cert, key) = pki::issue_client(&dir, &name, &out)?;
+            println!("certificate: {}", cert.display());
+            println!("private key: {}  (mode 0600)", key.display());
+            println!("\nCopy those two files and {}/ca-cert.pem to {name}, then:", dir.display());
+            println!("  nexmesh-node --hub wss://<hub>:7870 --ca-cert ca-cert.pem \\");
+            println!("               --client-cert {name}-cert.pem --client-key {name}-key.pem");
             return Ok(());
         }
         Some(Cmd::GenCert { hosts, out }) => {
@@ -336,6 +440,9 @@ async fn main() -> Result<()> {
              Mint one with `nexmesh-hub operator-token <label>`."
         );
     }
+    if args.client_ca.is_some() && tls.is_none() {
+        anyhow::bail!("--client-ca requires --tls-cert and --tls-key: there is no mutual TLS without TLS");
+    }
     if tls.is_none() && !addr.ip().is_loopback() {
         tracing::warn!(
             %addr,
@@ -349,16 +456,19 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding {addr}"))?;
     match tls {
         Some((cert, key)) => {
-            // rustls 0.23 refuses to guess a crypto provider when the feature
-            // flags in the dependency graph are ambiguous, and panics deep
-            // inside TLS setup. Choose one explicitly, up front.
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-                .await
+            let client_ca = args.client_ca.as_deref().map(state::expand);
+            let config = tls_config(&cert, &key, client_ca.as_deref())
                 .with_context(|| format!("loading TLS material from {cert} and {key}"))?;
             drop(listener);
             tracing::info!(%addr, version = VERSION, tls = true, authenticated = authed,
+                mutual_tls = client_ca.is_some(),
                 "hub listening (https/wss); dashboard at https://{addr}/");
+            if client_ca.is_none() {
+                tracing::warn!(
+                    "TLS without --client-ca: a stolen token is enough to reach this hub. \
+                     Run `nexmesh-hub pki init` to require client certificates."
+                );
+            }
             axum_server::bind_rustls(addr, config)
                 .serve(app.into_make_service())
                 .await?;

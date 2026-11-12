@@ -394,6 +394,36 @@ protected by default rather than by remembering. Revoking the last operator
 token does **not** turn authentication off — that would open the fleet at the
 exact moment you are reacting to a leak.
 
+**Mutual TLS: yes.** A token is a bearer secret — copy it and you are that
+node. A client certificate adds something that cannot be lifted out of a log,
+an environment listing or a config file, so reaching the hub needs both.
+
+```bash
+nexmesh-hub pki init --host zeiss --host 192.168.42.3   # CA + the hub's own cert
+nexmesh-hub pki issue zeiss --out /tmp/zeiss            # one per node, and per operator
+nexmesh-hub --tls-cert ~/.nexmesh/pki/server-cert.pem \
+            --tls-key  ~/.nexmesh/pki/server-key.pem \
+            --client-ca ~/.nexmesh/pki/ca-cert.pem --listen 0.0.0.0:7870 serve
+
+nexmesh-node --hub wss://zeiss:7870 --ca-cert ca-cert.pem \
+             --client-cert zeiss-cert.pem --client-key zeiss-key.pem
+```
+
+The CA key never leaves the hub; a node gets only `ca-cert.pem` plus its own
+certificate and key, all written 0600. With `--client-ca` set, a correct token
+with no certificate **cannot complete a TLS handshake at all** — it is refused
+before anything reads the token. `--client-ca` without `--tls-cert` is a
+startup error rather than a silently ignored flag.
+
+The two credentials answer different questions, and both are checked:
+
+- the **certificate** says *you belong to this fleet* — the CA is the boundary
+- the **token** says *which node or operator you are*
+
+What is not yet enforced is binding a certificate's common name to the identity
+the token claims, so any certificate the CA issued can be paired with any token
+the hub issued. That is a narrowing worth having and it is not done.
+
 **Encrypted: yes, natively.**
 
 ```bash
@@ -420,8 +450,9 @@ Two refusals rather than warnings, because both failure modes are silent:
   you to mint one, bind loopback, or pass `--allow-anonymous` if something in
   front already authenticates.
 
-Still open: mutual TLS (client certificates) for node identity, so a stolen
-token alone is not enough. The token model is the current boundary.
+Still open: binding a client certificate's common name to the identity its
+token claims (see above), and certificate revocation — today a compromised node
+certificate means re-issuing the CA.
 
 ## Status
 
@@ -452,13 +483,13 @@ reconnect-with-backoff and identity-checked signalling.
   `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-102 unit tests, plus nine end-to-end suites that drive real processes
+107 unit tests, plus ten end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt codex dashboard orchestrator; do
+for t in team spawn attach secure driver adopt codex dashboard orchestrator mtls; do
   python3 -I tests/e2e_$t.py || break
 done
 
@@ -492,8 +523,8 @@ tmux adoption.
 **Done since.** The web dashboard, and the orchestrator as an MCP server so any
 CLI can run the fleet.
 
-**Next** -- mutual TLS; workspace sync for shared-repo sessions; releasing and
-pausing agents from the orchestrator.
+**Next** -- workspace sync for shared-repo sessions; releasing and pausing
+agents from the orchestrator; binding certificate names to identities.
 **Milestone 5** -- workspace sync for shared-repo sessions; web dashboard; an
 MCP orchestrator server so a Claude Code session can drive the fleet.
 

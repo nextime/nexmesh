@@ -28,6 +28,12 @@ struct Args {
     /// PEM file with the hub's certificate (or its CA), for a self-signed hub.
     #[arg(long, env = "NEXMESH_CA_CERT")]
     ca_cert: Option<String>,
+    /// Your client certificate, when the hub requires mutual TLS.
+    #[arg(long, env = "NEXMESH_CLIENT_CERT", requires = "client_key")]
+    client_cert: Option<String>,
+    /// Private key for --client-cert.
+    #[arg(long, env = "NEXMESH_CLIENT_KEY", requires = "client_cert")]
+    client_key: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -171,13 +177,24 @@ fn token() -> Option<&'static String> {
     TOKEN.get().and_then(|t| t.as_ref())
 }
 
-fn client(ca_cert: Option<&str>) -> Result<reqwest::Client> {
+fn client(ca_cert: Option<&str>, identity: Option<(&str, &str)>) -> Result<reqwest::Client> {
     let mut b = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
     if let Some(path) = ca_cert {
         let pem = std::fs::read(path).with_context(|| format!("reading CA file {path}"))?;
         b = b.add_root_certificate(
             reqwest::Certificate::from_pem(&pem)
                 .with_context(|| format!("parsing {path} as a PEM certificate"))?,
+        );
+    }
+    if let Some((cert, key)) = identity {
+        // reqwest wants one PEM containing both.
+        let mut pem = std::fs::read(cert)
+            .with_context(|| format!("reading client certificate {cert}"))?;
+        pem.push(b'\n');
+        pem.extend(std::fs::read(key).with_context(|| format!("reading client key {key}"))?);
+        b = b.identity(
+            reqwest::Identity::from_pem(&pem)
+                .context("the client certificate and key could not be loaded together")?,
         );
     }
     Ok(b.build()?)
@@ -297,6 +314,7 @@ async fn attach(
     who: &str,
     replay: usize,
     ca_cert: Option<&str>,
+    identity: Option<(&str, &str)>,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -321,7 +339,7 @@ async fn attach(
         );
     }
     let (ws, _) = if url.starts_with("wss://") {
-        let tls = tlstrust::client_config(ca_cert)?;
+        let tls = tlstrust::client_config(ca_cert, identity)?;
         tokio_tungstenite::connect_async_tls_with_config(
             req,
             None,
@@ -440,7 +458,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let base = args.hub.trim_end_matches('/').to_string();
     let _ = TOKEN.set(args.token.clone());
-    let c = client(args.ca_cert.as_deref())?;
+    let identity = match (&args.client_cert, &args.client_key) {
+        (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+        _ => None,
+    };
+    let c = client(args.ca_cert.as_deref(), identity)?;
 
     match args.cmd {
         Cmd::Health => println!("{:#}", get(&c, format!("{base}/healthz")).await?),
@@ -639,7 +661,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Attach { session, who, replay } => {
-            attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref()).await?;
+            attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref(), identity).await?;
         }
 
         Cmd::InstallOrchestrator { cli_id, clis, name, orch, dry_run } => {

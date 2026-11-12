@@ -13,6 +13,7 @@ python3 -I tests/e2e_adopt.py    # adopting a tmux session that was already runn
 python3 -I tests/e2e_codex.py    # the Codex app-server driver, incl. a real-binary handshake
 python3 -I tests/e2e_dashboard.py     # the dashboard page and its snapshot
 python3 -I tests/e2e_orchestrator.py  # spinning up a team through the MCP orchestrator
+python3 -I tests/e2e_mtls.py          # mutual TLS: a valid token alone must be refused
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

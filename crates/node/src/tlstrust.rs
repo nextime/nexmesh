@@ -10,9 +10,11 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 
 /// Build a TLS config trusting the public CAs plus, if given, one extra PEM
-/// bundle. Public roots stay in place so a hub behind a real certificate works
-/// with no extra configuration.
-pub fn client_config(ca_pem: Option<&str>) -> Result<Arc<rustls::ClientConfig>> {
+/// bundle, and presenting a client certificate when the fleet requires one.
+pub fn client_config(
+    ca_pem: Option<&str>,
+    client: Option<(&str, &str)>,
+) -> Result<Arc<rustls::ClientConfig>> {
     // rustls 0.23 needs a crypto provider chosen for the process.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -35,11 +37,26 @@ pub fn client_config(ca_pem: Option<&str>) -> Result<Arc<rustls::ClientConfig>> 
         tracing::info!(path, added, "added trust anchors from the given CA file");
     }
 
-    Ok(Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ))
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    Ok(Arc::new(match client {
+        None => builder.with_no_client_auth(),
+        Some((cert_path, key_path)) => {
+            let cert_data = std::fs::read(cert_path)
+                .with_context(|| format!("reading client certificate {cert_path}"))?;
+            let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+                .collect::<std::result::Result<_, _>>()
+                .with_context(|| format!("parsing {cert_path}"))?;
+            anyhow::ensure!(!certs.is_empty(), "{cert_path} contains no certificates");
+            let key_data = std::fs::read(key_path)
+                .with_context(|| format!("reading client key {key_path}"))?;
+            let key = rustls_pemfile::private_key(&mut &key_data[..])
+                .with_context(|| format!("parsing {key_path}"))?
+                .with_context(|| format!("{key_path} contains no private key"))?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .context("the client certificate and key do not match")?
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -48,12 +65,12 @@ mod tests {
 
     #[test]
     fn public_roots_alone_build_a_config() {
-        assert!(client_config(None).is_ok());
+        assert!(client_config(None, None).is_ok());
     }
 
     #[test]
     fn a_missing_ca_file_is_a_clear_error() {
-        let err = client_config(Some("/nonexistent/ca.pem")).unwrap_err();
+        let err = client_config(Some("/nonexistent/ca.pem"), None).unwrap_err();
         assert!(err.to_string().contains("reading CA file"), "{err}");
     }
 
@@ -61,7 +78,7 @@ mod tests {
     fn a_pem_with_no_certificates_is_rejected_rather_than_ignored() {
         let p = std::env::temp_dir().join(format!("nexmesh-noca-{}.pem", std::process::id()));
         std::fs::write(&p, "not a certificate\n").unwrap();
-        let err = client_config(Some(p.to_str().unwrap())).unwrap_err();
+        let err = client_config(Some(p.to_str().unwrap()), None).unwrap_err();
         assert!(err.to_string().contains("no certificates"), "{err}");
         std::fs::remove_file(&p).ok();
     }

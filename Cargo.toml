@@ -35,7 +35,7 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["trace", "fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"

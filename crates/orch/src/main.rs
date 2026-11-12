@@ -42,6 +42,12 @@ struct Args {
     /// PEM with the hub's certificate, for a self-signed hub.
     #[arg(long, env = "NEXMESH_CA_CERT")]
     ca_cert: Option<String>,
+    /// Your client certificate, when the hub requires mutual TLS.
+    #[arg(long, env = "NEXMESH_CLIENT_CERT", requires = "client_key")]
+    client_cert: Option<String>,
+    /// Private key for --client-cert.
+    #[arg(long, env = "NEXMESH_CLIENT_KEY", requires = "client_cert")]
+    client_key: Option<String>,
 }
 
 struct Hub {
@@ -56,6 +62,14 @@ impl Hub {
         if let Some(path) = &a.ca_cert {
             let pem = std::fs::read(path).with_context(|| format!("reading CA file {path}"))?;
             b = b.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
+        }
+        if let (Some(cert), Some(key)) = (&a.client_cert, &a.client_key) {
+            let mut pem = std::fs::read(cert)
+                .with_context(|| format!("reading client certificate {cert}"))?;
+            pem.push(b'\n');
+            pem.extend(std::fs::read(key).with_context(|| format!("reading client key {key}"))?);
+            b = b.identity(reqwest::Identity::from_pem(&pem)
+                .context("the client certificate and key could not be loaded together")?);
         }
         Ok(Self {
             base: a.hub.trim_end_matches('/').to_string(),

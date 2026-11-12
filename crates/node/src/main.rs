@@ -63,6 +63,13 @@ struct Args {
     /// PEM file with the hub's certificate (or its CA), for a self-signed hub.
     #[arg(long, env = "NEXMESH_CA_CERT")]
     ca_cert: Option<String>,
+    /// This node's client certificate, when the hub requires mutual TLS.
+    /// Issue one with `nexmesh-hub pki issue <node>`.
+    #[arg(long, env = "NEXMESH_CLIENT_CERT", requires = "client_key")]
+    client_cert: Option<String>,
+    /// Private key for --client-cert.
+    #[arg(long, env = "NEXMESH_CLIENT_KEY", requires = "client_cert")]
+    client_key: Option<String>,
     /// Allow sending the enrolment token over plaintext ws:// to a remote hub.
     /// Only reasonable when the path is already encrypted, e.g. a WireGuard or
     /// OpenVPN tunnel.
@@ -259,7 +266,11 @@ async fn main() -> Result<()> {
 async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>) -> Result<()> {
     let url = format!("{}/v1/node/ws", args.hub.trim_end_matches('/'));
     let (ws, _) = if url.starts_with("wss://") {
-        let tls = tlstrust::client_config(args.ca_cert.as_deref())?;
+        let client = match (&args.client_cert, &args.client_key) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            _ => None,
+        };
+        let tls = tlstrust::client_config(args.ca_cert.as_deref(), client)?;
         tokio_tungstenite::connect_async_tls_with_config(
             url.as_str(),
             None,
