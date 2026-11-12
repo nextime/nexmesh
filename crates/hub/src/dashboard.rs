@@ -73,7 +73,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             })
             .and_then(|m| m.collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
     let sessions: Vec<Value> = db
         .prepare(
@@ -91,7 +94,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             })
             .and_then(|m| m.collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
     // Default to the most recently active session so the page is useful with
     // no query string at all.
@@ -113,7 +119,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                                   ELSE '-' END),
                             COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0),
                             COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
-                            a.id, s.mode
+                            a.id, s.mode, s.paused
                      FROM slots s
                      LEFT JOIN agents a ON a.id = (
                         SELECT id FROM agents WHERE slot_id = s.id
@@ -140,7 +146,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let messages: Vec<Value> = db
                 .prepare(
@@ -165,7 +174,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let plan: Vec<Value> = db
                 .prepare(
@@ -183,7 +195,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let knowledge: Vec<Value> = db
                 .prepare(
@@ -202,7 +217,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let locks: Vec<Value> = db
                 .prepare(
@@ -221,7 +239,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let zones: Vec<Value> = db
                 .prepare(
@@ -240,7 +261,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let workspaces: Vec<Value> = db
                 .prepare(
@@ -261,7 +285,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     })
                     .and_then(|m| m.collect())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
+            vec![]
+        });
 
             let session = db
                 .query_row(

@@ -609,10 +609,7 @@ reconnect-with-backoff and identity-checked signalling.
 ```bash
 cargo test
 cargo build
-for t in team spawn attach secure driver adopt codex opencode workspace \
-         control dashboard orchestrator mtls pairing; do
-  python3 -I tests/e2e_$t.py || break
-done
+tests/run-all.sh      # a suite printing no verdict counts as a failure
 
 # a two-machine team, by hand
 nexmesh-hub enrol machine-a                     # on the hub, once per node
