@@ -153,18 +153,22 @@ pub fn install(o: Opts) -> Result<String> {
         UserInstall::Command { argv, env_flag } => {
             let bin = crate::tlstrust::noop_resolve(&d.cli.command, &d.cli.extra_paths)
                 .with_context(|| format!("'{}' is not installed here", d.cli.command))?;
-            // Environment flags must precede the server name, which is a
-            // positional argument.
+            // Environment flags go AFTER the server name, which is where
+            // `claude mcp add`'s own help puts them -- and it is not a matter
+            // of taste: its `-e` takes a VARIADIC value, so flags placed
+            // before the name have the name swallowed as another variable and
+            // the command fails with "missing required argument
+            // 'commandOrUrl'". Verified against Claude Code 2.1.323.
             let mut rendered: Vec<String> = Vec::new();
             for a in &argv {
                 if a == "{name}" {
+                    rendered.push(o.server_name.to_string());
                     if let Some(flag) = &env_flag {
                         for (k, v) in &env {
                             rendered.push(flag.clone());
                             rendered.push(format!("{k}={v}"));
                         }
                     }
-                    rendered.push(o.server_name.to_string());
                 } else {
                     rendered.push(a.replace("{command}", &orch).replace("{name}", o.server_name));
                 }

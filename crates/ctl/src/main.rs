@@ -989,14 +989,28 @@ async fn main() -> Result<()> {
         } => {
             // A session that does not exist is worth catching here: the
             // alternative is a CLI that starts, fails to join, and says so
-            // only in a log the person is not reading.
+            // only in a log nobody is reading.
+            //
+            // But only when the hub can actually be asked. Registering a
+            // server in a CLI's own config is a LOCAL act -- the shim reaches
+            // the hub through the node on this machine, and needs no operator
+            // credentials -- so requiring them for the check would make the
+            // command refuse to run on the very machines it is meant for.
             if let Some(s) = session.as_deref() {
-                let v = get(&c, format!("{base}/v1/sessions")).await?;
-                let known = v["sessions"].as_array().is_some_and(|rows| {
-                    rows.iter().any(|r| r["id"] == *s || r["name"] == *s)
-                });
-                if !known {
-                    bail!("no session '{s}' on this hub; `nexmesh sessions` lists them");
+                match get(&c, format!("{base}/v1/sessions")).await {
+                    Ok(v) => {
+                        let known = v["sessions"].as_array().is_some_and(|rows| {
+                            rows.iter().any(|r| r["id"] == *s || r["name"] == *s)
+                        });
+                        if !known {
+                            bail!("no session '{s}' on this hub; `nexmesh sessions` lists them");
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "note: could not check that session '{s}' exists ({}); \
+                         installing anyway",
+                        e.to_string().lines().next().unwrap_or("hub unreachable")
+                    ),
                 }
             }
             let msg = install::install_seat(install::SeatOpts {
