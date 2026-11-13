@@ -66,6 +66,17 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Rename an agent. The name is how every command, message and log line
+    /// addresses it
+    RenameAgent {
+        /// Seat id, or the agent's current name with --session.
+        who: String,
+        /// The new name.
+        name: String,
+        /// Session to look the name up in.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Rename a session. The name is what you read on the dashboard and in
     /// every message, so it should be allowed to change.
     RenameSession {
@@ -264,6 +275,26 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mount a workspace into a session that already exists. The directory is
+    /// how an attached CLI finds the session it belongs to.
+    AddWorkspace {
+        /// Session id or name.
+        session: String,
+        /// Absolute path on that node.
+        path: String,
+        /// Node the directory is on.
+        #[arg(long)]
+        node: String,
+        /// Workspace name; defaults to the directory's basename.
+        #[arg(long)]
+        name: Option<String>,
+        /// "node_local" or "repo".
+        #[arg(long, default_value = "node_local")]
+        kind: String,
+        /// Git remote, for a repo workspace.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Make one of your own agent CLIs a member of a team: every conversation
     /// you start in it takes a seat, wherever you are running it.
     InstallSeat {
@@ -276,9 +307,6 @@ enum Cmd {
         /// Name the server appears under inside that CLI.
         #[arg(long, default_value = "nexmesh")]
         name: String,
-        /// Session to join, by id or name.
-        #[arg(long)]
-        session: Option<String>,
         /// Role these seats take, unless the session says otherwise.
         #[arg(long)]
         role: Option<String>,
@@ -692,6 +720,42 @@ async fn main() -> Result<()> {
             println!("removed {} ({} agent rows)", slot, v["agent_rows"].as_i64().unwrap_or(0));
         }
 
+        Cmd::RenameAgent { who, name, session } => {
+            // A seat id works anywhere; a name needs to be looked up, and
+            // only a session can say which agent a name means.
+            let slot = if who.starts_with("sl-") {
+                who.clone()
+            } else {
+                let s = session.clone().ok_or_else(|| anyhow::anyhow!(
+                    "'{who}' is a name, not a seat id, so say which session: --session <name>"
+                ))?;
+                let v = get(&c, format!("{base}/v1/sessions/{s}/status")).await?;
+                let empty = vec![];
+                let agents = v["agents"].as_array().unwrap_or(&empty);
+                agents
+                    .iter()
+                    .find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&who)))
+                    .and_then(|a| a["slot_id"].as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        let names: Vec<&str> =
+                            agents.iter().filter_map(|a| a["name"].as_str()).collect();
+                        anyhow::anyhow!(
+                            "no agent called '{who}' in '{s}'. There is: {}",
+                            if names.is_empty() { "nobody".to_string() } else { names.join(", ") }
+                        )
+                    })?
+            };
+            let v = post(&c, format!("{base}/v1/slots/{slot}/name"),
+                         json!({ "name": name })).await?;
+            bail_on_error(&v)?;
+            match v["was"].as_str() {
+                Some(was) => println!("{slot}: \"{was}\" is now \"{}\"",
+                                      v["name"].as_str().unwrap_or(&name)),
+                None => println!("{slot} is now \"{}\"", v["name"].as_str().unwrap_or(&name)),
+            }
+        }
+
         Cmd::RenameSession { session, name } => {
             let v = post(&c, format!("{base}/v1/sessions/{session}/name"),
                          json!({ "name": name })).await?;
@@ -984,42 +1048,27 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::InstallSeat {
-            cli_id, clis, name, session, role, seat_name, sock, mcpd, dry_run,
-        } => {
-            // A session that does not exist is worth catching here: the
-            // alternative is a CLI that starts, fails to join, and says so
-            // only in a log nobody is reading.
-            //
-            // But only when the hub can actually be asked. Registering a
-            // server in a CLI's own config is a LOCAL act -- the shim reaches
-            // the hub through the node on this machine, and needs no operator
-            // credentials -- so requiring them for the check would make the
-            // command refuse to run on the very machines it is meant for.
-            if let Some(s) = session.as_deref() {
-                match get(&c, format!("{base}/v1/sessions")).await {
-                    Ok(v) => {
-                        let known = v["sessions"].as_array().is_some_and(|rows| {
-                            rows.iter().any(|r| r["id"] == *s || r["name"] == *s)
-                        });
-                        if !known {
-                            bail!("no session '{s}' on this hub; `nexmesh sessions` lists them");
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "note: could not check that session '{s}' exists ({}); \
-                         installing anyway",
-                        e.to_string().lines().next().unwrap_or("hub unreachable")
-                    ),
-                }
-            }
+        Cmd::AddWorkspace { session, path, node, name, kind, repo } => {
+            let name = name.unwrap_or_else(|| {
+                path.trim_end_matches('/').rsplit('/').next().unwrap_or("work").to_string()
+            });
+            let mut body = json!({ "name": name, "kind": kind, "node": node, "path": path });
+            if let Some(r) = repo { body["repo_url"] = json!(r); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/workspaces"), body).await?;
+            bail_on_error(&v)?;
+            println!(
+                "mounted {} on {} as workspace \"{}\" of {}",
+                path, node, name, v["session_id"].as_str().unwrap_or(&session)
+            );
+        }
+
+        Cmd::InstallSeat { cli_id, clis, name, role, seat_name, sock, mcpd, dry_run } => {
             let msg = install::install_seat(install::SeatOpts {
                 cli_id: &cli_id,
                 clis_dir: &clis,
                 server_name: &name,
                 mcpd: mcpd.as_deref(),
                 sock: &sock,
-                session: session.as_deref(),
                 role: role.as_deref(),
                 name: seat_name.as_deref(),
                 dry_run,
@@ -1030,12 +1079,15 @@ async fn main() -> Result<()> {
                     "Every NEW conversation in {cli_id} on this machine now takes a seat; \
                      ones already open pick it up when they restart."
                 );
-                if session.is_none() {
-                    println!(
-                        "NOTE: no --session, so each conversation joins the session whose \
-                         workspace holds its directory, and refuses if that is ambiguous."
-                    );
-                }
+                // Deliberately NOT a --session flag. This config is shared by
+                // every conversation on the machine, and naming a session here
+                // is an explicit answer that beats the seat -- so it would drag
+                // a moved conversation back to one team on every restart.
+                // Placing a conversation is per-conversation work: move it once.
+                println!(
+                    "Place each one with `nexmesh move-agent <seat> <session>`; a conversation \
+                     returns to the session it was moved to on every restart."
+                );
             }
         }
 

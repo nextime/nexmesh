@@ -616,6 +616,8 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/slots", post(api::create_slot))
         .route("/v1/sessions/:id/adopt", post(api::adopt_slot))
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
+        .route("/v1/sessions/:id/workspaces", post(api::add_workspace))
+        .route("/v1/slots/:id/name", post(api::rename_slot))
         .route("/v1/sessions/:id/pause", post(api::pause))
         .route("/v1/sessions/:id/budget", post(api::set_budget))
         .route("/v1/sessions/:id/groups", post(api::set_group))

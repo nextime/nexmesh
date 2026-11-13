@@ -91,16 +91,19 @@ pub fn install_orchestrator(o: OrchOpts) -> Result<String> {
 /// hub -- it finds the node on this machine over a unix socket, and the node
 /// asks for the seat. So there is nothing here to leak, and a conversation
 /// started by hand joins on exactly the same footing as one the hub spawned.
+///
+/// And deliberately no session. This config is shared by every conversation
+/// the CLI opens on this machine, while membership of a team belongs to one
+/// conversation: `NEXMESH_SESSION` here is an explicit answer that outranks
+/// the seat, so it would pull every moved conversation back onto one team at
+/// its next restart. Conversations are placed one at a time, with
+/// `move-agent`, and stay placed.
 pub struct SeatOpts<'a> {
     pub cli_id: &'a str,
     pub clis_dir: &'a str,
     pub server_name: &'a str,
     pub mcpd: Option<&'a str>,
     pub sock: &'a str,
-    /// Session id or name. Worth setting: without it a CLI started outside
-    /// any workspace has to guess, and refuses when more than one session is
-    /// active.
-    pub session: Option<&'a str>,
     pub role: Option<&'a str>,
     /// Usually left alone. A fixed name makes every conversation in this CLI
     /// ask for the SAME seat, which is the duplication it looks like a fix
@@ -114,9 +117,6 @@ pub fn install_seat(o: SeatOpts) -> Result<String> {
         ("NEXMESH_SOCK".into(), o.sock.to_string()),
         ("NEXMESH_CLI".into(), o.cli_id.to_string()),
     ];
-    if let Some(s) = o.session {
-        env.push(("NEXMESH_SESSION".into(), s.to_string()));
-    }
     if let Some(r) = o.role {
         env.push(("NEXMESH_ROLE".into(), r.to_string()));
     }

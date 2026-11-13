@@ -23,6 +23,30 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> (StatusCode, Json<Value
     (code, Json(json!({ "error": msg.to_string() })))
 }
 
+/// A session's id, given its id OR its name.
+///
+/// Every command that takes a session takes a name -- that is what you read
+/// on the dashboard and type at a terminal -- but only the handlers that
+/// happened to spell out `id = ? OR name = ?` accepted one. `nexmesh status
+/// digesta` therefore matched no rows and reported "no agents in this
+/// session" for a session with four seats in it: the worst kind of wrong
+/// answer, because it looks like news about the fleet rather than a failure
+/// to understand the question.
+///
+/// Unresolvable input is handed back unchanged, so handlers that check
+/// existence themselves still produce their own error.
+fn session_ref_to_id(db: &rusqlite::Connection, given: &str) -> String {
+    db.query_row(
+        "SELECT id FROM sessions WHERE id = ?1 OR name = ?1 ORDER BY (id = ?1) DESC LIMIT 1",
+        [given],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| given.to_string())
+}
+
 fn bad(msg: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     err(StatusCode::BAD_REQUEST, msg)
 }
@@ -64,6 +88,15 @@ pub struct NewWorkspace {
     /// node name -> absolute path on that machine.
     #[serde(default)]
     pub mounts: std::collections::BTreeMap<String, String>,
+    /// Shorthand for a node_local workspace: the path on its own node, so the
+    /// common case needs one field rather than a map naming the same node.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RenameRequest {
+    pub name: String,
 }
 
 #[derive(Deserialize)]
@@ -245,6 +278,151 @@ pub async fn rename_session(
     Ok(Json(serde_json::json!({ "session_id": id, "name": name })))
 }
 
+/// Create one workspace, with its mounts, inside a session.
+///
+/// Shared by session creation and by mounting one later, because a workspace
+/// is the same thing whenever it arrives: a place work happens, and the paths
+/// that place has on each machine.
+fn insert_workspace(
+    db: &rusqlite::Connection,
+    session_id: &str,
+    w: &NewWorkspace,
+) -> std::result::Result<String, (axum::http::StatusCode, Json<Value>)> {
+    if !["node_local", "repo"].contains(&w.kind.as_str()) {
+        return Err(bad(format!("workspace kind must be node_local or repo, got '{}'", w.kind)));
+    }
+    let node_id: Option<String> = match &w.node {
+        Some(n) => Some(
+            db.query_row("SELECT id FROM nodes WHERE name = ?", [n], |r| r.get(0))
+                .optional()
+                .map_err(bad)?
+                .ok_or_else(|| bad(format!("no node named '{n}'")))?,
+        ),
+        None => None,
+    };
+    if w.kind == "node_local" && node_id.is_none() {
+        return Err(bad(format!("workspace '{}' is node_local but names no node", w.name)));
+    }
+    let ws_id = format!("ws-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    db.execute(
+        "INSERT INTO workspaces (id, session_id, name, kind, node_id, repo_url, repo_branch, sync)
+         VALUES (?,?,?,?,?,?,?,?)",
+        params![ws_id, session_id, w.name, w.kind, node_id, w.repo_url, w.repo_branch,
+                if w.kind == "repo" { "git" } else { "none" }],
+    )
+    .map_err(bad)?;
+    // A node_local workspace is mounted where it lives, so naming the node
+    // twice is not required of the caller.
+    let mut mounts = w.mounts.clone();
+    if w.kind == "node_local" && mounts.is_empty() {
+        if let (Some(n), Some(p)) = (w.node.as_deref(), w.path.as_deref()) {
+            mounts.insert(n.to_string(), p.to_string());
+        }
+    }
+    for (node_name, path) in &mounts {
+        if !path.starts_with('/') {
+            return Err(bad(format!(
+                "mount path must be absolute, got '{path}' -- a relative path means \
+                 nothing on a machine you are not standing on"
+            )));
+        }
+        let nid: Option<String> = db
+            .query_row("SELECT id FROM nodes WHERE name = ?", [node_name], |r| r.get(0))
+            .optional()
+            .map_err(bad)?;
+        let nid = nid.ok_or_else(|| bad(format!("mount names unknown node '{node_name}'")))?;
+        // Two sessions MAY mount the same directory on the same machine, and
+        // two agents in one directory may belong to different teams. A path
+        // says where files are, not who you work with -- so this is allowed,
+        // and `session_for_cwd` treats a contested directory as something it
+        // cannot answer rather than something nobody may ask.
+        db.execute(
+            "INSERT INTO workspace_mounts (workspace_id, node_id, path) VALUES (?,?,?)",
+            params![ws_id, nid, path],
+        )
+        .map_err(bad)?;
+    }
+    Ok(ws_id)
+}
+
+/// Mount a workspace into a session that already exists.
+///
+/// Without this a session's directories were fixed at creation, so the only
+/// way to give a running session a directory -- which is how an attached CLI
+/// finds the session it belongs to -- was to build another session and move
+/// everyone across.
+/// Rename a seat.
+///
+/// A name is not decoration: it is how every command, every message and every
+/// log line addresses an agent, and a seat is usually named before anyone
+/// knows what it will do -- `Claude-zeiss-3` says where it runs and nothing
+/// about the work. Renaming changes nothing else: same seat, same agent, same
+/// history, same inbox.
+///
+/// Two seats with one name in a session would make both unaddressable, so a
+/// collision is refused rather than resolved by guessing which was meant.
+pub async fn rename_slot(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameRequest>,
+) -> ApiResult {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(bad("an agent name must not be empty"));
+    }
+    if name.chars().count() > 64 {
+        return Err(bad("an agent name must be 64 characters or fewer"));
+    }
+    let db = st.db.lock().unwrap();
+    let (slot_id, session_id, was): (String, String, Option<String>) = db
+        .query_row(
+            "SELECT id, session_id, display_name FROM slots WHERE id = ?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no seat '{id}'")))?;
+    let taken: Option<String> = db
+        .query_row(
+            "SELECT id FROM slots WHERE session_id = ?1 AND display_name = ?2 AND id <> ?3",
+            params![session_id, name, slot_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(bad)?;
+    if let Some(other) = taken {
+        return Err(bad(format!(
+            "another seat in this session is already called '{name}' ({other}); \
+             two with one name leaves neither addressable"
+        )));
+    }
+    db.execute("UPDATE slots SET display_name = ? WHERE id = ?", params![name, slot_id])
+        .map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,'slot_renamed',?)",
+        params![now_ms(), "operator",
+                json!({ "slot": slot_id, "from": was, "to": name }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "slot_id": slot_id, "name": name, "was": was })))
+}
+
+pub async fn add_workspace(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(w): Json<NewWorkspace>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let session_id: String = db
+        .query_row("SELECT id FROM sessions WHERE id = ? OR name = ?", params![id, id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no session '{id}'")))?;
+    let ws_id = insert_workspace(&db, &session_id, &w)?;
+    Ok(Json(json!({ "workspace_id": ws_id, "session_id": session_id, "name": w.name })))
+}
+
 pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSession>) -> ApiResult {
     if req.name.trim().is_empty() {
         return Err(bad("session name must not be empty"));
@@ -260,41 +438,7 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
     .map_err(bad)?;
 
     for w in &req.workspaces {
-        if !["node_local", "repo"].contains(&w.kind.as_str()) {
-            return Err(bad(format!("workspace kind must be node_local or repo, got '{}'", w.kind)));
-        }
-        let node_id: Option<String> = match &w.node {
-            Some(n) => Some(
-                db.query_row("SELECT id FROM nodes WHERE name = ?", [n], |r| r.get(0))
-                    .optional()
-                    .map_err(bad)?
-                    .ok_or_else(|| bad(format!("no node named '{n}'")))?,
-            ),
-            None => None,
-        };
-        if w.kind == "node_local" && node_id.is_none() {
-            return Err(bad(format!("workspace '{}' is node_local but names no node", w.name)));
-        }
-        let ws_id = format!("ws-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        db.execute(
-            "INSERT INTO workspaces (id, session_id, name, kind, node_id, repo_url, repo_branch, sync)
-             VALUES (?,?,?,?,?,?,?,?)",
-            params![ws_id, id, w.name, w.kind, node_id, w.repo_url, w.repo_branch,
-                    if w.kind == "repo" { "git" } else { "none" }],
-        )
-        .map_err(bad)?;
-        for (node_name, path) in &w.mounts {
-            let nid: Option<String> = db
-                .query_row("SELECT id FROM nodes WHERE name = ?", [node_name], |r| r.get(0))
-                .optional()
-                .map_err(bad)?;
-            let nid = nid.ok_or_else(|| bad(format!("mount names unknown node '{node_name}'")))?;
-            db.execute(
-                "INSERT INTO workspace_mounts (workspace_id, node_id, path) VALUES (?,?,?)",
-                params![ws_id, nid, path],
-            )
-            .map_err(bad)?;
-        }
+        insert_workspace(&db, &id, w)?;
     }
 
     for (i, label) in req.plan.iter().enumerate() {
@@ -355,9 +499,11 @@ pub struct NewSlot {
 
 pub async fn create_slot(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<NewSlot>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let db = st.db.lock().unwrap();
     let exists: Option<i64> = db
         .query_row("SELECT 1 FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
@@ -551,9 +697,11 @@ pub struct SyncRequest {
 /// holds it.
 pub async fn sync_workspaces(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<SyncRequest>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let op = match req.op.as_deref().unwrap_or("status") {
         "publish" => proto::SyncOp::Publish,
         "refresh" => proto::SyncOp::Refresh,
@@ -600,9 +748,11 @@ pub struct PauseRequest {
 
 pub async fn pause(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<PauseRequest>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let r = match req.who.as_deref().filter(|w| !w.trim().is_empty()) {
         Some(who) => {
             crate::control::set_paused(&st, &session_id, who, req.paused, req.reason.as_deref()).await
@@ -639,9 +789,11 @@ fn yes() -> bool {
 /// memory, so an agent must not be able to add itself to one.
 pub async fn set_group(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<GroupRequest>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let db = st.db.lock().unwrap();
     let slot: Option<String> = db
         .query_row(
@@ -678,9 +830,11 @@ pub struct BudgetRequest {
 /// no effect.
 pub async fn set_budget(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<BudgetRequest>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     if let Some(b) = req.token_budget {
         if b <= 0 {
             return Err(bad("a token budget must be positive; omit it to remove the ceiling"));
@@ -729,9 +883,11 @@ pub struct ReleaseRequest {
 
 pub async fn release(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<ReleaseRequest>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let grace = req.grace_ms.unwrap_or(15_000).clamp(0, 600_000);
     let r = match req.who.as_deref().filter(|w| !w.trim().is_empty()) {
         Some(who) => {
@@ -745,7 +901,9 @@ pub async fn release(
     }
 }
 
-pub async fn session_status(State(st): State<AppState>, Path(session_id): Path<String>) -> Json<Value> {
+pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<String>) -> Json<Value> {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let db = st.db.lock().unwrap();
     let Ok(mut stmt) = db.prepare(
         "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
@@ -795,9 +953,11 @@ pub struct LogQuery {
 /// when a team looks stuck.
 pub async fn session_log(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Query(q): Query<LogQuery>,
 ) -> Json<Value> {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     let after = q.after.unwrap_or(0);
     let db = st.db.lock().unwrap();
@@ -886,9 +1046,11 @@ pub struct OperatorMessage {
 /// transport renders as "orchestrator".
 pub async fn operator_message(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<OperatorMessage>,
 ) -> ApiResult {
+    // A session may be named, not only identified.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     if req.text.trim().is_empty() {
         return Err(bad("text must not be empty"));
     }

@@ -332,6 +332,42 @@ async fn call_tool(hub: &Hub, name: &str, a: &Value) -> Result<String> {
             Ok(format!("{sid} is now \"{}\".", v["name"].as_str().unwrap_or(&name)))
         }
 
+        "rename_agent" => {
+            let who = need(a, "who")?;
+            let name = need(a, "name")?;
+            // A seat id works on its own; a name only means something inside
+            // a session, so that is where it is looked up.
+            let slot = if who.starts_with("sl-") {
+                who.clone()
+            } else {
+                let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
+                let st = hub.get(&format!("/v1/sessions/{sid}/status")).await?;
+                let empty = vec![];
+                let agents = st["agents"].as_array().unwrap_or(&empty);
+                let found = agents
+                    .iter()
+                    .find(|x| {
+                        x["name"].as_str().map(|n| n.eq_ignore_ascii_case(&who)).unwrap_or(false)
+                    })
+                    .and_then(|x| x["slot_id"].as_str().or_else(|| x["slot"].as_str()))
+                    .map(|s| s.to_string());
+                let Some(slot) = found else {
+                    let names: Vec<&str> =
+                        agents.iter().filter_map(|x| x["name"].as_str()).collect();
+                    anyhow::bail!("no agent called '{who}' in that session. There is: {}",
+                                  if names.is_empty() { "nobody".into() } else { names.join(", ") });
+                };
+                slot
+            };
+            let v = hub.post(&format!("/v1/slots/{slot}/name"), json!({ "name": name })).await?;
+            match v["was"].as_str() {
+                Some(was) => Ok(format!("\"{was}\" is now \"{}\".",
+                                        v["name"].as_str().unwrap_or(&name))),
+                None => Ok(format!("That seat is now \"{}\".",
+                                   v["name"].as_str().unwrap_or(&name))),
+            }
+        }
+
         "move_agent" => {
             let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
             let who = need(a, "who")?;

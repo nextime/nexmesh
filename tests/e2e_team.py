@@ -359,6 +359,23 @@ def main():
         check("and the seat it left stops showing a live teammate",
               not stale, str(stale))
 
+    # Every command takes a session NAME -- that is what the dashboard shows
+    # and what a person types -- so the endpoints behind them have to accept
+    # one. They used to match an id only, so `nexmesh status <name>` reported
+    # "no agents in this session" for a session full of them: a wrong answer
+    # that reads as news about the fleet rather than a misunderstood question.
+    by_id = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    by_name = http("GET", "/v1/sessions/e2e/status")[1].get("agents", [])
+    check("a session's status can be asked for by name, not just by id",
+          by_name and len(by_name) == len(by_id),
+          f"by id: {len(by_id)}, by name: {len(by_name)}")
+    by_name_log = http("GET", "/v1/sessions/e2e/log")[1].get("messages", [])
+    check("and so can its log",
+          isinstance(by_name_log, list) and len(by_name_log) > 0, str(by_name_log)[:160])
+    nosuch = http("GET", "/v1/sessions/no-such-session-at-all/status")[1].get("agents", [])
+    check("while a name that matches nothing still returns nothing",
+          nosuch == [], str(nosuch)[:160])
+
     print("\n=== a live agent can be moved between sessions without restarting ===")
     # Its session is not something the agent carries: a tool call resolves it
     # through the agent's slot. So moving the seat moves whoever is in it,
@@ -402,6 +419,25 @@ def main():
               str(after)[:300])
         s4, j4 = http("POST", f"/v1/slots/{slot}/move", {"session": "nowhere-at-all"})
         check("moving to a session that does not exist is refused", s4 == 400, f"{s4} {j4}")
+
+        # A move that does not survive a restart is not a move. With no
+        # NEXMESH_SESSION to go on, the conversation must come back to the
+        # seat it holds -- in the session it was moved INTO -- rather than
+        # being resolved all over again from its directory or from "the only
+        # active session". Before this, a restart quietly undid every move
+        # and left the seat it had been moved into empty.
+        again = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_ROLE": "tester",
+                      "NEXMESH_CLI_SESSION": "conv-mover"})
+        again.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                  "clientInfo": {"name": "Mover", "version": "1"}})
+        back = http("GET", f"/v1/sessions/{other}/status")[1].get("agents", [])
+        check("a moved conversation comes back to the session it was moved into",
+              any((a.get("slot_id") or a.get("slot")) == slot for a in back),
+              str(back)[:300])
+        not_here = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        check("and does not take a fresh seat in the session it left",
+              not any(a.get("name") == "Mover" for a in not_here),
+              str(not_here)[:300])
 
     print()
     if fails:

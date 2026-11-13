@@ -48,6 +48,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("agents", "model", "TEXT"),
         ("sessions", "token_budget", "INTEGER"),
         ("sessions", "budget_hit_at_ms", "INTEGER"),
+        // How far an operator's reach goes. NULL is the whole fleet -- a
+        // SUPER orchestrator -- and a session id confines the token to that
+        // one session. Nullable on purpose: every token minted before this
+        // existed was fleet-wide, and that is what NULL already means.
+        ("operator_tokens", "session_id", "TEXT"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.
@@ -58,6 +63,29 @@ fn migrate(conn: &Connection) -> Result<()> {
             issued_at_ms  INTEGER NOT NULL,
             revoked_at_ms INTEGER,
             last_used_ms  INTEGER
+         )",
+    )?;
+    // The operator channel: how a session's own orchestrator reaches the
+    // orchestrators who can see the whole fleet, and how they answer.
+    //
+    // Separate from `messages`, which belongs to a session and is read by its
+    // agents. These are between the people (or programs) DRIVING sessions:
+    // a scoped orchestrator cannot see another session exists, so when it
+    // needs something from outside its own team the only honest thing it can
+    // do is ask someone whose reach is wider.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operator_messages (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_label    TEXT NOT NULL,
+            from_session  TEXT,            -- NULL when a super sent it
+            to_session    TEXT,            -- NULL = addressed to the supers
+            body          TEXT NOT NULL,
+            sent_at_ms    INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS operator_messages_to ON operator_messages(to_session, id);
+         CREATE TABLE IF NOT EXISTS operator_read_cursor (
+            label     TEXT PRIMARY KEY,
+            last_id   INTEGER NOT NULL DEFAULT 0
          )",
     )?;
     // Memory v2 and cross-session continuity. The schema's CREATE TABLE IF NOT
@@ -286,6 +314,30 @@ pub struct TlsHandle {
     pub key: String,
     pub client_ca: Option<String>,
 }
+/// An authenticated operator, and how far it reaches.
+///
+/// `session: None` is a SUPER orchestrator: the whole fleet, every session,
+/// and the only one that may create a session or move a seat between two of
+/// them. `session: Some(id)` is that session's own orchestrator -- it never
+/// has to name its session and may not name another, so a scoped token
+/// cannot read, drive or even discover the rest of the fleet.
+#[derive(Clone, Debug)]
+pub struct Operator {
+    pub label: String,
+    pub session: Option<String>,
+}
+
+impl Operator {
+    pub fn is_super(&self) -> bool {
+        self.session.is_none()
+    }
+    /// A signed-in dashboard account, or an unauthenticated hub on loopback.
+    /// A person at the dashboard sees the whole fleet.
+    pub fn super_as(label: &str) -> Self {
+        Self { label: label.to_string(), session: None }
+    }
+}
+
 
 #[derive(Clone)]
 pub struct AppState {
@@ -633,23 +685,29 @@ impl AppState {
 
     /// Resolve an operator token to its label, recording the use.
     pub fn authenticate_operator(&self, token: &str) -> Option<String> {
+        self.operator_identity(token).map(|o| o.label)
+    }
+
+    /// Who this token is, and how far it reaches.
+    pub fn operator_identity(&self, token: &str) -> Option<Operator> {
         let hash = sha256_hex(token);
         let db = self.db.lock().unwrap();
-        let label: Option<String> = db
+        let found: Option<(String, Option<String>)> = db
             .query_row(
-                "SELECT label FROM operator_tokens WHERE token_sha256 = ? AND revoked_at_ms IS NULL",
+                "SELECT label, session_id FROM operator_tokens
+                  WHERE token_sha256 = ? AND revoked_at_ms IS NULL",
                 [&hash],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .unwrap_or(None);
-        if label.is_some() {
+        if found.is_some() {
             let _ = db.execute(
                 "UPDATE operator_tokens SET last_used_ms = ? WHERE token_sha256 = ?",
                 params![now_ms(), hash],
             );
         }
-        label
+        found.map(|(label, session_id)| Operator { label, session: session_id })
     }
 
     /// The label a live participant token was minted under, if it is one.

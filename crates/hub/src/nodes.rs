@@ -747,6 +747,34 @@ fn join(
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("no such session '{s}'"))?,
         None => {
+            // Where this conversation already sits, before anything is
+            // inferred from the filesystem.
+            //
+            // A directory resolves to ONE session per machine; a conversation
+            // does not have to. Two CLIs open in the same folder can belong
+            // to different teams, and the one thing that knows which is the
+            // seat the conversation already holds. Without this the directory
+            // won every restart, so an agent MOVED to another session came
+            // back to the session its folder names -- in a new seat, leaving
+            // the one it was moved into empty. A move that does not survive a
+            // restart is not a move.
+            let by_seat: Option<String> = match cli_session.as_deref() {
+                Some(cs) if !cs.is_empty() => db
+                    .query_row(
+                        "SELECT s.session_id FROM slots s
+                           JOIN sessions sx ON sx.id = s.session_id
+                          WHERE s.cli_session = ?1 AND sx.status = 'active'
+                          ORDER BY s.created_at_ms DESC LIMIT 1",
+                        [cs],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
+                _ => None,
+            };
+            if let Some(id) = by_seat {
+                tracing::info!(session = %id, "session taken from the seat this conversation holds");
+                id
+            } else {
             let by_cwd = cwd.as_deref().and_then(|c| session_for_cwd(&db, node_id, c).ok()).flatten();
             match by_cwd {
                 Some(id) => {
@@ -776,6 +804,7 @@ fn join(
                         }
                     }
                 }
+            }
             }
         }
     };

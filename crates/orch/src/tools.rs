@@ -178,6 +178,20 @@ pub fn tools() -> Vec<Tool> {
             }, "required": ["name"], "additionalProperties": false }),
         },
         Tool {
+            name: "rename_agent",
+            description: "Rename an agent. A name is not decoration: it is how you address an \
+                          agent in every other tool, how it is addressed in messages, and what \
+                          you read in the log. Seats are named before anyone knows what they \
+                          will do -- `Claude-zeiss-3` says where it runs and nothing about the \
+                          work -- so name them for the job once you know it. Renaming changes \
+                          nothing else: same seat, same agent, same history, same inbox.",
+            schema: json!({ "type": "object", "properties": {
+                "who": s("Agent name as team_status shows it, or a seat id"),
+                "session": s("Session it is in. Required when more than one exists"),
+                "name": s("The new name, 64 characters or fewer, unique in its session")
+            }, "required": ["who", "name"], "additionalProperties": false }),
+        },
+        Tool {
             name: "move_agent",
             description: "Move an agent to another session, without restarting it. An agent's \
                           session is not something it carries -- a tool call resolves it through \

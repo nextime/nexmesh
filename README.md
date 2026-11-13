@@ -690,16 +690,39 @@ other message here. Composing the team stays yours.
 
 ## Which session an agent joins, and moving between them
 
-A CLI launched by hand has to end up in the right session. The hub works it
+**A directory does not decide a session.** Two CLIs open in the same folder
+may belong to different teams, and one team's seats may sit in a dozen
+different folders on half a dozen machines. Session membership belongs to the
+seat, not to the filesystem — so it is something you set, and it stays set.
+
+A CLI launched by hand still has to end up somewhere, and the hub works that
 out in this order:
 
-1. `NEXMESH_SESSION`, which takes a session **name or id**.
-2. **The directory you are in** — if a session has a workspace mounted at or
-   above your working directory *on this machine*, that is the session. A
-   path is a claim about one host, so only mounts on this node count, and the
-   longest match wins.
-3. The only active session, if there is exactly one.
-4. Otherwise it refuses and names the active sessions, rather than guessing.
+1. `NEXMESH_SESSION`, which takes a session **name or id**. An explicit answer
+   always wins.
+2. **The seat this conversation already holds.** Wherever it was last placed
+   is where it belongs, whatever folder it is started from. This is what makes
+   `move-agent` stick: without it the next restart resolved the session afresh
+   and quietly undid the move.
+3. **The directory**, as a default for a conversation that has never been
+   placed — if a session has a workspace mounted at or above your working
+   directory *on this machine*. A path is a claim about one host, so only
+   mounts on this node count, and the longest match wins. Two sessions may
+   mount the same directory; that makes the directory unable to answer, not
+   forbidden, and a conversation starting there is told to say which.
+4. The only active session, if there is exactly one.
+5. Otherwise it refuses and names the active sessions, rather than guessing.
+
+So the usual way to place a conversation is to let it land anywhere and then
+move it once:
+
+```bash
+nexmesh move-agent sl-1a2b3c4d nexmesh
+```
+
+From then on that conversation returns to that session on every restart,
+`/resume` and reconnect, and the folder it happens to be sitting in makes no
+difference.
 
 A **seat** is a different question from a session. Several conversations can
 live in one directory — claude and opencode both keep more than one per

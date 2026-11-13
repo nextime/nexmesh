@@ -117,7 +117,8 @@ def main():
           "list_nodes" in r["result"].get("instructions", ""), str(r["result"].get("instructions"))[:160])
     names = [t["name"] for t in o.rpc("tools/list")["result"]["tools"]]
     for t in ("list_nodes", "create_team", "team_status", "read_log", "message_team",
-              "adopt_terminal", "read_transcript", "move_agent", "rename_session"):
+              "adopt_terminal", "read_transcript", "move_agent", "rename_session",
+              "rename_agent"):
         check(f"tools/list offers {t}", t in names, str(names))
 
     print("\n=== it can see the fleet ===")
@@ -183,6 +184,30 @@ def main():
     listed = o.tool("list_sessions")
     check("and the new name is what everyone sees afterwards",
           "renamed-by-the-orchestrator" in listed, listed[:300])
+
+    # A seat is named before anyone knows what it will do, so the name has to
+    # be changeable by whoever is running the team -- and a name is how every
+    # other tool addresses an agent, so a duplicate would leave two agents
+    # neither of which can be reached.
+    who = o.tool("team_status")
+    first = None
+    for line in who.splitlines():
+        if line.strip().startswith("- "):
+            first = line.strip()[2:].split(" ")[0]
+            break
+    if first:
+        out = o.tool("rename_agent", {"who": first, "name": "Archivist"})
+        check("the orchestrator can rename an agent",
+              "Archivist" in out, out[:200])
+        after = o.tool("team_status")
+        check("and the new name is what team_status shows",
+              "Archivist" in after, after[:300])
+        again = o.tool("rename_agent", {"who": "Archivist", "name": "Archivist"})
+        check("renaming it to its own name is not a collision",
+              "Archivist" in again, again[:200])
+    nope = o.tool("rename_agent", {"who": "Nobody-At-All", "name": "Whoever"})
+    check("renaming an agent that does not exist is refused by name",
+          "no agent called" in nope.lower(), nope[:200])
 
     print("\n=== errors come back as errors, not silence ===")
     out = o.tool("create_team", {"name": "bad", "agents": [
