@@ -84,6 +84,20 @@ pub fn team_tools() -> Vec<ToolDef> {
                 "reason": s("Why you are escalating: what you tried and where it failed"),
                 "task": s("What they should do. Omitted means your own current task")
             }), &["to", "reason"]),
+        tool("notify_operator",
+            "Raise something with whoever is DRIVING this team -- not a teammate. Use it when \
+             you are blocked on something no agent here can settle: a decision that is not \
+             yours, a machine or a session you cannot see, work that belongs to another team. \
+             It goes to this session's own orchestrator if there is one, and to the \
+             supervisors who can see the whole fleet if there is not, or if yours has stopped \
+             answering. The reply comes back with check_messages. This is not for progress \
+             reports: set_summary and signal_done are what the people watching already read.",
+            json!({
+                "text": s("What you need, and what you already tried"),
+                "escalate": json!({ "type": "boolean", "description":
+                    "Go straight to the supervisors, past this session's orchestrator. \
+                     For when the orchestrator itself is the problem" })
+            }), &["text"]),
         tool("submit_feedback",
             "Give review feedback on a teammate's work.",
             json!({ "to": s("Teammate name or role"), "text": s("The feedback"),

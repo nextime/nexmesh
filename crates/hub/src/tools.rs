@@ -143,22 +143,48 @@ impl<'a> Ctx<'a> {
     /// machine's own files is node-scoped, a shared tree is workspace-scoped.
     /// Without this, two agents editing their own local `src/main.rs` on
     /// different machines would fight over one lock.
+    /// Which lock domain this agent's files live in.
+    ///
+    /// Deliberately NOT the session: a lock is about a file, and two agents
+    /// editing one file must contend whichever teams they are on. So the
+    /// domain is the thing being edited -- a shared repo, or a directory on
+    /// one machine -- and `acquire_file` matches on it without filtering by
+    /// session.
+    ///
+    /// For a node_local workspace the domain is the machine AND THE MOUNT
+    /// PATH. The machine alone was not enough: it made one domain of every
+    /// local workspace on a host, so an agent locking `src/main.rs` under
+    /// /AI/sentenze blocked another locking `src/main.rs` under
+    /// /storage/coderai -- same relative path, different trees, a denial
+    /// naming an agent in a project you were not touching.
     fn lock_scope(&self) -> Result<String> {
-        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+        let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = self
             .db
             .query_row(
-                "SELECT w.kind, w.id, w.node_id FROM slots s
+                "SELECT w.kind, w.id, w.node_id,
+                        (SELECT m.path FROM workspace_mounts m
+                          WHERE m.workspace_id = w.id
+                            AND (m.node_id = w.node_id OR w.node_id IS NULL)
+                          ORDER BY m.path LIMIT 1)
+                 FROM slots s
                  LEFT JOIN workspaces w ON w.id = s.workspace_id WHERE s.id = ?",
                 [&self.slot_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         match row {
-            Some((Some(kind), Some(ws_id), node_id)) => match kind.as_str() {
-                "node_local" => Ok(format!(
-                    "node:{}",
-                    node_id.unwrap_or_else(|| ws_id.clone())
-                )),
+            Some((Some(kind), Some(ws_id), node_id, mount)) => match kind.as_str() {
+                "node_local" => {
+                    let node = node_id.unwrap_or_else(|| ws_id.clone());
+                    // A workspace with no mount recorded keeps the old domain
+                    // rather than inventing one: narrower than the truth
+                    // would let two agents edit one file believing they each
+                    // held it.
+                    Ok(match mount {
+                        Some(p) => format!("node:{node}:{}", p.trim_end_matches('/')),
+                        None => format!("node:{node}"),
+                    })
+                }
                 _ => Ok(format!("ws:{ws_id}")),
             },
             // No workspace: fall back to a session-wide domain so locks still
@@ -288,6 +314,7 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "update_plan" => update_plan(ctx, args),
         "signal_done" => signal_done(ctx, args),
         "escalate" => escalate(ctx, args),
+        "notify_operator" => notify_operator(ctx, args),
         "submit_feedback" => submit_feedback(ctx, args),
         "approve" => approve(ctx, args),
         "acquire_file" => acquire_file(ctx, args),
@@ -590,6 +617,78 @@ fn escalate(ctx: &Ctx, args: &Value) -> Result<String> {
         "Escalated to {them}. Your state is 'escalated' and theirs is 'working'; they have \
          your reason and the task. Do not keep working on it."
     ))
+}
+
+/// How long an orchestrator may be silent before it counts as absent.
+///
+/// A driving orchestrator talks to the hub constantly -- resolving a session,
+/// reading status, delivering a message -- so silence this long means nobody
+/// is holding the wheel.
+const ORCHESTRATOR_SILENT_MS: i64 = 10 * 60 * 1000;
+
+/// Raise something with whoever is driving this team.
+///
+/// The team's own orchestrator first, always: it knows the work, and an agent
+/// that goes over its head for every question makes the scoping pointless.
+/// The supervisors get it only when this session has no orchestrator of its
+/// own, when the one it has has gone quiet, or when the agent says the
+/// orchestrator is itself the problem.
+///
+/// Note the asymmetry this closes: a message from an operator is pushed into
+/// an agent's next tool result, while an agent's signals -- summaries, review
+/// requests -- sat until somebody looked. This is the agent's way to make
+/// something arrive.
+fn notify_operator(ctx: &Ctx, args: &Value) -> Result<String> {
+    let text = arg_str(args, "text")?;
+    let escalate = args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false);
+    let me = ctx.my_label();
+    let now = now_ms();
+
+    // Who, if anyone, drives this session: a live token scoped to it.
+    let own: Option<(String, Option<i64>)> = ctx
+        .db
+        .query_row(
+            "SELECT label, last_used_ms FROM operator_tokens
+              WHERE session_id = ? AND revoked_at_ms IS NULL
+              ORDER BY COALESCE(last_used_ms, 0) DESC LIMIT 1",
+            [&ctx.session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let (to_session, why) = match (&own, escalate) {
+        (_, true) => (None, "you asked for the supervisors directly".to_string()),
+        (None, _) => (None, "this session has no orchestrator of its own".to_string()),
+        (Some((label, last)), _) => {
+            let silent = now - last.unwrap_or(0) > ORCHESTRATOR_SILENT_MS;
+            if silent {
+                (
+                    None,
+                    format!("'{label}' drives this session but has not been heard from in a while"),
+                )
+            } else {
+                (Some(ctx.session_id.clone()), format!("'{label}' drives this session"))
+            }
+        }
+    };
+
+    ctx.db.execute(
+        "INSERT INTO operator_messages
+            (from_label, from_kind, from_session, to_session, body, sent_at_ms)
+         VALUES (?, 'agent', ?, ?, ?, ?)",
+        params![me, ctx.session_id, to_session, text, now],
+    )?;
+
+    Ok(match to_session {
+        Some(_) => format!(
+            "Raised with this session's orchestrator ({why}). Watch for a reply with \
+             check_messages, and carry on with anything that does not depend on it."
+        ),
+        None => format!(
+            "Raised with the supervisors who can see the whole fleet ({why}). Watch for a \
+             reply with check_messages, and carry on with anything that does not depend on it."
+        ),
+    })
 }
 
 fn submit_feedback(ctx: &Ctx, args: &Value) -> Result<String> {
@@ -978,6 +1077,11 @@ mod tests {
         Ctx { db, session_id: "s1".into(), slot_id: slot.into() }
     }
 
+    /// A seat in some other session, for the cases that are about two teams.
+    fn ctx2<'a>(db: &'a Connection, slot: &str, session: &str) -> Ctx<'a> {
+        Ctx { db, session_id: session.into(), slot_id: slot.into() }
+    }
+
     fn state(db: &Connection, slot: &str) -> String {
         db.query_row("SELECT task_state FROM slots WHERE id = ?", [slot], |r| r.get(0)).unwrap()
     }
@@ -1206,6 +1310,163 @@ mod tests {
         let b = dispatch(&ctx(&db, "sl-rev"), "acquire_file", &json!({"path": "src/main.rs"})).unwrap();
         assert!(a.contains("Locked"), "{a}");
         assert!(b.contains("Locked"), "both must get it: different machines, different files");
+    }
+
+    #[test]
+    fn two_local_workspaces_on_one_machine_do_not_share_a_lock_domain() {
+        // The bug this prevents: the domain was the machine alone, so every
+        // node_local workspace on a host shared one. An agent locking
+        // src/main.rs under /AI/sentenze blocked another locking
+        // src/main.rs under /storage/coderai -- different trees, and a
+        // denial naming an agent in a project you were not touching.
+        let db = fixture();
+        let now = now_ms();
+        for (wid, path) in [("w-sentenze", "/AI/sentenze"), ("w-coderai", "/storage/coderai")] {
+            db.execute(
+                "INSERT INTO workspaces (id, session_id, name, kind, node_id)
+                 VALUES (?,'s1',?,'node_local','n-machine-a')",
+                params![wid, wid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO workspace_mounts (workspace_id, node_id, path) VALUES (?,?,?)",
+                params![wid, "n-machine-a", path],
+            )
+            .unwrap();
+        }
+        let _ = now;
+        db.execute("UPDATE slots SET workspace_id = 'w-sentenze' WHERE id = 'sl-eng'", []).unwrap();
+        db.execute("UPDATE slots SET workspace_id = 'w-coderai' WHERE id = 'sl-rev'", []).unwrap();
+
+        let a = dispatch(&ctx(&db, "sl-eng"), "acquire_file", &json!({"path": "src/main.rs"})).unwrap();
+        let b = dispatch(&ctx(&db, "sl-rev"), "acquire_file", &json!({"path": "src/main.rs"})).unwrap();
+        assert!(a.contains("Locked"), "{a}");
+        assert!(b.contains("Locked"),
+                "same machine, same relative path, DIFFERENT directories: {b}");
+    }
+
+    #[test]
+    fn one_directory_contends_even_across_sessions() {
+        // The other half, and the reason the domain is not the session: two
+        // sessions may mount the same directory on the same machine, and two
+        // agents editing one file there must contend whichever team they are
+        // on. A lock is about the file.
+        let db = fixture();
+        let now = now_ms();
+        db.execute(
+            "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s2','other',?,?)",
+            params![now, now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO slots (id, session_id, cli_id, display_name, role, created_at_ms)
+             VALUES ('sl-other','s2','claude','Theirs','engineer',?)",
+            params![now],
+        )
+        .unwrap();
+        for (wid, sess) in [("w-mine", "s1"), ("w-theirs", "s2")] {
+            db.execute(
+                "INSERT INTO workspaces (id, session_id, name, kind, node_id)
+                 VALUES (?,?,?,'node_local','n-machine-a')",
+                params![wid, sess, wid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO workspace_mounts (workspace_id, node_id, path)
+                 VALUES (?, 'n-machine-a', '/srv/shared')",
+                [wid],
+            )
+            .unwrap();
+        }
+        db.execute("UPDATE slots SET workspace_id = 'w-mine' WHERE id = 'sl-eng'", []).unwrap();
+        db.execute("UPDATE slots SET workspace_id = 'w-theirs' WHERE id = 'sl-other'", []).unwrap();
+
+        let a = dispatch(&ctx(&db, "sl-eng"), "acquire_file", &json!({"path": "src/main.rs"})).unwrap();
+        assert!(a.contains("Locked"), "{a}");
+        let b = dispatch(&ctx2(&db, "sl-other", "s2"), "acquire_file",
+                         &json!({"path": "src/main.rs"})).unwrap();
+        assert!(b.contains("DENIED"),
+                "one directory, one file, two sessions: the second must be refused: {b}");
+    }
+
+    fn note_target(db: &Connection) -> (Option<String>, String, String) {
+        db.query_row(
+            "SELECT to_session, from_kind, from_label FROM operator_messages
+              ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn give_session_an_orchestrator(db: &Connection, label: &str, last_used_ms: i64) {
+        db.execute(
+            "INSERT INTO operator_tokens (token_sha256, label, session_id, issued_at_ms, last_used_ms)
+             VALUES (?,?, 's1', ?, ?)",
+            params![format!("hash-{label}"), label, now_ms(), last_used_ms],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_agent_raises_things_with_its_own_orchestrator_first() {
+        // The team's driver knows the work. An agent going over its head for
+        // every question would make scoping pointless.
+        let db = fixture();
+        give_session_an_orchestrator(&db, "alpha-lead", now_ms());
+        let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                           &json!({"text": "which database do we target?"})).unwrap();
+        assert!(out.contains("this session's orchestrator"), "{out}");
+        let (to, kind, from) = note_target(&db);
+        assert_eq!(to.as_deref(), Some("s1"), "it must be addressed to this session");
+        assert_eq!(kind, "agent", "an orchestrator must be able to tell this from a peer's note");
+        assert_eq!(from, "Max");
+    }
+
+    #[test]
+    fn with_no_orchestrator_of_its_own_an_agent_reaches_the_supervisors() {
+        let db = fixture();
+        let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                           &json!({"text": "nobody is driving this team"})).unwrap();
+        assert!(out.contains("supervisors"), "{out}");
+        assert!(out.contains("no orchestrator of its own"), "{out}");
+        assert_eq!(note_target(&db).0, None, "None is the supers' address");
+    }
+
+    #[test]
+    fn an_orchestrator_that_has_gone_quiet_is_treated_as_absent() {
+        // "Present" cannot mean "a token exists": a revoked-in-practice
+        // orchestrator that nobody is running would swallow every request an
+        // agent made, silently, for as long as the token existed.
+        let db = fixture();
+        give_session_an_orchestrator(&db, "asleep", now_ms() - ORCHESTRATOR_SILENT_MS - 1);
+        let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                           &json!({"text": "still blocked"})).unwrap();
+        assert!(out.contains("supervisors"), "{out}");
+        assert!(out.contains("not been heard from"), "{out}");
+        assert_eq!(note_target(&db).0, None);
+    }
+
+    #[test]
+    fn an_agent_can_say_the_orchestrator_itself_is_the_problem() {
+        let db = fixture();
+        give_session_an_orchestrator(&db, "alpha-lead", now_ms());
+        let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                           &json!({"text": "it keeps telling me to do the impossible",
+                                   "escalate": true})).unwrap();
+        assert!(out.contains("supervisors"), "{out}");
+        assert_eq!(note_target(&db).0, None, "escalate goes past the session's own driver");
+    }
+
+    #[test]
+    fn a_revoked_orchestrator_does_not_count_as_present() {
+        let db = fixture();
+        give_session_an_orchestrator(&db, "gone", now_ms());
+        db.execute("UPDATE operator_tokens SET revoked_at_ms = ? WHERE label = 'gone'",
+                   [now_ms()]).unwrap();
+        let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                           &json!({"text": "hello?"})).unwrap();
+        assert!(out.contains("no orchestrator of its own"), "{out}");
     }
 
     #[test]

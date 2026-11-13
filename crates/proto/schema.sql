@@ -313,9 +313,42 @@ CREATE TABLE IF NOT EXISTS mcp_sessions (
 CREATE TABLE IF NOT EXISTS operator_tokens (
   token_sha256  TEXT PRIMARY KEY,
   label         TEXT NOT NULL,
+  -- How far this operator reaches. NULL is the whole fleet -- a SUPER
+  -- orchestrator -- and a session id confines the token to that one session:
+  -- it drives that team and cannot see, touch or discover the rest.
+  session_id    TEXT REFERENCES sessions(id) ON DELETE CASCADE,
   issued_at_ms  INTEGER NOT NULL,
   revoked_at_ms INTEGER,
   last_used_ms  INTEGER
+);
+
+-- Notes between the programs DRIVING sessions, and from agents to them.
+--
+-- Separate from `messages`, which belongs to a session and is read by its
+-- agents. A scoped orchestrator cannot see that another session exists, so
+-- when it needs something from outside its own team the only honest thing it
+-- can do is ask someone whose reach is wider. An agent uses the same channel
+-- through notify_operator: its own session's orchestrator first, and the
+-- supervisors when there is none or it has gone quiet.
+CREATE TABLE IF NOT EXISTS operator_messages (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_label    TEXT NOT NULL,
+  -- operator | agent. Both carry a from_session, so without this an
+  -- orchestrator cannot tell a peer's note from one of its own team asking
+  -- for help.
+  from_kind     TEXT NOT NULL DEFAULT 'operator',
+  from_session  TEXT,                      -- NULL when a super sent it
+  to_session    TEXT,                      -- NULL = addressed to the supers
+  body          TEXT NOT NULL,
+  sent_at_ms    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS operator_messages_to ON operator_messages(to_session, id);
+
+-- Where each operator has read up to on that channel. Per label, so two
+-- supervisors each see a request rather than the first reader consuming it.
+CREATE TABLE IF NOT EXISTS operator_read_cursor (
+  label     TEXT PRIMARY KEY,
+  last_id   INTEGER NOT NULL DEFAULT 0
 );
 
 -- Credentials for external (non-CLI, non-node) participants. Deliberately a

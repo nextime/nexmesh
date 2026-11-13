@@ -53,6 +53,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // one session. Nullable on purpose: every token minted before this
         // existed was fleet-wide, and that is what NULL already means.
         ("operator_tokens", "session_id", "TEXT"),
+        // Whether a note on the operator channel came from a program driving
+        // a session or from an AGENT inside one. Both carry a from_session,
+        // so without this an orchestrator cannot tell a peer's message from
+        // one of its own team asking for help.
+        ("operator_messages", "from_kind", "TEXT NOT NULL DEFAULT 'operator'"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.
@@ -77,6 +82,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS operator_messages (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             from_label    TEXT NOT NULL,
+            from_kind     TEXT NOT NULL DEFAULT 'operator',  -- operator | agent
             from_session  TEXT,            -- NULL when a super sent it
             to_session    TEXT,            -- NULL = addressed to the supers
             body          TEXT NOT NULL,
