@@ -113,6 +113,64 @@ impl Node {
     }
 }
 
+/// Say who we are and take (or retake) a seat.
+async fn register(
+    node: &mut Node,
+    args: &Args,
+    pid: i32,
+    cwd: &str,
+) -> Result<(String, String, Vec<ToolDef>)> {
+    node.send(&McpdToNode::Register {
+        cli_id: args.cli.clone(),
+        pid,
+        cwd: cwd.to_string(),
+        agent_hint: args.agent_id.clone(),
+        slot_hint: args.slot.clone(),
+        session_hint: args.session.clone(),
+        role: args.role.clone(),
+        name: args.name.clone(),
+        cli_session: cli_session_id(),
+    })
+    .await?;
+    match node.recv().await? {
+        NodeToMcpd::Registered { agent_id, slot_id, tools, .. } => Ok((agent_id, slot_id, tools)),
+        NodeToMcpd::Error { message, .. } => {
+            anyhow::bail!("the node refused registration: {message}")
+        }
+        other => anyhow::bail!("unexpected first frame from the node: {other:?}"),
+    }
+}
+
+/// Reconnect to the node and take the seat again.
+///
+/// The node dials the hub and reconnects with backoff; this shim did not,
+/// so a node restart -- an upgrade, a reboot -- left every CLI attached to
+/// it permanently disconnected. The conversation carried on, the seat read
+/// `lost` for ever, and nothing short of restarting the CLI itself brought
+/// it back. The conversation id is unchanged across this, so the same seat
+/// is reclaimed rather than a new one taken.
+async fn reconnect(args: &Args, pid: i32, cwd: &str) -> Result<(Node, String)> {
+    let mut wait = std::time::Duration::from_millis(250);
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..8 {
+        if attempt > 0 {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(std::time::Duration::from_secs(5));
+        }
+        match Node::connect(&args.sock).await {
+            Ok(mut n) => match register(&mut n, args, pid, cwd).await {
+                Ok((agent_id, slot_id, _)) => {
+                    tracing::info!(%agent_id, %slot_id, attempt, "reconnected to the node");
+                    return Ok((n, slot_id));
+                }
+                Err(e) => last = Some(e),
+            },
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("could not reach the node")))
+}
+
 async fn write_stdout(v: &Value) -> Result<()> {
     let mut out = tokio::io::stdout();
     let mut s = serde_json::to_string(v)?;
@@ -198,24 +256,7 @@ async fn main() -> Result<()> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    node.send(&McpdToNode::Register {
-        cli_id: args.cli.clone(),
-        pid,
-        cwd,
-        agent_hint: args.agent_id.clone(),
-        slot_hint: args.slot.clone(),
-        session_hint: args.session.clone(),
-        role: args.role.clone(),
-        name: args.name.clone(),
-        cli_session: cli_session_id(),
-    })
-    .await?;
-
-    let (agent_id, slot_id, tools): (String, String, Vec<ToolDef>) = match node.recv().await? {
-        NodeToMcpd::Registered { agent_id, slot_id, tools, .. } => (agent_id, slot_id, tools),
-        NodeToMcpd::Error { message, .. } => anyhow::bail!("the node refused registration: {message}"),
-        other => anyhow::bail!("unexpected first frame from the node: {other:?}"),
-    };
+    let (agent_id, mut slot_id, tools) = register(&mut node, &args, pid, &cwd).await?;
     tracing::info!(%agent_id, %slot_id, tools = tools.len(), "registered with the node");
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -278,13 +319,54 @@ async fn main() -> Result<()> {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let req_id = node.next_req();
-                if let Err(e) = node.send(&McpdToNode::Tool { req_id, tool: name.clone(), args: arguments }).await {
-                    write_stdout(&rpc_err(id, -32603, format!("node unreachable: {e}"))).await?;
-                    continue;
+                // The node may have been restarted under us: an upgrade, a
+                // reboot. Which half of the exchange notices depends on
+                // timing -- a write into a socket whose far end has gone is
+                // as often buffered and accepted, leaving the read to fail
+                // -- so both halves lead here, and both are worth one
+                // reconnect. The model is waiting on this call, and an
+                // error is the one answer it cannot act on.
+                let mut reply = None;
+                let mut trouble = String::new();
+                for attempt in 0..2 {
+                    if attempt > 0 {
+                        match reconnect(&args, pid, &cwd).await {
+                            Ok((n, sl)) => {
+                                node = n;
+                                slot_id = sl;
+                            }
+                            Err(e) => {
+                                trouble = format!("node unreachable: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    let req_id = node.next_req();
+                    if let Err(e) = node
+                        .send(&McpdToNode::Tool {
+                            req_id,
+                            tool: name.clone(),
+                            args: arguments.clone(),
+                        })
+                        .await
+                    {
+                        trouble = format!("node unreachable: {e}");
+                        continue;
+                    }
+                    match node.recv().await {
+                        Ok(frame) => {
+                            reply = Some(frame);
+                            break;
+                        }
+                        Err(e) => trouble = format!("node unreachable: {e}"),
+                    }
                 }
-                match node.recv().await {
-                    Ok(NodeToMcpd::ToolReply { result, deliver, .. }) => {
+                let Some(frame) = reply else {
+                    write_stdout(&rpc_err(id, -32603, trouble)).await?;
+                    continue;
+                };
+                match frame {
+                    NodeToMcpd::ToolReply { result, deliver, .. } => {
                         let text = if result["ok"].as_bool() == Some(true) {
                             result["text"].as_str().unwrap_or("").to_string()
                         } else {
@@ -309,9 +391,8 @@ async fn main() -> Result<()> {
                         }
                         continue;
                     }
-                    Ok(NodeToMcpd::Error { message, .. }) => rpc_err(id, -32603, message),
-                    Ok(other) => rpc_err(id, -32603, format!("unexpected node frame: {other:?}")),
-                    Err(e) => rpc_err(id, -32603, e),
+                    NodeToMcpd::Error { message, .. } => rpc_err(id, -32603, message),
+                    other => rpc_err(id, -32603, format!("unexpected node frame: {other:?}")),
                 }
             }
 

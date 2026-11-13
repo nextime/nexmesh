@@ -967,17 +967,49 @@ fn join(
         .optional()?
         .flatten();
 
-    let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    db.execute(
-        "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance, status,
-                             cwd, started_at_ms, last_seen_ms)
-         VALUES (?,?,?,?,?, 'attached', 'running', ?, ?, ?)",
-        params![
-            agent_id, slot_id, node_id,
-            pid.as_ref().map(|p| p.pid), pid.as_ref().map(|p| p.start_ticks),
-            cwd, now, now
-        ],
-    )?;
+    // The same process may come back. A node restart does not end the CLI
+    // that node was serving -- the conversation is still there, and the shim
+    // reconnects -- and the identity triple, machine plus pid plus process
+    // start, is what says it is the same process rather than a new one. So
+    // the agent row is retaken. Inserting a second one hits the unique index
+    // on that triple, and the shim is told its registration was refused for
+    // as long as the conversation lasts, which is the exact failure the
+    // reconnect exists to prevent.
+    let returning: Option<String> = match pid.as_ref() {
+        Some(p) => db
+            .query_row(
+                "SELECT id FROM agents WHERE node_id = ? AND pid = ? AND proc_start_ticks = ?",
+                params![node_id, p.pid, p.start_ticks],
+                |r| r.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let agent_id = match returning {
+        Some(existing) => {
+            db.execute(
+                "UPDATE agents SET slot_id = ?, status = 'running', cwd = ?, last_seen_ms = ?
+                  WHERE id = ?",
+                params![slot_id, cwd, now, existing],
+            )?;
+            tracing::info!(%slot_id, agent_id = %existing, "attached agent rejoined");
+            existing
+        }
+        None => {
+            let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            db.execute(
+                "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance,
+                                     status, cwd, started_at_ms, last_seen_ms)
+                 VALUES (?,?,?,?,?, 'attached', 'running', ?, ?, ?)",
+                params![
+                    agent_id, slot_id, node_id,
+                    pid.as_ref().map(|p| p.pid), pid.as_ref().map(|p| p.start_ticks),
+                    cwd, now, now
+                ],
+            )?;
+            agent_id
+        }
+    };
     db.execute(
         "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,?, 'agent_joined', ?)",
         params![now, name.clone().unwrap_or_default(), node_id,
