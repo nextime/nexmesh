@@ -47,24 +47,24 @@ Many conversations belong to one session.
 A machine running
 .BR nexmesh-node (1).
 Addressed by the name it enrolled under \(em
-.IR machine-a ", " zeiss ", " sissy .
+.IR machine-a ", " machine-b .
 .PP
 So in
 .PP
 .RS
-.B nexmesh attach fleet Reviewer
+.B nexmesh attach payments Reviewer
 .RE
 .PP
 the words are: the command, the
 .B session
 called
-.IR fleet ,
+.IR payments ,
 and the
 .B seat
 called
 .IR Reviewer .
-A session named after the project reads oddly \(em
-.B nexmesh attach nexmesh Nexmesh-dev
+A session named after the tool itself reads oddly \(em
+.B nexmesh attach mesh Mesh-dev
 is command, session, seat \(em but the positions never change, and a session
 can be renamed at any time with
 .BR rename-session .
@@ -227,7 +227,7 @@ order:
 .IP 1. 4
 .BR NEXMESH_SESSION ,
 which takes a session name or id. Exporting it for one launch
-.RI ( "NEXMESH_SESSION=digesta claude" )
+.RI ( "NEXMESH_SESSION=payments claude" )
 decides that one conversation and nothing else.
 .IP 2. 4
 The seat that conversation already holds, wherever it was last placed.
@@ -282,8 +282,8 @@ Watch a team, then say something to one of its agents:
 .PP
 .RS
 .nf
-nexmesh status digesta
-nexmesh send digesta "the loader is ready for review" --to Reviewer
+nexmesh status payments
+nexmesh send payments "the loader is ready for review" --to Reviewer
 .fi
 .RE
 .PP
@@ -294,22 +294,22 @@ conversation:
 .nf
 nexmesh install-seat --cli claude --role engineer
 nexmesh status orchestrator            # find the seat it took
-nexmesh move-agent sl-1a2b3c4d digesta # it stays there from now on
+nexmesh move-agent sl-1a2b3c4d payments # it stays there from now on
 .fi
 .RE
 .PP
 Make a conversation attachable from anywhere. The tmux session is called
 .IR mywork ,
 the team
-.IR digesta ,
+.IR payments ,
 the seat
 .IR Reviewer :
 .PP
 .RS
 .nf
 tmux new -s mywork                     # start claude inside it
-nexmesh adopt digesta --node zeiss --tmux mywork --name Reviewer
-nexmesh attach digesta Reviewer        # from any machine; detach freely
+nexmesh adopt payments --node machine-b --tmux mywork --name Reviewer
+nexmesh attach payments Reviewer       # from any machine; detach freely
 .fi
 .RE
 .SH SEE ALSO

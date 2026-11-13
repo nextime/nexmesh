@@ -232,6 +232,22 @@ def main():
     only = sorted(a["name"] for a in (dn.get("detail") or {}).get("agents", []))
     check("picking one session still shows only that one", only == ["Solo"], str(only))
 
+    print("\n=== an agent is always shown by BOTH of its identifiers ===")
+    # An agent has a NAME, which every command addresses it by and a person
+    # reads, and a SEAT id, which the hub and half the API speak. Showing one
+    # on one surface and the other elsewhere is how a rename lands on the
+    # wrong agent -- which happened on a real fleet before this check existed.
+    for a in det["agents"]:
+        check(f"{a['name']} carries its seat id",
+              bool(a.get("slot_id", "").startswith("sl-")), str(a)[:160])
+    for m in det["messages"]:
+        check("a message says which seats it is between",
+              "from_slot" in m and "to_slot" in m, str(m)[:200])
+        break
+    s_h, html = req("/", raw=True)
+    check("the page renders the seat id beside the name",
+          "seatid" in html, "no seatid element in the dashboard")
+
     print("\n=== a seat can be renamed from where you read it ===")
     # The dashboard is where a person looks at a team, so it is where the
     # name has to be changeable. A seat is named before anyone knows what it

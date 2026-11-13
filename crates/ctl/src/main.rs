@@ -852,9 +852,14 @@ async fn main() -> Result<()> {
                 println!("no agents in this session");
                 return Ok(());
             }
+            // Both identifiers, always. An agent has a NAME, which is what
+            // every command addresses it by and what a person reads, and a
+            // SEAT id, which is what the hub and half the API speak. Showing
+            // one here and the other there is how a rename gets applied to
+            // the wrong agent: it happened on this fleet.
             println!(
-                "{:<12} {:<14} {:<9} {:<9} {:<20} {:>9} SUMMARY",
-                "NAME", "ROLE", "HOST", "KIND", "STATE", "TOKENS"
+                "{:<16} {:<14} {:<12} {:<9} {:<9} {:<18} {:>9} SUMMARY",
+                "NAME", "SEAT", "ROLE", "HOST", "KIND", "STATE", "TOKENS"
             );
             for a in rows {
                 let tin = a["input_tokens"].as_i64().unwrap_or(0);
@@ -865,8 +870,9 @@ async fn main() -> Result<()> {
                     format!("{}/{}", human(tin), human(tout))
                 };
                 println!(
-                    "{:<12} {:<14} {:<9} {:<9} {:<20} {:>9} {}",
+                    "{:<16} {:<14} {:<12} {:<9} {:<9} {:<18} {:>9} {}",
                     a["name"].as_str().unwrap_or("?"),
+                    a["slot_id"].as_str().unwrap_or("-"),
                     a["role"].as_str().unwrap_or("-"),
                     a["host"].as_str().unwrap_or("-"),
                     a["provenance"].as_str().unwrap_or("-"),

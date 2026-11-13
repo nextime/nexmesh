@@ -257,7 +257,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                  ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
                             m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL,
                             COALESCE(mx.name, ''),
-                            m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, '')
+                            m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, ''),
+                            COALESCE(m.from_slot, ''), COALESCE(m.to_slot, '')
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
@@ -274,6 +275,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "session": r.get::<_, String>(8)?,
                             "claimed": r.get::<_, bool>(9)?,
                             "claimed_by": r.get::<_, String>(10)?,
+                            "from_slot": r.get::<_, String>(11)?,
+                            "to_slot": r.get::<_, String>(12)?,
                         }))
                     })
                     .and_then(|m| m.collect())

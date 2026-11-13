@@ -85,6 +85,10 @@
   th.sortable:hover { color: var(--fg, #e8e8ea); }
   /* A seat's name is editable in place; say so before it is clicked. */
   .rename { cursor: text; border-bottom: 1px dotted currentColor; opacity: .95; }
+  /* Both identifiers, always: an agent has a name you address it by and a
+     seat id the API speaks, and showing one here and the other there is how
+     a rename lands on the wrong agent. */
+  .seatid { font-family: var(--mono); font-size: 11px; color: var(--faint); }
   .rename:hover { border-bottom-style: solid; }
   .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
 
@@ -892,6 +896,8 @@ function viewAgents(d, now) {
             <span class="mono rename" title="click to rename"
                   onclick="renameAgent('${esc(a.slot_id)}', '${esc(a.name).replace(/'/g, "\\'")}')"
                   >${esc(a.name)}</span>
+            <br><span class="seatid" title="seat id — what the API and the hub call it"
+                  >${esc(a.slot_id)}</span>
             ${flap ? ' <span class="badge bad">flapping</span>' : ""}
             ${a.restarts ? ` <span class="badge warn" title="restarts">↻${a.restarts}</span>` : ""}</td>
         ${all ? `<td><span class="badge info">${esc(a.session)}</span></td>` : ""}
@@ -972,8 +978,10 @@ function viewMessages(d, now) {
     return `<div class="msg ${cls}">
       <div class="t">${hhmmss(m.at_ms)}</div>
       <div class="mark" title="${esc(title)}">${mark}</div>
-      <div>${chan}<span class="who">${esc(m.from)}</span> <span class="arrow">→</span>
-           <span class="who">${esc(m.to)}</span><br>
+      <div>${chan}<span class="who" title="${esc(m.from_slot || "operator")}"
+             >${esc(m.from)}</span> <span class="arrow">→</span>
+           <span class="who" title="${esc(m.to_slot || "the team")}"
+             >${esc(m.to)}</span><br>
            <span class="body">${kind}${esc(m.body)}</span></div>
     </div>`;
   }).join("");
