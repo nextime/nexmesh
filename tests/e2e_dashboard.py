@@ -260,10 +260,28 @@ def main():
     check("the icon is served", s == 200 and "<svg" in icon, str(s))
     s, sw = req("/sw.js", raw=True)
     check("the service worker is served", s == 200 and "addEventListener" in sw, str(s))
+    # Chrome will not offer to install without a fetch handler, and will not
+    # offer at all without PNG icons at 192 and 512: an SVG-only manifest
+    # looks complete and never produces a prompt on Android.
+    check("it handles fetch, which is part of being installable",
+          "fetch" in sw, sw[:160])
+    sizes = {i.get("sizes") for i in m.get("icons", [])}
+    check("the manifest offers the bitmap sizes Android wants",
+          {"192x192", "512x512"} <= sizes, str(sizes))
+    types = {i.get("type") for i in m.get("icons", [])}
+    check("and they are PNGs", "image/png" in types, str(types))
+    check("one is maskable, so Android does not letterbox it",
+          any(i.get("purpose") == "maskable" for i in m.get("icons", [])), str(m.get("icons")))
+    for name in ("icon-192.png", "icon-512.png"):
+        s, _ = req("/" + name, raw=True)
+        check(f"{name} is served", s == 200, str(s))
     # A dashboard is a live view. A cached one shows yesterday's agents as
     # though they were running, which is worse than showing nothing.
-    check("and it caches nothing", "caches.open" not in sw and "cache" not in sw.lower(),
-          sw[:200])
+    # Look for the API, not the word: the worker's own comment explains why
+    # it refuses to cache, which a naive substring check trips over.
+    uses_cache = any(x in sw for x in ("caches.open", "caches.match", "cache.put",
+                                       "CacheStorage", "cache.add"))
+    check("and it caches nothing", not uses_cache, sw[:200])
 
     print("\n=== messages stay unread until somebody claims them ===")
     # Reading is not answering: a message glanced at used to be a message

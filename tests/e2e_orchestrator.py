@@ -73,6 +73,12 @@ class Orch:
     def __init__(self, token=None):
         env = dict(os.environ, NEXMESH_HUB_HTTP=HUB, RUST_LOG="warn")
         env.pop("NEXMESH_OPERATOR_TOKEN", None)
+        # The orchestrator falls back to a PAIRED IDENTITY in ~/.nexmesh, so
+        # on a machine where the developer has paired, an orchestrator this
+        # test means to leave unauthenticated quietly picks up their real
+        # operator token and the check about saying "no operator token"
+        # fails. Point it at somewhere that cannot exist.
+        env["NEXMESH_IDENTITY"] = os.path.join(T, "no-identity-here")
         if token: env["NEXMESH_OPERATOR_TOKEN"] = token
         self.p = subprocess.Popen([f"{BIN}/nexmesh-orch"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)

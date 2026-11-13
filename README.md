@@ -261,6 +261,7 @@ Every screenshot in this repository comes from it.
 | [Terminals, failure and recovery](docs/GUIDE.md#terminals-failure-and-recovery) | attach from anywhere, crash recovery, adopting a running tmux session |
 | [Running it for real](docs/GUIDE.md#running-it-for-real) | installing, the dashboard, mutual TLS, deployment |
 | [tests/README.md](tests/README.md) | the twenty-three end-to-end suites, and what each one guards |
+| `man nexmesh` ([source](docs/man/nexmesh.1)) | every command and which argument is which, at the terminal |
 
 ## Status
 

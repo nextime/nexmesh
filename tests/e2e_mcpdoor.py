@@ -253,9 +253,18 @@ def main():
     check("the old session id no longer works", s == 404, f"{s} {j}")
     s, j, h = rpc("initialize", {"protocolVersion": "2025-03-26",
         "clientInfo": {"name": "handwritten", "version": "0"}}, token=tok, url=url)
-    check("and a client that comes back gets a fresh seat",
-          s == 200 and len(q("SELECT id FROM slots WHERE session_id=?", (sid,))) == 2,
+    # This used to assert a FRESH seat, and that was the bug: an external
+    # client has no conversation id and no process the hub can see, so its
+    # name is its identity, and every reconnect left a derelict seat behind
+    # under the same name. A client that comes back sits down where it sat
+    # before; a genuinely concurrent second instance still gets its own.
+    seats = q("SELECT id FROM slots WHERE session_id=?", (sid,))
+    check("a client that comes back sits down where it sat before",
+          s == 200 and len(seats) == 1,
           str(q("SELECT id,display_name,status FROM slots")))
+    check("and it is live again",
+          bool(q("SELECT id FROM agents WHERE exited_at_ms IS NULL")),
+          str(q("SELECT id,exited_at_ms FROM agents")))
 
     print()
     if fails:

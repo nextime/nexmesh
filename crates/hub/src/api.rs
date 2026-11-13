@@ -1161,6 +1161,97 @@ pub async fn build_graph(
     }
 }
 
+/// Retire the seats nothing is sitting in any more.
+///
+/// A seat outlives its process on purpose: that is what crash recovery
+/// stands on, and what lets a conversation come back to where it was. The
+/// cost is that a conversation RESUMED under a new id -- which is what
+/// `claude --continue` gives you -- leaves its predecessor behind, and a
+/// session fills with teammates who will never answer.
+///
+/// The hub must not resolve that by guessing: from here a resumed
+/// conversation and a brand new one in the same directory are the same
+/// thing, and guessing let a second window inherit the first's seat, name
+/// and inbox. So retiring is a judgement, and it is the operator's. Only
+/// seats that are SUPERSEDED go: dead, with a live seat on the same machine
+/// in the same directory doing the same job. Anything still unclaimed for
+/// them is carried across rather than deleted, because a message nobody
+/// claimed is work somebody still has to do.
+pub async fn tidy_seats(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let session_id = session_ref_to_id(&db, &session_ref);
+    let rows: Vec<(String, String, String, String, String)> = db
+        .prepare(
+            "SELECT s.id, COALESCE(s.display_name,''), COALESCE(s.cli_id,''),
+                    COALESCE(a.node_id,''), COALESCE(a.cwd,'')
+               FROM slots s
+               LEFT JOIN agents a ON a.id = (
+                   SELECT id FROM agents WHERE slot_id = s.id
+                    ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+              WHERE s.session_id = ?1 AND s.participant_kind = 'cli'",
+        )
+        .and_then(|mut q| {
+            q.query_map([&session_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .and_then(|m| m.collect())
+        })
+        .map_err(bad)?;
+
+    let mut live_places: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    let mut dead: Vec<(String, String, String, String, String)> = Vec::new();
+    for row in rows {
+        let alive: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE slot_id = ?
+                                AND exited_at_ms IS NULL AND status <> 'lost')",
+                [&row.0],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if alive {
+            live_places.insert((row.2.clone(), row.3.clone(), row.4.clone()));
+        } else {
+            dead.push(row);
+        }
+    }
+
+    let mut retired = Vec::new();
+    for (slot, name, cli, node, cwd) in dead {
+        if cwd.is_empty() || !live_places.contains(&(cli.clone(), node.clone(), cwd.clone())) {
+            continue;
+        }
+        // Where its unfinished work goes: the live seat in the same place.
+        let heir: Option<String> = db
+            .query_row(
+                "SELECT s.id FROM slots s
+                   JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
+                                AND a.status <> 'lost'
+                  WHERE s.session_id = ?1 AND COALESCE(s.cli_id,'') = ?2
+                    AND a.node_id = ?3 AND a.cwd = ?4 LIMIT 1",
+                params![session_id, cli, node, cwd],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(bad)?;
+        if let Some(heir) = heir {
+            db.execute(
+                "UPDATE messages SET to_slot = ?1 WHERE to_slot = ?2 AND claimed_at_ms IS NULL",
+                params![heir, slot],
+            )
+            .map_err(bad)?;
+        }
+        db.execute("DELETE FROM agents WHERE slot_id = ?", [&slot]).map_err(bad)?;
+        db.execute("DELETE FROM slots WHERE id = ?", [&slot]).map_err(bad)?;
+        retired.push(json!({ "slot_id": slot, "name": name, "cwd": cwd }));
+    }
+    Ok(Json(json!({ "retired": retired.len(), "seats": retired })))
+}
+
 pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<String>) -> Json<Value> {
     // A session may be named, not only identified.
     let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
@@ -1468,20 +1559,67 @@ pub(crate) fn join_participant(
     };
 
     let now = now_ms();
-    let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    db.execute(
-        "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
-                            display_name, role, role_description, capabilities, status,
-                            created_at_ms)
-         VALUES (?,?,?, NULL, 'external', 'headless', ?,?,?,?, 'connected', ?)",
-        params![
-            slot_id, session_id, ws_id, req.name, req.role, req.role_description,
-            serde_json::to_string(&normalise_capabilities(&req.capabilities))
-                .unwrap_or_else(|_| "[]".into()),
-            now
-        ],
-    )
-    .map_err(bad)?;
+    let caps = serde_json::to_string(&normalise_capabilities(&req.capabilities))
+        .unwrap_or_else(|_| "[]".into());
+
+    // Come back to the seat you had. An external participant is identified
+    // by its NAME -- it has no conversation id and no process the hub can
+    // see -- so a bridge or a hermes agent that restarts was taking a fresh
+    // seat every time and leaving a derelict one behind, under the same
+    // name. That is the duplication that filled a session with teammates
+    // who never answer, and it was fixed everywhere except here.
+    //
+    // A seat whose agent is still live is left alone: that is a genuinely
+    // concurrent second instance, and it deserves its own.
+    let existing: Option<String> = db
+        .query_row(
+            "SELECT s.id FROM slots s
+              WHERE s.session_id = ?1 AND s.participant_kind = 'external'
+                AND COALESCE(s.display_name, '') = ?2
+                AND NOT EXISTS (
+                    SELECT 1 FROM agents a
+                     WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL
+                       AND a.status <> 'lost')
+              ORDER BY s.created_at_ms DESC LIMIT 1",
+            params![session_id, req.name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(bad)?;
+
+    let slot_id = match existing {
+        Some(id) => {
+            // What it can do may have changed since last time: a bridge
+            // probes its service at startup, and a service gains and loses
+            // endpoints.
+            db.execute(
+                "UPDATE slots SET capabilities = ?, role = COALESCE(?, role),
+                                  role_description = COALESCE(?, role_description),
+                                  workspace_id = COALESCE(?, workspace_id),
+                                  status = 'connected'
+                  WHERE id = ?",
+                params![caps, req.role, req.role_description, ws_id, id],
+            )
+            .map_err(bad)?;
+            tracing::info!(slot_id = %id, name = %req.name,
+                "an external participant returned to its seat");
+            id
+        }
+        None => {
+            let id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            db.execute(
+                "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
+                                    display_name, role, role_description, capabilities, status,
+                                    created_at_ms)
+                 VALUES (?,?,?, NULL, 'external', 'headless', ?,?,?,?, 'connected', ?)",
+                params![
+                    id, session_id, ws_id, req.name, req.role, req.role_description, caps, now
+                ],
+            )
+            .map_err(bad)?;
+            id
+        }
+    };
     let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
         "INSERT INTO agents (id, slot_id, node_id, provenance, status, kind_hint,

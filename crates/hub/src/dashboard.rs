@@ -66,7 +66,10 @@ pub async fn manifest() -> Response {
   "background_color": "#0b0f14",
   "theme_color": "#0b0f14",
   "icons": [
-    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
   ]
 }"##,
     )
@@ -83,6 +86,18 @@ pub async fn app_icon() -> Response {
         .into_response()
 }
 
+/// PNG icons, because a manifest with only an SVG does not meet Chrome's bar
+/// for installability -- it wants 192 and 512 px bitmaps, and without them
+/// Android never offers to install at all.
+pub async fn app_icon_png(axum::extract::Path(size): axum::extract::Path<String>) -> Response {
+    let bytes: &[u8] = match size.as_str() {
+        "icon-192.png" => include_bytes!("../static/icon-192.png"),
+        "icon-512.png" => include_bytes!("../static/icon-512.png"),
+        _ => return (axum::http::StatusCode::NOT_FOUND, "no such icon").into_response(),
+    };
+    ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+}
+
 /// A service worker, which is what makes the browser offer to install it.
 ///
 /// Deliberately almost nothing: it claims the scope and passes every request
@@ -97,8 +112,10 @@ pub async fn service_worker() -> Response {
         ],
         r##"self.addEventListener("install", (e) => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
-// No caching, on purpose: a stale fleet view is worse than no fleet view.
-self.addEventListener("fetch", () => {});
+// A fetch handler is part of what makes a browser treat this as an app, but
+// it caches NOTHING and never will: a stale view of a fleet would show
+// yesterday's agents as though they were running.
+self.addEventListener("fetch", (e) => e.respondWith(fetch(e.request)));
 "##,
     )
         .into_response()

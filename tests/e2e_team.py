@@ -54,15 +54,19 @@ def http(method, path, body=None, token=None):
 
 class Mcpd:
     """An MCP client speaking to nexmesh-mcpd over stdio, as a CLI would."""
-    def __init__(self, env_extra):
+    def __init__(self, env_extra, cwd=None):
         env = dict(os.environ, NEXMESH_SOCK=SOCK, RUST_LOG="warn", **env_extra)
         # A human runs their CLI inside the workspace, so mcpd's cwd is how
         # the hub infers which workspace this agent is in.
         self.p = subprocess.Popen([f"{BIN}/nexmesh-mcpd"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
-            bufsize=1, cwd=WS_DIR)
+            bufsize=1, cwd=cwd or WS_DIR)
         procs.append(self.p)
         self.n = 0
+    def close(self):
+        try: self.p.terminate(); self.p.wait(timeout=3)
+        except Exception: pass
+
     def call(self, method, params=None):
         self.n += 1
         msg = {"jsonrpc": "2.0", "id": self.n, "method": method}
@@ -375,6 +379,103 @@ def main():
     nosuch = http("GET", "/v1/sessions/no-such-session-at-all/status")[1].get("agents", [])
     check("while a name that matches nothing still returns nothing",
           nosuch == [], str(nosuch)[:160])
+
+    print("\n=== a new conversation retires the dead seats it replaces ===")
+    # `claude --continue` resumes a conversation but issues a NEW id, so the
+    # hub cannot match it to the seat its predecessor held -- four
+    # conversations came back from a restart as eight seats. The seat is NOT
+    # handed over: from here a resumed conversation and a brand new one in
+    # the same directory are indistinguishable, and guessing let a second
+    # window steal the first's seat, name and inbox. Instead the dead ones
+    # are retired, and anything still waiting for them is carried across,
+    # because a message nobody claimed is work somebody still has to do.
+    import os as _os
+    ghost_dir = _os.path.join(WS_DIR, "ghost-town")
+    _os.makedirs(ghost_dir, exist_ok=True)
+    g1 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_NAME": "Ghosty", "NEXMESH_CLI_SESSION": "conv-ghost-1"}, cwd=ghost_dir)
+    g1.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "Ghosty", "version": "1"}})
+    seats_before = [a for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+                    if a.get("name") == "Ghosty"]
+    check("the first conversation has a seat", len(seats_before) == 1, str(seats_before)[:200])
+    first_ghost = seats_before[0]["slot_id"] if seats_before else None
+    # Something is said to it that nobody claims.
+    http("POST", f"/v1/sessions/{sid}/messages", {"text": "for whoever works here", "to": "Ghosty"})
+    g1.close() if hasattr(g1, "close") else g1.p.terminate()
+    time.sleep(1.5)
+    # It comes back with a different id, as a resumed conversation does.
+    g2 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_NAME": "Ghosty-again", "NEXMESH_CLI_SESSION": "conv-ghost-2"}, cwd=ghost_dir)
+    g2.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "Ghosty", "version": "1"}})
+    after = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    ghosts = [a for a in after if a.get("name", "").startswith("Ghost")]
+    # BOTH seats exist: a seat outlives its process on purpose, which is what
+    # crash recovery stands on, and the hub must not guess which dead seat
+    # was a restart and which is a conversation that may yet come back.
+    check("the new conversation gets its own seat, and the old one remains",
+          len(ghosts) == 2, str([(a["name"], a["status"]) for a in ghosts]))
+    check("and the new conversation kept its own identity",
+          any(g["name"] == "Ghosty-again" and g["slot_id"] != first_ghost for g in ghosts),
+          str(ghosts)[:200])
+    # Retiring the empty one is the operator's call, and only takes seats a
+    # live one has replaced in the same place.
+    s_t, j_t = http("POST", f"/v1/sessions/{sid}/seats/tidy", {})
+    check("tidying retires the superseded seat", s_t == 200 and j_t.get("retired") == 1,
+          f"{s_t} {j_t}")
+    left = [a for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+            if a.get("name", "").startswith("Ghost")]
+    check("leaving the live one", len(left) == 1 and left[0]["name"] == "Ghosty-again",
+          str([(a["name"], a["status"]) for a in left]))
+    s_t2, j_t2 = http("POST", f"/v1/sessions/{sid}/seats/tidy", {})
+    check("and tidying again takes nothing", s_t2 == 200 and j_t2.get("retired") == 0,
+          f"{s_t2} {j_t2}")
+    # The unclaimed message followed the work, not the corpse.
+    msgs = http("GET", f"/v1/sessions/{sid}/log")[1].get("messages", [])
+    carried = [m for m in msgs if "for whoever works here" in (m.get("body") or "")]
+    check("and what was waiting was carried over, not deleted", bool(carried), str(msgs)[:200])
+
+    print("\n=== an external participant comes back to its own seat ===")
+    # A bridge or a hermes agent has no conversation id and no process the
+    # hub can see, so its NAME is its identity. Restarting one used to mint a
+    # fresh seat and leave a derelict one behind under the same name --
+    # exactly the duplication that fills a session with teammates who never
+    # answer, and it was fixed everywhere except here.
+    s1, j1 = http("POST", "/v1/participant/join",
+                  {"session": sid, "name": "Bridgey", "role": "bridge",
+                   "capabilities": ["ocr"]}, token=ptok)
+    first_slot = j1.get("slot_id")
+    check("an external participant joins", s1 == 200 and bool(first_slot), f"{s1} {j1}")
+
+    s2, j2 = http("POST", "/v1/participant/join",
+                  {"session": sid, "name": "Bridgey", "role": "bridge",
+                   "capabilities": ["ocr"]}, token=ptok)
+    check("a SECOND live instance gets its own seat",
+          s2 == 200 and j2.get("slot_id") != first_slot,
+          f"{j2.get('slot_id')} vs {first_slot}")
+
+    # Let both leases lapse, as they would when a bridge is stopped, then
+    # rejoin: that must return to a seat rather than making a third.
+    gone = False
+    for _ in range(90):
+        time.sleep(0.5)
+        agents = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        live = [a for a in agents
+                if a.get("name") == "Bridgey" and a.get("status") == "running"]
+        if not live:
+            gone = True
+            break
+    check("their leases lapse once nothing renews them", gone, "still live after 45s")
+    s3, j3 = http("POST", "/v1/participant/join",
+                  {"session": sid, "name": "Bridgey", "role": "bridge",
+                   "capabilities": ["ocr", "transcribe"]}, token=ptok)
+    check("a restart returns to a seat it already had",
+          s3 == 200 and j3.get("slot_id") in (first_slot, j2.get("slot_id")),
+          f"{j3.get('slot_id')} is neither {first_slot} nor {j2.get('slot_id')}")
+    seats = [a for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+             if a.get("name") == "Bridgey"]
+    check("and no third seat is left behind", len(seats) == 2, str(len(seats)))
 
     print("\n=== a live agent can be moved between sessions without restarting ===")
     # Its session is not something the agent carries: a tool call resolves it

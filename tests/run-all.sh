@@ -13,6 +13,14 @@ cd "$(dirname "$0")/.."
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID \
       QWEN_SESSION_ID GEMINI_SESSION_ID NEXMESH_CLI_SESSION
 
+# And the operator's own credentials. The ctl and the orchestrator both fall
+# back to a PAIRED IDENTITY in ~/.nexmesh, so on the machine where the fleet
+# is actually run a suite can silently reach the REAL hub, or an
+# orchestrator meant to be unauthenticated picks up a real token. Point them
+# at somewhere that cannot exist.
+unset NEXMESH_OPERATOR_TOKEN NEXMESH_HUB_HTTP NEXMESH_CLIENT_CERT NEXMESH_CLIENT_KEY
+export NEXMESH_IDENTITY=/nonexistent/nexmesh-identity
+
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
         control dashboard orchestrator mtls pairing revoke bind plugin mcpdoor
         capability memory codegraph coderai webauth)

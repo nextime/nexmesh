@@ -1,0 +1,327 @@
+.TH NEXMESH 1 "November 2026" "nexmesh 0.1.0" "Fleet control"
+.SH NAME
+nexmesh \- drive a team of agent CLIs across every machine you own
+.SH SYNOPSIS
+.B nexmesh
+.RI [ global-options ]
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B nexmesh
+is the operator's command line for a nexmesh fleet. It talks to the
+.BR nexmesh-hub (1)
+over HTTPS; the hub holds all state and is the only component that does.
+.PP
+Four things are easy to confuse, and nearly every argument below is one of
+them. They are, from smallest to largest:
+.TP
+.B conversation
+One window of one agent CLI \(em one
+.BR claude ,
+.B codex
+or
+.B opencode
+session. Its own id is what makes a seat the same seat across a restart.
+You never name a conversation in a command.
+.TP
+.B seat
+A place on a team, with a stable name, that outlives whatever process is
+filling it. Written
+.I sl-1a2b3c4d
+internally; addressed by its
+.B name
+\(em what the AGENT column of the dashboard shows, and what
+.B status
+prints. This is what commands mean by
+.IR agent " or " who .
+.TP
+.B session
+A team: one workspace, one message log, one lock domain, one token budget.
+Addressed by
+.B name
+or by id
+.RI ( se-1a2b3c4d ).
+Many conversations belong to one session.
+.TP
+.B node
+A machine running
+.BR nexmesh-node (1).
+Addressed by the name it enrolled under \(em
+.IR machine-a ", " zeiss ", " sissy .
+.PP
+So in
+.PP
+.RS
+.B nexmesh attach fleet Reviewer
+.RE
+.PP
+the words are: the command, the
+.B session
+called
+.IR fleet ,
+and the
+.B seat
+called
+.IR Reviewer .
+A session named after the project reads oddly \(em
+.B nexmesh attach nexmesh Nexmesh-dev
+is command, session, seat \(em but the positions never change, and a session
+can be renamed at any time with
+.BR rename-session .
+.SH GLOBAL OPTIONS
+.TP
+.BI \-\-hub " URL"
+The hub. Defaults to
+.I http://127.0.0.1:7870
+and is usually taken from an identity file instead.
+.RB [ NEXMESH_HUB_HTTP ]
+.TP
+.BI \-\-token " TOKEN"
+Operator token. Mint one with
+.BR "nexmesh-hub operator-token" .
+.RB [ NEXMESH_OPERATOR_TOKEN ]
+.TP
+.BI \-\-ca\-cert " FILE"
+PEM holding the hub's certificate, or the CA that signed it, for a
+self\-signed hub.
+.RB [ NEXMESH_CA_CERT ]
+.TP
+.BI \-\-client\-cert " FILE" ", \-\-client\-key " FILE
+Your certificate and key, where the hub requires mutual TLS. Its name must
+match the operator label the token was minted for.
+.RB [ NEXMESH_CLIENT_CERT ", " NEXMESH_CLIENT_KEY ]
+.TP
+.BI \-\-identity\-dir " DIR"
+A paired identity: anything not given explicitly is read from here. Defaults
+to
+.IR ~/.nexmesh .
+.RB [ NEXMESH_IDENTITY ]
+.SH COMMANDS
+.SS Looking
+.TP
+.B health
+The hub's version, and whether it answers.
+.TP
+.B nodes
+Every machine, whether it is connected, and which agent CLIs it has.
+.TP
+.B sessions
+Every session, with how many seats each holds.
+.TP
+.BI status " SESSION"
+Every seat in one session: role, machine, state, tokens, summary.
+.TP
+.BI log " SESSION " [ \-\-follow ]
+What the agents have said to each other, with delivery state.
+.TP
+.BI transcript " SESSION WHO"
+What one agent's process actually printed. Outlives the process.
+.TP
+.B certs
+Certificates the fleet CA has issued.
+.SS Teams and seats
+.TP
+.BI new\-session " NAME " [ \-\-workspace " NAME" " \-\-node " NODE " \-\-path " DIR ]
+Create a session, optionally with a directory on one machine. That directory
+is how a CLI started there finds this team.
+.TP
+.BI add\-workspace " SESSION PATH " \-\-node " NODE"
+Mount another directory into a session that already exists.
+.TP
+.BI add\-agent " SESSION " \-\-cli " CLI " \-\-name " NAME " [ \-\-node " NODE" ]
+Add an empty seat. Nothing runs until
+.B spawn.
+.TP
+.BI spawn " SEAT"
+Ask the seat's machine to start its agent. An interactive seat runs the CLI's
+real terminal under a pty, which is what makes
+.B attach
+possible.
+.TP
+.BI rename\-agent " WHO NEW\-NAME " [ \-\-session " SESSION" ]
+Rename a seat.
+.I WHO
+may be a seat id, or a name together with
+.BR \-\-session .
+A name already used in that session is refused: two seats with one name
+leaves neither addressable.
+.TP
+.BI rename\-session " SESSION NEW\-NAME"
+Rename a team. Changes nothing else.
+.TP
+.BI move\-agent " SEAT SESSION"
+Move a seat, and whoever is sitting in it, to another team. No restart. Its
+workspace, file locks and ownership zones are released, because all three
+describe the team being left. A conversation returns to the team it was
+moved to on every later restart, whatever directory it starts in.
+.TP
+.BI remove\-agent " SEAT " [ \-\-force ]
+Remove a seat and the history that only describes who sat in it. Refuses
+while somebody is sitting in it unless
+.B \-\-force
+is given.
+.SS Driving
+.TP
+.BI send " SESSION TEXT " [ \-\-to " WHO" ]
+Say something to a team, or to one of its agents, as the operator.
+.TP
+.BI pause " SESSION " [ WHO ]
+Stop giving work to one agent, or to everybody. A turn already running
+finishes.
+.TP
+.BI resume " SESSION " [ WHO ]
+Start again.
+.TP
+.BI release " SESSION " [ WHO ]
+Accept the work and let the agent stop. Omit
+.I WHO
+to release the team.
+.TP
+.BI budget " SESSION " [ \-\-tokens " N" ]
+Set, raise or clear a session's token ceiling. Changing it re\-arms the
+guard, so a session paused on budget can be given more and resumed.
+.TP
+.BI sync " SESSION " \-\-op " publish|refresh|status"
+Publish, pull, or report on a shared workspace, on every machine at once.
+.SS Terminals
+.TP
+.BI attach " SESSION WHO"
+Attach to an agent's terminal, wherever it runs. Only reaches an agent the
+hub holds a pty for: one it spawned in interactive mode, or one adopted from
+tmux. A CLI you started by hand in an ordinary terminal has no such pty.
+.TP
+.BI adopt " SESSION " \-\-node " NODE " \-\-tmux " TARGET " \-\-name " NAME"
+Adopt a tmux session that is already running, so it can be watched and
+driven from anywhere. Your own terminal stays attached.
+.I TARGET
+is a tmux session, window or pane \(em
+.IR mywork ", " mywork:1.0 ", " %3 .
+.SS Joining a fleet
+.TP
+.BI pair " CODE"
+Join as an operator using a one\-time code from the dashboard. The key is
+generated here and never leaves this machine. Writes
+.IR ~/.nexmesh/identity.json ,
+after which every command above works with no options.
+.TP
+.BI install\-seat " " \-\-cli " CLI " [ \-\-role " ROLE" ]
+Register the shim in one of your own agent CLIs, so every conversation you
+start in it takes a seat. Deliberately takes no session: that configuration
+is shared by every conversation on the machine, and a session named there
+would pull them all onto one team. Place each conversation with
+.B move\-agent
+instead \(em it stays placed.
+.TP
+.BI install\-orchestrator " " \-\-cli " CLI " [ \-\-token " TOKEN" ]
+Register
+.BR nexmesh-orch (1)
+in a CLI, so you can drive the fleet from the conversation you are already
+in.
+.TP
+.BI revoke " NAME"
+Revoke a machine or an operator. Its certificate stops working at the TLS
+handshake, its token is revoked, and any connection it holds is closed.
+.SH WHICH SESSION A CLI JOINS
+A CLI started by hand has to end up somewhere. The hub decides in this
+order:
+.IP 1. 4
+.BR NEXMESH_SESSION ,
+which takes a session name or id. Exporting it for one launch
+.RI ( "NEXMESH_SESSION=digesta claude" )
+decides that one conversation and nothing else.
+.IP 2. 4
+The seat that conversation already holds, wherever it was last placed.
+.IP 3. 4
+The directory, if a session has a workspace mounted at or above it
+.I on this machine.
+Only mounts on this node count; the longest match wins. Two sessions may
+mount one directory, which makes the directory unable to answer rather than
+forbidden.
+.IP 4. 4
+The only active session, if there is exactly one.
+.IP 5. 4
+Otherwise it refuses, and names the candidates.
+.PP
+A directory is a default, never a verdict: two agents in one folder may
+belong to different teams, and one team's seats may sit in a dozen folders
+on half a dozen machines.
+.SH FILES
+.TP
+.I ~/.nexmesh/identity.json
+A paired operator identity: hub address, token, and the names of the
+certificate and key beside it. Mode 0600. Written by
+.BR pair .
+.TP
+.I ~/.nexmesh/pki/
+Certificates and keys for that identity.
+.TP
+.I /etc/nexmesh/clis/
+CLI descriptors: how to start each agent CLI, how to give it the shim, and
+how to drive it.
+.SH ENVIRONMENT
+.TP
+.B NEXMESH_HUB_HTTP
+Hub URL.
+.TP
+.B NEXMESH_OPERATOR_TOKEN
+Operator token.
+.TP
+.B NEXMESH_IDENTITY
+Directory holding a paired identity.
+.TP
+.B NEXMESH_SESSION
+Read by the MCP shim, not by this command: the session a CLI started in this
+environment should join.
+.TP
+.B NEXMESH_CLI_SESSION
+Pins a conversation identity for a CLI that publishes none, so every
+reconnect reclaims the same seat.
+.SH EXAMPLES
+.PP
+Watch a team, then say something to one of its agents:
+.PP
+.RS
+.nf
+nexmesh status digesta
+nexmesh send digesta "the loader is ready for review" --to Reviewer
+.fi
+.RE
+.PP
+Make the CLI you already use a member of a team, then place that one
+conversation:
+.PP
+.RS
+.nf
+nexmesh install-seat --cli claude --role engineer
+nexmesh status orchestrator            # find the seat it took
+nexmesh move-agent sl-1a2b3c4d digesta # it stays there from now on
+.fi
+.RE
+.PP
+Make a conversation attachable from anywhere. The tmux session is called
+.IR mywork ,
+the team
+.IR digesta ,
+the seat
+.IR Reviewer :
+.PP
+.RS
+.nf
+tmux new -s mywork                     # start claude inside it
+nexmesh adopt digesta --node zeiss --tmux mywork --name Reviewer
+nexmesh attach digesta Reviewer        # from any machine; detach freely
+.fi
+.RE
+.SH SEE ALSO
+.BR nexmesh-hub (1),
+.BR nexmesh-node (1),
+.BR nexmesh-orch (1),
+.BR tmux (1)
+.PP
+The guide in
+.I docs/GUIDE.md
+covers the parts that do not fit here: lock domains, scoped and super
+orchestrators, capability bridges, the code graph, and the dashboard.
+.SH AUTHOR
+Stefy Lanza <stefy@nexlab.net>. A reimplementation of multiagents by Arman
+Andreasyan, whose design it inherits.

@@ -165,6 +165,19 @@
   @media (max-width: 620px) {
     .msg { grid-template-columns: 52px 14px minmax(0, 1fr); }
     th.hide, td.hide { display: none; }
+    /* A table with eight columns on a 390px screen is unreadable however it
+       is squeezed. Let it scroll sideways instead, keep the first column in
+       view so a row can still be identified, and give cells room to wrap. */
+    .panel { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .panel table { min-width: 560px; }
+    th, td { padding: 7px 8px; }
+    td { word-break: break-word; }
+    table th:first-child, table td:first-child {
+      position: sticky; left: 0; background: var(--panel);
+      box-shadow: 1px 0 0 var(--line);
+    }
+    /* The summary is prose and wraps badly beside everything else. */
+    .feed { max-height: 56vh; }
     /* Installed on a phone this is the whole app, so it gets the whole
        width, keeps clear of the notch, and gives taps something to hit. */
     body { padding: 0 10px env(safe-area-inset-bottom) 10px; }
@@ -236,6 +249,8 @@
     <button id="renameBtn" class="tiny" title="Rename this session">rename</button>
     <button id="newBtn" class="tiny" title="Start a new session">new</button>
     <button id="addBtn" class="tiny" title="Launch an agent on a machine">add agent</button>
+    <button id="installBtn" class="tiny" hidden onclick="installApp()"
+            title="Install this as an app on this device">install</button>
     <span class="spacer"></span>
     <span class="tiny muted" id="hubInfo"></span>
     <span class="dot" id="liveDot" title="polling"></span>
@@ -324,6 +339,33 @@ function currentSession() {
 // a stale view of a fleet is worse than no view.
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+
+// Android buries "install" in a menu, and only offers it at all once the
+// browser is satisfied. Catch the event and put a button where it can be
+// seen.
+let installPrompt = null;
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  const b = document.getElementById("installBtn");
+  if (b) b.hidden = false;
+});
+window.addEventListener("appinstalled", () => {
+  installPrompt = null;
+  const b = document.getElementById("installBtn");
+  if (b) b.hidden = true;
+});
+async function installApp() {
+  if (!installPrompt) {
+    note("Your browser has not offered to install this. On iOS use Share \u2192 Add to Home Screen.");
+    return;
+  }
+  installPrompt.prompt();
+  await installPrompt.userChoice.catch(() => {});
+  installPrompt = null;
+  const b = document.getElementById("installBtn");
+  if (b) b.hidden = true;
 }
 
 let snap = null, failures = 0, timer = null;
@@ -486,6 +528,17 @@ $("forget").addEventListener("click", async () => {
 // Which seat is being renamed right now, if any. The poll leaves the view
 // alone while this is set.
 let editingSeat = null;
+
+// Is the person typing into something the poll would destroy? A rebuild
+// takes the focused element with it, and the keyboard goes with the
+// element.
+function typingInView() {
+  const el = document.activeElement;
+  if (!el || !$("view")) return false;
+  const editable = el.tagName === "INPUT" || el.tagName === "TEXTAREA"
+    || el.tagName === "SELECT" || el.isContentEditable;
+  return editable && $("view").contains(el);
+}
 
 // Column sorting for the agents table. Kept outside the render so it
 // survives the poll, which would otherwise reset the order every few
@@ -781,12 +834,13 @@ function render() {
     focus: document.activeElement ? document.activeElement.id : null,
   };
 
-  // An open rename owns the view until it is finished. The poll rebuilds
-  // this element wholesale, which destroyed the input mid-keystroke: the
-  // field simply vanished a second or two after it was clicked, which looks
-  // exactly like a rename that does not work. Everything above -- the tiles,
-  // the counts -- still refreshes.
-  if (!editingSeat) {
+  // Anything being typed owns the view until it is finished. The poll
+  // rebuilds this element wholesale, which destroys whatever has focus --
+  // the rename field vanished mid-keystroke, and on Android the soft
+  // keyboard opened and shut again within a second or two, because the
+  // input it belonged to had ceased to exist. Everything above -- the
+  // tiles, the counts -- still refreshes.
+  if (!editingSeat && !typingInView()) {
     $("view").innerHTML = (!d && tab !== "fleet")
       ? `<div class="panel"><div class="empty">No sessions yet. Press
            <strong>new</strong> above, or pair a machine on the
@@ -852,7 +906,7 @@ function viewAgents(d, now) {
             ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}</td>
         <td class="muted">${esc(a.summary) || "<span class=tiny>—</span>"}</td>
       </tr>`;
-    }).join("") + "</tbody></table>");
+    }).join("") + "</tbody></table>") + tidy;
 }
 
 // The whole fleet's traffic, read like a chat log.
@@ -861,11 +915,29 @@ function viewAgents(d, now) {
 // session it belongs to -- because a fleet is several conversations at once
 // and reading them one session at a time loses the thing you actually want
 // to see, which is what happened when.
+// Retiring seats nobody is in. Deliberately a button: the hub must not
+// guess which dead seat was a restart and which is a conversation that
+// might still come back.
+async function tidySeats() {
+  if (!needOneSession("retiring seats")) return;
+  const sid = currentSession();
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/seats/tidy`, {});
+    if (r && r.error) throw new Error(r.error);
+    note(r.retired ? `Retired ${r.retired} empty seat(s).`
+                   : "Nothing to retire: no empty seat has been replaced.");
+  } catch (e) {
+    note(e.message || "could not retire those");
+  }
+  tick();
+}
+
 function viewMessages(d, now) {
   const all = isAll();
   const unclaimed = (d.messages || []).filter((m) => !m.claimed).length;
   const bar = `<div class="composer">
       ${all ? `<select id="sendTo" title="session to send to">` +
+               `<option value="*">every session</option>` +
                (snap.sessions || []).map((x) =>
                  `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join("") +
                `</select>` : ""}
@@ -1088,12 +1160,27 @@ async function sendOperatorMessage() {
   const sid = isAll() ? ($("sendTo") || {}).value : currentSession();
   if (!sid) { note("Pick a session to send to."); return; }
   box.value = "";
-  try {
-    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/messages`, { text });
-    if (r && r.error) throw new Error(r.error);
-  } catch (e) {
+  // "every session" is one message to each team, not a message to a session
+  // called "*": each team has its own log, and a message belongs in one.
+  const targets = sid === "*"
+    ? (snap.sessions || []).map((x) => x.id)
+    : [sid];
+  const failed = [];
+  for (const t of targets) {
+    try {
+      const r = await post(`/v1/sessions/${encodeURIComponent(t)}/messages`, { text });
+      if (r && r.error) throw new Error(r.error);
+    } catch (e) {
+      failed.push(t);
+    }
+  }
+  if (failed.length === targets.length) {
     box.value = text;
-    note(e.message || "could not send that");
+    note("Could not send that.");
+  } else if (failed.length) {
+    note(`Sent, except to ${failed.length} session(s).`);
+  } else if (targets.length > 1) {
+    note(`Sent to all ${targets.length} sessions.`);
   }
   tick();
 }

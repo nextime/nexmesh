@@ -22,6 +22,18 @@ Two addresses on the hub on purpose. Loopback is for nginx; the LAN address is
 for the machines. **Not `0.0.0.0`** — machine-a has public addresses on `wan0`,
 so a wildcard bind would put an API that starts processes on the internet.
 
+## Manual pages
+
+```bash
+install -Dm644 docs/man/nexmesh.1 /usr/local/share/man/man1/nexmesh.1
+mandb -q 2>/dev/null || true
+man nexmesh
+```
+
+Worth doing on every machine an operator types on, not just the hub: the
+page is mostly about which argument is which, and that is what you need at
+the terminal rather than in a browser.
+
 ## 1. Binaries
 
 Built static against musl, generic CPU. machine-a is a Celeron J1900 with **no

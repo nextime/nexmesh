@@ -657,6 +657,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/workspaces", post(api::add_workspace))
         .route("/v1/slots/:id/name", post(api::rename_slot))
         .route("/v1/sessions/:id/messages/clear", post(api::clear_unclaimed))
+        .route("/v1/sessions/:id/seats/tidy", post(api::tidy_seats))
         // A person at the dashboard using the fleet's own services --
         // transcription, speech -- rather than only agents being able to.
         .route("/v1/capabilities/ask", post(api::operator_ask))
@@ -705,6 +706,7 @@ async fn main() -> Result<()> {
         // anything about the fleet.
         .route("/manifest.webmanifest", get(dashboard::manifest))
         .route("/icon.svg", get(dashboard::app_icon))
+        .route("/:icon_png", get(dashboard::app_icon_png))
         .route("/sw.js", get(dashboard::service_worker))
         .route("/healthz", get(api::health))
         // Signing in cannot itself require being signed in. These three are
