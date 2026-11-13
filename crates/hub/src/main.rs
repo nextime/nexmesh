@@ -48,7 +48,7 @@ use clap::{Parser, Subcommand};
 /// Where a hub keeps its database when nobody says otherwise.
 const DEFAULT_DB: &str = "~/.nexmesh/hub.db";
 use nexmesh_proto::now_ms;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use state::{random_token, sha256_hex, AppState};
 use std::net::SocketAddr;
 
@@ -141,7 +141,14 @@ enum Cmd {
     /// Revoke a node's tokens.
     Revoke { node_name: String },
     /// Mint an operator token: full control of the fleet. Printed once.
-    OperatorToken { label: String },
+    OperatorToken {
+        label: String,
+        /// Confine this token to one session, by id or name: it drives that
+        /// team and cannot see, touch or discover the rest of the fleet.
+        /// Omitted, the token is a SUPER orchestrator's -- the whole fleet.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Revoke operator tokens by label.
     RevokeOperator { label: String },
     /// List operator tokens (labels and last use, never the tokens).
@@ -417,19 +424,50 @@ async fn main() -> Result<()> {
             println!("\nShown once. This token may call team tools; it cannot spawn processes.");
             return Ok(());
         }
-        Some(Cmd::OperatorToken { label }) => {
+        Some(Cmd::OperatorToken { label, session }) => {
             let token = random_token(48);
             let db = st.db.lock().unwrap();
+            // A scope has to name a session that exists. Minting a token for
+            // a typo would produce a credential that authenticates perfectly
+            // and can reach nothing, which is a bad half-hour for whoever
+            // holds it.
+            let scope: Option<String> = match session.as_deref() {
+                Some(given) => Some(
+                    db.query_row(
+                        "SELECT id FROM sessions WHERE id = ?1 OR name = ?1
+                          ORDER BY (id = ?1) DESC LIMIT 1",
+                        [given],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .with_context(|| format!(
+                        "no session '{given}'; `nexmesh-hub --db <db> sessions` or the \
+                         dashboard lists them"
+                    ))?,
+                ),
+                None => None,
+            };
             db.execute(
-                "INSERT INTO operator_tokens (token_sha256, label, issued_at_ms) VALUES (?,?,?)",
-                params![sha256_hex(&token), label, now_ms()],
+                "INSERT INTO operator_tokens (token_sha256, label, session_id, issued_at_ms)
+                 VALUES (?,?,?,?)",
+                params![sha256_hex(&token), label, scope, now_ms()],
             )?;
             println!("operator: {label}");
             println!("token:    {token}");
+            match &scope {
+                Some(id) => println!("scope:    {id} (this session only)"),
+                None => println!("scope:    the whole fleet (super orchestrator)"),
+            }
             println!("\nShown once; the hub stores only its SHA-256.");
             println!("Use it with:  export NEXMESH_OPERATOR_TOKEN={token}");
-            println!("\nThis token can spawn processes on every node and attach to any");
-            println!("agent's terminal. Treat it like an ssh key.");
+            if scope.is_some() {
+                println!("\nThis token drives one session. It cannot create sessions, list");
+                println!("machines, move a seat to another session, or learn that any other");
+                println!("session exists. To reach past it, message the super orchestrators.");
+            } else {
+                println!("\nThis token can spawn processes on every node and attach to any");
+                println!("agent's terminal. Treat it like an ssh key.");
+            }
             return Ok(());
         }
         Some(Cmd::RevokeOperator { label }) => {
@@ -618,6 +656,10 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
         .route("/v1/sessions/:id/workspaces", post(api::add_workspace))
         .route("/v1/slots/:id/name", post(api::rename_slot))
+        // The operator channel. Not session-scoped on purpose: it is how a
+        // scoped orchestrator reaches past its own session, which is the one
+        // thing it is otherwise unable to do.
+        .route("/v1/operator/messages", post(api::operator_note).get(api::operator_inbox))
         .route("/v1/sessions/:id/pause", post(api::pause))
         .route("/v1/sessions/:id/budget", post(api::set_budget))
         .route("/v1/sessions/:id/groups", post(api::set_group))

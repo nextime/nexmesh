@@ -12,6 +12,7 @@
 //! that carried it, so the two must name the same operator. See `peer.rs`.
 
 use crate::state::AppState;
+use rusqlite::OptionalExtension;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
@@ -31,6 +32,83 @@ pub fn bearer(headers: &HeaderMap) -> Option<String> {
     scheme.eq_ignore_ascii_case("bearer").then(|| value.trim().to_string())
 }
 
+/// How far a scoped operator may reach, decided from the path it is asking for.
+///
+/// In the middleware rather than in each handler, for the reason this module
+/// already gives: a route added later is covered without anyone having to
+/// remember. A scoped orchestrator drives ONE session, so it may not name
+/// another, may not touch a seat belonging to another, and may not do the
+/// things that are about the fleet rather than about a team -- creating a
+/// session, listing machines, moving a seat between two sessions.
+///
+/// Returns Err with the reason when the request is out of reach.
+fn within_scope(st: &AppState, op: &crate::state::Operator, req: &Request) -> Result<(), String> {
+    let Some(scope) = op.session.clone() else { return Ok(()) };
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // Fleet-wide surfaces: a scoped orchestrator has no business here.
+    let fleet_only = matches!(
+        seg.as_slice(),
+        ["v1", "nodes", ..] | ["v1", "certs", ..] | ["v1", "revoke", ..] | ["v1", "pair", ..]
+    );
+    if fleet_only {
+        return Err(format!(
+            "this token is scoped to one session, and {path} is about the whole fleet; \
+             ask a super orchestrator"
+        ));
+    }
+    if seg.as_slice() == ["v1", "sessions"] && method == axum::http::Method::POST {
+        return Err("creating a session needs a super orchestrator's token".to_string());
+    }
+
+    let db = st.db.lock().unwrap();
+    // /v1/sessions/<ref>/...
+    if let ["v1", "sessions", given, ..] = seg.as_slice() {
+        let id: Option<String> = db
+            .query_row(
+                "SELECT id FROM sessions WHERE id = ?1 OR name = ?1 ORDER BY (id = ?1) DESC LIMIT 1",
+                [given],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        // An unknown name is the handler's to answer, not ours to leak a
+        // judgement about: saying "out of scope" would tell a scoped token
+        // that some other session has that name.
+        if let Some(id) = id {
+            if id != scope {
+                return Err("that session is not the one this token drives".to_string());
+            }
+        }
+        return Ok(());
+    }
+    // /v1/slots/<id>/... -- a seat belongs to a session, so the seat decides.
+    if let ["v1", "slots", slot, rest @ ..] = seg.as_slice() {
+        let owner: Option<String> = db
+            .query_row("SELECT session_id FROM slots WHERE id = ?", [slot], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(owner) = owner {
+            if owner != scope {
+                return Err("that seat is in a session this token does not drive".to_string());
+            }
+        }
+        // Moving a seat BETWEEN sessions is how the fleet is arranged, and
+        // the destination is by definition somewhere this token cannot see.
+        if rest.first() == Some(&"move") {
+            return Err(
+                "moving a seat to another session needs a super orchestrator's token".to_string()
+            );
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
 pub async fn require_operator(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -44,6 +122,9 @@ pub async fn require_operator(
     // loopback, which `main` enforces at startup, so this cannot silently
     // expose a fleet.
     if !st.operator_auth_configured() {
+        let mut req = req;
+        req.extensions_mut()
+            .insert(std::sync::Arc::new(crate::state::Operator::super_as("anonymous")));
         return next.run(req).await;
     }
     // A signed-in dashboard session counts. The account authenticates a
@@ -65,6 +146,10 @@ pub async fn require_operator(
                     }
                 }
                 tracing::debug!(%user, path = %req.uri().path(), "authorised by session");
+                // A person signed in to the dashboard sees the whole fleet.
+                let mut req = req;
+                req.extensions_mut()
+                    .insert(std::sync::Arc::new(crate::state::Operator::super_as(&user)));
                 return next.run(req).await;
             }
         }
@@ -83,8 +168,9 @@ pub async fn require_operator(
         )
             .into_response();
     };
-    match st.authenticate_operator(&token) {
-        Some(label) => {
+    match st.operator_identity(&token) {
+        Some(op) => {
+            let label = op.label.clone();
             // A valid token is not enough under mutual TLS: it has to have
             // arrived on that operator's own connection.
             if st.identity_binding() {
@@ -97,7 +183,19 @@ pub async fn require_operator(
                         .into_response();
                 }
             }
-            tracing::debug!(operator = %label, path = %req.uri().path(), "authorised");
+            // A scoped token reaches one session and no further.
+            if let Err(why) = within_scope(&st, &op, &req) {
+                tracing::warn!(operator = %label, scope = ?op.session,
+                    path = %req.uri().path(), "rejected: out of scope");
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": why })))
+                    .into_response();
+            }
+            tracing::debug!(operator = %label, scope = ?op.session,
+                path = %req.uri().path(), "authorised");
+            // Handlers that list things have to filter by reach, and a
+            // handler cannot ask the token: it never sees the header.
+            let mut req = req;
+            req.extensions_mut().insert(std::sync::Arc::new(op));
             next.run(req).await
         }
         None => {

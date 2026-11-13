@@ -332,6 +332,54 @@ async fn call_tool(hub: &Hub, name: &str, a: &Value) -> Result<String> {
             Ok(format!("{sid} is now \"{}\".", v["name"].as_str().unwrap_or(&name)))
         }
 
+        "message_supervisor" => {
+            let text = need(a, "text")?;
+            let v = hub.post("/v1/operator/messages", json!({ "text": text })).await?;
+            if let Some(e) = v["error"].as_str() {
+                anyhow::bail!("{e}");
+            }
+            Ok("Sent to the supervisors. They read it with read_operator_messages; \
+                check for an answer the same way."
+                .to_string())
+        }
+
+        "message_orchestrator" => {
+            let session = need(a, "session")?;
+            let text = need(a, "text")?;
+            let v = hub
+                .post("/v1/operator/messages", json!({ "text": text, "to": session }))
+                .await?;
+            if let Some(e) = v["error"].as_str() {
+                anyhow::bail!("{e}");
+            }
+            Ok(format!("Sent to whoever is driving '{session}'."))
+        }
+
+        "read_operator_messages" => {
+            let limit = a.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+            let v = hub.get(&format!("/v1/operator/messages?limit={limit}")).await?;
+            let empty = vec![];
+            let msgs = v["messages"].as_array().unwrap_or(&empty);
+            if msgs.is_empty() {
+                return Ok(format!(
+                    "No notes. You are '{}', scope: {}.",
+                    v["as"].as_str().unwrap_or("?"),
+                    v["scope"].as_str().unwrap_or("?")
+                ));
+            }
+            let mut out = format!("{} note(s):\n", msgs.len());
+            for m in msgs {
+                let from = m["from"].as_str().unwrap_or("?");
+                match m["from_session"].as_str() {
+                    Some(fs) => out.push_str(&format!("- {from} (driving {fs}): ")),
+                    None => out.push_str(&format!("- {from} (supervisor): ")),
+                }
+                out.push_str(m["text"].as_str().unwrap_or(""));
+                out.push('\n');
+            }
+            Ok(out)
+        }
+
         "rename_agent" => {
             let who = need(a, "who")?;
             let name = need(a, "name")?;

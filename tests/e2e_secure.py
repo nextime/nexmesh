@@ -187,7 +187,88 @@ def main():
     check("nexmesh without the CA cert refuses to trust the hub",
           r.returncode != 0, (r.stdout + r.stderr)[-200:])
 
-    print("\n=== 9. revocation takes effect ===")
+    print("\n=== 9. an orchestrator scoped to one session cannot reach past it ===")
+    # Two sessions, a token confined to the first, and every way out tried.
+    sa = https("POST", "/v1/sessions", {"name": "alpha"}, token=optok)[1]["session_id"]
+    sb = https("POST", "/v1/sessions", {"name": "beta"}, token=optok)[1]["session_id"]
+    scoped_out = hub_cli("operator-token", "alpha-lead", "--session", "alpha").stdout
+    scoped = next((l.split()[-1] for l in scoped_out.splitlines()
+                   if l.startswith("token:")), None)
+    check("a scoped token can be minted", bool(scoped), scoped_out[-200:])
+    check("and it says what its reach is",
+          "this session only" in scoped_out, scoped_out[-300:])
+    r = hub_cli("operator-token", "nowhere-lead", "--session", "no-such-session")
+    check("scoping to a session that does not exist is refused, not minted",
+          r.returncode != 0 and "no session" in (r.stdout + r.stderr),
+          (r.stdout + r.stderr)[-200:])
+
+    s1, j1 = https("GET", f"/v1/sessions/{sa}/status", token=scoped)
+    check("it can read its own session", s1 == 200, f"{s1} {j1}")
+    s2, j2 = https("GET", f"/v1/sessions/{sb}/status", token=scoped)
+    check("but not another session's", s2 == 403, f"{s2} {j2}")
+    s3, j3 = https("GET", "/v1/sessions", token=scoped)
+    names = [x.get("name") for x in j3.get("sessions", [])]
+    check("and the fleet's other sessions are not even listed to it",
+          names == ["alpha"], str(names))
+    s4, j4 = https("GET", "/v1/nodes", token=scoped)
+    check("machines are a fleet matter, so it is refused", s4 == 403, f"{s4} {j4}")
+    s5, j5 = https("POST", "/v1/sessions", {"name": "gamma"}, token=scoped)
+    check("creating a session needs a super", s5 == 403, f"{s5} {j5}")
+    s6, j6 = https("GET", "/v1/certs", token=scoped)
+    check("certificates are a fleet matter too", s6 == 403, f"{s6} {j6}")
+
+    # A seat belongs to a session, so the seat decides -- a scoped token must
+    # not reach one through the /v1/slots path either.
+    slot_b = https("POST", f"/v1/sessions/{sb}/slots",
+                   {"cli_id": "handmade", "display_name": "Theirs", "role": "tester",
+                    "mode": "interactive"}, token=optok)[1].get("slot_id")
+    if slot_b:
+        s7, j7 = https("POST", f"/v1/slots/{slot_b}/name", {"name": "Mine"}, token=scoped)
+        check("a seat in another session cannot be touched by its id",
+              s7 == 403, f"{s7} {j7}")
+    slot_a = https("POST", f"/v1/sessions/{sa}/slots",
+                   {"cli_id": "handmade", "display_name": "Ours", "role": "tester",
+                    "mode": "interactive"}, token=scoped)[1].get("slot_id")
+    check("while a seat in its own session can be added", bool(slot_a), str(slot_a))
+    if slot_a:
+        s8, j8 = https("POST", f"/v1/slots/{slot_a}/name", {"name": "Renamed"}, token=scoped)
+        check("and renamed", s8 == 200, f"{s8} {j8}")
+        s9, j9 = https("POST", f"/v1/slots/{slot_a}/move", {"session": "beta"}, token=scoped)
+        check("but moving a seat between sessions needs a super",
+              s9 == 403, f"{s9} {j9}")
+    # Naming a session that does not exist must not reveal whether some other
+    # session owns that name: it gets the ordinary answer, not "out of scope".
+    s10, j10 = https("GET", "/v1/sessions/not-a-session-here/status", token=scoped)
+    check("an unknown session name leaks nothing about scope",
+          s10 == 200 and j10.get("agents") == [], f"{s10} {j10}")
+
+    print("\n=== 10. a scoped orchestrator can reach the supervisors ===")
+    s, j = https("POST", "/v1/operator/messages",
+                 {"text": "alpha needs a GPU machine it cannot see"}, token=scoped)
+    check("it can send a note to the supers", s == 200 and j.get("to") == "supers", f"{s} {j}")
+    s, j = https("POST", "/v1/operator/messages",
+                 {"text": "to beta please", "to": "beta"}, token=scoped)
+    check("but it cannot address another session directly", s == 400, f"{s} {j}")
+    s, j = https("GET", "/v1/operator/messages", token=optok)
+    texts = [m.get("text") for m in j.get("messages", [])]
+    check("a super reads what was sent to the supers",
+          any("GPU machine" in t for t in texts), str(texts)[:200])
+    check("and sees which session it came from",
+          any(m.get("from_session") == sa for m in j.get("messages", [])), str(j)[:300])
+    s, j = https("GET", "/v1/operator/messages", token=optok)
+    check("reading advances that operator's cursor, so it is not served twice",
+          j.get("messages") == [], str(j)[:200])
+    s, j = https("POST", "/v1/operator/messages",
+                 {"text": "no GPU today, use zeiss tomorrow", "to": "alpha"}, token=optok)
+    check("a super can answer one session's orchestrator", s == 200, f"{s} {j}")
+    s, j = https("GET", "/v1/operator/messages", token=scoped)
+    texts = [m.get("text") for m in j.get("messages", [])]
+    check("and the scoped orchestrator reads the answer",
+          any("zeiss tomorrow" in t for t in texts), str(texts)[:200])
+    check("while never being shown notes addressed elsewhere",
+          all(m.get("to_session") == sa for m in j.get("messages", [])), str(j)[:300])
+
+    print("\n=== 11. revocation takes effect ===")
     hub_cli("revoke-operator", "machine-b")
     s, j = https("GET", "/v1/nodes", token=optok)
     check("a revoked operator token stops working", s == 401, f"{s} {j}")

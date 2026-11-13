@@ -856,6 +856,62 @@ than editing a config format that may change underneath us; for opencode, whose
 `mcp add` is interactive and so unscriptable, it writes the documented config
 instead. Either way the token never appears in the output, including `--dry-run`.
 
+## Orchestrators, scoped and super
+
+Driving a fleet and driving a team are different jobs, and an operator token
+now says which one it is for:
+
+```bash
+nexmesh-hub operator-token sentenze-lead --session digesta   # one team
+nexmesh-hub operator-token fleet-boss                        # the whole fleet
+```
+
+A **scoped** orchestrator drives one session. It never has to name that
+session — it is the only one it can see — and it cannot name another. It may
+add, rename, pause, release and message the agents in its own team, read its
+own log, and sync its own workspace. It may not create a session, list the
+machines, touch the certificates, move a seat to another session, or *learn
+that any other session exists*: `list_sessions` returns its own and nothing
+else, because a list of names is how you would go looking for something to
+ask for.
+
+A **super** orchestrator is the fleet: every session, and the only one that
+can arrange who is where. There can be as many as you like — the orchestrator
+is a stateless MCP client, so it is the token that carries the authority, and
+each one can be revoked on its own. A signed-in dashboard account is a super,
+because a person at the dashboard is looking at the whole fleet.
+
+This is enforced in the authentication middleware rather than in each
+handler, for the same reason authentication is: a route added later is
+covered without anyone having to remember. One deliberate subtlety — a
+scoped token naming a session that does not exist gets the ordinary "no such
+session", not a refusal. Saying "out of scope" there would confirm that some
+*other* session owns that name, which is exactly what scoping hides.
+
+### Asking for what you cannot see
+
+A scoped orchestrator that needs something outside its own team has one way
+out, and it is the honest one: ask somebody whose reach is wider.
+
+| tool | who uses it |
+|---|---|
+| `message_supervisor` | a scoped orchestrator, to the supers |
+| `message_orchestrator` | a super, to one session's orchestrator |
+| `read_operator_messages` | either, for its own notes |
+
+It does not need to know who the supervisors are — "the supers" is an
+address, not a person, so one can be added or revoked without telling
+anybody. The read cursor is per operator, so two supervisors each see a
+request rather than the first reader consuming it. And a scoped orchestrator
+addressing another session directly is refused rather than quietly
+redirected: believing you reached a team you cannot address is worse than
+being told you cannot.
+
+This channel is between the programs *driving* sessions. The agents inside
+them still cannot see or address each other across a session — that wall is
+what makes a session a unit of isolation, with its own locks, budget, log and
+inbox.
+
 ## The web dashboard
 
 Served by the hub itself, with no CDN and no external fonts: one page, inline.

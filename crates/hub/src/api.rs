@@ -9,6 +9,7 @@
 use crate::{state::AppState, tools};
 use axum::{
     extract::{Path, Query, State},
+    Extension,
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -451,17 +452,24 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
     Ok(Json(json!({ "session_id": id, "name": req.name })))
 }
 
-pub async fn list_sessions(State(st): State<AppState>) -> Json<Value> {
+pub async fn list_sessions(
+    State(st): State<AppState>,
+    op: Option<Extension<std::sync::Arc<crate::state::Operator>>>,
+) -> Json<Value> {
+    // A scoped orchestrator is told about its own session and no other. Not
+    // merely barred from driving them -- it cannot learn that they exist,
+    // because a list of names is how you would find something to ask for.
+    let scope = op.and_then(|Extension(o)| o.session.clone());
     let db = st.db.lock().unwrap();
     let Ok(mut stmt) = db.prepare(
         "SELECT s.id, s.name, s.status, s.created_at_ms,
                 (SELECT COUNT(*) FROM slots WHERE session_id = s.id)
-         FROM sessions s ORDER BY s.created_at_ms DESC",
+         FROM sessions s WHERE (?1 IS NULL OR s.id = ?1) ORDER BY s.created_at_ms DESC",
     ) else {
         return Json(json!({ "sessions": [] }));
     };
     let rows: Vec<Value> = stmt
-        .query_map([], |r| {
+        .query_map([&scope], |r| {
             Ok(json!({
                 "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
                 "status": r.get::<_, String>(2)?, "created_at_ms": r.get::<_, i64>(3)?,
@@ -899,6 +907,131 @@ pub async fn release(
         Ok(detail) => Ok(Json(json!({ "ok": true, "detail": detail }))),
         Err(e) => Err(bad(format!("{e:#}"))),
     }
+}
+
+#[derive(Deserialize)]
+pub struct OperatorNote {
+    pub text: String,
+    /// A super addressing one session's orchestrator. Omitted by a scoped
+    /// orchestrator, which can only address the supers.
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// The operator channel: send.
+///
+/// A scoped orchestrator cannot see that another session exists, so when it
+/// needs something from outside its own team the honest thing it can do is
+/// ask whoever can see the fleet. It does not have to know who they are --
+/// "the supers" is an address, not a person -- which also means a super can
+/// be added or revoked without telling anybody.
+pub async fn operator_note(
+    State(st): State<AppState>,
+    Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
+    Json(req): Json<OperatorNote>,
+) -> ApiResult {
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err(bad("text must not be empty"));
+    }
+    let db = st.db.lock().unwrap();
+    // A scoped orchestrator writes to the supers, whatever it asks for; a
+    // super writes to a named session's orchestrator, or to the supers.
+    let to_session: Option<String> = match (&op.session, req.to.as_deref()) {
+        // Silently redirecting a scoped orchestrator's message to the supers
+        // would have it believe it had reached a session it cannot address.
+        // Better to say so.
+        (Some(_), Some(t)) => {
+            return Err(bad(format!(
+                "this token drives one session and cannot address '{t}'; send without 'to' \
+                 and the super orchestrators will see it"
+            )))
+        }
+        (Some(_), None) => None,
+        (None, Some(t)) => Some(
+            db.query_row(
+                "SELECT id FROM sessions WHERE id = ?1 OR name = ?1 ORDER BY (id = ?1) DESC LIMIT 1",
+                [t],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(bad)?
+            .ok_or_else(|| bad(format!("no session '{t}'")))?,
+        ),
+        (None, None) => None,
+    };
+    db.execute(
+        "INSERT INTO operator_messages (from_label, from_session, to_session, body, sent_at_ms)
+         VALUES (?,?,?,?,?)",
+        params![op.label, op.session, to_session, text, now_ms()],
+    )
+    .map_err(bad)?;
+    Ok(Json(json!({
+        "sent": true,
+        "to": match &to_session { Some(s) => json!(s), None => json!("supers") },
+    })))
+}
+
+/// The operator channel: read, and advance this operator's cursor.
+///
+/// A super reads everything addressed to the supers plus anything addressed
+/// to it; a scoped orchestrator reads only what was addressed to its own
+/// session. Nothing here lets a scoped token learn another session's name.
+pub async fn operator_inbox(
+    State(st): State<AppState>,
+    Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
+    Query(q): Query<LogQuery>,
+) -> Json<Value> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let db = st.db.lock().unwrap();
+    let after = match q.after {
+        Some(a) => a,
+        None => db
+            .query_row("SELECT last_id FROM operator_read_cursor WHERE label = ?", [&op.label],
+                       |r| r.get::<_, i64>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+    };
+    // One statement, three bindings, whichever kind of operator is asking.
+    // Two statements with different parameter counts is how the super's inbox
+    // came back empty: the extra binding made query_map fail, and an empty
+    // list is indistinguishable from "no messages" to whoever is reading.
+    let Ok(mut stmt) = db.prepare(
+        "SELECT id, from_label, from_session, to_session, body, sent_at_ms
+           FROM operator_messages
+          WHERE id > ?1
+            AND ((?3 = '' AND to_session IS NULL) OR (?3 <> '' AND to_session = ?3))
+          ORDER BY id LIMIT ?2",
+    ) else {
+        return Json(json!({ "messages": [] }));
+    };
+    let scope = op.session.clone().unwrap_or_default();
+    let rows: Vec<Value> = stmt
+        .query_map(params![after, limit, scope], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "from": r.get::<_, String>(1)?,
+                "from_session": r.get::<_, Option<String>>(2)?,
+                "to_session": r.get::<_, Option<String>>(3)?,
+                "text": r.get::<_, String>(4)?,
+                "sent_at_ms": r.get::<_, i64>(5)?,
+            }))
+        })
+        .and_then(|m| m.collect())
+        .unwrap_or_default();
+    // Reading is what marks them read; a cursor per operator, so two supers
+    // each see a message once rather than one of them seeing it at all.
+    if let Some(last) = rows.last().and_then(|r| r["id"].as_i64()) {
+        let _ = db.execute(
+            "INSERT INTO operator_read_cursor (label, last_id) VALUES (?1, ?2)
+             ON CONFLICT(label) DO UPDATE SET last_id = MAX(last_id, ?2)",
+            params![op.label, last],
+        );
+    }
+    Json(json!({ "messages": rows, "as": op.label,
+                 "scope": match &op.session { Some(s) => json!(s), None => json!("fleet") } }))
 }
 
 pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<String>) -> Json<Value> {

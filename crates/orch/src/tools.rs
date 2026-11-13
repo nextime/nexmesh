@@ -178,6 +178,38 @@ pub fn tools() -> Vec<Tool> {
             }, "required": ["name"], "additionalProperties": false }),
         },
         Tool {
+            name: "message_supervisor",
+            description: "Send a note to the orchestrators who can see the whole fleet. Use \
+                          this when what you need is outside your own session: another team's \
+                          help, a seat moved in or out, a session created, a machine you \
+                          cannot see. You do not need to know who the supervisors are -- they \
+                          may change, and the message finds them.",
+            schema: json!({ "type": "object", "properties": {
+                "text": s("What you need, and why. Say which session you are speaking for")
+            }, "required": ["text"], "additionalProperties": false }),
+        },
+        Tool {
+            name: "message_orchestrator",
+            description: "Answer, or instruct, the orchestrator driving one session. For \
+                          supervisors: a session-scoped orchestrator cannot see the fleet, so \
+                          this is how it is told what was decided.",
+            schema: json!({ "type": "object", "properties": {
+                "session": s("Session whose orchestrator should read this"),
+                "text": s("The message")
+            }, "required": ["session", "text"], "additionalProperties": false }),
+        },
+        Tool {
+            name: "read_operator_messages",
+            description: "Notes between orchestrators -- requests from session-scoped \
+                          orchestrators if you supervise the fleet, answers from supervisors \
+                          if you drive one session. Separate from read_log, which is what the \
+                          AGENTS in a session said to each other. Reading marks them read for \
+                          you alone, so two supervisors each see a request.",
+            schema: json!({ "type": "object", "properties": {
+                "limit": { "type": "integer", "description": "Most recent N (default 100)" }
+            }, "additionalProperties": false }),
+        },
+        Tool {
             name: "rename_agent",
             description: "Rename an agent. A name is not decoration: it is how you address an \
                           agent in every other tool, how it is addressed in messages, and what \
