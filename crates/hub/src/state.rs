@@ -167,6 +167,21 @@ fn migrate(conn: &Connection) -> Result<()> {
             communities INTEGER NOT NULL DEFAULT 0)",
     )?;
 
+    // The CLI's own conversation id, for seats that follow a conversation
+    // rather than a directory. Added after the fact: an existing hub must
+    // keep its slots.
+    let _ = conn.execute("ALTER TABLE slots ADD COLUMN cli_session TEXT", []);
+    // Guarded: migrate() also runs against databases predating most of this
+    // schema, where `slots` may not have session_id yet. An index naming a
+    // column that is not there fails the whole migration.
+    if has_column(conn, "slots", "session_id")? && has_column(conn, "slots", "cli_session")? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS slots_cli_session_idx
+                ON slots(session_id, cli_session)",
+        )?;
+    }
+
+
     // Carry any rows from the original flat `knowledge` table into session
     // scope. An upgraded hub must not look as though it forgot everything.
     // Runs once: the INSERT ignores keys memory already has.
@@ -748,6 +763,20 @@ impl AppState {
         let _ = db.execute(
             "UPDATE agents SET status = 'lost' WHERE node_id = ? AND exited_at_ms IS NULL",
             [node_id],
+        );
+        // An ATTACHED agent reaches the hub through this node's unix socket,
+        // so when the node goes the shim is gone with it -- there is no
+        // process left to come back to that seat. Saying so is what lets the
+        // next connection reclaim the seat instead of taking a new one: a
+        // node restart used to leave a seat occupied by nobody, and three
+        // restarts left three of them, all called the same thing.
+        //
+        // A MANAGED agent is left merely lost: its process may well still be
+        // running, and the node can adopt it again when it returns.
+        let _ = db.execute(
+            "UPDATE agents SET exited_at_ms = ?
+              WHERE node_id = ? AND exited_at_ms IS NULL AND provenance = 'attached'",
+            params![now_ms(), node_id],
         );
         let _ = db.execute(
             "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL

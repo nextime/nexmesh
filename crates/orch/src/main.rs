@@ -325,6 +325,56 @@ async fn call_tool(hub: &Hub, name: &str, a: &Value) -> Result<String> {
             Ok(v["detail"].as_str().unwrap_or("done").to_string())
         }
 
+        "rename_session" => {
+            let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
+            let name = need(a, "name")?;
+            let v = hub.post(&format!("/v1/sessions/{sid}/name"), json!({ "name": name })).await?;
+            Ok(format!("{sid} is now \"{}\".", v["name"].as_str().unwrap_or(&name)))
+        }
+
+        "move_agent" => {
+            let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
+            let who = need(a, "who")?;
+            // Addressed by name, because that is what the orchestrator's own
+            // team_status shows; a slot id is an internal handle.
+            let st = hub.get(&format!("/v1/sessions/{sid}/status")).await?;
+            let empty = vec![];
+            let agents = st["agents"].as_array().unwrap_or(&empty);
+            let slot = agents
+                .iter()
+                .find(|x| {
+                    x["name"].as_str().map(|n| n.eq_ignore_ascii_case(&who)).unwrap_or(false)
+                })
+                .and_then(|x| x["slot_id"].as_str().or_else(|| x["slot"].as_str()))
+                .map(|s| s.to_string());
+            let Some(slot) = slot else {
+                let names: Vec<&str> = agents.iter().filter_map(|x| x["name"].as_str()).collect();
+                anyhow::bail!("no agent called '{who}' in that session. There is: {}",
+                              if names.is_empty() { "nobody".into() } else { names.join(", ") });
+            };
+            let to = need(a, "to")?;
+            let v = hub.post(&format!("/v1/slots/{slot}/move"), json!({ "session": to })).await?;
+            let left = v["messages_left_unread"].as_i64().unwrap_or(0);
+            Ok(format!(
+                "{who} is now in {}{}{}.",
+                v["session_name"].as_str().unwrap_or(&to),
+                if left > 0 {
+                    format!(", leaving {left} message(s) unread in the old session")
+                } else {
+                    String::new()
+                },
+                {
+                    let l = v["locks_released"].as_i64().unwrap_or(0);
+                    let z = v["zones_released"].as_i64().unwrap_or(0);
+                    if l > 0 || z > 0 {
+                        format!(" ({l} lock(s) and {z} zone(s) released)")
+                    } else {
+                        String::new()
+                    }
+                }
+            ))
+        }
+
         "release_agents" => {
             let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
             let mut body = json!({});

@@ -417,9 +417,78 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                     .and_then(|m| m.collect())
                                 })
                                 .unwrap_or_default();
-                            json!({ "id": c, "n": n, "members": members })
+                            // What to call a subsystem nobody named. The
+                            // file most of it lives in beats the alphabetically
+                            // first function in it, which is how a community
+                            // came to be labelled after a test.
+                            let path: Option<String> = db
+                                .query_row(
+                                    // Skip the empty path: an external
+                                    // import is a `module:` node with no file
+                                    // of its own, and a community full of them
+                                    // would otherwise be labelled "".
+                                    "SELECT path FROM code_graph_nodes
+                                      WHERE workspace_id = ? AND community = ?
+                                        AND path <> ''
+                                      GROUP BY path ORDER BY COUNT(*) DESC, path LIMIT 1",
+                                    rusqlite::params![ws_id, c],
+                                    |r| r.get(0),
+                                )
+                                .optional()
+                                .ok()
+                                .flatten();
+                            json!({ "id": c, "n": n, "members": members, "path": path })
                         })
                         .collect();
+                    // How the subsystems depend on each other. A table of
+                    // communities says what exists; only this says what the
+                    // thing is SHAPED like, which is the question a person
+                    // opens a code graph to answer.
+                    //
+                    // Aggregated to community level deliberately: 1400 symbols
+                    // drawn at once is a hairball, 19 subsystems is a map.
+                    let mut agg: std::collections::BTreeMap<(i64, i64), (i64, bool)> =
+                        Default::default();
+                    if let Ok(mut st) = db.prepare(
+                        "SELECT a.community, b.community, e.kind, COUNT(*)
+                           FROM code_graph_edges e
+                           JOIN code_graph_nodes a
+                             ON a.workspace_id = e.workspace_id AND a.id = e.from_id
+                           JOIN code_graph_nodes b
+                             ON b.workspace_id = e.workspace_id AND b.id = e.to_id
+                          WHERE e.workspace_id = ?
+                            AND a.community IS NOT NULL AND b.community IS NOT NULL
+                            AND a.community <> b.community
+                          GROUP BY 1, 2, 3",
+                    ) {
+                        let rows = st.query_map([ws_id], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, i64>(3)?,
+                            ))
+                        });
+                        if let Ok(rows) = rows {
+                            for row in rows.flatten() {
+                                let (a, b, kind, n) = row;
+                                // `defines` and `imports` are read off the
+                                // tree; a call resolved by name is a guess,
+                                // and the drawing says which is which.
+                                let certain = kind == "defines" || kind == "imports";
+                                let e = agg.entry((a, b)).or_insert((0, false));
+                                e.0 += n;
+                                e.1 |= certain;
+                            }
+                        }
+                    }
+                    let links: Vec<Value> = agg
+                        .into_iter()
+                        .map(|((a, b), (n, certain))| {
+                            json!({ "a": a, "b": b, "n": n, "certain": certain })
+                        })
+                        .collect();
+
                     Some(json!({
                         "workspace": ws_name,
                         "workspace_id": ws_id,
@@ -429,6 +498,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         "communities": communities,
                         "counts": counts,
                         "subsystems": subsystems,
+                        "links": links,
                     }))
                 })
                 .collect();

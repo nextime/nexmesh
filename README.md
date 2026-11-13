@@ -688,6 +688,58 @@ no model tiering the hub enforces, and no agent the hub decides is better. An
 agent asks for a capability and the hub routes it, exactly as it routes every
 other message here. Composing the team stays yours.
 
+## Which session an agent joins, and moving between them
+
+A CLI launched by hand has to end up in the right session. The hub works it
+out in this order:
+
+1. `NEXMESH_SESSION`, which takes a session **name or id**.
+2. **The directory you are in** — if a session has a workspace mounted at or
+   above your working directory *on this machine*, that is the session. A
+   path is a claim about one host, so only mounts on this node count, and the
+   longest match wins.
+3. The only active session, if there is exactly one.
+4. Otherwise it refuses and names the active sessions, rather than guessing.
+
+A **seat** is a different question from a session. Several conversations can
+live in one directory — claude and opencode both keep more than one per
+project — and resuming one starts a new process with a new pid, so neither
+the directory nor the pid identifies a seat. The CLI's own conversation id
+does, and the shim reports it:
+
+| CLI | variable | verified |
+|---|---|---|
+| claude | `CLAUDE_CODE_SESSION_ID` | yes, by dumping the environment it gives an MCP server |
+| codex | `CODEX_THREAD_ID` | yes |
+| opencode | — | publishes none; falls back to directory and name |
+| anything | `NEXMESH_CLI_SESSION` | an explicit override, consulted first |
+
+So two windows on the same project get two seats, and `/resume` returns to
+its own. For a long-lived assistant that publishes no id of its own, pin one:
+set `NEXMESH_CLI_SESSION=hermes-lisa` and every reconnect reclaims that seat
+instead of taking another.
+
+A pinned identity is one process, so joining somewhere marks it gone
+everywhere else — which is what lets it **move**: point it at another session
+and it takes, or returns to, its seat there.
+
+To move an agent that is already running, without restarting it:
+
+```bash
+nexmesh move-agent sl-1a2b3c4d other-session
+```
+
+The orchestrator offers the same thing as `move_agent`, addressed by the name
+`team_status` shows rather than a slot id, so a CLI driving the fleet can
+reorganise it without anyone at a terminal. `rename_session` is there too.
+
+An agent's session is not something it carries — a tool call resolves it
+through the agent's slot — so moving the seat moves whoever is in it,
+mid-conversation. Its workspace, file locks and ownership zones are released
+rather than carried: all three describe the session being left, and a lock on
+`src/**` there says nothing about anywhere else. Anything it had not yet read
+stays behind, and the command says how much.
+
 ## Reaching any CLI from any machine
 
 Two independent axes, deliberately:

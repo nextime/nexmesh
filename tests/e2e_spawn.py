@@ -6,6 +6,16 @@ import json, os, signal, subprocess, sys, time, urllib.request, urllib.error
 SCR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCR); BIN = f"{ROOT}/target/debug"
 import tempfile, shutil
+
+# A CLI exports its conversation id to the MCP servers it starts, and these
+# suites are routinely run FROM inside one. Inherited, it would hand every
+# shim here the same identity and make them all claim a single seat -- which
+# looks like a bug in the hub and is not. The tests choose their own.
+import os as _os
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+    _os.environ.pop(_v, None)
+
 # Assemble a descriptor directory: the real CLIs plus the test-only fake one,
 # whose extra_paths must point at this checkout's tests/fake-cli.
 CLIS = tempfile.mkdtemp(prefix="nexmesh-clis-")

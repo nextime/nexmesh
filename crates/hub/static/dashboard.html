@@ -201,6 +201,9 @@
   <header>
     <div class="brand">nex<span>mesh</span></div>
     <select id="sessionSel" title="Session"></select>
+    <button id="renameBtn" class="tiny" title="Rename this session">rename</button>
+    <button id="newBtn" class="tiny" title="Start a new session">new</button>
+    <button id="addBtn" class="tiny" title="Launch an agent on a machine">add agent</button>
     <span class="spacer"></span>
     <span class="tiny muted" id="hubInfo"></span>
     <span class="dot" id="liveDot" title="polling"></span>
@@ -210,6 +213,27 @@
   <div id="err" class="err" hidden></div>
   <div class="stats" id="stats"></div>
   <nav id="tabs"></nav>
+  <!-- Outside #view deliberately: that is replaced wholesale on every poll,
+       and a form living inside it would be wiped mid-sentence. -->
+  <div id="addAgent" class="panel" hidden style="margin:12px 16px 0">
+    <form id="addAgentForm" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input id="aaName" type="text" placeholder="name" required maxlength="40"
+             style="font-family:var(--mono);width:130px">
+      <input id="aaRole" type="text" placeholder="role" maxlength="40"
+             style="width:150px">
+      <select id="aaNode" title="Which machine"></select>
+      <select id="aaCli" title="Which CLI, from that machine's inventory"></select>
+      <select id="aaMode" title="How it runs">
+        <option value="interactive">interactive (attachable)</option>
+        <option value="headless">headless (works on its own)</option>
+      </select>
+      <input id="aaModel" type="text" placeholder="model (optional)" maxlength="60"
+             style="font-family:var(--mono);width:150px">
+      <button type="submit">launch</button>
+      <button type="button" id="aaCancel" class="tiny">cancel</button>
+      <span id="aaMsg" class="tiny muted"></span>
+    </form>
+  </div>
   <main><div id="view"></div></main>
 </div>
 
@@ -224,6 +248,20 @@ let submitted = false;
 let tab = location.hash.replace("#", "") || "agents";
 if (!TABS.includes(tab)) tab = "agents";
 let session = new URLSearchParams(location.search).get("session") || "";
+
+// The session being LOOKED AT, which is not the same as `session`: empty
+// there means "whatever the hub shows by default", and reading it as "no
+// session" made every button that acts on one refuse to work until you had
+// picked from the dropdown.
+function currentSession() {
+  if (session) return session;
+  const sel = $("sessionSel");
+  if (sel && sel.tagName === "SELECT" && sel.value) return sel.value;
+  const d = snap && snap.detail;
+  if (d && d.session && d.session.id) return d.session.id;
+  const first = snap && (snap.sessions || [])[0];
+  return (first && first.id) || "";
+}
 let snap = null, failures = 0, timer = null;
 
 const $ = (id) => document.getElementById(id);
@@ -378,6 +416,149 @@ $("forget").addEventListener("click", async () => {
   try { await post("/v1/auth/logout", {}); } catch (e) { /* already gone */ }
   showGate("Signed out.");
 });
+// Naming a session, whether it exists yet or not. The selector becomes a
+// text field in place, so there is no dialog to dismiss and Escape always
+// means "leave it alone".
+function editSessionName(current, placeholder, commit) {
+  const sel = $("sessionSel");
+  if (sel.tagName !== "SELECT") return;          // an edit is already open
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = current;
+  input.placeholder = placeholder;
+  input.maxLength = 64;
+  input.style.cssText = "font-family:var(--mono);width:" + Math.max(200, sel.offsetWidth) + "px";
+  sel.replaceWith(input);
+  $("renameBtn").hidden = true;
+  $("newBtn").hidden = true;
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    input.replaceWith(sel);
+    $("renameBtn").hidden = false;
+    $("newBtn").hidden = false;
+    if (save && name && name !== current) {
+      try { await commit(name); }
+      catch (err) { $("err").hidden = false; $("err").textContent = err.message; }
+    }
+    tick();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+// A fleet gets named before anyone knows what it is for. Renaming it should
+// not mean recreating it.
+$("renameBtn").addEventListener("click", () => {
+  const sid = currentSession();
+  if (!sid) return;
+  const current = (snap && (snap.sessions || []).find((x) => x.id === sid) || {}).name || "";
+  editSessionName(current, "session name", (name) =>
+    post(`/v1/sessions/${encodeURIComponent(sid)}/name`, { name }));
+});
+
+// Launching an agent: pick a machine, pick one of the CLIs that machine
+// actually has, and the hub places a seat and starts it.
+//
+// The CLI list comes from the node's own inventory rather than a fixed list,
+// because what is installed differs per machine -- offering `qwen` on a host
+// without it produces a spawn that fails for a reason nobody can see here.
+function fillAddAgent() {
+  const nodes = (snap && snap.nodes || []).filter((n) => n.connected);
+  const nodeSel = $("aaNode");
+  const want = nodeSel.value;
+  nodeSel.innerHTML = nodes.length
+    ? nodes.map((n) => `<option value="${esc(n.name)}">${esc(n.name)}</option>`).join("")
+    : `<option value="">no machine is connected</option>`;
+  if (want && nodes.some((n) => n.name === want)) nodeSel.value = want;
+  fillAddAgentClis();
+}
+
+function fillAddAgentClis() {
+  const nodes = (snap && snap.nodes || []);
+  const node = nodes.find((n) => n.name === $("aaNode").value);
+  const clis = (node && node.clis || []).filter((c) => c !== "tmux");
+  const sel = $("aaCli");
+  const want = sel.value;
+  sel.innerHTML = clis.length
+    ? clis.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")
+    : `<option value="">that machine has no agent CLI</option>`;
+  if (want && clis.includes(want)) sel.value = want;
+}
+
+$("addBtn").addEventListener("click", () => {
+  if (!currentSession()) {
+    $("err").hidden = false;
+    $("err").textContent = "Make a session first: press new.";
+    return;
+  }
+  const panel = $("addAgent");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) {
+    $("aaMsg").textContent = "";
+    fillAddAgent();
+    $("aaName").focus();
+  }
+});
+
+$("aaCancel").addEventListener("click", () => { $("addAgent").hidden = true; });
+$("aaNode").addEventListener("change", fillAddAgentClis);
+
+$("addAgentForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("aaName").value.trim();
+  const cli = $("aaCli").value;
+  const node = $("aaNode").value;
+  if (!name || !cli || !node) {
+    $("aaMsg").textContent = "a name, a machine and a CLI are all needed";
+    return;
+  }
+  $("aaMsg").textContent = "placing the seat\u2026";
+  try {
+    const body = {
+      cli_id: cli, mode: $("aaMode").value, display_name: name,
+      role: $("aaRole").value.trim() || null,
+      placement: { node },
+    };
+    const model = $("aaModel").value.trim();
+    if (model) body.model = model;
+    const slot = await post(`/v1/sessions/${encodeURIComponent(currentSession())}/slots`, body);
+    $("aaMsg").textContent = "starting it\u2026";
+    // Two steps on purpose: the seat exists whether or not the process
+    // starts, so a CLI that fails to launch leaves something to retry
+    // rather than nothing at all.
+    await post(`/v1/slots/${encodeURIComponent(slot.slot_id)}/spawn`, {});
+    $("aaMsg").textContent = `${name} is starting on ${node}`;
+    $("aaName").value = ""; $("aaRole").value = ""; $("aaModel").value = "";
+    tick();
+  } catch (err) {
+    $("aaMsg").textContent = err.message;
+  }
+});
+
+// A new session, with no workspace: agents that join it work in their own
+// node's home until one is added. Starting empty is the common case -- a
+// workspace is a claim about paths on particular machines, and the dashboard
+// is the wrong place to be typing those.
+$("newBtn").addEventListener("click", () => {
+  editSessionName("", "name for the new session", async (name) => {
+    const j = await post("/v1/sessions", { name, workspaces: [], plan: [] });
+    if (j && j.session_id) {
+      session = j.session_id;
+      const u = new URL(location);
+      u.searchParams.set("session", session);
+      history.replaceState(null, "", u);
+    }
+  });
+});
+
 $("sessionSel").addEventListener("change", (e) => {
   session = e.target.value;
   const u = new URL(location);
@@ -442,8 +623,8 @@ function render() {
   };
 
   $("view").innerHTML = (!d && tab !== "fleet")
-    ? `<div class="panel"><div class="empty">No sessions yet. Create one with
-         <code>nexmesh new-session &lt;name&gt;</code>, or pair a machine on the
+    ? `<div class="panel"><div class="empty">No sessions yet. Press
+         <strong>new</strong> above, or pair a machine on the
          <a href="#fleet">fleet</a> tab.</div></div>`
     : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
          knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
@@ -457,6 +638,10 @@ function render() {
     }
   }
   if (keep.out && $("pairOut")) $("pairOut").innerHTML = keep.out;
+
+  // The form lives outside #view so typing survives a poll, which means its
+  // machine list has to be refreshed deliberately.
+  if (!$("addAgent").hidden && document.activeElement !== $("aaNode")) fillAddAgent();
 
   if (tab === "messages") {
     const f = document.querySelector(".feed");
@@ -533,9 +718,207 @@ function viewPlan(d) {
         <td class="muted tiny">${esc(p.who)}</td></tr>`).join("") + `</tbody></table>`);
 }
 
-// The code graph, as a person wants to read it: subsystems largest first,
-// each with enough members to be recognisable. An agent gets the same thing
-// through query_code_graph; this is so you can see it too.
+// ---- the subsystem map -------------------------------------------------
+//
+// A table of subsystems says what exists. Only a drawing says what the thing
+// is SHAPED like, which is what a person opens a code graph to find out.
+//
+// Drawn at subsystem level on purpose: 1400 symbols at once is a hairball,
+// twenty subsystems is a map. Laid out once per parse and cached, because
+// this page re-renders every second and a simulation that re-ran each time
+// would never stop moving.
+const layouts = {};
+let selSub = null;
+
+// Deterministic: the same parse must produce the same picture every time,
+// or a reader cannot point at it and say "that one".
+function seeded(seed) {
+  let x = seed >>> 0 || 1;
+  return () => {
+    x ^= x << 13; x >>>= 0;
+    x ^= x >> 17;
+    x ^= x << 5; x >>>= 0;
+    return x / 4294967296;
+  };
+}
+
+function layoutGraph(g) {
+  const key = `${g.workspace_id}:${g.built_at_ms}:${(g.subsystems || []).length}`;
+  if (layouts[key]) return layouts[key];
+
+  const W = 1500, H = 460;
+  const subs = (g.subsystems || []).slice(0, 24);
+  const index = new Map(subs.map((sx, i) => [sx.id, i]));
+  const rand = seeded(subs.length * 7919 + 13);
+  // Start on a ring rather than at random: a random start sometimes folds
+  // the graph over itself and no number of iterations undoes it.
+  const nodes = subs.map((sx, i) => {
+    const a = (i / Math.max(1, subs.length)) * Math.PI * 2;
+    return {
+      id: sx.id, n: sx.n, members: sx.members || [], path: sx.path || "",
+      x: W / 2 + Math.cos(a) * 260 + (rand() - 0.5) * 40,
+      y: H / 2 + Math.sin(a) * 190 + (rand() - 0.5) * 40,
+      vx: 0, vy: 0,
+      r: 7 + Math.sqrt(sx.n) * 1.7,
+    };
+  });
+  const links = (g.links || [])
+    .filter((l) => index.has(l.a) && index.has(l.b) && l.a !== l.b)
+    .map((l) => ({ s: index.get(l.a), t: index.get(l.b), n: l.n, certain: l.certain }));
+
+  // Fruchterman-Reingold, fixed iterations, no animation.
+  const k = Math.sqrt((W * H) / Math.max(1, nodes.length)) * 0.52;
+  for (let it = 0; it < 320; it++) {
+    const temp = (1 - it / 320) * 34 + 0.6;
+    for (const a of nodes) { a.vx = 0; a.vy = 0; }
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let dist = Math.hypot(dx, dy) || 0.01;
+        // Keep circles from overlapping, not just centres apart.
+        const want = k + a.r + b.r;
+        const force = (want * want) / dist;
+        dx /= dist; dy /= dist;
+        a.vx += dx * force; a.vy += dy * force;
+        b.vx -= dx * force; b.vy -= dy * force;
+      }
+    }
+    for (const l of links) {
+      const a = nodes[l.s], b = nodes[l.t];
+      let dx = a.x - b.x, dy = a.y - b.y;
+      const dist = Math.hypot(dx, dy) || 0.01;
+      // Weight compresses: one shared symbol should not pull as hard as a
+      // hundred, but nor should a hundred collapse the pair into one blob.
+      const pull = (dist * dist) / k * (0.55 + Math.log2(1 + l.n) * 0.16);
+      dx /= dist; dy /= dist;
+      a.vx -= dx * pull; a.vy -= dy * pull;
+      b.vx += dx * pull; b.vy += dy * pull;
+    }
+    for (const a of nodes) {
+      // Gentle pull to the middle so detached subsystems do not drift off.
+      a.vx += (W / 2 - a.x) * 0.012;
+      a.vy += (H / 2 - a.y) * 0.012;
+      const sp = Math.hypot(a.vx, a.vy) || 0.01;
+      const step = Math.min(sp, temp);
+      a.x += (a.vx / sp) * step;
+      a.y += (a.vy / sp) * step;
+      a.x = Math.max(a.r + 6, Math.min(W - a.r - 6, a.x));
+      a.y = Math.max(a.r + 6, Math.min(H - a.r - 6, a.y));
+    }
+  }
+  // Fit to the frame. Where a force layout settles is arbitrary, and it
+  // routinely settled in one corner with a third of the canvas empty.
+  const pad = 46;
+  const xs = nodes.map((n) => n.x), ys = nodes.map((n) => n.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = (W - pad * 2) / Math.max(1, x1 - x0);
+  const sy = (H - pad * 2) / Math.max(1, y1 - y0);
+  const sc = Math.min(sx, sy, 6);
+  for (const n of nodes) {
+    n.x = pad + (n.x - x0) * sc + (W - pad * 2 - (x1 - x0) * sc) / 2;
+    n.y = pad + (n.y - y0) * sc + (H - pad * 2 - (y1 - y0) * sc) / 2;
+  }
+  const out = { nodes, links, W, H };
+  layouts[key] = out;
+  return out;
+}
+
+// A subsystem is found, not named. The file most of it lives in says far
+// more than the alphabetically first symbol in it, which is how one came to
+// be labelled after a test function.
+function subLabel(sub, ambiguous) {
+  if (sub.path && sub.path.trim()) {
+    const parts = sub.path.split("/").filter(Boolean);
+    const base = parts.slice(-1)[0] || sub.path;
+    // Several crates have a main.rs, and qualifying it with its parent gives
+    // three identical "src/main.rs". Drop the segments every crate shares, so
+    // the qualifier is the part that actually differs.
+    if (ambiguous && ambiguous.has(base) && parts.length > 1) {
+      const meaningful = parts.filter((p) => !["src", "crates", "lib"].includes(p));
+      if (meaningful.length > 1) return meaningful.slice(-2).join("/");
+      return parts.slice(-2).join("/");
+    }
+    return base;
+  }
+  const m = (sub.members || [])[0];
+  if (!m) return `subsystem ${sub.id}`;
+  return m.name.length > 20 ? m.name.slice(0, 19) + "\u2026" : m.name;
+}
+
+function subHue(id) { return (id * 47) % 360; }
+
+function graphSvg(g) {
+  const { nodes, links, W, H } = layoutGraph(g);
+  if (!nodes.length) return "";
+  const seen = new Map();
+  for (const nd of nodes) {
+    const b = (nd.path || "").split("/").filter(Boolean).slice(-1)[0];
+    if (b) seen.set(b, (seen.get(b) || 0) + 1);
+  }
+  const ambiguous = new Set([...seen].filter(([, n]) => n > 1).map(([b]) => b));
+  const on = (i) => selSub === null || nodes[i].id === selSub
+    || links.some((l) => (nodes[l.s].id === selSub && l.t === i)
+                      || (nodes[l.t].id === selSub && l.s === i));
+
+  const edges = links.map((l) => {
+    const a = nodes[l.s], b = nodes[l.t];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    // Stop at the rim so the arrowhead is not buried under the circle.
+    const x2 = b.x - (dx / dist) * (b.r + 7), y2 = b.y - (dy / dist) * (b.r + 7);
+    const x1 = a.x + (dx / dist) * a.r, y1 = a.y + (dy / dist) * a.r;
+    const lit = selSub === null || nodes[l.s].id === selSub || nodes[l.t].id === selSub;
+    return `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}"
+        x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"
+        stroke="currentColor" stroke-width="${(0.6 + Math.log2(1 + l.n) * 0.55).toFixed(2)}"
+        ${l.certain ? "" : 'stroke-dasharray="4 3"'}
+        opacity="${lit ? (l.certain ? 0.5 : 0.34) : 0.07}"
+        marker-end="url(#gArrow)"><title>${l.n} reference${l.n === 1 ? "" : "s"}${
+          l.certain ? "" : ", inferred"}</title></line>`;
+  }).join("");
+
+  const circles = nodes.map((nd, i) => {
+    const lit = on(i);
+    const hue = subHue(nd.id);
+    const names = nd.members.slice(0, 5).map((m) => m.name).join(", ");
+    return `<g class="gnode" onclick="selectSub(${nd.id})" style="cursor:pointer"
+        opacity="${lit ? 1 : 0.18}">
+        <title>subsystem ${nd.id} — ${nd.n} members${
+          nd.path ? "\n" + nd.path : ""}${names ? "\n" + names : ""}</title>
+        <circle cx="${nd.x.toFixed(1)}" cy="${nd.y.toFixed(1)}" r="${nd.r.toFixed(1)}"
+          fill="hsl(${hue} 58% 55%)" fill-opacity="${nd.id === selSub ? 0.95 : 0.62}"
+          stroke="hsl(${hue} 60% 72%)" stroke-width="${nd.id === selSub ? 2.4 : 1.1}"/>
+        <text x="${nd.x.toFixed(1)}" y="${(nd.y + nd.r + 12).toFixed(1)}"
+          text-anchor="middle" font-size="11" fill="currentColor"
+          style="font-family:var(--mono)" opacity=".85">${esc(subLabel(nd, ambiguous))}</text>
+      </g>`;
+  }).join("");
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet"
+      style="display:block;color:var(--dim);margin:6px 0"
+      role="img" aria-label="subsystem map">
+      <defs><marker id="gArrow" viewBox="0 0 8 8" refX="7" refY="4"
+        markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0 0 L8 4 L0 8 z" fill="currentColor" opacity=".6"/></marker></defs>
+      ${edges}${circles}</svg>
+    <div class="tiny muted" style="margin-top:6px">
+      Circle size is members; an arrow points from a subsystem to one it uses.
+      Solid edges are read off the syntax tree, dashed ones were inferred by
+      matching a name. Click a subsystem to isolate it${
+        selSub !== null ? ` &mdash; <a href="#graph" onclick="selectSub(null)">show all</a>` : ""}.
+    </div>`;
+}
+
+function selectSub(id) {
+  selSub = (selSub === id) ? null : id;
+  render();
+}
+
+// The code graph, as a person wants to read it: a map first, then subsystems
+// largest first, each with enough members to be recognisable. An agent gets
+// the same thing through query_code_graph; this is so you can see it too.
 function viewGraph(d, now) {
   const gs = d.graph || [];
   if (!gs.length)
@@ -575,7 +958,7 @@ function viewGraph(d, now) {
               files.length > 3 ? ` +${files.length - 3}` : ""}</td>
       </tr>`;
     }).join("");
-    return panel(head + `<table><thead><tr><th class="num">#</th><th>size</th>
+    return panel(head + graphSvg(g) + `<table><thead><tr><th class="num">#</th><th>size</th>
         <th class="num">members</th><th>what is in it</th>
         <th class="hide">files</th></tr></thead><tbody>${rows}</tbody></table>`);
   }).join("");

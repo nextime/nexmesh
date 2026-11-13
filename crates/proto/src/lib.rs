@@ -176,6 +176,12 @@ pub struct SpawnSpec {
     pub cli_id: String,
     pub mode: RunMode,
     /// Absolute path on *this* node, resolved by the hub from workspace_mounts.
+    ///
+    /// Empty means the slot has no workspace and the node should decide. The
+    /// hub must not guess: it once filled this from its own `HOME`, which is a
+    /// path on the hub's machine, belonging to the hub's user -- so every
+    /// workspace-less spawn asked a node to work in a directory that, on that
+    /// node, it had no right to create.
     pub cwd: String,
     pub role: Option<String>,
     pub display_name: Option<String>,
@@ -293,6 +299,10 @@ pub enum NodeToHub {
         name: Option<String>,
         cwd: Option<String>,
         proc: Option<ProcIdentity>,
+        /// The CLI's own conversation id, when it has one. See
+        /// `McpdToNode::Register::cli_session`.
+        #[serde(default)]
+        cli_session: Option<String>,
     },
     SyncResult {
         req_id: u64,

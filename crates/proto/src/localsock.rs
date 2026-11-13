@@ -27,6 +27,15 @@ pub enum McpdToNode {
         session_hint: Option<String>,
         role: Option<String>,
         name: Option<String>,
+        /// The CLI's OWN conversation id, when it publishes one.
+        ///
+        /// A directory is not an identity: claude and opencode both keep
+        /// several conversations per project, and resuming one starts a new
+        /// process with a new pid. The conversation id is the thing that is
+        /// stable across a resume and different between two windows in the
+        /// same folder, which is exactly what a seat should follow.
+        #[serde(default)]
+        cli_session: Option<String>,
     },
     Tool {
         req_id: u64,

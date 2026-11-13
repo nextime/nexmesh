@@ -8,6 +8,16 @@ or Codex would take.
 import json, os, shutil, signal, sqlite3, subprocess, sys, tempfile, time
 import urllib.request, urllib.error
 
+# A CLI exports its conversation id to the MCP servers it starts, and these
+# suites are routinely run FROM inside one. Inherited, it would hand every
+# shim here the same identity and make them all claim a single seat -- which
+# looks like a bug in the hub and is not. The tests choose their own.
+import os as _os
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+    _os.environ.pop(_v, None)
+
+
 SCR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCR); BIN = f"{ROOT}/target/debug"
 PORT = 17902; HUB = f"http://127.0.0.1:{PORT}"
@@ -107,7 +117,7 @@ def main():
           "list_nodes" in r["result"].get("instructions", ""), str(r["result"].get("instructions"))[:160])
     names = [t["name"] for t in o.rpc("tools/list")["result"]["tools"]]
     for t in ("list_nodes", "create_team", "team_status", "read_log", "message_team",
-              "adopt_terminal", "read_transcript"):
+              "adopt_terminal", "read_transcript", "move_agent", "rename_session"):
         check(f"tools/list offers {t}", t in names, str(names))
 
     print("\n=== it can see the fleet ===")
@@ -159,6 +169,20 @@ def main():
     out = o.tool("read_transcript", {"who": "Max"})
     check("read_transcript returns the agent's own output",
           "fakestream" in out or "session=" in out, out[:200])
+
+    print("\n=== moving an agent between sessions, addressed by name ===")
+    # The orchestrator is how a CLI drives the fleet, so anything the
+    # operator can do from a terminal has to be reachable here too.
+    missing = o.tool("move_agent", {"who": "Nobody", "to": "anywhere"})
+    check("an unknown agent is refused by name, and the real ones listed",
+          "no agent called" in missing.lower() or "nobody" in missing.lower(), missing[:200])
+
+    renamed = o.tool("rename_session", {"name": "renamed-by-the-orchestrator"})
+    check("it can rename the session it is working in",
+          "renamed-by-the-orchestrator" in renamed, renamed[:200])
+    listed = o.tool("list_sessions")
+    check("and the new name is what everyone sees afterwards",
+          "renamed-by-the-orchestrator" in listed, listed[:300])
 
     print("\n=== errors come back as errors, not silence ===")
     out = o.tool("create_team", {"name": "bad", "agents": [

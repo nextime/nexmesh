@@ -138,6 +138,17 @@ def main():
     if s != 200:
         raise SystemExit(f"could not create the dashboard account: {s} {j}")
 
+    # The node advertises whatever CLIs this machine actually has, plus the
+    # fakes the test suite uses. Without the fakes, pressing "launch" on the
+    # dashboard would start a REAL agent and spend real money -- which is not
+    # what a demo should do to someone trying it for the first time.
+    clis_dir = os.path.join(T, "clis")
+    os.makedirs(clis_dir, exist_ok=True)
+    for d in (f"{ROOT}/clis", f"{ROOT}/tests/fake-cli"):
+        for f in os.listdir(d):
+            if f.endswith(".toml"):
+                shutil.copy2(os.path.join(d, f), clis_dir)
+
     print("starting two nodes")
     socks = {}
     for name, tok in (("machine-a", tok_a), ("machine-b", tok_b)):
@@ -145,9 +156,10 @@ def main():
         socks[name] = sock
         procs.append(subprocess.Popen(
             [f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}", "--name", name,
-             "--clis", f"{ROOT}/clis", "--sock", sock, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+             "--clis", clis_dir, "--sock", sock, "--mcpd", f"{BIN}/nexmesh-mcpd"],
             stdout=open(f"{T}/{name}.log", "w"), stderr=subprocess.STDOUT,
-            env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
+            env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
+                     PATH=f"{ROOT}/tests/fake-cli:" + os.environ.get("PATH", ""))))
     until(lambda: len([n for n in req("/v1/nodes", optok)[1].get("nodes", [])
                        if n.get("connected")]) == 2)
 
@@ -235,6 +247,11 @@ def main():
 
   Two nodes, four agents, one session awaiting review, and a code graph
   parsed from a copy of {ROOT}.
+
+  Press "add agent" to launch another. The CLIs whose names start with
+  "fake" are stand-ins that speak the real protocols and cost nothing;
+  the rest are whatever this machine has installed, and starting one
+  starts the real thing.
 
   Ctrl-C to stop.
 """)

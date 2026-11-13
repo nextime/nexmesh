@@ -204,6 +204,25 @@ def main():
           'id="setupForm"' in body, body[:200])
     check("with a graph tab", '"graph"' in body, body[:200])
 
+    print("\n=== the dashboard's own credentials reach the routes it drives ===")
+    # The dashboard creates sessions and launches agents with a COOKIE, not a
+    # bearer token. If the operator middleware took only the header, every one
+    # of those buttons would 401 in a browser while working perfectly from
+    # the command line.
+    s, j = req("POST", "/v1/sessions", {"name": "from-the-dashboard"})
+    check("it can create a session with a cookie", s == 200 and "session_id" in j, f"{s} {j}")
+    new_sid = j.get("session_id")
+    if new_sid:
+        s, j = req("POST", f"/v1/sessions/{new_sid}/name", {"name": "renamed-in-a-browser"})
+        check("and rename it", s == 200, f"{s} {j}")
+        s, j = req("POST", f"/v1/sessions/{new_sid}/slots",
+                   {"cli_id": "claude", "mode": "interactive", "display_name": "Browser",
+                    "role": "engineer", "placement": {"node": "nowhere"}})
+        # No node is connected in this suite, so placement must fail -- but it
+        # must fail on PLACEMENT, not on who is asking.
+        check("and reach the slot route (refused on placement, not on auth)",
+              s != 401, f"{s} {j}")
+
     print("\n=== an admin command will not mint into a database that is not there ===")
     # The silent version of this cost an hour: a bare `dashboard-setup-code`
     # on a service install created an empty ~/.nexmesh/hub.db, printed a code

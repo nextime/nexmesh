@@ -77,6 +77,174 @@ pub struct NewSession {
     pub token_budget: Option<i64>,
 }
 
+/// Remove a slot: the seat, and the agent rows that only describe who sat
+/// in it.
+///
+/// You could always add a seat and never take one away, which is how three
+/// seats called "Hermes" came to sit in one session with nobody in two of
+/// them. A seat someone is actually using is refused unless `force` is set,
+/// because removing it under a working agent is not a tidy-up.
+pub async fn remove_slot(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> ApiResult {
+    let force = matches!(q.get("force").map(|s| s.as_str()), Some("1") | Some("true"));
+    let db = st.db.lock().unwrap();
+    let exists: bool = db
+        .query_row("SELECT 1 FROM slots WHERE id = ?", [&id], |_| Ok(true))
+        .optional()
+        .map_err(bad)?
+        .unwrap_or(false);
+    if !exists {
+        return Err(bad(format!("no slot '{id}'")));
+    }
+    // "Live" means a lease that has not run out, not merely a row that was
+    // never marked exited: a node restart leaves agents looking busy forever.
+    let cutoff = now_ms() - proto::NODE_LEASE_MS as i64;
+    let live: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM agents
+              WHERE slot_id = ? AND exited_at_ms IS NULL AND status <> 'lost'
+                AND COALESCE(last_seen_ms, 0) > ?",
+            params![id, cutoff],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if live > 0 && !force {
+        return Err(bad(format!(
+            "slot '{id}' still has a live agent; stop it first, or pass force=1"
+        )));
+    }
+    let agents = db.execute("DELETE FROM agents WHERE slot_id = ?", [&id]).map_err(bad)?;
+    db.execute("DELETE FROM slots WHERE id = ?", [&id]).map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+        params![now_ms(), "operator", "slot_removed",
+                serde_json::json!({ "slot": id, "agents": agents }).to_string()],
+    )
+    .ok();
+    Ok(Json(serde_json::json!({ "removed": id, "agent_rows": agents })))
+}
+
+#[derive(Deserialize)]
+pub struct MoveSlot {
+    /// Target session: its id or its name.
+    pub session: String,
+}
+
+/// Move a seat -- and whoever is sitting in it -- to another session.
+///
+/// No restart. An agent's session is not something it carries: tools resolve
+/// it by looking up the agent's slot, so moving the slot moves the live
+/// agent with it, and its next tool call lands in the new session.
+///
+/// What does NOT come along: the workspace, the file locks and the ownership
+/// zones. All three are claims about the session being left -- a workspace
+/// belongs to one session, and a lock on `src/**` there says nothing about
+/// anywhere else -- so they are released rather than carried into a session
+/// where they would mean something different.
+pub async fn move_slot(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<MoveSlot>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let from: String = db
+        .query_row("SELECT session_id FROM slots WHERE id = ?", [&id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no slot '{id}'")))?;
+    let (to, to_name, status): (String, String, String) = db
+        .query_row(
+            "SELECT id, name, status FROM sessions WHERE id = ? OR name = ?",
+            params![req.session, req.session],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no session '{}'", req.session)))?;
+    if to == from {
+        return Err(bad(format!("that seat is already in '{to_name}'")));
+    }
+    if status != "active" {
+        return Err(bad(format!("session '{to_name}' is {status}, not active")));
+    }
+
+    // Anything undelivered where it is now can never be read there, because
+    // the reader is leaving. Say how much rather than discarding it silently.
+    let stranded: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+              WHERE session_id = ? AND to_slot = ? AND acked_at_ms IS NULL",
+            params![from, id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let locks = db.execute("DELETE FROM locks WHERE held_by_slot = ?", [&id]).unwrap_or(0);
+    let zones = db.execute("DELETE FROM ownership WHERE slot_id = ?", [&id]).unwrap_or(0);
+    db.execute(
+        "UPDATE slots SET session_id = ?, workspace_id = NULL WHERE id = ?",
+        params![to, id],
+    )
+    .map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+        params![now_ms(), "operator", "slot_moved",
+                serde_json::json!({ "slot": id, "from": from, "to": to }).to_string()],
+    )
+    .ok();
+
+    Ok(Json(serde_json::json!({
+        "slot": id,
+        "from": from,
+        "to": to,
+        "session_name": to_name,
+        "locks_released": locks,
+        "zones_released": zones,
+        "messages_left_unread": stranded,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct RenameSession {
+    pub name: String,
+}
+
+/// Rename a session.
+///
+/// A fleet gets named before anyone knows what it is for, and the name is
+/// what everybody then reads on the dashboard and in every message. Making
+/// it permanent would mean recreating the session to change a word.
+pub async fn rename_session(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameSession>,
+) -> ApiResult {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(bad("session name must not be empty"));
+    }
+    if name.chars().count() > 64 {
+        return Err(bad("a session name must be 64 characters or fewer"));
+    }
+    let db = st.db.lock().unwrap();
+    let n = db
+        .execute("UPDATE sessions SET name = ? WHERE id = ?", params![name, id])
+        .map_err(bad)?;
+    if n == 0 {
+        return Err(bad(format!("no session '{id}'")));
+    }
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+        params![now_ms(), "operator", "session_renamed",
+                serde_json::json!({ "session": id, "name": name }).to_string()],
+    )
+    .ok();
+    Ok(Json(serde_json::json!({ "session_id": id, "name": name })))
+}
+
 pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSession>) -> ApiResult {
     if req.name.trim().is_empty() {
         return Err(bad("session name must not be empty"));

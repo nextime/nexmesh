@@ -16,6 +16,13 @@ HUB_HTTP = f"http://127.0.0.1:{PORT}"
 DB = f"{_T}/e2e.db"
 SOCK = f"{_T}/node.sock"
 WS_DIR = f"{_T}/workspace"
+# A CLI exports its conversation id to its MCP children -- and this suite is
+# very often run FROM inside such a CLI, which would hand every shim the same
+# identity and make them all share one seat. The tests choose their own.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+    os.environ.pop(_v, None)
+
 procs = []
 fails = []
 
@@ -286,6 +293,115 @@ def main():
     check("and there is exactly one of it",
           sum(1 for a in seats if a.get("name") == "Handmade") == 1,
           str([a.get("name") for a in seats]))
+
+    print("\n=== a seat follows the CLI's conversation, not the directory ===")
+    # claude and opencode both keep several conversations per project, and
+    # resuming one starts a NEW process with a new pid. So a seat cannot be
+    # identified by directory, by pid, or by name alone. The CLI publishes
+    # the conversation id -- CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID -- and
+    # that is what a seat follows.
+    def talk(conversation, name="Window"):
+        e = dict(os.environ, NEXMESH_SOCK=SOCK, NEXMESH_CLI="handmade",
+                 NEXMESH_NAME=name, NEXMESH_ROLE="tester", NEXMESH_SESSION=sid,
+                 NEXMESH_CLI_SESSION=conversation)
+        p = subprocess.Popen([f"{BIN}/nexmesh-mcpd"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, env=e, bufsize=1, cwd=WS_DIR)
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                  "params": {"protocolVersion": "2024-11-05",
+                                             "capabilities": {},
+                                             "clientInfo": {"name": name, "version": "1"}}}) + "\n")
+        p.stdin.flush()
+        p.stdout.readline()
+        p.stdin.close(); p.wait(timeout=20)
+
+    base = len(http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", []))
+    talk("conv-aaa")
+    one = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("a conversation takes a seat", len(one) == base + 1, f"{base} -> {len(one)}")
+
+    # Same folder, same name, DIFFERENT conversation: a second window.
+    talk("conv-bbb")
+    two = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("a second conversation in the same directory gets its own seat",
+          len(two) == base + 2, f"expected {base + 2}, got {len(two)}")
+
+    # Resuming the first: same conversation id, new process.
+    talk("conv-aaa"); talk("conv-aaa")
+    three = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("resuming a conversation returns to its own seat, however often",
+          len(three) == base + 2, f"expected {base + 2}, got {len(three)}")
+
+    # And it can move: the same identity pointed at another session takes a
+    # seat there, and stops occupying the one it left.
+    s2, j2 = http("POST", "/v1/sessions", {"name": "elsewhere"})
+    other = j2.get("session_id")
+    check("a second session exists to move to", s2 == 200 and bool(other), str(j2))
+    if other:
+        e = dict(os.environ, NEXMESH_SOCK=SOCK, NEXMESH_CLI="handmade",
+                 NEXMESH_NAME="Window", NEXMESH_ROLE="tester",
+                 NEXMESH_SESSION=other, NEXMESH_CLI_SESSION="conv-aaa")
+        p = subprocess.Popen([f"{BIN}/nexmesh-mcpd"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, env=e, bufsize=1, cwd=WS_DIR)
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                  "params": {"protocolVersion": "2024-11-05",
+                                             "capabilities": {},
+                                             "clientInfo": {"name": "Window", "version": "1"}}}) + "\n")
+        p.stdin.flush(); p.stdout.readline(); p.stdin.close(); p.wait(timeout=20)
+        moved = http("GET", f"/v1/sessions/{other}/status")[1].get("agents", [])
+        check("the identity takes a seat in the session it moved to",
+              any(a.get("name") == "Window" for a in moved), str(moved))
+        left = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        stale = [a for a in left
+                 if a.get("name") == "Window" and a.get("state") not in (None, "exited")
+                 and a.get("kind") not in (None, "-")]
+        check("and the seat it left stops showing a live teammate",
+              not stale, str(stale))
+
+    print("\n=== a live agent can be moved between sessions without restarting ===")
+    # Its session is not something the agent carries: a tool call resolves it
+    # through the agent's slot. So moving the seat moves whoever is in it,
+    # mid-conversation, with no restart.
+    mover = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_NAME": "Mover",
+                  "NEXMESH_ROLE": "tester", "NEXMESH_SESSION": sid,
+                  "NEXMESH_CLI_SESSION": "conv-mover"})
+    mover.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                              "clientInfo": {"name": "Mover", "version": "1"}})
+    mover.call("tools/call", {"name": "acquire_file",
+                              "arguments": {"path": "moved.rs", "purpose": "editing"}})
+    here = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("it starts where it joined", any(a.get("name") == "Mover" for a in here),
+          str([a.get("name") for a in here]))
+    slot = next((a.get("slot_id") or a.get("slot") for a in here
+                 if a.get("name") == "Mover"), None)
+    check("its seat is identifiable", bool(slot), str(here))
+
+    if slot and other:
+        s3, j3 = http("POST", f"/v1/slots/{slot}/move", {"session": "elsewhere"})
+        check("the move is accepted", s3 == 200, f"{s3} {j3}")
+        check("and it reports the lock it had to let go of",
+              j3.get("locks_released", 0) >= 1, str(j3))
+        now_there = http("GET", f"/v1/sessions/{other}/status")[1].get("agents", [])
+        check("the agent is in the new session",
+              any(a.get("name") == "Mover" for a in now_there),
+              str([a.get("name") for a in now_there]))
+        gone = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        check("and no longer in the old one",
+              not any(a.get("name") == "Mover" for a in gone),
+              str([a.get("name") for a in gone]))
+        # The process never restarted: it should still be able to work, and
+        # its work should land in the session it was moved to.
+        r = mover.call("tools/call", {"name": "set_summary",
+                                      "arguments": {"summary": "still here, elsewhere"}})
+        check("the same process keeps working after the move", "result" in r, str(r)[:200])
+        after = http("GET", f"/v1/sessions/{other}/status")[1].get("agents", [])
+        check("and its work lands in the new session",
+              any(a.get("name") == "Mover" and a.get("summary") == "still here, elsewhere"
+                  for a in after),
+              str(after)[:300])
+        s4, j4 = http("POST", f"/v1/slots/{slot}/move", {"session": "nowhere-at-all"})
+        check("moving to a session that does not exist is refused", s4 == 400, f"{s4} {j4}")
 
     print()
     if fails:

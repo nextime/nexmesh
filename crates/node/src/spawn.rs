@@ -166,6 +166,20 @@ pub fn write_mcp_config(
     }
 }
 
+/// Where a slot with no workspace should work.
+///
+/// Empty means the hub had nothing to resolve, so the choice belongs here:
+/// `HOME` on this machine is the home of the user this daemon runs as. The
+/// hub reading its own `HOME` names a directory on the hub's machine, owned
+/// by the hub's user, which is how every workspace-less spawn came to fail
+/// with a bare "Permission denied" on the node.
+fn resolve_cwd(cwd: &str) -> String {
+    if !cwd.trim().is_empty() {
+        return cwd.to_string();
+    }
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+}
+
 pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     let d = ctx
         .descriptor(&spec.cli_id)
@@ -203,7 +217,20 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("'{}' has no {mode_name} mode", spec.cli_id))?
         .clone();
 
+    let mut spec = spec;
+    spec.cwd = resolve_cwd(&spec.cwd);
+
     let state_dir = PathBuf::from(&spec.cwd).join(".nexmesh");
+    // Named, because "Permission denied (os error 13)" on its own sends you
+    // looking at the CLI rather than at the directory.
+    std::fs::create_dir_all(&state_dir).with_context(|| {
+        format!(
+            "creating {} as {}: the agent's working directory must be writable by \
+             the user this node runs as",
+            state_dir.display(),
+            std::env::var("USER").unwrap_or_else(|_| "this node's user".into())
+        )
+    })?;
     let inline = write_mcp_config(&d, &spec, &ctx.mcpd_path, &ctx.sock_path, &state_dir)?;
 
     let mut vars: BTreeMap<&str, String> = BTreeMap::new();
@@ -248,7 +275,6 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         }
     }
 
-    std::fs::create_dir_all(&state_dir).ok();
     // Descriptor environment first, the shim's own afterwards so it wins.
     let mut env = descriptor_env(&d);
     env.extend(shim_env(&spec, &ctx.sock_path));
@@ -882,6 +908,23 @@ where
 mod tests {
     use super::*;
     use nexmesh_proto::cli_descriptor::CliDescriptor;
+
+    /// The hub used to fill an empty cwd from its OWN `HOME`, naming a
+    /// directory on the hub's machine owned by the hub's user. Every
+    /// workspace-less spawn then failed on the node with a bare
+    /// "Permission denied". The node resolves it now, because the node is
+    /// the only component that knows where its user may write.
+    #[test]
+    fn an_empty_cwd_resolves_here_and_a_given_one_is_left_alone() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        assert_eq!(resolve_cwd(""), home);
+        assert_eq!(resolve_cwd("   "), home, "whitespace is not a path");
+        assert_eq!(
+            resolve_cwd("/srv/project"),
+            "/srv/project",
+            "a workspace mount the hub did resolve must be used as given"
+        );
+    }
 
     fn spec(cwd: &str) -> SpawnSpec {
         SpawnSpec {

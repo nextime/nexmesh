@@ -343,8 +343,10 @@ async fn handle(
             tools::ack_messages(&db, &agent_id, &message_ids)?;
         }
 
-        NodeToHub::JoinRequest { req_id, session_hint, cli_id, role, name, cwd, proc: pid } => {
-            let granted = join(st, node_id, session_hint, cli_id, role, name, cwd, pid);
+        NodeToHub::JoinRequest {
+            req_id, session_hint, cli_id, role, name, cwd, proc: pid, cli_session,
+        } => {
+            let granted = join(st, node_id, session_hint, cli_id, role, name, cwd, pid, cli_session);
             let frame = match granted {
                 Ok((slot_id, session_id, agent_id, display_name, role)) => HubToNode::JoinGranted {
                     req_id, slot_id, session_id, agent_id, display_name, role,
@@ -714,25 +716,53 @@ fn join(
     name: Option<String>,
     cwd: Option<String>,
     pid: Option<proto::ProcIdentity>,
+    cli_session: Option<String>,
 ) -> Result<(String, String, String, Option<String>, Option<String>)> {
     let db = st.db.lock().unwrap();
     let now = now_ms();
 
-    // Pick the session: the one named, else the only active one.
+    // Pick the session: the one named, else the one that owns the directory
+    // you are standing in, else the only active one.
+    //
+    // The directory matters because that is how a person actually works: you
+    // cd into a project and start a CLI, or resume one there. Having to
+    // remember a session id to do that is a worse interface than the
+    // filesystem, which already knows which project this is.
     let session_id: String = match session_hint {
         Some(s) => db
             .query_row("SELECT id FROM sessions WHERE id = ? OR name = ?", params![s, s], |r| r.get(0))
             .optional()?
-            .ok_or_else(|| anyhow::anyhow!("no such session"))?,
+            .ok_or_else(|| anyhow::anyhow!("no such session '{s}'"))?,
         None => {
-            let ids: Vec<String> = db
-                .prepare("SELECT id FROM sessions WHERE status = 'active'")?
-                .query_map([], |r| r.get(0))?
-                .collect::<std::result::Result<_, _>>()?;
-            match ids.len() {
-                1 => ids[0].clone(),
-                0 => anyhow::bail!("no active session to join"),
-                k => anyhow::bail!("{k} active sessions; specify which one"),
+            let by_cwd = cwd.as_deref().and_then(|c| session_for_cwd(&db, node_id, c).ok()).flatten();
+            match by_cwd {
+                Some(id) => {
+                    tracing::info!(session = %id, cwd = ?cwd, "session taken from the directory");
+                    id
+                }
+                None => {
+                    let ids: Vec<(String, String)> = db
+                        .prepare("SELECT id, name FROM sessions WHERE status = 'active'")?
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<std::result::Result<_, _>>()?;
+                    match ids.len() {
+                        1 => ids[0].0.clone(),
+                        0 => anyhow::bail!("no active session to join"),
+                        _ => {
+                            // Name them. "3 active sessions" leaves the reader
+                            // to go and look up what they are called.
+                            let names: Vec<String> =
+                                ids.iter().map(|(_, n)| n.clone()).collect();
+                            anyhow::bail!(
+                                "this directory belongs to no workspace, and there are {} \
+                                 active sessions ({}). Say which: NEXMESH_SESSION=<name>, \
+                                 or give the session a workspace mounted here",
+                                ids.len(),
+                                names.join(", ")
+                            )
+                        }
+                    }
+                }
             }
         }
     };
@@ -767,15 +797,54 @@ fn join(
     //
     // A seat whose agent is still LIVE is left alone: that is a genuinely
     // concurrent second instance, and it deserves its own.
-    let existing: Option<String> = db
+    // The conversation, when the CLI publishes one, is a better identity than
+    // anything we could infer. It is stable across a resume -- where the pid
+    // is not -- and different between two windows open on the same folder,
+    // which is precisely the case a directory cannot tell apart.
+    //
+    // A seat matched this way is reclaimed even if its last agent still looks
+    // live: one conversation cannot be in two places, so whatever is recorded
+    // there has gone whether or not anybody said so.
+    let by_conversation: Option<String> = match cli_session.as_deref() {
+        Some(cs) if !cs.is_empty() => db
+            .query_row(
+                "SELECT id FROM slots
+                  WHERE session_id = ?1 AND participant_kind = 'cli'
+                    AND cli_session = ?2
+                  ORDER BY created_at_ms DESC LIMIT 1",
+                params![session_id, cs],
+                |r| r.get(0),
+            )
+            .optional()?,
+        _ => None,
+    };
+    // One pinned identity is one process, so joining here means it is no
+    // longer sitting anywhere else. This is what lets an agent MOVE between
+    // sessions: point it at another session and it takes (or returns to) its
+    // seat there, while the seat it left stops claiming to be occupied
+    // instead of showing a teammate who will never answer.
+    if let Some(cs) = cli_session.as_deref().filter(|c| !c.is_empty()) {
+        db.execute(
+            "UPDATE agents SET exited_at_ms = COALESCE(exited_at_ms, ?1)
+              WHERE exited_at_ms IS NULL
+                AND slot_id IN (SELECT id FROM slots WHERE cli_session = ?2)",
+            params![now, cs],
+        )?;
+    }
+
+    let existing: Option<String> = match by_conversation {
+        Some(id) => Some(id),
+        None => db
         .query_row(
             "SELECT s.id FROM slots s
               WHERE s.session_id = ?1 AND s.participant_kind = 'cli'
                 AND COALESCE(s.cli_id,'') = COALESCE(?2,'')
                 AND COALESCE(s.display_name,'') = COALESCE(?3,'')
+                AND COALESCE(s.cli_session,'') = ''
                 AND NOT EXISTS (
                     SELECT 1 FROM agents a
                      WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL
+                       AND a.status <> 'lost'
                        AND a.provenance = 'attached')
                 AND EXISTS (
                     SELECT 1 FROM agents a
@@ -785,7 +854,8 @@ fn join(
             params![session_id, cli_id, name, node_id],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()?,
+    };
 
     let slot_id = match existing {
         Some(id) => {
@@ -795,6 +865,17 @@ fn join(
                   WHERE id = ?",
                 params![workspace_id, role, id],
             )?;
+            // Adopt: an identity that arrives for the first time and finds its
+            // own seat by name takes that seat over, rather than leaving an
+            // unclaimed twin behind. Without this, pinning NEXMESH_CLI_SESSION
+            // for an agent that already had a seat makes a SECOND one, which
+            // looks exactly like the duplication the pin was meant to stop.
+            if let Some(cs) = cli_session.as_deref().filter(|c| !c.is_empty()) {
+                db.execute(
+                    "UPDATE slots SET cli_session = ? WHERE id = ? AND cli_session IS NULL",
+                    params![cs, id],
+                )?;
+            }
             tracing::info!(slot_id = %id, "an attached agent returned to its seat");
             id
         }
@@ -802,9 +883,9 @@ fn join(
             let id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
             db.execute(
                 "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
-                                    display_name, role, status, created_at_ms)
-                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?)",
-                params![id, session_id, workspace_id, cli_id, name, role, now],
+                                    display_name, role, status, created_at_ms, cli_session)
+                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?,?)",
+                params![id, session_id, workspace_id, cli_id, name, role, now, cli_session],
             )?;
             id
         }
@@ -833,6 +914,59 @@ fn join(
 /// specific (longest) path so nested workspaces resolve correctly.
 ///
 /// Matching is on path boundaries: `/srv/app` must not match `/srv/application`.
+/// Which session owns the directory an agent started in.
+///
+/// Only workspaces mounted on THIS node are considered: a path is a claim
+/// about one machine, and `/srv/app` on one host is not `/srv/app` on
+/// another. The longest matching mount wins, so a workspace nested inside
+/// another is not shadowed by its parent.
+///
+/// Two active sessions mounting the same directory on the same machine is a
+/// genuine ambiguity, and this refuses rather than picking one: joining the
+/// wrong team is worse than being asked which.
+fn session_for_cwd(
+    db: &rusqlite::Connection,
+    node_id: &str,
+    cwd: &str,
+) -> Result<Option<String>> {
+    let rows: Vec<(String, String)> = db
+        .prepare(
+            "SELECT m.path, w.session_id FROM workspace_mounts m
+               JOIN workspaces w ON w.id = m.workspace_id
+               JOIN sessions sx ON sx.id = w.session_id
+              WHERE m.node_id = ? AND sx.status = 'active'",
+        )?
+        .query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let cwd_t = cwd.trim_end_matches('/');
+    let mut best_len = 0usize;
+    let mut best: Vec<String> = Vec::new();
+    for (path, session_id) in rows {
+        let p = path.trim_end_matches('/');
+        let contained =
+            cwd_t == p || cwd_t.strip_prefix(p).map(|r| r.starts_with('/')).unwrap_or(false);
+        if !contained {
+            continue;
+        }
+        if p.len() > best_len {
+            best_len = p.len();
+            best = vec![session_id];
+        } else if p.len() == best_len && !best.contains(&session_id) {
+            best.push(session_id);
+        }
+    }
+    match best.len() {
+        0 => Ok(None),
+        1 => Ok(Some(best.remove(0))),
+        _ => anyhow::bail!(
+            "{} active sessions have a workspace mounted at this directory; \
+             set NEXMESH_SESSION to say which",
+            best.len()
+        ),
+    }
+}
+
 pub fn workspace_for_cwd(mounts: &[(String, String)], cwd: &str) -> Option<String> {
     let cwd = cwd.trim_end_matches('/');
     let mut best: Option<(&str, usize)> = None;

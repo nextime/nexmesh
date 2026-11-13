@@ -82,9 +82,12 @@ async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
         };
 
         match frame {
-            McpdToNode::Register { cli_id, pid, cwd, agent_hint, slot_hint, session_hint, role, name } => {
+            McpdToNode::Register {
+                cli_id, pid, cwd, agent_hint, slot_hint, session_hint, role, name, cli_session,
+            } => {
                 attached = agent_hint.is_none();
-                match register(&ctx, cli_id, pid, cwd, agent_hint, slot_hint, session_hint, role, name).await {
+                match register(&ctx, cli_id, pid, cwd, agent_hint, slot_hint, session_hint, role,
+                               name, cli_session).await {
                     Ok(frame) => {
                         if let NodeToMcpd::Registered { agent_id: ref a, .. } = frame {
                             agent_id = Some(a.clone());
@@ -195,6 +198,7 @@ async fn register(
     session_hint: Option<String>,
     role: Option<String>,
     name: Option<String>,
+    cli_session: Option<String>,
 ) -> Result<NodeToMcpd> {
     let tools = proto::tools::team_tools();
 
@@ -235,6 +239,7 @@ async fn register(
             pid,
             start_ticks,
         }),
+        cli_session,
     })
     .await?;
 

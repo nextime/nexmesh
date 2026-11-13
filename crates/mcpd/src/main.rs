@@ -150,6 +150,38 @@ fn tool_content(text: &str, deliver: &[Envelope]) -> Value {
     json!({ "content": [ { "type": "text", "text": body } ] })
 }
 
+/// Environment variables through which a CLI tells an MCP server which of
+/// its own conversations is running.
+///
+/// Verified by dumping the environment each CLI actually hands a server, not
+/// read off documentation: claude sets `CLAUDE_CODE_SESSION_ID`, codex sets
+/// `CODEX_THREAD_ID`. opencode publishes nothing of the kind today, so it
+/// falls back to identity by directory and name -- which is why this is a
+/// list and not an assumption.
+const CLI_SESSION_VARS: &[&str] = &[
+    // An explicit override wins: a wrapper that knows better can say so.
+    "NEXMESH_CLI_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    // Not observed in the wild yet; harmless, and ready if they appear.
+    "OPENCODE_SESSION_ID",
+    "QWEN_SESSION_ID",
+    "GEMINI_SESSION_ID",
+];
+
+/// Which conversation this shim belongs to, if the CLI says.
+fn cli_session_id() -> Option<String> {
+    for key in CLI_SESSION_VARS {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -175,6 +207,7 @@ async fn main() -> Result<()> {
         session_hint: args.session.clone(),
         role: args.role.clone(),
         name: args.name.clone(),
+        cli_session: cli_session_id(),
     })
     .await?;
 
@@ -290,4 +323,20 @@ async fn main() -> Result<()> {
 
     let _ = node.send(&McpdToNode::Bye).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CLI_SESSION_VARS;
+
+    #[test]
+    fn the_explicit_override_is_consulted_first() {
+        assert_eq!(CLI_SESSION_VARS[0], "NEXMESH_CLI_SESSION");
+    }
+
+    #[test]
+    fn the_two_cli_variables_we_verified_are_there() {
+        assert!(CLI_SESSION_VARS.contains(&"CLAUDE_CODE_SESSION_ID"));
+        assert!(CLI_SESSION_VARS.contains(&"CODEX_THREAD_ID"));
+    }
 }

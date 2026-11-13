@@ -50,6 +50,28 @@ enum Cmd {
     Nodes,
     /// List sessions.
     Sessions,
+    /// Move a seat -- and whoever is sitting in it -- to another session.
+    /// No restart: the agent's next tool call lands in the new session. Its
+    /// workspace, file locks and ownership zones are released, since all
+    /// three describe the session being left.
+    MoveAgent {
+        slot: String,
+        session: String,
+    },
+    /// Remove a seat from a session, with whatever history belongs to it.
+    /// Refuses while someone is sitting in it unless --force.
+    RemoveAgent {
+        slot: String,
+        /// Remove it even though an agent is live in it.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Rename a session. The name is what you read on the dashboard and in
+    /// every message, so it should be allowed to change.
+    RenameSession {
+        session: String,
+        name: String,
+    },
     /// Create a session, optionally with a workspace on one node.
     NewSession {
         name: String,
@@ -612,6 +634,36 @@ async fn main() -> Result<()> {
                     s["slots"].as_i64().unwrap_or(0)
                 );
             }
+        }
+
+        Cmd::MoveAgent { slot, session } => {
+            let v = post(&c, format!("{base}/v1/slots/{slot}/move"),
+                         json!({ "session": session })).await?;
+            println!("{} moved to {}", slot, v["session_name"].as_str().unwrap_or(&session));
+            let left = v["messages_left_unread"].as_i64().unwrap_or(0);
+            if left > 0 {
+                println!("  {left} message(s) it had not read stay in the old session");
+            }
+            let l = v["locks_released"].as_i64().unwrap_or(0);
+            let z = v["zones_released"].as_i64().unwrap_or(0);
+            if l > 0 || z > 0 {
+                println!("  released {l} lock(s) and {z} ownership zone(s)");
+            }
+        }
+
+        Cmd::RemoveAgent { slot, force } => {
+            let url = format!("{base}/v1/slots/{slot}{}", if force { "?force=1" } else { "" });
+            // authed(), like every other call here: a bare client sends no
+            // operator token and the hub rightly refuses it.
+            let r = authed(c.delete(&url)).send().await.with_context(|| format!("DELETE {url}"))?;
+            let v = body_or_error(r, "removing the slot").await?;
+            println!("removed {} ({} agent rows)", slot, v["agent_rows"].as_i64().unwrap_or(0));
+        }
+
+        Cmd::RenameSession { session, name } => {
+            let v = post(&c, format!("{base}/v1/sessions/{session}/name"),
+                         json!({ "name": name })).await?;
+            println!("{} is now \"{}\"", session, v["name"].as_str().unwrap_or(&name));
         }
 
         Cmd::NewSession { name, workspace, kind, node, path, repo, token_budget } => {

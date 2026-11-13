@@ -167,6 +167,31 @@ pub fn tools() -> Vec<Tool> {
             }, "additionalProperties": false }),
         },
         Tool {
+            name: "rename_session",
+            description: "Rename a session. The name is what everyone reads on the dashboard \
+                          and in every message, and a fleet usually gets named before anyone \
+                          knows what it is for. Renaming changes nothing else: the same seats, \
+                          the same agents, the same history.",
+            schema: json!({ "type": "object", "properties": {
+                "session": s("Session id or name. Required when more than one session exists"),
+                "name": s("The new name, 64 characters or fewer")
+            }, "required": ["name"], "additionalProperties": false }),
+        },
+        Tool {
+            name: "move_agent",
+            description: "Move an agent to another session, without restarting it. An agent's \
+                          session is not something it carries -- a tool call resolves it through \
+                          the agent's seat -- so the agent keeps working, mid-conversation, and \
+                          its next action lands in the session it was moved to. Its workspace, \
+                          file locks and ownership zones are released: all three describe the \
+                          session being left. Anything it had not yet read stays behind.",
+            schema: json!({ "type": "object", "properties": {
+                "who": s("Agent name, as team_status shows it"),
+                "session": s("The session it is in now. Required when more than one exists"),
+                "to": s("Session to move it to: id or name")
+            }, "required": ["who", "to"], "additionalProperties": false }),
+        },
+        Tool {
             name: "release_agents",
             description: "Accept an agent's work and let it stop. Agents cannot disconnect on \
                           their own -- that is what stops one wandering off before review -- so \

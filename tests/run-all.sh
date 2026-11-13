@@ -7,6 +7,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Every suite drives nexmesh-mcpd, and a CLI exports its conversation id to
+# its MCP children. Running the suite from inside such a CLI would give every
+# shim the same identity and make them all claim one seat.
+unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID \
+      QWEN_SESSION_ID GEMINI_SESSION_ID NEXMESH_CLI_SESSION
+
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
         control dashboard orchestrator mtls pairing revoke bind plugin mcpdoor
         capability memory codegraph coderai webauth)

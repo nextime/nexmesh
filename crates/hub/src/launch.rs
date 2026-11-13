@@ -89,7 +89,9 @@ pub async fn launch_slot(
                     db.query_row("SELECT kind FROM workspaces WHERE id = ?", [w], |r| r.get(0))?;
                 (path, kind == "repo")
             }
-            None => (std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()), false),
+            // No workspace: the node decides where its own user can work.
+            // Reading HOME here reads the *hub's* environment.
+            None => (String::new(), false),
         };
         (node_name, cwd, shared)
     };

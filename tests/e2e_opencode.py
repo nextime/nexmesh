@@ -8,6 +8,16 @@ opened on demand -- without any model calls.
 import fcntl, json, os, pty, select, shutil, signal, sqlite3, struct, subprocess
 import sys, tempfile, termios, time, urllib.request, urllib.error
 
+# A CLI exports its conversation id to the MCP servers it starts, and these
+# suites are routinely run FROM inside one. Inherited, it would hand every
+# shim here the same identity and make them all claim a single seat -- which
+# looks like a bug in the hub and is not. The tests choose their own.
+import os as _os
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+    _os.environ.pop(_v, None)
+
+
 SCR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCR); BIN = f"{ROOT}/target/debug"
 PORT = 17907; HUB = f"http://127.0.0.1:{PORT}"
