@@ -746,12 +746,21 @@ this hub may answer on a public address. Creating it needs a code the hub
 prints to its own terminal:
 
 ```bash
-nexmesh-hub dashboard-setup-code
+# On a service install, say which database -- see below.
+NEXMESH_DB=/var/lib/nexmesh/hub.db nexmesh-hub dashboard-setup-code
 # setup code: xK3f...
 ```
 
-Paste that into the first-run form with a username and a password, and you are
-in. Afterwards: `nexmesh-hub dashboard-user <name>` to add another,
+Every administrative subcommand works on a database, and the default is
+`~/.nexmesh/hub.db` — which on a host where the hub runs as a service is
+**not** the database the hub is serving. Run one of them bare there and it
+refuses rather than minting a credential into an empty file that nothing is
+reading; that refusal exists because the silent version of it cost an hour.
+Pass `--db`, or set `NEXMESH_DB`, or source the service's own environment
+file.
+
+Paste the code into the first-run form with a username and a password, and you
+are in. Afterwards: `nexmesh-hub dashboard-user <name>` to add another,
 `nexmesh-hub dashboard-passwd <name>` to reset one — which also ends that
 account's open sessions, because a password change that leaves them alive
 locks nobody out. Both read the password from stdin by default, since one on a

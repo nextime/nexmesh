@@ -204,6 +204,24 @@ def main():
           'id="setupForm"' in body, body[:200])
     check("with a graph tab", '"graph"' in body, body[:200])
 
+    print("\n=== an admin command will not mint into a database that is not there ===")
+    # The silent version of this cost an hour: a bare `dashboard-setup-code`
+    # on a service install created an empty ~/.nexmesh/hub.db, printed a code
+    # into it, and the running hub -- serving a different file -- rejected
+    # every attempt to use it.
+    empty_home = tempfile.mkdtemp(prefix="nexmesh-nohome-")
+    r = subprocess.run([f"{BIN}/nexmesh-hub", "dashboard-setup-code"],
+                       capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items()
+                            if k != "NEXMESH_DB"} | {"HOME": empty_home})
+    check("it refuses", r.returncode != 0, r.stdout + r.stderr)
+    check("naming the database it looked for",
+          "/.nexmesh/hub.db" in (r.stdout + r.stderr), r.stdout + r.stderr)
+    check("and saying how to point it at the right one",
+          "NEXMESH_DB" in (r.stdout + r.stderr), r.stdout + r.stderr)
+    check("and creates nothing",
+          not os.path.exists(os.path.join(empty_home, ".nexmesh", "hub.db")))
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1
