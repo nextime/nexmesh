@@ -55,7 +55,9 @@ pub fn team_tools() -> Vec<ToolDef> {
             "Send a message to every teammate at once.",
             json!({ "text": s("Message body") }), &["text"]),
         tool("check_messages",
-            "Fetch messages addressed to you that you have not yet seen.",
+            "What is waiting on you. Reading does NOT clear it: a message stays here until \
+             you claim_messages, so nothing is lost by looking, and anyone watching the team \
+             can tell what has actually been dealt with from what has merely been seen.",
             json!({}), &[]),
         tool("set_summary",
             "Update your one-line status, visible to peers and on the dashboard.",
@@ -84,6 +86,16 @@ pub fn team_tools() -> Vec<ToolDef> {
                 "reason": s("Why you are escalating: what you tried and where it failed"),
                 "task": s("What they should do. Omitted means your own current task")
             }), &["to", "reason"]),
+        tool("claim_messages",
+            "Say you have dealt with the messages waiting on you. This is the ONLY thing that \
+             clears them: check_messages shows them and leaves them, because reading is not \
+             answering, and a message glanced at used to be a message gone. Claim them once \
+             you have acted, replied, or decided they need nothing. Omit 'ids' to claim \
+             everything waiting on you.",
+            json!({
+                "ids": json!({ "type": "array", "items": { "type": "integer" },
+                               "description": "Message ids from check_messages. Omitted means all" })
+            }), &[]),
         tool("notify_operator",
             "Raise something with whoever is DRIVING this team -- not a teammate. Use it when \
              you are blocked on something no agent here can settle: a decision that is not \

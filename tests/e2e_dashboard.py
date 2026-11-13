@@ -105,8 +105,18 @@ def main():
     refs = re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+)', html)
     external = [u for u in refs if u.startswith("http") or u.startswith("//")]
     check("no external resources are referenced", not external, str(external))
-    check("there is no <script src> or <link> at all",
-          not re.search(r'<script[^>]+src=', html) and "<link" not in html, str(refs))
+    check("no script is loaded from anywhere",
+          not re.search(r'<script[^>]+src=', html), str(refs))
+    # Links are allowed now, but only to this hub's own routes: a manifest
+    # and an icon are what make the page installable on a phone, and they
+    # have to be referenced by URL. The rule being protected is that nothing
+    # is fetched from a THIRD PARTY -- a dashboard that phones a CDN leaks
+    # the existence of the fleet to it, and breaks without the internet.
+    links = re.findall(r'<link[^>]+href\s*=\s*["\']([^"\']+)', html)
+    offsite = [u for u in links if "//" in u or u.startswith("data:")]
+    check("every link is to this hub", not offsite, str(links))
+    check("the page is installable: it links a manifest",
+          any(u.endswith("manifest.webmanifest") for u in links), str(links))
     # What matters is that the PAGE is static: it is served without
     # authentication, so anything of a session baked into it would be a leak.
     check("it carries no session data", "sl-" not in html, "no slot ids in the page")
@@ -221,6 +231,73 @@ def main():
     s, dn = req(f"/v1/dashboard/state?session={sid2}", optok)
     only = sorted(a["name"] for a in (dn.get("detail") or {}).get("agents", []))
     check("picking one session still shows only that one", only == ["Solo"], str(only))
+
+    print("\n=== a seat can be renamed from where you read it ===")
+    # The dashboard is where a person looks at a team, so it is where the
+    # name has to be changeable. A seat is named before anyone knows what it
+    # will do: `Claude-zeiss-3` says where it runs and nothing about the work.
+    seat = [a for a in det["agents"] if a["name"] == "Iris"][0]["slot_id"]
+    s, j = req(f"/v1/slots/{seat}/name", optok, "POST", {"name": "Reviewer"})
+    check("renaming a seat is accepted", s == 200 and j.get("name") == "Reviewer", f"{s} {j}")
+    check("and it reports what the name was", j.get("was") == "Iris", str(j))
+    s, dr = req(f"/v1/dashboard/state?session={sid}", optok)
+    nm = sorted(a["name"] for a in (dr.get("detail") or {}).get("agents", []))
+    check("the snapshot shows the new name", "Reviewer" in nm and "Iris" not in nm, str(nm))
+    s, j = req(f"/v1/slots/{seat}/name", optok, "POST", {"name": "Max"})
+    check("a name already taken in that session is refused", s == 400, f"{s} {j}")
+    s, j = req(f"/v1/slots/{seat}/name", optok, "POST", {"name": "   "})
+    check("and so is an empty one", s == 400, f"{s} {j}")
+
+    print("\n=== it installs on a phone ===")
+    s, mf = req("/manifest.webmanifest", raw=True)
+    check("the manifest is served", s == 200 and "nexmesh" in mf, str(s))
+    import json as _json
+    m = _json.loads(mf)
+    check("it is standalone, so it opens as an app",
+          m.get("display") == "standalone", str(m.get("display")))
+    check("and names an icon", bool(m.get("icons")), str(m.get("icons")))
+    s, icon = req("/icon.svg", raw=True)
+    check("the icon is served", s == 200 and "<svg" in icon, str(s))
+    s, sw = req("/sw.js", raw=True)
+    check("the service worker is served", s == 200 and "addEventListener" in sw, str(s))
+    # A dashboard is a live view. A cached one shows yesterday's agents as
+    # though they were running, which is worse than showing nothing.
+    check("and it caches nothing", "caches.open" not in sw and "cache" not in sw.lower(),
+          sw[:200])
+
+    print("\n=== messages stay unread until somebody claims them ===")
+    # Reading is not answering: a message glanced at used to be a message
+    # gone, and nobody could tell afterwards what had been dealt with.
+    s, dm = req(f"/v1/dashboard/state?session={sid}", optok)
+    msgs = (dm.get("detail") or {}).get("messages", [])
+    check("messages say whether they were claimed",
+          msgs and all("claimed" in m for m in msgs), str(msgs[:1])[:200])
+    unclaimed_before = len([m for m in msgs if not m["claimed"]])
+    check("and some are waiting on somebody", unclaimed_before > 0, str(unclaimed_before))
+    st2 = (dm.get("detail") or {}).get("stats") or {}
+    check("the stats count what is unclaimed, not just what is undelivered",
+          st2.get("unclaimed") == unclaimed_before, str(st2))
+
+    # The operator speaking into a team, from the dashboard.
+    s, j = req(f"/v1/sessions/{sid}/messages", optok, "POST", {"text": "operator here"})
+    check("the operator can inject a message", s == 200, f"{s} {j}")
+    s, dm2 = req(f"/v1/dashboard/state?session={sid}", optok)
+    bodies = [m["body"] for m in (dm2.get("detail") or {}).get("messages", [])]
+    check("and it appears in the log", "operator here" in bodies, str(bodies)[:200])
+
+    # And clearing what nobody claimed, without pretending an agent did.
+    s, j = req(f"/v1/sessions/{sid}/messages/clear", optok, "POST", {})
+    check("the operator can clear unclaimed messages", s == 200 and j.get("cleared", 0) > 0,
+          f"{s} {j}")
+    s, dm3 = req(f"/v1/dashboard/state?session={sid}", optok)
+    left = [m for m in (dm3.get("detail") or {}).get("messages", []) if not m["claimed"]]
+    check("after which nothing is left unclaimed", left == [], str(left)[:200])
+    who = {m.get("claimed_by") for m in (dm3.get("detail") or {}).get("messages", [])}
+    check("and the log says the operator closed them",
+          any(w and w.startswith("operator") for w in who), str(who))
+    # Clearing by NAME must work too, since every command takes a name.
+    s, j = req("/v1/sessions/e2e/messages/clear", optok, "POST", {})
+    check("clearing accepts a session name", s == 200, f"{s} {j}")
 
     print("\n=== an unknown session is not a crash ===")
     s, d3 = req("/v1/dashboard/state?session=se-nope", optok)

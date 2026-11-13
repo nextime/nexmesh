@@ -44,6 +44,66 @@ pub async fn favicon() -> Response {
         .into_response()
 }
 
+/// The manifest that makes this installable on a phone.
+///
+/// A fleet is watched from wherever you happen to be, which is usually not
+/// at a desk. Installed, it opens as its own app rather than a tab in a
+/// browser you then have to find again.
+pub async fn manifest() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/manifest+json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        r##"{
+  "name": "nexmesh",
+  "short_name": "nexmesh",
+  "description": "Agents across every machine you own.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0f14",
+  "theme_color": "#0b0f14",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}"##,
+    )
+        .into_response()
+}
+
+/// The installed app's icon. One SVG at any size, so there is nothing to
+/// regenerate and nothing to keep in step.
+pub async fn app_icon() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#0b0f14"/><circle cx="256" cy="150" r="46" fill="#6ee7b7"/><circle cx="140" cy="370" r="46" fill="#93c5fd"/><circle cx="372" cy="370" r="46" fill="#fcd34d"/><path d="M256 196v70m0 0-92 70m92-70 92 70" stroke="#4b5563" stroke-width="22" fill="none" stroke-linecap="round"/></svg>"##,
+    )
+        .into_response()
+}
+
+/// A service worker, which is what makes the browser offer to install it.
+///
+/// Deliberately almost nothing: it claims the scope and passes every request
+/// straight through. A dashboard is a live view of a fleet, and a cached one
+/// is worse than none -- it would show yesterday's agents as though they
+/// were running.
+pub async fn service_worker() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        r##"self.addEventListener("install", (e) => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+// No caching, on purpose: a stale fleet view is worse than no fleet view.
+self.addEventListener("fetch", () => {});
+"##,
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct StateQuery {
     /// Which session to detail. Omitted: just the fleet and the session list.
@@ -179,7 +239,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             CASE WHEN m.to_slot IS NULL THEN '(team)'
                                  ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
                             m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL,
-                            COALESCE(mx.name, '')
+                            COALESCE(mx.name, ''),
+                            m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, '')
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
@@ -194,6 +255,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "from": r.get::<_, String>(4)?, "to": r.get::<_, String>(5)?,
                             "delivered": r.get::<_, bool>(6)?, "in_flight": r.get::<_, bool>(7)?,
                             "session": r.get::<_, String>(8)?,
+                            "claimed": r.get::<_, bool>(9)?,
+                            "claimed_by": r.get::<_, String>(10)?,
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -359,6 +422,9 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 .iter()
                 .filter(|m| m["delivered"] == false && m["in_flight"] == false)
                 .count();
+            // Delivered is not dealt with. This is the number a person
+            // actually wants: what is waiting on somebody.
+            let unclaimed = messages.iter().filter(|m| m["claimed"] == false).count();
             let tin: i64 = agents.iter().filter_map(|a| a["input_tokens"].as_i64()).sum();
             let tout: i64 = agents.iter().filter_map(|a| a["output_tokens"].as_i64()).sum();
             let flapping = agents.iter().filter(|a| a["slot_status"] == "flapping").count();
@@ -539,7 +605,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 "stats": {
                     "slots": agents.len(), "live": live, "working": working,
                     "awaiting_review": awaiting, "approved": approved,
-                    "undelivered": undelivered, "flapping": flapping,
+                    "undelivered": undelivered, "unclaimed": unclaimed, "flapping": flapping,
                     "input_tokens": tin, "output_tokens": tout,
                 },
             })

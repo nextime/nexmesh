@@ -58,6 +58,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         // so without this an orchestrator cannot tell a peer's message from
         // one of its own team asking for help.
         ("operator_messages", "from_kind", "TEXT NOT NULL DEFAULT 'operator'"),
+        // Delivered is not read. See schema.sql.
+        ("messages", "claimed_at_ms", "INTEGER"),
+        ("messages", "claimed_by", "TEXT"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.

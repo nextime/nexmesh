@@ -1034,6 +1034,133 @@ pub async fn operator_inbox(
                  "scope": match &op.session { Some(s) => json!(s), None => json!("fleet") } }))
 }
 
+/// Clear messages nobody claimed.
+///
+/// The other half of messages that no longer clear themselves: they pile up,
+/// and somebody has to be able to say "this no longer matters" without
+/// pretending an agent dealt with it. Claimed by `operator`, so the log
+/// still says who closed it and when.
+pub async fn clear_unclaimed(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let session_id = session_ref_to_id(&db, &session_ref);
+    let ids: Vec<i64> = db
+        .prepare("SELECT id FROM messages WHERE session_id = ? AND claimed_at_ms IS NULL")
+        .and_then(|mut q| {
+            q.query_map([&session_id], |r| r.get::<_, i64>(0)).and_then(|m| m.collect())
+        })
+        .map_err(bad)?;
+    let who = format!("operator:{}", op.label);
+    let n = crate::tools::claim_messages(&db, &who, &ids).map_err(bad)?;
+    Ok(Json(json!({ "cleared": n, "session_id": session_id })))
+}
+
+#[derive(Deserialize)]
+pub struct OperatorAsk {
+    pub capability: String,
+    /// Arguments for the capability, as the manifest's `accepts` names them.
+    #[serde(default)]
+    pub request: Value,
+    /// Which team's providers to ask. A super may omit it and the fleet is
+    /// searched; a scoped token is confined to its own session anyway.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// Use a team capability as the operator.
+///
+/// The capability machinery was reachable only by agents, so a person at the
+/// dashboard could not use the very services their own fleet advertises --
+/// the transcription running on their GPU box was available to every agent
+/// and to nobody holding a phone.
+pub async fn operator_ask(
+    State(st): State<AppState>,
+    Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
+    Json(req): Json<OperatorAsk>,
+) -> ApiResult {
+    if req.capability.trim().is_empty() {
+        return Err(bad("name a capability"));
+    }
+    let db = st.db.lock().unwrap();
+    // Where to look: what was asked for, else this token's own session,
+    // else anywhere a provider is sitting.
+    let sessions: Vec<String> = match (req.session.as_deref(), op.session.as_deref()) {
+        (Some(s), _) => vec![session_ref_to_id(&db, s)],
+        (None, Some(scope)) => vec![scope.to_string()],
+        (None, None) => db
+            .prepare("SELECT id FROM sessions WHERE status = 'active'")
+            .and_then(|mut q| q.query_map([], |r| r.get::<_, String>(0)).and_then(|m| m.collect()))
+            .map_err(bad)?,
+    };
+    let body = serde_json::to_string(&req.request).unwrap_or_else(|_| "{}".into());
+    for sid in &sessions {
+        // "operator" is not a seat, so it excludes nobody from answering.
+        match crate::asks::create(&db, sid, "operator", &req.capability, &body, None) {
+            Ok((id, to_slot, label)) => {
+                return Ok(Json(json!({
+                    "ask_id": id, "to": label, "to_slot": to_slot, "session_id": sid
+                })))
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(bad(format!(
+        "nothing in {} offers '{}'",
+        if sessions.len() == 1 { "that session".to_string() } else { "the fleet".to_string() },
+        req.capability.trim().to_lowercase()
+    )))
+}
+
+/// Has it answered yet? The dashboard polls this.
+pub async fn operator_ask_result(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    let db = st.db.lock().unwrap();
+    match crate::asks::poll(&db, &id) {
+        Ok(Some((status, result))) => json!({
+            "done": true, "status": status, "result": result
+        })
+        .into(),
+        _ => json!({ "done": false }).into(),
+    }
+}
+
+/// Parse a workspace and build its map, now.
+///
+/// The graph was only ever built as a side effect of an agent asking about
+/// the code, so a person looking at the dashboard of a fresh fleet was told
+/// "nothing has been parsed yet" with no way to change that. The map is for
+/// reading a codebase you did not write; needing an agent to want it first
+/// is backwards.
+pub async fn build_graph(
+    State(st): State<AppState>,
+    Path(workspace_ref): Path<String>,
+) -> ApiResult {
+    let found: Option<(String, String, String)> = {
+        let db = st.db.lock().unwrap();
+        db.query_row(
+            "SELECT w.id, m.node_id, m.path
+               FROM workspaces w JOIN workspace_mounts m ON m.workspace_id = w.id
+              WHERE w.id = ?1 OR w.name = ?1
+              ORDER BY length(m.path) LIMIT 1",
+            [&workspace_ref],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(bad)?
+    };
+    let (ws_id, node_id, path) =
+        found.ok_or_else(|| bad(format!("no workspace '{workspace_ref}', or it has no mount")))?;
+    match crate::graph::build(&st, &ws_id, &node_id, &path).await {
+        Ok(summary) => Ok(Json(json!({ "workspace_id": ws_id, "summary": summary }))),
+        Err(e) => Err(bad(format!("could not parse {path}: {e}"))),
+    }
+}
+
 pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<String>) -> Json<Value> {
     // A session may be named, not only identified.
     let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);

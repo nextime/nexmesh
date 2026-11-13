@@ -499,7 +499,15 @@ CREATE TABLE IF NOT EXISTS messages (
   inflight_agent  TEXT,                        -- handed to a driver, awaiting ack
   inflight_at_ms  INTEGER,
   acked_at_ms     INTEGER,                     -- proven to have reached the model
-  acked_by_agent  TEXT
+  acked_by_agent  TEXT,
+  -- DELIVERED is not READ. `acked_at_ms` says a message reached the model,
+  -- which is what stops it being handed over again; it says nothing about
+  -- anyone having dealt with it. Checking your messages used to ack them,
+  -- so a glance was indistinguishable from an answer and the message was
+  -- gone. A message stays UNCLAIMED until an agent explicitly claims it, or
+  -- an operator clears it by hand.
+  claimed_at_ms   INTEGER,
+  claimed_by      TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, to_slot) WHERE acked_at_ms IS NULL;
 

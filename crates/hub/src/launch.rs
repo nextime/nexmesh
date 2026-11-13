@@ -24,6 +24,10 @@ struct SlotRow {
     resume: Option<String>,
     tmux_target: Option<String>,
     model: Option<String>,
+    /// The CLI's own conversation id, when this seat was taken by a human's
+    /// CLI rather than spawned. For claude and codex this IS a resume
+    /// handle.
+    cli_session: Option<String>,
 }
 
 fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
@@ -31,7 +35,7 @@ fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
     db.query_row(
         "SELECT s.session_id, se.name, s.cli_id, s.mode, s.placement, s.display_name,
                 s.role, s.role_description, s.workspace_id, s.resume_handle, s.tmux_target,
-                s.model
+                s.model, s.cli_session
          FROM slots s JOIN sessions se ON se.id = s.session_id WHERE s.id = ?",
         [slot_id],
         |r| {
@@ -48,6 +52,7 @@ fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
                 resume: r.get(9)?,
                 tmux_target: r.get(10)?,
                 model: r.get(11)?,
+                cli_session: r.get(12)?,
             })
         },
     )
@@ -125,7 +130,14 @@ pub async fn launch_slot(
     // session, so a seat that worked here yesterday would otherwise start
     // from nothing. The identity is the CLI, the workspace and the name --
     // what makes tomorrow's agent the same agent.
-    let mut resume = row.resume.clone();
+    // A seat taken by hand has no resume_handle -- nothing reported one,
+    // because no node was driving it -- but it does have the CLI's own
+    // conversation id, which for claude and codex is exactly what --resume
+    // takes. Without this, restarting someone's closed conversation under
+    // the hub's control gives them a BLANK one wearing the same name.
+    let mut resume = row.resume.clone().or_else(|| {
+        row.cli_session.clone().filter(|c| !c.trim().is_empty())
+    });
     let cli_for_identity = row.cli_id.clone().unwrap_or_default();
     let name_for_identity = row.display_name.clone().unwrap_or_default();
     if !cli_for_identity.is_empty() && !name_for_identity.is_empty() {

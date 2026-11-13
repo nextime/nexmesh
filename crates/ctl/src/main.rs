@@ -13,7 +13,7 @@
 mod install;
 mod tlstrust;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 

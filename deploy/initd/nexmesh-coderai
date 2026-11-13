@@ -33,6 +33,11 @@ if [ -z "$NEXMESH_HUB" ] || [ -z "$NEXMESH_PARTICIPANT_TOKEN" ]; then
 fi
 
 ARGS="--hub $NEXMESH_HUB --service $CODERAI_URL --manifest $NEXMESH_CAPABILITIES --name $NEXMESH_BRIDGE_NAME"
+# A hub reachable off its own machine speaks TLS, usually against the fleet's
+# own CA, and often wants a client certificate as well.
+[ -n "${NEXMESH_CA_CERT:-}" ]     && ARGS="$ARGS --ca-cert $NEXMESH_CA_CERT"
+[ -n "${NEXMESH_CLIENT_CERT:-}" ] && ARGS="$ARGS --client-cert $NEXMESH_CLIENT_CERT"
+[ -n "${NEXMESH_CLIENT_KEY:-}" ]  && ARGS="$ARGS --client-key $NEXMESH_CLIENT_KEY"
 [ -n "$NEXMESH_SESSION" ] && ARGS="$ARGS --session $NEXMESH_SESSION"
 [ -n "$NEXMESH_EXTRA" ] && ARGS="$ARGS $NEXMESH_EXTRA"
 

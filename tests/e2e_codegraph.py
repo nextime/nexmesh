@@ -263,6 +263,14 @@ def main():
               all(subs[i]["n"] >= subs[i+1]["n"] for i in range(len(subs)-1)),
               str([x["n"] for x in subs]))
 
+    print("\n=== a person can build the map without an agent asking for it ===")
+    # The graph used to appear only as a side effect of query_code_graph, so
+    # a fresh fleet showed "nothing parsed yet" with no way to change it.
+    s, j = http("POST", "/v1/workspaces/local/graph", {})
+    check("parsing can be asked for directly", s == 200 and "summary" in j, f"{s} {str(j)[:200]}")
+    s, j = http("POST", "/v1/workspaces/no-such-workspace/graph", {})
+    check("and an unknown workspace is a clean error", s == 400, f"{s} {str(j)[:160]}")
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1

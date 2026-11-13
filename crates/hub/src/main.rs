@@ -656,6 +656,13 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
         .route("/v1/sessions/:id/workspaces", post(api::add_workspace))
         .route("/v1/slots/:id/name", post(api::rename_slot))
+        .route("/v1/sessions/:id/messages/clear", post(api::clear_unclaimed))
+        // A person at the dashboard using the fleet's own services --
+        // transcription, speech -- rather than only agents being able to.
+        .route("/v1/capabilities/ask", post(api::operator_ask))
+        .route("/v1/capabilities/ask/:id", get(api::operator_ask_result))
+        .route("/v1/workspaces/:id/graph", post(api::build_graph))
+
         // The operator channel. Not session-scoped on purpose: it is how a
         // scoped orchestrator reaches past its own session, which is the one
         // thing it is otherwise unable to do.
@@ -692,6 +699,13 @@ async fn main() -> Result<()> {
         .route("/", get(dashboard::page))
         .route("/dashboard", get(dashboard::page))
         .route("/favicon.ico", get(dashboard::favicon))
+        // Installable on a phone: a fleet is watched from wherever you are.
+        // Public, like the page: a browser fetches a manifest, an icon and
+        // a service worker without credentials, and none of the three holds
+        // anything about the fleet.
+        .route("/manifest.webmanifest", get(dashboard::manifest))
+        .route("/icon.svg", get(dashboard::app_icon))
+        .route("/sw.js", get(dashboard::service_worker))
         .route("/healthz", get(api::health))
         // Signing in cannot itself require being signed in. These three are
         // the only unauthenticated write paths on the hub, and each is

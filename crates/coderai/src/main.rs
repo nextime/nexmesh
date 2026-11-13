@@ -71,6 +71,20 @@ struct Args {
     #[arg(long, env = "CODERAI_TOKEN")]
     service_token: Option<String>,
     /// Capability manifest.
+    /// PEM holding the hub's certificate, or its CA, for a self-signed hub.
+    ///
+    /// Without this the bridge could not reach a hub that uses TLS at all --
+    /// which is every hub reachable off its own machine. It is the one
+    /// component that had no way to trust the fleet CA, so on a secured
+    /// fleet it could only ever fail the handshake.
+    #[arg(long, env = "NEXMESH_CA_CERT")]
+    ca_cert: Option<String>,
+    /// This bridge's own client certificate, when the hub requires mutual
+    /// TLS. Its name must match the participant label, as for any operator.
+    #[arg(long, env = "NEXMESH_CLIENT_CERT")]
+    client_cert: Option<String>,
+    #[arg(long, env = "NEXMESH_CLIENT_KEY")]
+    client_key: Option<String>,
     #[arg(long, env = "NEXMESH_CAPABILITIES", default_value = "capabilities/coderai.toml")]
     manifest: String,
     /// Report what it would advertise, then exit. For checking an install
@@ -328,6 +342,37 @@ impl Hub {
     }
 }
 
+/// The client that talks to the HUB, which on any fleet reachable off one
+/// machine means TLS against a private CA, and often a client certificate
+/// too. The service behind the bridge is a different matter: it is local,
+/// and its client is built plainly.
+fn hub_client(args: &Args) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60));
+    if let Some(path) = args.ca_cert.as_deref() {
+        let pem = std::fs::read(path).with_context(|| format!("reading CA file {path}"))?;
+        b = b.add_root_certificate(
+            reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("parsing {path} as a PEM certificate"))?,
+        );
+    }
+    match (args.client_cert.as_deref(), args.client_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            // reqwest wants one PEM holding both.
+            let mut pem = std::fs::read(cert)
+                .with_context(|| format!("reading client certificate {cert}"))?;
+            pem.push(b'\n');
+            pem.extend(std::fs::read(key).with_context(|| format!("reading client key {key}"))?);
+            b = b.identity(
+                reqwest::Identity::from_pem(&pem)
+                    .context("the client certificate and key could not be loaded together")?,
+            );
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("--client-cert and --client-key go together, or neither"),
+    }
+    Ok(b.build()?)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -380,7 +425,7 @@ async fn main() -> Result<()> {
     }
 
     // Join as an ordinary participant, advertising what was found.
-    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
+    let http = hub_client(&args).context("building the client that talks to the hub")?;
     let base = args.hub.trim_end_matches('/').to_string();
     let mut join = json!({
         "name": args.name,

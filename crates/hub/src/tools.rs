@@ -227,6 +227,58 @@ impl<'a> Ctx<'a> {
 
 /// Messages waiting for a slot, excluding any already in flight to a live
 /// agent. Used by every transport to piggyback delivery on a tool result.
+/// What this seat has been sent and has not yet dealt with.
+///
+/// Distinct from `pending_for_slot`, which is about DELIVERY: that one finds
+/// messages still to be handed over, and hands each over once. This one is
+/// about ATTENTION, and keeps showing a message until somebody claims it.
+/// Checking used to ack, so a glance was indistinguishable from an answer
+/// and the message was gone; an operator watching the fleet had no way to
+/// tell a message that had been acted on from one that had merely scrolled
+/// past an agent.
+pub fn unclaimed_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Result<Vec<Envelope>> {
+    let mut stmt = db.prepare(
+        "SELECT m.id, m.from_slot,
+                COALESCE(s.display_name, s.role, 'orchestrator'),
+                m.to_slot, m.kind, m.body, m.sent_at_ms
+         FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
+         WHERE m.session_id = ?1
+           AND (m.to_slot = ?2 OR m.to_slot IS NULL)
+           AND m.from_slot IS NOT ?2
+           AND m.claimed_at_ms IS NULL
+         ORDER BY m.id ASC LIMIT 50",
+    )?;
+    let out = stmt
+        .query_map(params![session_id, slot_id], |r| {
+            Ok(Envelope {
+                id: r.get(0)?,
+                from_slot: r.get(1)?,
+                from_name: r.get(2)?,
+                to_slot: r.get(3)?,
+                kind: serde_json::from_value(Value::String(r.get::<_, String>(4)?))
+                    .unwrap_or(MessageKind::Text),
+                body: r.get(5)?,
+                sent_at_ms: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(out)
+}
+
+/// Mark messages dealt with. The only thing that clears them.
+pub fn claim_messages(db: &Connection, who: &str, ids: &[i64]) -> Result<usize> {
+    let now = now_ms();
+    let mut n = 0;
+    for id in ids {
+        n += db.execute(
+            "UPDATE messages SET claimed_at_ms = ?, claimed_by = ?
+             WHERE id = ? AND claimed_at_ms IS NULL",
+            params![now, who, id],
+        )?;
+    }
+    Ok(n)
+}
+
 pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Result<Vec<Envelope>> {
     let mut stmt = db.prepare(
         "SELECT m.id, m.from_slot,
@@ -308,6 +360,7 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "send_message" => send_message(ctx, args),
         "broadcast" => broadcast(ctx, args),
         "check_messages" => check_messages(ctx),
+        "claim_messages" => claim_messages_tool(ctx, args),
         "set_summary" => set_summary(ctx, args),
         "check_team_status" => check_team_status(ctx),
         "get_plan" => get_plan(ctx),
@@ -436,22 +489,49 @@ fn broadcast(ctx: &Ctx, args: &Value) -> Result<String> {
 }
 
 fn check_messages(ctx: &Ctx) -> Result<String> {
-    let msgs = pending_for_slot(ctx.db, &ctx.session_id, &ctx.slot_id)?;
+    let msgs = unclaimed_for_slot(ctx.db, &ctx.session_id, &ctx.slot_id)?;
     if msgs.is_empty() {
-        return Ok("No new messages.".into());
+        return Ok("Nothing waiting on you.".into());
     }
-    // An explicit check is itself proof of delivery, so ack immediately.
-    let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
-    ack_messages(ctx.db, "self-check", &ids)?;
-    let mut out = format!("{} new message(s):\n", msgs.len());
+    // Reading is not answering. This used to ack everything it showed, so a
+    // message glanced at was a message gone -- and nobody, agent or
+    // operator, could tell the difference afterwards.
+    let mut out = format!(
+        "{} message(s) waiting on you. They stay here until you claim them \
+         with claim_messages:\n",
+        msgs.len()
+    );
     for m in msgs {
         out.push_str(&format!(
-            "- from {}: {}\n",
+            "- [{}] from {}: {}\n",
+            m.id,
             m.from_name.unwrap_or_else(|| "orchestrator".into()),
             m.body
         ));
     }
     Ok(out)
+}
+
+/// Say you have dealt with what you were sent.
+fn claim_messages_tool(ctx: &Ctx, args: &Value) -> Result<String> {
+    let waiting = unclaimed_for_slot(ctx.db, &ctx.session_id, &ctx.slot_id)?;
+    if waiting.is_empty() {
+        return Ok("Nothing was waiting on you.".into());
+    }
+    let ids: Vec<i64> = match args.get("ids").and_then(|v| v.as_array()) {
+        Some(a) => {
+            let wanted: Vec<i64> = a.iter().filter_map(|v| v.as_i64()).collect();
+            // Only ever your own: an id from another seat's inbox is not
+            // yours to close.
+            waiting.iter().map(|m| m.id).filter(|id| wanted.contains(id)).collect()
+        }
+        None => waiting.iter().map(|m| m.id).collect(),
+    };
+    if ids.is_empty() {
+        bail!("none of those ids are waiting on you; check_messages lists what is");
+    }
+    let n = claim_messages(ctx.db, &ctx.my_label(), &ids)?;
+    Ok(format!("Claimed {n} message(s). They will not be shown to you again."))
 }
 
 fn set_summary(ctx: &Ctx, args: &Value) -> Result<String> {
@@ -1470,6 +1550,72 @@ mod tests {
     }
 
     #[test]
+    fn checking_messages_does_not_clear_them() {
+        // Reading is not answering. This acked everything it showed, so a
+        // message glanced at was a message gone, and nobody -- agent or
+        // operator -- could tell afterwards what had actually been dealt
+        // with.
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message",
+                 &json!({"to": "Max", "text": "look at the loader"})).unwrap();
+        let first = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
+        assert!(first.contains("look at the loader"), "{first}");
+        let again = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
+        assert!(again.contains("look at the loader"),
+                "a second check must still show it: {again}");
+    }
+
+    #[test]
+    fn claiming_is_what_clears_a_message() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message",
+                 &json!({"to": "Max", "text": "ping"})).unwrap();
+        let out = dispatch(&ctx(&db, "sl-eng"), "claim_messages", &json!({})).unwrap();
+        assert!(out.contains("Claimed 1"), "{out}");
+        let after = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
+        assert!(after.contains("Nothing waiting"), "{after}");
+        let who: String = db
+            .query_row("SELECT claimed_by FROM messages WHERE body = 'ping'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(who, "Max", "the log must say who closed it");
+    }
+
+    #[test]
+    fn a_seat_cannot_claim_another_seats_messages() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message",
+                 &json!({"to": "Max", "text": "for max only"})).unwrap();
+        let id: i64 = db
+            .query_row("SELECT id FROM messages WHERE body = 'for max only'", [], |r| r.get(0))
+            .unwrap();
+        // The reviewer tries to close a message addressed to the engineer.
+        let _ = dispatch(&ctx(&db, "sl-rev"), "claim_messages", &json!({"ids": [id]}));
+        let claimed: Option<i64> = db
+            .query_row("SELECT claimed_at_ms FROM messages WHERE id = ?", [id], |r| r.get(0))
+            .unwrap();
+        assert!(claimed.is_none(), "another seat must not be able to close your message");
+        let still = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
+        assert!(still.contains("for max only"), "{still}");
+    }
+
+    #[test]
+    fn an_operator_can_clear_what_nobody_claimed() {
+        // The other half of messages that no longer clear themselves: they
+        // pile up, and somebody has to be able to say "this no longer
+        // matters" without pretending an agent dealt with it.
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message",
+                 &json!({"to": "Max", "text": "stale"})).unwrap();
+        let ids: Vec<i64> = db
+            .prepare("SELECT id FROM messages WHERE claimed_at_ms IS NULL").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<std::result::Result<_, _>>().unwrap();
+        assert_eq!(claim_messages(&db, "operator:me", &ids).unwrap(), 1);
+        let after = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
+        assert!(after.contains("Nothing waiting"), "{after}");
+    }
+
+    #[test]
     fn an_ambiguous_peer_name_is_refused_rather_than_guessed() {
         let db = fixture();
         let now = now_ms();
@@ -1558,13 +1704,28 @@ mod tests {
     }
 
     #[test]
-    fn check_messages_acks_what_it_shows() {
+    fn check_messages_shows_without_clearing_and_delivery_still_acks() {
+        // This test used to assert the opposite -- that a check acked what
+        // it showed. That is the behaviour being reversed: reading is not
+        // answering. What must NOT change is delivery: a message handed
+        // over and acked is still not handed over twice, which is what
+        // keeps a respawned agent from re-reading its whole inbox.
         let db = fixture();
         dispatch(&ctx(&db, "sl-rev"), "send_message", &json!({"to": "Max", "text": "ping"})).unwrap();
         let out = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
         assert!(out.contains("ping"), "{out}");
         let again = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
-        assert!(again.contains("No new messages"), "{again}");
+        assert!(again.contains("ping"), "a check must not clear it: {again}");
+
+        // Delivery is a separate axis and is untouched.
+        let handed = pending_for_slot(&db, "s1", "sl-eng").unwrap();
+        assert_eq!(handed.len(), 1);
+        ack_messages(&db, "a-eng", &[handed[0].id]).unwrap();
+        assert!(pending_for_slot(&db, "s1", "sl-eng").unwrap().is_empty(),
+                "an acked message must not be handed over again");
+        let still = dispatch(&ctx(&db, "sl-eng"), "check_messages", &json!({})).unwrap();
+        assert!(still.contains("ping"),
+                "delivered is not dealt with: it still waits on the agent: {still}");
     }
 
     #[test]

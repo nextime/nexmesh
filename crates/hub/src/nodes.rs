@@ -910,6 +910,12 @@ fn join(
         None => mint_seat_name(&db, &session_id, cli_id.as_deref(), node_id).ok(),
     };
 
+    // The machine's NAME, because that is what a placement records.
+    let node_name: String = db
+        .query_row("SELECT name FROM nodes WHERE id = ?", [node_id], |r| r.get(0))
+        .optional()?
+        .unwrap_or_default();
+
     let slot_id = match existing {
         Some(id) => {
             db.execute(
@@ -935,10 +941,19 @@ fn join(
         None => {
             let id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
             db.execute(
+                // Remember WHERE this seat lives. An attached agent is a
+                // process on one machine, and if the hub is later asked to
+                // restart it -- so it can be attached to and detached from
+                // like any managed agent -- a seat with no placement is
+                // placed by fallback: the first online node with that CLI,
+                // in name order. A seat closed on one machine would quietly
+                // come back on another.
                 "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
-                                    display_name, role, status, created_at_ms, cli_session)
-                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?,?)",
-                params![id, session_id, workspace_id, cli_id, name, role, now, cli_session],
+                                    display_name, role, status, created_at_ms, cli_session,
+                                    placement)
+                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?,?,?)",
+                params![id, session_id, workspace_id, cli_id, name, role, now, cli_session,
+                        serde_json::json!({ "node": node_name }).to_string()],
             )?;
             id
         }

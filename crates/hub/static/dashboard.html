@@ -2,8 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>nexmesh</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0b0f14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="icon.svg">
 <!--
   Served by the hub itself. No external fonts, scripts or stylesheets: a fleet
   hub may sit on a network with no route to the internet, and a dashboard that
@@ -75,6 +81,11 @@
   th { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); font-weight: 600; }
   tr:last-child td { border-bottom: none; }
   td.mono, .mono { font-family: var(--mono); font-size: 13px; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--fg, #e8e8ea); }
+  /* A seat's name is editable in place; say so before it is clicked. */
+  .rename { cursor: text; border-bottom: 1px dotted currentColor; opacity: .95; }
+  .rename:hover { border-bottom-style: solid; }
   .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
 
   .badge {
@@ -99,6 +110,17 @@
   .msg .mark { text-align: center; font-family: var(--mono); color: var(--faint); }
   .msg.undelivered .mark { color: var(--bad); font-weight: 700; }
   .msg.inflight .mark { color: var(--warn); }
+  /* Nobody has claimed it. Reading no longer clears a message, so this is
+     the mark that matters: what is still waiting on somebody. */
+  .msg.unclaimed .mark { color: var(--warn); }
+  .msg.unclaimed { background: color-mix(in srgb, var(--warn) 5%, transparent); }
+  /* Which team said it, in a fleet-wide read. */
+  .msg .chan { color: var(--accent, #7aa2f7); font-family: var(--mono); font-size: 12px; }
+
+  .composer { display: flex; gap: 8px; padding: 10px 12px; align-items: center;
+              border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .composer input { flex: 1 1 18em; min-width: 12em; }
+  .composer select { max-width: 14em; }
 
   .bar { height: 7px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
   .bar > i { display: block; height: 100%; background: var(--ok); }
@@ -143,7 +165,17 @@
   @media (max-width: 620px) {
     .msg { grid-template-columns: 52px 14px minmax(0, 1fr); }
     th.hide, td.hide { display: none; }
+    /* Installed on a phone this is the whole app, so it gets the whole
+       width, keeps clear of the notch, and gives taps something to hit. */
+    body { padding: 0 10px env(safe-area-inset-bottom) 10px; }
+    header { padding-top: env(safe-area-inset-top); flex-wrap: wrap; gap: 6px; }
+    #sessionSel { max-width: 48vw; }
+    .composer { position: sticky; bottom: 0; background: var(--panel);
+                padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+    .composer button, header button { min-height: 38px; }
+    .feed { max-height: 60vh; }
   }
+  .mic.on { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -288,6 +320,12 @@ function currentSession() {
   const first = snap && (snap.sessions || [])[0];
   return (first && first.id) || "";
 }
+// What makes a browser offer "install". The worker itself caches nothing:
+// a stale view of a fleet is worse than no view.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+
 let snap = null, failures = 0, timer = null;
 
 const $ = (id) => document.getElementById(id);
@@ -445,6 +483,92 @@ $("forget").addEventListener("click", async () => {
 // Naming a session, whether it exists yet or not. The selector becomes a
 // text field in place, so there is no dialog to dismiss and Escape always
 // means "leave it alone".
+// Which seat is being renamed right now, if any. The poll leaves the view
+// alone while this is set.
+let editingSeat = null;
+
+// Column sorting for the agents table. Kept outside the render so it
+// survives the poll, which would otherwise reset the order every few
+// seconds -- a table that re-sorts itself under you is worse than one that
+// cannot be sorted at all.
+let sortKey = null, sortDir = 1;
+
+function sortBy(key) {
+  if (sortKey === key) sortDir = -sortDir;
+  else { sortKey = key; sortDir = 1; }
+  render();
+}
+
+function sorted(rows) {
+  if (!sortKey) return rows;
+  const val = (r) => {
+    if (sortKey === "tokens") return (r.input_tokens || 0) + (r.output_tokens || 0);
+    const v = r[sortKey];
+    return typeof v === "string" ? v.toLowerCase() : (v ?? "");
+  };
+  return rows.slice().sort((a, b) => {
+    const x = val(a), y = val(b);
+    if (x === y) return 0;
+    return (x > y ? 1 : -1) * sortDir;
+  });
+}
+
+// A header that says whether it is sorted, and which way.
+function th(label, key, cls) {
+  const on = sortKey === key;
+  const mark = on ? (sortDir > 0 ? " ▲" : " ▼") : "";
+  return `<th class="${cls || ""} sortable" onclick="sortBy('${key}')"
+              title="sort by ${esc(label.toLowerCase())}">${esc(label)}${mark}</th>`;
+}
+
+// Renaming a seat, in the table where you are looking at it.
+//
+// A seat is named before anyone knows what it will do -- `Claude-zeiss-3`
+// says where it runs and nothing about the work -- so the name has to be
+// changeable from the place you read it, not only from a terminal.
+async function renameAgent(slot, current) {
+  const cell = document.getElementById("nm-" + slot);
+  if (!cell || cell.dataset.editing) return;
+  cell.dataset.editing = "1";
+  editingSeat = slot;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = current;
+  input.maxLength = 64;
+  input.style.cssText = "font-family:var(--mono);width:14em";
+  const held = cell.innerHTML;
+  cell.innerHTML = "";
+  cell.appendChild(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    cell.innerHTML = held;
+    delete cell.dataset.editing;
+    editingSeat = null;
+    if (save && name && name !== current) {
+      try {
+        const r = await post(`/v1/slots/${encodeURIComponent(slot)}/name`, { name });
+        if (r && r.error) throw new Error(r.error);
+      } catch (err) {
+        // A name already taken in this session is refused by the hub, and
+        // the reason is the useful part: two seats with one name leaves
+        // neither addressable.
+        note(err.message || "could not rename that agent");
+      }
+    }
+    tick();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 function editSessionName(current, placeholder, commit) {
   const sel = $("sessionSel");
   if (sel.tagName !== "SELECT") return;          // an edit is already open
@@ -632,6 +756,8 @@ function render() {
     tile((snap.nodes || []).filter((n) => n.connected).length + "/" + (snap.nodes || []).length, "nodes"),
   ].join("");
 
+  speakNew();
+
   const openCodes = (snap.pairing || []).filter((c) => c.state === "open").length;
   const counts = {
     agents: (d && d.agents || []).length, messages: (d && d.messages || []).length,
@@ -655,13 +781,20 @@ function render() {
     focus: document.activeElement ? document.activeElement.id : null,
   };
 
-  $("view").innerHTML = (!d && tab !== "fleet")
-    ? `<div class="panel"><div class="empty">No sessions yet. Press
-         <strong>new</strong> above, or pair a machine on the
-         <a href="#fleet">fleet</a> tab.</div></div>`
-    : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
-         knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
-         fleet: viewFleet })[tab](d, now);
+  // An open rename owns the view until it is finished. The poll rebuilds
+  // this element wholesale, which destroyed the input mid-keystroke: the
+  // field simply vanished a second or two after it was clicked, which looks
+  // exactly like a rename that does not work. Everything above -- the tiles,
+  // the counts -- still refreshes.
+  if (!editingSeat) {
+    $("view").innerHTML = (!d && tab !== "fleet")
+      ? `<div class="panel"><div class="empty">No sessions yet. Press
+           <strong>new</strong> above, or pair a machine on the
+           <a href="#fleet">fleet</a> tab.</div></div>`
+      : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
+           knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
+           fleet: viewFleet })[tab](d, now);
+  }
 
   if (keep.name !== null && $("pairName")) {
     $("pairName").value = keep.name;
@@ -691,15 +824,20 @@ function viewAgents(d, now) {
   const all = isAll();
   if (!d.agents.length)
     return empty(all ? "No agents anywhere yet." : "No agents in this session yet.");
-  return panel(`<table><thead><tr>
-      <th>Agent</th>${all ? "<th>Session</th>" : ""}<th>Role</th><th>Where</th>
-      <th class="hide">How</th>
-      <th>State</th><th class="num hide">Tokens</th><th>Summary</th></tr></thead><tbody>` +
-    d.agents.map((a) => {
+  return panel(`<table><thead><tr>` +
+      th("Agent", "name") + (all ? th("Session", "session") : "") +
+      th("Role", "role") + th("Where", "host") + th("How", "cli", "hide") +
+      th("State", "task_state") + th("Tokens", "tokens", "num hide") +
+      th("Summary", "summary") +
+    `</tr></thead><tbody>` +
+    sorted(d.agents).map((a) => {
       const flap = a.slot_status === "flapping";
       const dead = a.status !== "running";
       return `<tr>
-        <td><span class="mono">${esc(a.name)}</span>
+        <td id="nm-${esc(a.slot_id)}">
+            <span class="mono rename" title="click to rename"
+                  onclick="renameAgent('${esc(a.slot_id)}', '${esc(a.name).replace(/'/g, "\\'")}')"
+                  >${esc(a.name)}</span>
             ${flap ? ' <span class="badge bad">flapping</span>' : ""}
             ${a.restarts ? ` <span class="badge warn" title="restarts">↻${a.restarts}</span>` : ""}</td>
         ${all ? `<td><span class="badge info">${esc(a.session)}</span></td>` : ""}
@@ -717,29 +855,262 @@ function viewAgents(d, now) {
     }).join("") + "</tbody></table>");
 }
 
+// The whole fleet's traffic, read like a chat log.
+//
+// Every team's messages in one place, oldest first, each line saying which
+// session it belongs to -- because a fleet is several conversations at once
+// and reading them one session at a time loses the thing you actually want
+// to see, which is what happened when.
 function viewMessages(d, now) {
-  if (!d.messages.length) return empty("No messages yet.");
+  const all = isAll();
+  const unclaimed = (d.messages || []).filter((m) => !m.claimed).length;
+  const bar = `<div class="composer">
+      ${all ? `<select id="sendTo" title="session to send to">` +
+               (snap.sessions || []).map((x) =>
+                 `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join("") +
+               `</select>` : ""}
+      <input id="sendText" type="text" placeholder="message the team as the operator"
+             onkeydown="if(event.key==='Enter')sendOperatorMessage()">
+      ${(canHear() || fleetHas("transcribe")) ? `<button id="micBtn" class="mic"
+              onclick="dictate()" title="dictate">\u{1F3A4}</button>` : ""}
+      <button onclick="sendOperatorMessage()">send</button>
+      ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
+              title="read new messages aloud">${speaking ? "\u{1F50A}" : "\u{1F507}"}</button>` : ""}
+      <button onclick="clearUnclaimed()" title="mark everything nobody has claimed as handled"
+              ${unclaimed ? "" : "disabled"}>clear ${unclaimed || ""} unclaimed</button>
+    </div>`;
+
+  if (!d.messages.length)
+    return panel(`<div class="feed"><div class="empty">Nothing said yet.</div></div>`) + bar;
+
   // The snapshot is newest-first; read it oldest-first like a conversation.
   const rows = d.messages.slice().reverse().map((m) => {
-    const cls = m.delivered ? "" : (m.in_flight ? "inflight" : "undelivered");
-    const mark = m.delivered ? "" : (m.in_flight ? "~" : "!");
-    const title = m.delivered ? "delivered to the model"
-      : (m.in_flight ? "handed over, not yet confirmed" : "the recipient has not seen this yet");
+    const cls = [m.claimed ? "" : "unclaimed",
+                 m.delivered ? "" : (m.in_flight ? "inflight" : "undelivered")]
+                .filter(Boolean).join(" ");
+    const mark = !m.claimed ? "\u25cf" : "";
+    const title = m.claimed
+      ? `claimed by ${m.claimed_by || "someone"}`
+      : (m.delivered ? "delivered, but nobody has claimed it"
+                     : (m.in_flight ? "handed over, not yet confirmed"
+                                    : "the recipient has not seen this yet"));
     const kind = m.kind === "text" ? "" : `<span class="badge tiny">${esc(m.kind)}</span> `;
-    const where = isAll() && m.session
-      ? `<span class="badge info tiny">${esc(m.session)}</span> ` : "";
+    const chan = all && m.session
+      ? `<span class="chan" title="session">#${esc(m.session)}</span> ` : "";
     return `<div class="msg ${cls}">
       <div class="t">${hhmmss(m.at_ms)}</div>
       <div class="mark" title="${esc(title)}">${mark}</div>
-      <div><span class="who">${esc(m.from)}</span> <span class="arrow">→</span>
+      <div>${chan}<span class="who">${esc(m.from)}</span> <span class="arrow">→</span>
            <span class="who">${esc(m.to)}</span><br>
-           <span class="body">${where}${kind}${esc(m.body)}</span></div>
+           <span class="body">${kind}${esc(m.body)}</span></div>
     </div>`;
   }).join("");
   return panel(`<div class="feed" onscroll="this.dataset.stick=
-      (this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'">${rows}</div>`) +
+      (this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'">${rows}</div>`) + bar +
     `<p class="tiny muted" style="margin:8px 2px">
-       <b>!</b> the recipient has not seen it yet · <b>~</b> delivery in flight</p>`;
+       <b>\u25cf</b> nobody has claimed it yet — reading no longer clears a message,
+       only claim_messages does, or the button above</p>`;
+}
+
+// Speech, where the browser offers it. Chrome on Android has both; Firefox
+// has only the speaking half; nothing here is required for the dashboard to
+// work, so each control appears only if its API exists.
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recog = null;
+
+function canHear() { return !!SR; }
+function canSpeak() { return "speechSynthesis" in window; }
+
+// Does the fleet itself offer this? Preferred over the browser's own: it
+// works where the browser has no speech API at all, and the audio stays on
+// machines you own rather than going to whoever the browser asks.
+function fleetHas(cap) {
+  const agents = (snap && snap.detail && snap.detail.agents) || [];
+  return agents.some((a) => (a.summary || "").includes(cap));
+}
+
+// Run one of the fleet's capabilities and wait for the answer.
+async function askFleet(capability, request, waitMs) {
+  const started = await post("/v1/capabilities/ask", { capability, request });
+  if (!started || started.error) throw new Error((started && started.error) || "nothing offers it");
+  const deadline = Date.now() + (waitMs || 120000);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 700));
+    const r = await fetch(`/v1/capabilities/ask/${encodeURIComponent(started.ask_id)}`,
+                          { credentials: "same-origin" }).then((x) => x.json());
+    if (r.done) {
+      if (r.status !== "answered") throw new Error(r.result || "it could not do that");
+      return r.result;
+    }
+  }
+  throw new Error("timed out waiting for " + capability);
+}
+
+// Record from the microphone, transcribe it on the fleet, put the words in
+// the box. Phones are where this matters: typing a sentence to a team
+// one-handed is the thing people do not do.
+let recorder = null;
+async function dictateViaFleet() {
+  const btn = $("micBtn");
+  if (recorder) { recorder.stop(); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    note("No microphone: " + (e.message || e.name));
+    return;
+  }
+  const chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
+    recorder = null;
+    if (btn) btn.classList.remove("on");
+    const blob = new Blob(chunks, { type: chunks[0] ? chunks[0].type : "audio/webm" });
+    if (!blob.size) return;
+    note("Transcribing on the fleet…");
+    try {
+      const b64 = await new Promise((res, rej) => {
+        const fr = new FileReader();
+        fr.onload = () => res(String(fr.result).split(",")[1] || "");
+        fr.onerror = rej;
+        fr.readAsDataURL(blob);
+      });
+      const out = await askFleet("transcribe", { audio_base64: b64, language: navigator.language });
+      const text = (() => { try { const j = JSON.parse(out); return j.text || out; }
+                           catch (e) { return out; } })();
+      const box = $("sendText");
+      box.value = (box.value ? box.value + " " : "") + String(text).trim();
+      note("");
+      $("notice").hidden = true;
+    } catch (e) {
+      note(e.message || "could not transcribe that");
+    }
+  };
+  if (btn) btn.classList.add("on");
+  recorder.start();
+}
+
+// Dictate into the message box. Phones are where this matters: typing a
+// sentence to a team one-handed is the thing people do not do.
+function dictate() {
+  // The fleet's own transcription first, where it has some.
+  if (fleetHas("transcribe") && navigator.mediaDevices && window.MediaRecorder) {
+    dictateViaFleet();
+    return;
+  }
+  if (!SR) { note("No speech recognition here, and the fleet offers none."); return; }
+  const btn = $("micBtn");
+  if (recog) { recog.stop(); return; }
+  recog = new SR();
+  recog.lang = navigator.language || "en-GB";
+  recog.interimResults = true;
+  recog.continuous = false;
+  const box = $("sendText");
+  const before = box.value;
+  recog.onresult = (e) => {
+    let said = "";
+    for (const r of e.results) said += r[0].transcript;
+    box.value = (before ? before + " " : "") + said;
+  };
+  recog.onerror = (e) => note("Could not hear: " + (e.error || "unknown"));
+  recog.onend = () => { recog = null; if (btn) btn.classList.remove("on"); };
+  if (btn) btn.classList.add("on");
+  recog.start();
+}
+
+// Read new traffic aloud. Off by default and remembered, because a
+// dashboard that starts talking unprompted is a dashboard you close.
+let speaking = false;
+try { speaking = localStorage.getItem("nexmesh.speak") === "1"; } catch (e) {}
+let spokenUpTo = 0;
+
+function toggleSpeak() {
+  speaking = !speaking;
+  try { localStorage.setItem("nexmesh.speak", speaking ? "1" : "0"); } catch (e) {}
+  if (!speaking && canSpeak()) window.speechSynthesis.cancel();
+  // Start from here rather than reciting the backlog.
+  spokenUpTo = Math.max(spokenUpTo, lastMessageId());
+  note(speaking ? "Reading new messages aloud." : "Stopped reading aloud.");
+  render();
+}
+
+function lastMessageId() {
+  const m = (snap && snap.detail && snap.detail.messages) || [];
+  return m.length ? Math.max(...m.map((x) => x.id || 0)) : 0;
+}
+
+// Called on every poll. Says only what arrived since the last time.
+function speakNew() {
+  if (!speaking || !canSpeak()) return;
+  const msgs = ((snap && snap.detail && snap.detail.messages) || [])
+    .filter((m) => (m.id || 0) > spokenUpTo)
+    .sort((a, b) => a.id - b.id);
+  if (!msgs.length) return;
+  spokenUpTo = Math.max(spokenUpTo, ...msgs.map((m) => m.id));
+  for (const m of msgs) {
+    const where = isAll() && m.session ? `in ${m.session}, ` : "";
+    say(`${where}${m.from} says: ${m.body}`);
+  }
+}
+
+// Speak a line: the fleet's own voice if it has one, the browser's if not.
+async function say(text) {
+  if (fleetHas("tts")) {
+    try {
+      const out = await askFleet("tts", { input: text }, 60000);
+      const j = (() => { try { return JSON.parse(out); } catch (e) { return null; } })();
+      const src = j && (j.url || (j.data && j.data.url) || j.audio_base64);
+      if (src) {
+        const audio = new Audio(
+          String(src).startsWith("http") || String(src).startsWith("/")
+            ? src : "data:audio/mpeg;base64," + src);
+        await audio.play().catch(() => {});
+        return;
+      }
+    } catch (e) {
+      // Fall through to the browser rather than going silent.
+    }
+  }
+  if (!canSpeak()) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = navigator.language || "en-GB";
+  window.speechSynthesis.speak(u);
+}
+
+// The operator speaking into a team. In the combined view it has to say
+// which one; a message has to land somewhere.
+async function sendOperatorMessage() {
+  const box = $("sendText");
+  const text = (box.value || "").trim();
+  if (!text) return;
+  const sid = isAll() ? ($("sendTo") || {}).value : currentSession();
+  if (!sid) { note("Pick a session to send to."); return; }
+  box.value = "";
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/messages`, { text });
+    if (r && r.error) throw new Error(r.error);
+  } catch (e) {
+    box.value = text;
+    note(e.message || "could not send that");
+  }
+  tick();
+}
+
+// Messages no longer clear themselves, so somebody has to be able to say
+// "this no longer matters" without pretending an agent dealt with it.
+async function clearUnclaimed() {
+  const sid = isAll() ? ($("sendTo") || {}).value : currentSession();
+  if (!sid) { note("Pick a session to clear."); return; }
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/messages/clear`, {});
+    if (r && r.error) throw new Error(r.error);
+    note(`Cleared ${r.cleared || 0} unclaimed message(s).`);
+  } catch (e) {
+    note(e.message || "could not clear those");
+  }
+  tick();
 }
 
 function viewPlan(d) {
@@ -950,6 +1321,20 @@ function graphSvg(g) {
     </div>`;
 }
 
+// Parse a workspace on demand. It happens on the machine the files are on,
+// so this can take a few seconds on a large tree.
+async function buildGraph(ws) {
+  note(`Parsing ${ws}…`);
+  try {
+    const r = await post(`/v1/workspaces/${encodeURIComponent(ws)}/graph`, {});
+    if (r && r.error) throw new Error(r.error);
+    note(r.summary ? String(r.summary).split("\n")[0] : `Parsed ${ws}.`);
+  } catch (e) {
+    note(e.message || `could not parse ${ws}`);
+  }
+  tick();
+}
+
 function selectSub(id) {
   selSub = (selSub === id) ? null : id;
   render();
@@ -960,15 +1345,26 @@ function selectSub(id) {
 // the same thing through query_code_graph; this is so you can see it too.
 function viewGraph(d, now) {
   const gs = d.graph || [];
+  // Nothing parsed yet is the normal state of a fresh fleet, and it used to
+  // be a dead end: the map appeared only once an agent happened to ask
+  // about the code. A workspace you can see is a workspace you can parse.
+  const buildable = (d.workspaces || []).filter((w) => w.name);
+  const offer = buildable.length
+    ? `<div class="pair">` + buildable.map((w) =>
+        `<button onclick="buildGraph('${esc(w.name)}')">parse ${esc(w.name)}</button>`).join("") +
+      `<span class="tiny muted">reads the tree on its machine and finds the subsystems;
+         a large repository takes a few seconds</span></div>`
+    : "";
   if (!gs.length)
-    return empty(`No workspace here has been parsed yet. An agent builds the graph the first
-      time it asks about the code, or you can ask for it with
-      <code>query_code_graph</code>.`);
+    return panel(`<div class="empty">No workspace here has been parsed yet. An agent builds
+      the map the first time it asks about the code — or press a button.</div>` + offer);
   return gs.map((g) => {
     const kinds = (g.counts || [])
       .map((c) => `${human(c.n)} ${esc(c.kind)}${c.n === 1 ? "" : "s"}`).join(" · ");
     const head = `<div class="row">
         <strong>${esc(g.workspace || g.workspace_id)}</strong>
+        <button class="tiny" onclick="buildGraph('${esc(g.workspace || g.workspace_id)}')"
+                title="parse it again">refresh</button>
         <span class="muted tiny">${human(g.files)} file${g.files === 1 ? "" : "s"}
           · ${g.communities} subsystem${g.communities === 1 ? "" : "s"}
           · parsed ${ago(g.built_at_ms, now)}</span>
