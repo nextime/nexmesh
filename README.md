@@ -2,6 +2,13 @@
 
 Multi-agent orchestration for agent CLIs **across machines**.
 
+![The dashboard: four agents on two machines, one awaiting review](docs/images/dashboard-agents.png)
+
+*Four agents on two machines — an architect and an engineer on one, a reviewer
+on another, and a capability bridge that is not a CLI at all. Every screenshot
+here comes from `tests/demo-fleet.py`, which stands the whole thing up locally
+in about a minute.*
+
 ## Credits
 
 **nexmesh is a reimplementation of
@@ -746,12 +753,21 @@ this hub may answer on a public address. Creating it needs a code the hub
 prints to its own terminal:
 
 ```bash
-nexmesh-hub dashboard-setup-code
+# On a service install, say which database -- see below.
+NEXMESH_DB=/var/lib/nexmesh/hub.db nexmesh-hub dashboard-setup-code
 # setup code: xK3f...
 ```
 
-Paste that into the first-run form with a username and a password, and you are
-in. Afterwards: `nexmesh-hub dashboard-user <name>` to add another,
+Every administrative subcommand works on a database, and the default is
+`~/.nexmesh/hub.db` — which on a host where the hub runs as a service is
+**not** the database the hub is serving. Run one of them bare there and it
+refuses rather than minting a credential into an empty file that nothing is
+reading; that refusal exists because the silent version of it cost an hour.
+Pass `--db`, or set `NEXMESH_DB`, or source the service's own environment
+file.
+
+Paste the code into the first-run form with a username and a password, and you
+are in. Afterwards: `nexmesh-hub dashboard-user <name>` to add another,
 `nexmesh-hub dashboard-passwd <name>` to reset one — which also ends that
 account's open sessions, because a password change that leaves them alive
 locks nobody out. Both read the password from stdin by default, since one on a
@@ -811,6 +827,37 @@ same operator middleware as everything else.
 There are **no external fonts, scripts or stylesheets**. A fleet hub may sit on
 a network with no route to the internet, and a dashboard that needs a CDN to
 render is a dashboard that fails exactly when you need it.
+
+### What it shows
+
+Messages carry their delivery state, because "I told the reviewer" and "the
+reviewer has read it" are different claims and only one of them is true on its
+own schedule:
+
+![The message log, with unseen and in-flight markers](docs/images/dashboard-messages.png)
+
+The code graph, parsed on whichever machine holds the workspace, with
+subsystems found by the Leiden pass rather than labelled by anyone:
+
+![The code graph tab: 79 files, 19 subsystems](docs/images/dashboard-graph.png)
+
+And the fleet itself — every node, what it runs on, and which agent CLIs it
+actually has installed:
+
+![The fleet tab: two connected nodes and the CLIs each one offers](docs/images/dashboard-fleet.png)
+
+### Seeing it without installing anything
+
+```bash
+cargo build --workspace
+python3 tests/demo-fleet.py      # then open the URL it prints
+```
+
+That stands up a hub, two node daemons, four agents, a session awaiting review
+and a code graph parsed from this repository, all on one machine, in a
+temporary directory it removes on Ctrl-C. Nothing talks to a model and nothing
+spends a credit: the agents are MCP shims driven by the script, which is how
+the test suite drives them too. The screenshots above are that script.
 
 ## Watching the team
 

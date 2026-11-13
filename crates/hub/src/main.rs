@@ -44,6 +44,9 @@ use axum::{
     Router,
 };
 use clap::{Parser, Subcommand};
+
+/// Where a hub keeps its database when nobody says otherwise.
+const DEFAULT_DB: &str = "~/.nexmesh/hub.db";
 use nexmesh_proto::now_ms;
 use rusqlite::params;
 use state::{random_token, sha256_hex, AppState};
@@ -76,7 +79,7 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Parser)]
 #[command(name = "nexmesh-hub", version, about = "nexmesh coordination hub")]
 struct Args {
-    #[arg(long, env = "NEXMESH_DB", default_value = "~/.nexmesh/hub.db")]
+    #[arg(long, env = "NEXMESH_DB", default_value = DEFAULT_DB)]
     db: String,
     /// Listen address, repeatable. Bind to loopback or a LAN/VPN address;
     /// never 0.0.0.0 without TLS in front, since this API can start
@@ -283,6 +286,34 @@ pub fn build_tls(
     Ok(std::sync::Arc::new(cfg))
 }
 
+/// Refuse an administrative subcommand whose database is not there.
+///
+/// Only applied when the path is the built-in default: an explicit `--db` or
+/// `NEXMESH_DB` is someone saying where they want it, and creating it then is
+/// their call. The default, though, is where a system install is *not* -- its
+/// database lives wherever the service unit says -- so this is exactly the
+/// case where a silently created empty database costs an hour.
+fn guard_db_exists(args: &Args) -> anyhow::Result<()> {
+    let administrative = !matches!(
+        args.cmd,
+        None | Some(Cmd::Serve) | Some(Cmd::Pki(_)) | Some(Cmd::GenCert { .. })
+    );
+    if !administrative || args.db != DEFAULT_DB || std::env::var_os("NEXMESH_DB").is_some() {
+        return Ok(());
+    }
+    let path = state::expand(&args.db);
+    if std::path::Path::new(&path).exists() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no hub database at {path}, and this command will not create one.\n\
+         A hub installed as a service keeps its database elsewhere -- read the path from its \n\
+         configuration and pass it:\n\
+         \n    NEXMESH_DB=/var/lib/nexmesh/hub.db nexmesh-hub <command>\n\
+         \nOr, on a hub that has never run, start it once with `serve` first."
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -292,6 +323,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // An administrative subcommand pointed at a database that does not exist
+    // is a mistake every time. SQLite would happily create an empty one,
+    // print a setup code or a token into it, and leave you holding a
+    // credential the running hub has never heard of -- with no error to say
+    // so. Only `serve` may bring a database into being.
+    guard_db_exists(&args)?;
     let st = AppState::open(&args.db)?
         .with_pki_dir(&args.pki_dir)
         .with_pair_listen(args.pair_listen.clone())
