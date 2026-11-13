@@ -101,6 +101,15 @@ pub struct RenameRequest {
 }
 
 #[derive(Deserialize)]
+pub struct RoleRequest {
+    pub role: String,
+    /// What the role means for this seat, in its own words. Left alone when
+    /// omitted.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct NewSession {
     pub name: String,
     #[serde(default)]
@@ -346,12 +355,47 @@ fn insert_workspace(
     Ok(ws_id)
 }
 
-/// Mount a workspace into a session that already exists.
+/// Change what a seat is FOR.
 ///
-/// Without this a session's directories were fixed at creation, so the only
-/// way to give a running session a directory -- which is how an attached CLI
-/// finds the session it belongs to -- was to build another session and move
-/// everyone across.
+/// A role is not decoration: `list_peers` and the capability router use it
+/// to decide who to ask, and the review state machine uses it to decide who
+/// may approve. A team's needs change -- the engineer seat becomes the
+/// reviewer seat when the work moves from building to checking -- and
+/// deleting the seat to change that would throw away its history and its
+/// inbox with it.
+pub async fn set_role(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RoleRequest>,
+) -> ApiResult {
+    let role = req.role.trim();
+    if role.is_empty() {
+        return Err(bad("a role must not be empty"));
+    }
+    if role.chars().count() > 64 {
+        return Err(bad("a role must be 64 characters or fewer"));
+    }
+    let db = st.db.lock().unwrap();
+    let was: Option<String> = db
+        .query_row("SELECT role FROM slots WHERE id = ?", [&id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no seat '{id}'")))?;
+    db.execute(
+        "UPDATE slots SET role = ?, role_description = COALESCE(?, role_description)
+          WHERE id = ?",
+        params![role, req.description, id],
+    )
+    .map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,'role_changed',?)",
+        params![now_ms(), "operator",
+                json!({ "slot": id, "from": was, "to": role }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "slot_id": id, "role": role, "was": was })))
+}
+
 /// Rename a seat.
 ///
 /// A name is not decoration: it is how every command, every message and every
@@ -409,6 +453,12 @@ pub async fn rename_slot(
     Ok(Json(json!({ "slot_id": slot_id, "name": name, "was": was })))
 }
 
+/// Mount a workspace into a session that already exists.
+///
+/// Without this a session's directories were fixed at creation, so the only
+/// way to give a running session a directory -- which is how an attached CLI
+/// finds the session it belongs to -- was to build another session and move
+/// everyone across.
 pub async fn add_workspace(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -578,10 +628,48 @@ pub async fn create_slot(
 }
 
 /// Place a slot on a node and ask that node to start it.
-pub async fn spawn_slot(State(st): State<AppState>, Path(slot_id): Path<String>) -> ApiResult {
+#[derive(Deserialize, Default)]
+pub struct SpawnRequest {
+    /// Start a different CLI in this seat than the one it has been running.
+    ///
+    /// A seat is a place on a team, not a commitment to one program: the
+    /// work may be better done by codex today than by claude yesterday, and
+    /// having to delete the seat and lose its history to try is a poor
+    /// trade. The change is kept, because the seat really is running that
+    /// CLI from now on.
+    #[serde(default)]
+    pub cli: Option<String>,
+}
+
+pub async fn spawn_slot(
+    State(st): State<AppState>,
+    Path(slot_id): Path<String>,
+    body: Option<Json<SpawnRequest>>,
+) -> ApiResult {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(cli) = req.cli.as_deref().filter(|c| !c.trim().is_empty()) {
+        let known: bool = {
+            let db = st.db.lock().unwrap();
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM node_clis WHERE cli_id = ?)",
+                [cli],
+                |r| r.get(0),
+            )
+            .unwrap_or(false)
+        };
+        if !known {
+            return Err(bad(format!(
+                "no machine in this fleet has '{cli}'; `nexmesh nodes` lists what each one has"
+            )));
+        }
+        let db = st.db.lock().unwrap();
+        db.execute("UPDATE slots SET cli_id = ? WHERE id = ?", params![cli, slot_id])
+            .map_err(bad)?;
+    }
     match crate::launch::launch_slot(&st, &slot_id, None).await {
         Ok((agent_id, node)) => Ok(Json(json!({
-            "slot_id": slot_id, "agent_id": agent_id, "node": node
+            "slot_id": slot_id, "agent_id": agent_id, "node": node,
+            "cli": req.cli,
         }))),
         Err(e) => Err(bad(e)),
     }

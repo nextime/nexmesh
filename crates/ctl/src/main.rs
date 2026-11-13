@@ -54,13 +54,32 @@ enum Cmd {
     /// No restart: the agent's next tool call lands in the new session. Its
     /// workspace, file locks and ownership zones are released, since all
     /// three describe the session being left.
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh status payments            # find the seat in the SEAT column
+  nexmesh move-agent sl-1a2b3c4d docs-site
+
+The agent keeps working; its next tool call lands in the new session. It
+returns to that session on every later restart, whatever directory it
+starts in.")]
     MoveAgent {
+        /// Seat id: the SEAT column of `nexmesh status`, like sl-1a2b3c4d.
+        #[arg(value_name = "SEAT")]
         slot: String,
+        /// Session to move it to: its name or id.
+        #[arg(value_name = "SESSION")]
         session: String,
     },
     /// Remove a seat from a session, with whatever history belongs to it.
     /// Refuses while someone is sitting in it unless --force.
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh status payments            # find the seat in the SEAT column
+  nexmesh remove-agent sl-1a2b3c4d   # refuses if somebody is sitting in it
+  nexmesh remove-agent sl-1a2b3c4d --force")]
     RemoveAgent {
+        /// Seat id: the SEAT column of `nexmesh status`, like sl-1a2b3c4d.
+        #[arg(value_name = "SEAT")]
         slot: String,
         /// Remove it even though an agent is live in it.
         #[arg(long)]
@@ -68,14 +87,47 @@ enum Cmd {
     },
     /// Rename an agent. The name is how every command, message and log line
     /// addresses it
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh rename-agent sl-1a2b3c4d Reviewer
+  nexmesh rename-agent Claude-zeiss-3 Reviewer --session payments
+
+A seat id works on its own. A NAME only means something inside a session,
+so it needs --session. A name already used in that session is refused.")]
     RenameAgent {
-        /// Seat id, or the agent's current name with --session.
+        /// Seat id (sl-1a2b3c4d), or the agent's current name with --session.
+        #[arg(value_name = "SEAT|NAME")]
         who: String,
-        /// The new name.
+        /// The new name, 64 characters or fewer.
+        #[arg(value_name = "NEW-NAME")]
         name: String,
-        /// Session to look the name up in.
-        #[arg(long)]
+        /// Session to look the name up in. Needed when WHO is a name.
+        #[arg(long, value_name = "SESSION")]
         session: Option<String>,
+    },
+    /// Change what a seat is for. The role decides who gets asked for what,
+    /// and who may approve whose work
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh set-role payments Reviewer reviewer
+  nexmesh set-role sl-1a2b3c4d architect --description \"you decide the shape\"
+
+A role is not decoration: list_peers and the capability router use it to
+decide who to ask, and the review state machine uses it to decide who may
+approve.")]
+    SetRole {
+        /// Session the seat is in — or a bare seat id (sl-1a2b3c4d).
+        #[arg(value_name = "SESSION|SEAT")]
+        session: String,
+        /// Agent name from the NAME column, or a seat id.
+        #[arg(value_name = "NAME|SEAT")]
+        who: Option<String>,
+        /// The new role: engineer, reviewer, architect — your words.
+        #[arg(value_name = "ROLE")]
+        role: Option<String>,
+        /// What the role means for this seat, in its own words.
+        #[arg(long)]
+        description: Option<String>,
     },
     /// Rename a session. The name is what you read on the dashboard and in
     /// every message, so it should be allowed to change.
@@ -142,11 +194,44 @@ enum Cmd {
         #[arg(long = "owns")]
         owns: Vec<String>,
     },
-    /// Ask the placed node to start a slot's agent.
-    Spawn { slot: String },
+    /// Start an agent in a seat, on the machine that seat belongs to.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh spawn payments Reviewer           # by name, the usual way
+  nexmesh spawn payments Reviewer opencode  # start a different CLI in it
+  nexmesh spawn sl-1a2b3c4d                 # by seat id, no session needed
+
+Then watch it from any machine:
+  nexmesh attach payments Reviewer
+
+Close the CLI in its own terminal first, or the seat ends up with two
+processes in it. Naming a CLI is kept: the seat really is running that one
+from then on.")]
+    Spawn {
+        /// Session the seat is in — or a bare seat id (sl-1a2b3c4d), in
+        /// which case nothing else is needed.
+        #[arg(value_name = "SESSION|SEAT")]
+        session: String,
+        /// Agent name from the NAME column, or a seat id.
+        #[arg(value_name = "NAME|SEAT")]
+        who: Option<String>,
+        /// Start this CLI instead of the one the seat has been running:
+        /// claude, codex, opencode, qwen — whatever `nexmesh nodes` lists.
+        #[arg(value_name = "CLI")]
+        cli: Option<String>,
+    },
     /// Adopt an already-running tmux session so you can watch and drive it
     /// from anywhere. Your own terminal stays attached.
+    #[command(after_help = "\
+EXAMPLE
+  tmux new -s mywork                 # start your CLI inside it
+  nexmesh adopt payments --node machine-b --tmux mywork --name Reviewer
+  nexmesh attach payments Reviewer
+
+Your own terminal stays attached; others can watch and type too.")]
     Adopt {
+        /// Session to join: its name or id.
+        #[arg(value_name = "SESSION")]
         session: String,
         /// Node whose tmux server holds it.
         #[arg(long)]
@@ -231,9 +316,20 @@ enum Cmd {
     ///
     /// An interactive agent can be watched AND typed into; a headless one is
     /// view-only. Detach with Ctrl-] -- the agent keeps working either way.
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh status payments            # the NAME column is what you pass
+  nexmesh attach payments Reviewer
+
+Reaches an agent the hub holds a terminal for: one it spawned in
+interactive mode, or one adopted from tmux. A CLI you started by hand in an
+ordinary terminal has none, so `spawn` or `adopt` it first.")]
     Attach {
+        /// Session: its name or id.
+        #[arg(value_name = "SESSION")]
         session: String,
-        /// Agent name, role, slot id or agent id.
+        /// Agent name from the NAME column, or a seat id.
+        #[arg(value_name = "NAME|SEAT")]
         who: String,
         /// Bytes of scrollback to replay first.
         #[arg(long, default_value_t = 16384)]
@@ -387,6 +483,34 @@ async fn body_or_error(r: reqwest::Response, what: &str) -> Result<Value> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| text.chars().take(200).collect());
     anyhow::bail!("{what} failed ({status}): {msg}")
+}
+
+/// A seat id, from a name and the session it is in.
+///
+/// Every command that acts on one agent needs the same thing, and a person
+/// reading the dashboard has the NAME, not the id. Making them look it up
+/// first is a step a computer can take.
+async fn resolve_seat(
+    c: &reqwest::Client,
+    base: &str,
+    session: &str,
+    who: &str,
+) -> Result<String> {
+    let v = get(c, format!("{base}/v1/sessions/{session}/status")).await?;
+    let empty = vec![];
+    let agents = v["agents"].as_array().unwrap_or(&empty);
+    if let Some(slot) = agents
+        .iter()
+        .find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(who)))
+        .and_then(|a| a["slot_id"].as_str())
+    {
+        return Ok(slot.to_string());
+    }
+    let names: Vec<&str> = agents.iter().filter_map(|a| a["name"].as_str()).collect();
+    anyhow::bail!(
+        "no agent called '{who}' in '{session}'. There is: {}",
+        if names.is_empty() { "nobody".to_string() } else { names.join(", ") }
+    )
 }
 
 async fn get(c: &reqwest::Client, url: String) -> Result<Value> {
@@ -756,6 +880,28 @@ async fn main() -> Result<()> {
             }
         }
 
+        Cmd::SetRole { session, who, role, description } => {
+            // Same two shapes as spawn: a seat id on its own, or a session
+            // and a name.
+            let (slot, role) = match (who.as_deref(), role.as_deref()) {
+                (Some(w), Some(r)) if w.starts_with("sl-") => (w.to_string(), r.to_string()),
+                (Some(w), Some(r)) => (resolve_seat(&c, &base, &session, w).await?, r.to_string()),
+                (Some(r), None) if session.starts_with("sl-") => (session.clone(), r.to_string()),
+                _ => anyhow::bail!("say which seat and which role: \
+                            `nexmesh set-role <session> <name> <role>`, or \
+                            `nexmesh set-role <seat> <role>`"),
+            };
+            let mut body = json!({ "role": role });
+            if let Some(d) = description { body["description"] = json!(d); }
+            let v = post(&c, format!("{base}/v1/slots/{slot}/role"), body).await?;
+            bail_on_error(&v)?;
+            match v["was"].as_str() {
+                Some(was) => println!("{slot}: \"{was}\" is now \"{}\"",
+                                      v["role"].as_str().unwrap_or(&role)),
+                None => println!("{slot} is now \"{}\"", v["role"].as_str().unwrap_or(&role)),
+            }
+        }
+
         Cmd::RenameSession { session, name } => {
             let v = post(&c, format!("{base}/v1/sessions/{session}/name"),
                          json!({ "name": name })).await?;
@@ -815,8 +961,19 @@ async fn main() -> Result<()> {
             println!("slot {} created", v["slot_id"].as_str().unwrap_or("?"));
         }
 
-        Cmd::Spawn { slot } => {
-            let v = post(&c, format!("{base}/v1/slots/{slot}/spawn"), json!({})).await?;
+        Cmd::Spawn { session, who, cli } => {
+            // Two shapes, because both are natural: name the seat directly
+            // when you have its id, or say which team and who in it.
+            let slot = match who.as_deref() {
+                None => session.clone(),
+                Some(w) if w.starts_with("sl-") => w.to_string(),
+                Some(w) => resolve_seat(&c, &base, &session, w).await?,
+            };
+            let mut body = json!({});
+            if let Some(c) = cli.as_deref().filter(|x| !x.trim().is_empty()) {
+                body["cli"] = json!(c);
+            }
+            let v = post(&c, format!("{base}/v1/slots/{slot}/spawn"), body).await?;
             bail_on_error(&v)?;
             println!(
                 "spawning {} on {}",
@@ -858,8 +1015,8 @@ async fn main() -> Result<()> {
             // one here and the other there is how a rename gets applied to
             // the wrong agent: it happened on this fleet.
             println!(
-                "{:<16} {:<14} {:<12} {:<9} {:<9} {:<18} {:>9} SUMMARY",
-                "NAME", "SEAT", "ROLE", "HOST", "KIND", "STATE", "TOKENS"
+                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<15} {:>8} SUMMARY",
+                "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "TOKENS"
             );
             for a in rows {
                 let tin = a["input_tokens"].as_i64().unwrap_or(0);
@@ -870,9 +1027,14 @@ async fn main() -> Result<()> {
                     format!("{}/{}", human(tin), human(tout))
                 };
                 println!(
-                    "{:<16} {:<14} {:<12} {:<9} {:<9} {:<18} {:>9} {}",
+                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<15} {:>8} {}",
                     a["name"].as_str().unwrap_or("?"),
                     a["slot_id"].as_str().unwrap_or("-"),
+                    // Which program is in the seat. Worth a column of its
+                    // own now that a seat can be spawned with a different
+                    // one: you cannot choose what to change without seeing
+                    // what it is.
+                    a["cli"].as_str().unwrap_or("-"),
                     a["role"].as_str().unwrap_or("-"),
                     a["host"].as_str().unwrap_or("-"),
                     a["provenance"].as_str().unwrap_or("-"),

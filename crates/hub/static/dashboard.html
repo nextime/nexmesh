@@ -289,7 +289,16 @@
       <span id="aaMsg" class="tiny muted"></span>
     </form>
   </div>
-  <main><div id="view"></div></main>
+  <main><div id="view"></div>
+    <!-- Outside #view on purpose. The poll replaces that element wholesale,
+         which destroys whatever has focus: the message box lost its caret
+         and, on a phone, the keyboard shut within a second. Freezing the
+         rebuild while something had focus fixed that and introduced a worse
+         fault -- clicking into the box stopped the agents and messages
+         pages updating at all, for as long as the focus stayed there. A
+         composer that is never rebuilt needs neither. -->
+    <div id="composerHost" hidden></div>
+  </main>
 </div>
 
 <script>
@@ -626,6 +635,50 @@ async function renameAgent(slot, current) {
   input.addEventListener("blur", () => finish(true));
 }
 
+// Changing what a seat is FOR, from the table where you read it. A role is
+// not decoration: it decides who gets asked for what, and who may approve
+// whose work.
+async function editRole(slot, current) {
+  const cell = document.getElementById("rl-" + slot);
+  if (!cell || cell.dataset.editing) return;
+  cell.dataset.editing = "1";
+  editingSeat = slot;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = current === "-" ? "" : current;
+  input.maxLength = 64;
+  input.placeholder = "engineer, reviewer, …";
+  input.style.cssText = "font-family:var(--mono);width:11em";
+  const held = cell.innerHTML;
+  cell.innerHTML = "";
+  cell.appendChild(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const role = input.value.trim();
+    cell.innerHTML = held;
+    delete cell.dataset.editing;
+    editingSeat = null;
+    if (save && role && role !== current) {
+      try {
+        const r = await post(`/v1/slots/${encodeURIComponent(slot)}/role`, { role });
+        if (r && r.error) throw new Error(r.error);
+      } catch (e) {
+        note(e.message || "could not change that role");
+      }
+    }
+    tick();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 function editSessionName(current, placeholder, commit) {
   const sel = $("sessionSel");
   if (sel.tagName !== "SELECT") return;          // an edit is already open
@@ -813,6 +866,7 @@ function render() {
     tile((snap.nodes || []).filter((n) => n.connected).length + "/" + (snap.nodes || []).length, "nodes"),
   ].join("");
 
+  paintComposer(d);
   speakNew();
 
   const openCodes = (snap.pairing || []).filter((c) => c.state === "open").length;
@@ -844,7 +898,8 @@ function render() {
   // keyboard opened and shut again within a second or two, because the
   // input it belonged to had ceased to exist. Everything above -- the
   // tiles, the counts -- still refreshes.
-  if (!editingSeat && !typingInView()) {
+  // Only an in-table rename holds the view still, and only until it ends.
+  if (!editingSeat) {
     $("view").innerHTML = (!d && tab !== "fleet")
       ? `<div class="panel"><div class="empty">No sessions yet. Press
            <strong>new</strong> above, or pair a machine on the
@@ -882,6 +937,16 @@ function viewAgents(d, now) {
   const all = isAll();
   if (!d.agents.length)
     return empty(all ? "No agents anywhere yet." : "No agents in this session yet.");
+  // A seat outlives its process on purpose, so a conversation resumed under
+  // a new id leaves its predecessor behind. Which of those are finished
+  // with is a judgement, so it is offered rather than done.
+  const derelict = d.agents.filter((a) => a.status !== "running" && a.kind !== "external");
+  const tidy = (derelict.length && !all)
+    ? `<div class="pair"><button onclick="tidySeats()">retire ${derelict.length} empty
+         seat${derelict.length === 1 ? "" : "s"}</button>
+       <span class="tiny muted">only seats a live one has replaced — same machine, same
+         directory, same CLI; anything still waiting for them is carried over</span></div>`
+    : "";
   return panel(`<table><thead><tr>` +
       th("Agent", "name") + (all ? th("Session", "session") : "") +
       th("Role", "role") + th("Where", "host") + th("How", "cli", "hide") +
@@ -901,7 +966,9 @@ function viewAgents(d, now) {
             ${flap ? ' <span class="badge bad">flapping</span>' : ""}
             ${a.restarts ? ` <span class="badge warn" title="restarts">↻${a.restarts}</span>` : ""}</td>
         ${all ? `<td><span class="badge info">${esc(a.session)}</span></td>` : ""}
-        <td class="muted">${esc(a.role)}</td>
+        <td class="muted"><span class="rename" title="click to change the role"
+              onclick="editRole('${esc(a.slot_id)}', '${esc(a.role).replace(/'/g, "\\'")}')"
+              id="rl-${esc(a.slot_id)}">${esc(a.role)}</span></td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}</td>
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
@@ -938,10 +1005,22 @@ async function tidySeats() {
   tick();
 }
 
-function viewMessages(d, now) {
+// The composer, rebuilt only when what it OFFERS changes -- the session
+// list, or how many messages are unclaimed. Never on every poll, because
+// replacing it would take the caret and the keyboard with it.
+function paintComposer(d) {
+  const host = $("composerHost");
+  if (!host) return;
+  host.hidden = tab !== "messages" || !d;
+  if (host.hidden) return;
   const all = isAll();
-  const unclaimed = (d.messages || []).filter((m) => !m.claimed).length;
-  const bar = `<div class="composer">
+  const unclaimed = ((d && d.messages) || []).filter((m) => !m.claimed).length;
+  const sig = [all, unclaimed, speaking,
+               (snap.sessions || []).map((x) => x.id).join("|")].join("~");
+  if (host.dataset.sig === sig) return;
+  host.dataset.sig = sig;
+  const keep = $("sendText") ? $("sendText").value : "";
+  host.innerHTML = `<div class="composer">
       ${all ? `<select id="sendTo" title="session to send to">` +
                `<option value="*">every session</option>` +
                (snap.sessions || []).map((x) =>
@@ -957,9 +1036,13 @@ function viewMessages(d, now) {
       <button onclick="clearUnclaimed()" title="mark everything nobody has claimed as handled"
               ${unclaimed ? "" : "disabled"}>clear ${unclaimed || ""} unclaimed</button>
     </div>`;
+  if (keep && $("sendText")) $("sendText").value = keep;
+}
 
+function viewMessages(d, now) {
+  const all = isAll();
   if (!d.messages.length)
-    return panel(`<div class="feed"><div class="empty">Nothing said yet.</div></div>`) + bar;
+    return panel(`<div class="feed"><div class="empty">Nothing said yet.</div></div>`);
 
   // The snapshot is newest-first; read it oldest-first like a conversation.
   const rows = d.messages.slice().reverse().map((m) => {
@@ -986,7 +1069,7 @@ function viewMessages(d, now) {
     </div>`;
   }).join("");
   return panel(`<div class="feed" onscroll="this.dataset.stick=
-      (this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'">${rows}</div>`) + bar +
+      (this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'">${rows}</div>`) +
     `<p class="tiny muted" style="margin:8px 2px">
        <b>\u25cf</b> nobody has claimed it yet — reading no longer clears a message,
        only claim_messages does, or the button above</p>`;

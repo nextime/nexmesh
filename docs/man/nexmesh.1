@@ -68,6 +68,39 @@ A session named after the tool itself reads oddly \(em
 is command, session, seat \(em but the positions never change, and a session
 can be renamed at any time with
 .BR rename-session .
+.SH FINDING A SEAT
+Most commands that act on one agent want its
+.BR seat ,
+and every one of them means the same thing: the
+.B SEAT
+column of
+.BR "nexmesh status" .
+.PP
+.RS
+.nf
+$ nexmesh status payments
+NAME          SEAT          CLI       ROLE       HOST       KIND      STATE
+Reviewer      sl-1a2b3c4d   codex     reviewer   machine-b  attached  idle
+Builder       sl-9f8e7d6c   claude    engineer   machine-a  managed   working
+.fi
+.RE
+.PP
+So
+.I sl-1a2b3c4d
+is what
+.BR spawn ", " move-agent ", " remove-agent
+and
+.B rename-agent
+take, and
+.I Reviewer
+is what
+.BR attach ", " send " \(em\& " --to ", " pause ", " resume
+and
+.B release
+take. Where a command accepts either, its help says
+.IR SEAT|NAME .
+A seat id is unambiguous anywhere; a name only means something inside one
+session.
 .SH GLOBAL OPTIONS
 .TP
 .BI \-\-hub " URL"
@@ -132,19 +165,65 @@ Mount another directory into a session that already exists.
 Add an empty seat. Nothing runs until
 .B spawn.
 .TP
-.BI spawn " SEAT"
-Ask the seat's machine to start its agent. An interactive seat runs the CLI's
-real terminal under a pty, which is what makes
+.BI spawn " SESSION NAME " [ CLI ]
+.TQ
+.BI spawn " SEAT " [ CLI ]
+Start an agent in a seat, on the machine that seat belongs to. An
+interactive seat runs the CLI's real terminal under a pty, which is what
+makes
 .B attach
-possible.
+possible. Close the CLI in its own terminal first, or the seat ends up with
+two processes in it.
+.IP
+Naming a
+.I CLI
+starts that one instead of the seat's usual: a seat is a place on a team,
+not a commitment to one program, and the work may be better done by codex
+today than by claude yesterday. The change is kept, because the seat really
+is running that CLI from then on. What each machine has is in
+.BR "nexmesh nodes" ,
+and what each seat runs is the CLI column of
+.BR "nexmesh status" .
+.RS
+.PP
+.EX
+nexmesh spawn payments Reviewer
+nexmesh spawn payments Reviewer opencode
+nexmesh spawn sl-1a2b3c4d
+.EE
+.RE
 .TP
-.BI rename\-agent " WHO NEW\-NAME " [ \-\-session " SESSION" ]
-Rename a seat.
-.I WHO
-may be a seat id, or a name together with
+.BI rename\-agent " SEAT|NAME NEW\-NAME " [ \-\-session " SESSION" ]
+Rename a seat. A seat id works on its own; a name only means something
+inside a session, so it needs
 .BR \-\-session .
 A name already used in that session is refused: two seats with one name
 leaves neither addressable.
+.RS
+.PP
+.EX
+nexmesh rename-agent sl-1a2b3c4d Reviewer
+nexmesh rename-agent Claude-zeiss-3 Reviewer --session payments
+.EE
+.RE
+.TP
+.BI set\-role " SESSION NAME ROLE " [ \-\-description " TEXT" ]
+.TQ
+.BI set\-role " SEAT ROLE " [ \-\-description " TEXT" ]
+Change what a seat is for. A role is not decoration:
+.B list_peers
+and the capability router use it to decide who to ask, and the review state
+machine uses it to decide who may approve whose work. A team's needs change
+\(em the engineer seat becomes the reviewer seat when the work moves from
+building to checking \(em and deleting the seat to change that would throw
+away its history and its inbox with it.
+.RS
+.PP
+.EX
+nexmesh set-role payments Reviewer reviewer
+nexmesh set-role sl-1a2b3c4d architect --description "you decide the shape"
+.EE
+.RE
 .TP
 .BI rename\-session " SESSION NEW\-NAME"
 Rename a team. Changes nothing else.
@@ -154,12 +233,24 @@ Move a seat, and whoever is sitting in it, to another team. No restart. Its
 workspace, file locks and ownership zones are released, because all three
 describe the team being left. A conversation returns to the team it was
 moved to on every later restart, whatever directory it starts in.
+.RS
+.PP
+.EX
+nexmesh move-agent sl-1a2b3c4d docs-site
+.EE
+.RE
 .TP
 .BI remove\-agent " SEAT " [ \-\-force ]
 Remove a seat and the history that only describes who sat in it. Refuses
 while somebody is sitting in it unless
 .B \-\-force
 is given.
+.RS
+.PP
+.EX
+nexmesh remove-agent sl-1a2b3c4d --force
+.EE
+.RE
 .SS Driving
 .TP
 .BI send " SESSION TEXT " [ \-\-to " WHO" ]
@@ -185,10 +276,20 @@ guard, so a session paused on budget can be given more and resumed.
 Publish, pull, or report on a shared workspace, on every machine at once.
 .SS Terminals
 .TP
-.BI attach " SESSION WHO"
+.BI attach " SESSION NAME|SEAT"
 Attach to an agent's terminal, wherever it runs. Only reaches an agent the
 hub holds a pty for: one it spawned in interactive mode, or one adopted from
-tmux. A CLI you started by hand in an ordinary terminal has no such pty.
+tmux. A CLI you started by hand in an ordinary terminal has none, so
+.B spawn
+or
+.B adopt
+it first.
+.RS
+.PP
+.EX
+nexmesh attach payments Reviewer
+.EE
+.RE
 .TP
 .BI adopt " SESSION " \-\-node " NODE " \-\-tmux " TARGET " \-\-name " NAME"
 Adopt a tmux session that is already running, so it can be watched and

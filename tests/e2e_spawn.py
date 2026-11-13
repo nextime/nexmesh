@@ -117,6 +117,24 @@ def main():
     s, j = http("POST", f"/v1/slots/{slot}/spawn")
     check("spawn accepted and placed on machine-b", s == 200 and j.get("node") == "machine-b", str(j))
 
+    print("\n=== a seat can be started with a different CLI ===")
+    # A seat is a place on a team, not a commitment to one program: the work
+    # may be better done by another CLI than the one it ran yesterday, and
+    # having to delete the seat and lose its history to try is a poor trade.
+    s, j = http("POST", f"/v1/slots/{ghost}/spawn", {"cli": "nothing-has-this"})
+    check("a CLI no machine has is refused before anything starts",
+          s >= 400 and "nothing-has-this" in json.dumps(j), f"{s} {j}")
+    s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "nosuchcli",
+        "display_name": "Switcher", "mode": "headless",
+        "placement": {"node": "machine-b"}})
+    switcher = j.get("slot_id")
+    s, j = http("POST", f"/v1/slots/{switcher}/spawn", {"cli": "fakecli"})
+    check("naming a CLI the fleet has starts it instead", s == 200, f"{s} {j}")
+    s, j = http("GET", f"/v1/sessions/{sid}/status")
+    sw = [a for a in j.get("agents", []) if a["name"] == "Switcher"]
+    check("and the seat is recorded as running it from now on",
+          sw and sw[0].get("cli") == "fakecli", str(sw)[:200])
+
     print("\n=== the spawned agent reaches the hub ===")
     summary = None
     for _ in range(150):

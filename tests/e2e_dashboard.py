@@ -333,6 +333,23 @@ def main():
     s, j = req("/v1/sessions/e2e/messages/clear", optok, "POST", {})
     check("clearing accepts a session name", s == 200, f"{s} {j}")
 
+    print("\n=== a seat's role can be changed from where you read it ===")
+    # A role is not decoration: list_peers and the capability router use it
+    # to decide who to ask, and the review state machine uses it to decide
+    # who may approve. A team's needs change, and deleting the seat to
+    # change that would throw away its history and its inbox with it.
+    seat2 = [a for a in det["agents"] if a["name"] == "Max"][0]["slot_id"]
+    s, j = req(f"/v1/slots/{seat2}/role", optok, "POST", {"role": "architect"})
+    check("the role can be changed", s == 200 and j.get("role") == "architect", f"{s} {j}")
+    check("and it says what it was", j.get("was") == "engineer", str(j))
+    s, dr2 = req(f"/v1/dashboard/state?session={sid}", optok)
+    roles = {a["name"]: a["role"] for a in (dr2.get("detail") or {}).get("agents", [])}
+    check("the snapshot shows the new role", roles.get("Max") == "architect", str(roles))
+    s, j = req(f"/v1/slots/{seat2}/role", optok, "POST", {"role": "  "})
+    check("an empty role is refused", s == 400, f"{s} {j}")
+    s, html2 = req("/", raw=True)
+    check("and the page offers to change it", "editRole" in html2, "no editRole in the page")
+
     print("\n=== an unknown session is not a crash ===")
     s, d3 = req("/v1/dashboard/state?session=se-nope", optok)
     check("unknown session returns 200 with an empty detail",
