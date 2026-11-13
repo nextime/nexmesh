@@ -227,7 +227,7 @@ def main():
     # heartbeat the hub rightly marks it lost after a while. A real bridge
     # polls for work; this stands in for that.
     while True:
-        time.sleep(20)
+        time.sleep(7)   # NODE_LEASE_MS is 20s; stay well inside it
         req("/v1/participant/tool", pt, "POST",
             {"agent_id": bridge, "tool": "list_peers", "args": {}})
 
