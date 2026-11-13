@@ -43,6 +43,13 @@ fn is_reviewer(role: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+struct Peer {
+    id: String,
+    name: String,
+    role: String,
+    capabilities: Vec<String>,
+}
+
 impl<'a> Ctx<'a> {
     fn my_label(&self) -> String {
         self.label_of(&self.slot_id)
@@ -67,25 +74,41 @@ impl<'a> Ctx<'a> {
             .flatten()
     }
 
-    /// Find a teammate by display name or role, case-insensitively. Ambiguity
-    /// is an error rather than a silent pick -- sending review feedback to the
-    /// wrong agent is worse than a retry.
-    fn resolve_peer(&self, needle: &str) -> Result<String> {
-        let n = needle.trim().to_lowercase();
+    /// Every teammate in this session but me, with what they answer to.
+    fn peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, LOWER(COALESCE(display_name, '')), LOWER(COALESCE(role, ''))
+            "SELECT id, LOWER(COALESCE(display_name, '')), LOWER(COALESCE(role, '')), capabilities
              FROM slots WHERE session_id = ? AND id != ?",
         )?;
-        let rows: Vec<(String, String, String)> = stmt
+        let rows = stmt
             .query_map(params![self.session_id, self.slot_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                let caps: String = r.get(3)?;
+                Ok(Peer {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    role: r.get(2)?,
+                    capabilities: serde_json::from_str(&caps).unwrap_or_default(),
+                })
             })?
-            .collect::<std::result::Result<_, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 
-        let exact: Vec<&(String, String, String)> =
-            rows.iter().filter(|(_, d, r)| *d == n || *r == n).collect();
+    /// Find a teammate by display name, role, or capability label,
+    /// case-insensitively. Ambiguity is an error rather than a silent pick --
+    /// sending review feedback to the wrong agent is worse than a retry.
+    ///
+    /// Capability comes last on purpose. A label like "strong" is usually held
+    /// by several teammates, so it is the right way to ask `list_peers` who
+    /// can do something and the wrong way to address one of them; matching it
+    /// here is a convenience for the case where exactly one seat has it.
+    fn resolve_peer(&self, needle: &str) -> Result<String> {
+        let n = needle.trim().to_lowercase();
+        let rows = self.peers()?;
+
+        let exact: Vec<&Peer> = rows.iter().filter(|p| p.name == n || p.role == n).collect();
         if exact.len() == 1 {
-            return Ok(exact[0].0.clone());
+            return Ok(exact[0].id.clone());
         }
         if exact.len() > 1 {
             bail!(
@@ -93,12 +116,24 @@ impl<'a> Ctx<'a> {
                 exact.len()
             );
         }
-        let partial: Vec<&(String, String, String)> = rows
+        let by_cap: Vec<&Peer> =
+            rows.iter().filter(|p| p.capabilities.iter().any(|c| c == &n)).collect();
+        if by_cap.len() == 1 {
+            return Ok(by_cap[0].id.clone());
+        }
+        if by_cap.len() > 1 {
+            bail!(
+                "'{needle}' is a capability held by {} teammates; name one of them, or use \
+                 list_peers with capability='{needle}' to choose",
+                by_cap.len()
+            );
+        }
+        let partial: Vec<&Peer> = rows
             .iter()
-            .filter(|(_, d, r)| d.contains(&n) || r.contains(&n))
+            .filter(|p| p.name.contains(&n) || p.role.contains(&n))
             .collect();
         match partial.len() {
-            1 => Ok(partial[0].0.clone()),
+            1 => Ok(partial[0].id.clone()),
             0 => bail!("no teammate matching '{needle}'"),
             k => bail!("'{needle}' is ambiguous ({k} matches); use a unique name"),
         }
@@ -252,6 +287,7 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "get_plan" => get_plan(ctx),
         "update_plan" => update_plan(ctx, args),
         "signal_done" => signal_done(ctx, args),
+        "escalate" => escalate(ctx, args),
         "submit_feedback" => submit_feedback(ctx, args),
         "approve" => approve(ctx, args),
         "acquire_file" => acquire_file(ctx, args),
@@ -264,43 +300,88 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
     }
 }
 
+struct PeerRow {
+    name: String,
+    role: String,
+    state: String,
+    summary: String,
+    kind: String,
+    host: String,
+    status: String,
+    capabilities: Vec<String>,
+    /// What the agent reported, falling back to what the seat asked for. A
+    /// reported model is the truth; a requested one is a hope.
+    model: Option<String>,
+}
+
 fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
-    let filter = opt_str(args, "role");
+    let role_filter = opt_str(args, "role");
+    let cap_filter = opt_str(args, "capability").map(|c| c.trim().to_lowercase());
     let mut stmt = ctx.db.prepare(
         "SELECT COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
                 s.task_state, s.summary, s.participant_kind,
                 COALESCE(n.name, CASE WHEN a.provenance = 'external' THEN 'external' ELSE '-' END),
-                COALESCE(a.status, 'disconnected')
+                COALESCE(a.status, 'disconnected'), s.capabilities, a.model, s.model
          FROM slots s
          LEFT JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
          LEFT JOIN nodes n ON n.id = a.node_id
          WHERE s.session_id = ? AND s.id != ?
          ORDER BY 1",
     )?;
-    let rows: Vec<(String, String, String, String, String, String, String)> = stmt
+    let rows: Vec<PeerRow> = stmt
         .query_map(params![ctx.session_id, ctx.slot_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            let caps: String = r.get(7)?;
+            let reported: Option<String> = r.get(8)?;
+            let requested: Option<String> = r.get(9)?;
+            Ok(PeerRow {
+                name: r.get(0)?,
+                role: r.get(1)?,
+                state: r.get(2)?,
+                summary: r.get(3)?,
+                kind: r.get(4)?,
+                host: r.get(5)?,
+                status: r.get(6)?,
+                capabilities: serde_json::from_str(&caps).unwrap_or_default(),
+                model: reported.or(requested),
+            })
         })?
         .collect::<std::result::Result<_, _>>()?;
 
     let rows: Vec<_> = rows
         .into_iter()
-        .filter(|(_, role, ..)| match &filter {
-            Some(f) => role.to_lowercase().contains(&f.to_lowercase()),
+        .filter(|p| match &role_filter {
+            Some(f) => p.role.to_lowercase().contains(&f.to_lowercase()),
+            None => true,
+        })
+        .filter(|p| match &cap_filter {
+            // Exact on a label: "strong" must not also match "strongish".
+            Some(f) => p.capabilities.iter().any(|c| c == f),
             None => true,
         })
         .collect();
 
     if rows.is_empty() {
-        return Ok("No teammates yet.".into());
+        return Ok(match (&role_filter, &cap_filter) {
+            (_, Some(c)) => format!("No teammate has the capability '{c}'."),
+            (Some(r), _) => format!("No teammate has the role '{r}'."),
+            _ => "No teammates yet.".into(),
+        });
     }
     let mut out = format!("{} teammate(s):\n", rows.len());
-    for (name, role, state, summary, kind, host, status) in rows {
+    for p in rows {
         out.push_str(&format!(
-            "- {name} [{role}] on {host} ({kind}, {status}) state={state}\n"
+            "- {} [{}] on {} ({}, {}) state={}",
+            p.name, p.role, p.host, p.kind, p.status, p.state
         ));
-        if !summary.is_empty() {
-            out.push_str(&format!("    {summary}\n"));
+        if let Some(m) = &p.model {
+            out.push_str(&format!(" model={m}"));
+        }
+        if !p.capabilities.is_empty() {
+            out.push_str(&format!(" can={}", p.capabilities.join(",")));
+        }
+        out.push('\n');
+        if !p.summary.is_empty() {
+            out.push_str(&format!("    {}\n", p.summary));
         }
     }
     Ok(out)
@@ -452,6 +533,56 @@ fn signal_done(ctx: &Ctx, args: &Value) -> Result<String> {
         &format!("{me} signalled done and is awaiting review. {notes}"),
     )?;
     Ok("Marked done, pending review. A reviewer will approve or send feedback.".into())
+}
+
+/// Hand a task up to a teammate better equipped for it.
+///
+/// The mirror of `submit_feedback`, which hands work BACK down for rework.
+/// Both exist because the alternative is an agent that is stuck and silent:
+/// with a mixed team, the cheap seat hitting its limit is the normal case, not
+/// an error, and it needs a move that is neither "done" nor "failed".
+///
+/// It is deliberately not a scheduler. The hub does not decide who is more
+/// capable -- the agent asks for a capability and the hub routes it, the same
+/// as every other message here.
+fn escalate(ctx: &Ctx, args: &Value) -> Result<String> {
+    let to = arg_str(args, "to")?;
+    let reason = arg_str(args, "reason")?;
+    let target = ctx.resolve_peer(&to)?;
+    if target == ctx.slot_id {
+        bail!("you cannot escalate to yourself");
+    }
+    let me = ctx.my_label();
+    // Their task: what the escalator named, or whatever this seat was doing.
+    let task = match opt_str(args, "task") {
+        Some(t) => t,
+        None => ctx
+            .db
+            .query_row(
+                "SELECT COALESCE(NULLIF(summary, ''), COALESCE(role_description, ''))
+                 FROM slots WHERE id = ?",
+                [&ctx.slot_id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default(),
+    };
+    let body = if task.trim().is_empty() {
+        format!("Escalated from {me}. Reason: {reason}")
+    } else {
+        format!("Escalated from {me}. Reason: {reason}\n\nTask: {task}")
+    };
+    ctx.insert_message(Some(&target), MessageKind::Handoff, &body)?;
+    // Both ends move: the escalator is no longer the one to chase, and the
+    // receiver is working. Leaving either state alone is how a task gets
+    // silently dropped between two agents that each think the other has it.
+    ctx.set_state(&ctx.slot_id, "escalated")?;
+    ctx.set_state(&target, "working")?;
+    let them = ctx.label_of(&target);
+    tracing::info!(from = %me, to = %them, "task escalated");
+    Ok(format!(
+        "Escalated to {them}. Your state is 'escalated' and theirs is 'working'; they have \
+         your reason and the task. Do not keep working on it."
+    ))
 }
 
 fn submit_feedback(ctx: &Ctx, args: &Value) -> Result<String> {
@@ -685,16 +816,17 @@ mod tests {
              VALUES ('w1','s1','main','repo','git@git:x.git','git')",
             [],
         ).unwrap();
-        for (id, name, role, kind, cli) in [
-            ("sl-eng", "Max", "engineer", "cli", Some("claude")),
-            ("sl-rev", "Iris", "code reviewer", "cli", Some("opencode")),
-            ("sl-ext", "Hermes", "archivist", "external", None),
+        for (id, name, role, kind, cli, caps, model) in [
+            ("sl-eng", "Max", "engineer", "cli", Some("claude"), r#"["cheap"]"#, None),
+            ("sl-rev", "Iris", "code reviewer", "cli", Some("opencode"), r#"["strong","vision"]"#,
+             Some("anthropic/claude-opus-4")),
+            ("sl-ext", "Hermes", "archivist", "external", None, r#"["ocr"]"#, None),
         ] {
             db.execute(
                 "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind,
-                                    display_name, role, created_at_ms)
-                 VALUES (?,?, 'w1', ?, ?, ?, ?, ?)",
-                params![id, "s1", cli, kind, name, role, now],
+                                    display_name, role, capabilities, model, created_at_ms)
+                 VALUES (?,?, 'w1', ?, ?, ?, ?, ?, ?, ?)",
+                params![id, "s1", cli, kind, name, role, caps, model, now],
             ).unwrap();
         }
         for (aid, slot, prov, node) in [
@@ -753,6 +885,124 @@ mod tests {
 
         dispatch(&ctx(&db, "sl-rev"), "approve", &json!({"to": "Max"})).unwrap();
         assert_eq!(state(&db, "sl-eng"), "approved");
+    }
+
+    #[test]
+    fn list_peers_shows_capabilities_and_the_model() {
+        let db = fixture();
+        let out = dispatch(&ctx(&db, "sl-eng"), "list_peers", &json!({})).unwrap();
+        assert!(out.contains("can=strong,vision"), "{out}");
+        assert!(out.contains("model=anthropic/claude-opus-4"), "{out}");
+        assert!(out.contains("can=ocr"), "{out}");
+    }
+
+    #[test]
+    fn list_peers_filters_by_capability() {
+        let db = fixture();
+        let out = dispatch(&ctx(&db, "sl-eng"), "list_peers",
+            &json!({"capability": "OCR"})).unwrap();
+        assert!(out.contains("Hermes"), "{out}");
+        assert!(!out.contains("Iris"), "case must not matter: {out}");
+    }
+
+    #[test]
+    fn a_capability_nobody_has_says_so_rather_than_listing_everyone() {
+        let db = fixture();
+        let out = dispatch(&ctx(&db, "sl-eng"), "list_peers",
+            &json!({"capability": "quantum"})).unwrap();
+        assert!(out.contains("No teammate has the capability 'quantum'"), "{out}");
+    }
+
+    #[test]
+    fn a_capability_label_is_matched_whole_not_as_a_prefix() {
+        // "strong" must not match a seat labelled "strongish".
+        let db = fixture();
+        db.execute("UPDATE slots SET capabilities = '[\"strongish\"]' WHERE id = 'sl-ext'", [])
+            .unwrap();
+        let out = dispatch(&ctx(&db, "sl-eng"), "list_peers",
+            &json!({"capability": "strong"})).unwrap();
+        assert!(out.contains("Iris") && !out.contains("Hermes"), "{out}");
+    }
+
+    #[test]
+    fn a_teammate_can_be_addressed_by_a_capability_only_one_holds() {
+        let db = fixture();
+        let out = dispatch(&ctx(&db, "sl-eng"), "send_message",
+            &json!({"to": "ocr", "text": "scan this"})).unwrap();
+        assert!(out.contains("Hermes"), "{out}");
+    }
+
+    #[test]
+    fn a_capability_several_hold_is_refused_rather_than_guessed() {
+        let db = fixture();
+        db.execute("UPDATE slots SET capabilities = '[\"strong\"]' WHERE id = 'sl-ext'", [])
+            .unwrap();
+        let err = dispatch(&ctx(&db, "sl-eng"), "send_message",
+            &json!({"to": "strong", "text": "help"})).unwrap_err().to_string();
+        assert!(err.contains("capability held by 2"), "{err}");
+        assert!(err.contains("list_peers"), "it must say how to choose: {err}");
+    }
+
+    #[test]
+    fn a_name_wins_over_a_capability_of_the_same_spelling() {
+        // Otherwise naming a teammate could be hijacked by a label.
+        let db = fixture();
+        db.execute("UPDATE slots SET capabilities = '[\"iris\"]' WHERE id = 'sl-ext'", [])
+            .unwrap();
+        let out = dispatch(&ctx(&db, "sl-eng"), "send_message",
+            &json!({"to": "Iris", "text": "hi"})).unwrap();
+        assert!(out.contains("Iris") && !out.contains("Hermes"), "{out}");
+    }
+
+    #[test]
+    fn escalating_moves_both_ends_and_carries_the_reason() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-eng"), "set_summary",
+            &json!({"summary": "wiring the parser", "status": "in_progress"})).unwrap();
+        let out = dispatch(&ctx(&db, "sl-eng"), "escalate",
+            &json!({"to": "strong", "reason": "the grammar is beyond me"})).unwrap();
+        assert!(out.contains("Iris"), "{out}");
+        // Neither side may be left thinking the other has it.
+        assert_eq!(state(&db, "sl-eng"), "escalated");
+        assert_eq!(state(&db, "sl-rev"), "working");
+        let body: String = db
+            .query_row("SELECT body FROM messages WHERE to_slot = 'sl-rev'", [], |r| r.get(0))
+            .unwrap();
+        assert!(body.contains("the grammar is beyond me"), "{body}");
+        assert!(body.contains("wiring the parser"), "it should carry the task too: {body}");
+        let kind: String = db
+            .query_row("SELECT kind FROM messages WHERE to_slot = 'sl-rev'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "handoff");
+    }
+
+    #[test]
+    fn escalating_can_name_a_different_task() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-eng"), "escalate",
+            &json!({"to": "Iris", "reason": "needs vision", "task": "read the scanned table"}))
+            .unwrap();
+        let body: String = db
+            .query_row("SELECT body FROM messages WHERE to_slot = 'sl-rev'", [], |r| r.get(0))
+            .unwrap();
+        assert!(body.contains("read the scanned table"), "{body}");
+    }
+
+    #[test]
+    fn you_cannot_escalate_to_yourself() {
+        let db = fixture();
+        let err = dispatch(&ctx(&db, "sl-eng"), "escalate",
+            &json!({"to": "Max", "reason": "stuck"})).unwrap_err().to_string();
+        assert!(err.contains("yourself") || err.contains("no teammate"), "{err}");
+    }
+
+    #[test]
+    fn escalating_to_nobody_is_an_error_not_a_silent_drop() {
+        let db = fixture();
+        let err = dispatch(&ctx(&db, "sl-eng"), "escalate",
+            &json!({"to": "nobody-here", "reason": "stuck"})).unwrap_err().to_string();
+        assert!(err.contains("no teammate"), "{err}");
+        assert_eq!(state(&db, "sl-eng"), "idle", "my state must not move if it failed");
     }
 
     #[test]

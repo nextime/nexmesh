@@ -95,6 +95,7 @@ pub async fn run_stream_json<R>(
     let mut usage = Usage::default();
     let mut seq = 0u64;
     let mut resume_sent = false;
+    let mut model_sent = false;
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -110,6 +111,19 @@ pub async fn run_stream_json<R>(
         };
         match v["type"].as_str().unwrap_or("") {
             "system" if v["subtype"] == "init" => {
+                // The init event names the model. It used to be dropped here,
+                // which left the token counts beside it meaningless.
+                if let Some(model) = v["model"].as_str() {
+                    if !model_sent {
+                        model_sent = true;
+                        let _ = ctx
+                            .send_hub(&proto::NodeToHub::AgentModel {
+                                agent_id: agent_id.clone(),
+                                model: model.to_string(),
+                            })
+                            .await;
+                    }
+                }
                 if let (false, Some(sid)) = (resume_sent, v["session_id"].as_str()) {
                     resume_sent = true;
                     let _ = ctx

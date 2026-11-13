@@ -44,6 +44,12 @@ pub struct CliMeta {
     /// (npm-global, ~/.local/bin, ~/.opencode/bin -- all real cases here).
     #[serde(default)]
     pub extra_paths: Vec<String>,
+    /// How to ask this CLI for a particular model, with `{model}` substituted.
+    /// Empty means it cannot be told on the command line -- which is not the
+    /// same as cannot be told at all: Codex takes the model in its own
+    /// protocol instead, and a plugin may do the same.
+    #[serde(default)]
+    pub model_args: Vec<String>,
     /// Environment variables to CLEAR for this CLI. A node started from inside
     /// tmux inherits `$TMUX`, and a tmux client that sees it refuses to run
     /// ("sessions should be nested with care"), so adoption would fail

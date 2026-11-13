@@ -19,6 +19,7 @@ id = "opencode"
 display_name = "opencode"
 command = "opencode"
 version_args = ["--version"]
+# opencode takes a ModelRef on POST /api/session, so no flag here.
 extra_paths = ["~/.opencode/bin"]
 
 [mcp]

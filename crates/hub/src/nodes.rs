@@ -248,6 +248,12 @@ async fn handle(
             tracing::debug!(%slot_id, "stored a resume handle");
         }
 
+        NodeToHub::AgentModel { agent_id, model } => {
+            let db = st.db.lock().unwrap();
+            db.execute("UPDATE agents SET model = ? WHERE id = ?", params![model, agent_id])?;
+            tracing::info!(%agent_id, %model, "agent reported its model");
+        }
+
         NodeToHub::InjectionsLost { message_ids, .. } => {
             // Back in the queue, or they are never redelivered.
             let db = st.db.lock().unwrap();
@@ -272,12 +278,20 @@ async fn handle(
         }
 
         NodeToHub::TokenUsage { agent_id, input, output, cache_read } => {
-            let db = st.db.lock().unwrap();
-            db.execute(
-                "UPDATE agents SET input_tokens = ?, output_tokens = ?, cache_read_tokens = ?
-                 WHERE id = ?",
-                params![input, output, cache_read, agent_id],
-            )?;
+            let over = {
+                let db = st.db.lock().unwrap();
+                db.execute(
+                    "UPDATE agents SET input_tokens = ?, output_tokens = ?, cache_read_tokens = ?
+                     WHERE id = ?",
+                    params![input, output, cache_read, agent_id],
+                )?;
+                crate::budget::exceeded(&db, &agent_id)?
+            };
+            // Checked here because this is the only place spending is learnt,
+            // and acted on outside the lock: pausing talks to every node.
+            if let Some(hit) = over {
+                crate::budget::enforce(st, hit).await;
+            }
         }
 
         NodeToHub::MessageAcked { agent_id, message_ids } => {

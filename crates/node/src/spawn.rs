@@ -206,6 +206,23 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         }
     }
 
+    // How this CLI is told which model to run, when it takes a flag at all.
+    // Codex and opencode are told in their own protocols instead, so their
+    // descriptors declare no model_args and the driver carries it.
+    if let Some(model) = &spec.model {
+        if d.cli.model_args.is_empty() {
+            if matches!(d.driver, DriverSpec::McpOnly | DriverSpec::StreamJson { .. }) {
+                tracing::warn!(cli = %spec.cli_id, %model,
+                    "a model was requested but this CLI declares no model_args and its \
+                     driver cannot ask for one; it will run its default");
+            }
+        } else {
+            for a in &d.cli.model_args {
+                args.push(a.replace("{model}", model));
+            }
+        }
+    }
+
     std::fs::create_dir_all(&state_dir).ok();
     let env = shim_env(&spec, &ctx.sock_path);
 
@@ -583,6 +600,7 @@ async fn spawn_on_pipes(
                     spec2.prompt.clone(),
                     spec2.cwd.clone(),
                     spec2.resume_handle.clone(),
+                    spec2.model.clone(),
                 )
                 .await;
             });
@@ -625,6 +643,7 @@ async fn spawn_on_pipes(
             spec.prompt.clone(),
             spec.cwd.clone(),
             spec.resume_handle.clone(),
+            spec.model.clone(),
         ));
         return Ok(());
     }
@@ -690,6 +709,7 @@ async fn spawn_on_pipes(
                 cwd: spec.cwd.clone(),
                 prompt: spec.prompt.clone(),
                 resume: spec.resume_handle.clone(),
+                model: spec.model.clone(),
             },
             io,
             in_tx,
@@ -850,6 +870,7 @@ mod tests {
             env: vec![],
             resume_handle: None,
             tmux_target: None,
+            model: None,
         }
     }
 

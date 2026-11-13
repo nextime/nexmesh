@@ -4,6 +4,7 @@ id = "claude"
 display_name = "Claude Code"
 command = "claude"
 version_args = ["--version"]
+model_args = ["--model", "{model}"]
 extra_paths = ["~/.local/bin", "~/.npm-global/bin"]
 
 [mcp]

@@ -21,7 +21,13 @@ def emit(obj):
     obj.setdefault("uuid", str(uuid.uuid4()))
     print(json.dumps(obj), flush=True)
 
-emit({"type": "system", "subtype": "init", "model": "fake",
+# Honour --model so the whole path is exercised: the node appends the flag
+# from the descriptor's model_args, and this is reported straight back.
+model = "fake"
+if "--model" in sys.argv:
+    model = sys.argv[sys.argv.index("--model") + 1]
+
+emit({"type": "system", "subtype": "init", "model": model,
       "resumed_from": resume, "tools": []})
 print(f"[fakestream] session={session} resumed={bool(resume)}", file=sys.stderr, flush=True)
 

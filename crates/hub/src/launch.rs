@@ -23,13 +23,15 @@ struct SlotRow {
     workspace_id: Option<String>,
     resume: Option<String>,
     tmux_target: Option<String>,
+    model: Option<String>,
 }
 
 fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
     let db = st.db.lock().unwrap();
     db.query_row(
         "SELECT s.session_id, se.name, s.cli_id, s.mode, s.placement, s.display_name,
-                s.role, s.role_description, s.workspace_id, s.resume_handle, s.tmux_target
+                s.role, s.role_description, s.workspace_id, s.resume_handle, s.tmux_target,
+                s.model
          FROM slots s JOIN sessions se ON se.id = s.session_id WHERE s.id = ?",
         [slot_id],
         |r| {
@@ -45,6 +47,7 @@ fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
                 workspace_id: r.get(8)?,
                 resume: r.get(9)?,
                 tmux_target: r.get(10)?,
+                model: r.get(11)?,
             })
         },
     )
@@ -130,6 +133,7 @@ pub async fn launch_slot(
         env: vec![],
         resume_handle: row.resume,
         tmux_target: row.tmux_target,
+        model: row.model,
     };
 
     {

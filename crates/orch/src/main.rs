@@ -356,6 +356,12 @@ async fn add_one(hub: &Hub, sid: &str, a: &Value) -> Result<(String, String)> {
     if let Some(r) = arg_str(a, "role") {
         body["role"] = json!(r);
     }
+    if let Some(m) = arg_str(a, "model") {
+        body["model"] = json!(m);
+    }
+    if let Some(c) = a.get("can").cloned() {
+        body["capabilities"] = c;
+    }
     if let Some(w) = arg_str(a, "workspace") {
         body["workspace"] = json!(w);
     }
@@ -388,6 +394,9 @@ async fn create_team(hub: &Hub, a: &Value) -> Result<String> {
 
     let mut session_body = json!({ "name": name, "workspaces": [], "plan":
         a.get("plan").cloned().unwrap_or(json!([])) });
+    if let Some(b) = a.get("token_budget").and_then(|v| v.as_i64()) {
+        session_body["token_budget"] = json!(b);
+    }
     let mut workspace_name = None;
     if let Some(w) = a.get("workspace").filter(|w| w.is_object()) {
         let wname = w["name"].as_str().unwrap_or("workspace").to_string();

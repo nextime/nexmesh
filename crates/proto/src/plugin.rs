@@ -56,6 +56,10 @@ pub enum ToPlugin {
         /// plugin last reported as its resume handle.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume: Option<String>,
+        /// The model this seat was asked to run, if any. The plugin decides
+        /// how its CLI wants to be told.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// A chunk of the CLI's stdout, exactly as it arrived. Not necessarily a
     /// whole line: a plugin that needs lines must buffer.
@@ -95,6 +99,9 @@ pub enum FromPlugin {
     /// calls it. Reported as soon as it is known, because a crash before that
     /// means the agent restarts from nothing.
     Resume { handle: String },
+    /// The model this CLI is running, if the plugin can tell. Optional: a CLI
+    /// that never says gets no entry, which is better than a guess.
+    Model { model: String },
     /// A line for the node's log. For a plugin that would rather not write to
     /// stderr.
     Log {
@@ -157,9 +164,11 @@ mod tests {
             cwd: "/tmp".into(),
             prompt: "do the thing".into(),
             resume: None,
+            model: None,
         })
         .unwrap();
         assert!(!s.contains("resume"), "{s}");
+        assert!(!s.contains("model"), "{s}");
         let s2 = serde_json::to_string(&ToPlugin::Hello {
             protocol: 1,
             agent_id: "ag-1".into(),
@@ -168,9 +177,11 @@ mod tests {
             cwd: "/tmp".into(),
             prompt: "p".into(),
             resume: Some("thread-9".into()),
+            model: Some("gpt-5".into()),
         })
         .unwrap();
         assert!(s2.contains("\"resume\":\"thread-9\""), "{s2}");
+        assert!(s2.contains("\"model\":\"gpt-5\""), "{s2}");
     }
 
     #[test]
@@ -219,6 +230,12 @@ mod tests {
     fn token_fields_are_optional_so_a_plugin_can_report_what_it_knows() {
         let f: FromPlugin = serde_json::from_str(r#"{"type":"tokens","input":10}"#).unwrap();
         assert_eq!(f, FromPlugin::Tokens { input: 10, output: 0, cache_read: 0 });
+    }
+
+    #[test]
+    fn a_plugin_can_report_the_model_it_is_driving() {
+        let f: FromPlugin = serde_json::from_str(r#"{"type":"model","model":"gpt-5"}"#).unwrap();
+        assert_eq!(f, FromPlugin::Model { model: "gpt-5".into() });
     }
 
     #[test]

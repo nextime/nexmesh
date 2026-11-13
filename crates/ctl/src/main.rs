@@ -68,6 +68,17 @@ enum Cmd {
         /// Git remote, for a repo workspace.
         #[arg(long)]
         repo: Option<String>,
+        /// Pause this session once it has spent this many tokens in total.
+        #[arg(long)]
+        token_budget: Option<i64>,
+    },
+    /// Set, raise or clear a session's token budget. Changing it re-arms the
+    /// guard, so a session paused on budget can be given more and resumed.
+    Budget {
+        session: String,
+        /// New ceiling in total tokens. Omit to remove the ceiling.
+        #[arg(long)]
+        tokens: Option<i64>,
     },
     /// Add a slot to a session.
     AddAgent {
@@ -75,6 +86,12 @@ enum Cmd {
         /// CLI id from a node's inventory, e.g. claude, opencode, qwen.
         #[arg(long)]
         cli: String,
+        /// Model this seat should run, if its CLI can be told.
+        #[arg(long)]
+        model: Option<String>,
+        /// Capability label teammates can address, e.g. --can strong --can vision.
+        #[arg(long = "can")]
+        can: Vec<String>,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -597,8 +614,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::NewSession { name, workspace, kind, node, path, repo } => {
+        Cmd::NewSession { name, workspace, kind, node, path, repo, token_budget } => {
             let mut body = json!({ "name": name, "workspaces": [] });
+            if let Some(b) = token_budget {
+                body["token_budget"] = json!(b);
+            }
             if let Some(ws) = workspace {
                 if kind == "node_local" && (node.is_none() || path.is_none()) {
                     anyhow::bail!("a node_local workspace needs --node and --path");
@@ -620,11 +640,24 @@ async fn main() -> Result<()> {
             println!("session {} created", v["session_id"].as_str().unwrap_or("?"));
         }
 
-        Cmd::AddAgent { session, cli, name, role, task, workspace, node, mode, owns } => {
+        Cmd::Budget { session, tokens } => {
+            let mut body = json!({});
+            if let Some(t) = tokens {
+                body["token_budget"] = json!(t);
+            }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/budget"), body).await?;
+            bail_on_error(&v)?;
+            println!("{}", v["detail"].as_str().unwrap_or("budget updated"));
+        }
+
+        Cmd::AddAgent {
+            session, cli, model, can, name, role, task, workspace, node, mode, owns,
+        } => {
             let mut body = json!({
                 "cli_id": cli, "display_name": name, "mode": mode,
-                "file_ownership": owns,
+                "file_ownership": owns, "capabilities": can,
             });
+            if let Some(m) = model { body["model"] = json!(m); }
             if let Some(r) = role { body["role"] = json!(r); }
             if let Some(t) = task { body["task"] = json!(t); }
             if let Some(w) = workspace { body["workspace"] = json!(w); }

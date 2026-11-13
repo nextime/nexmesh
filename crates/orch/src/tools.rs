@@ -54,6 +54,9 @@ pub fn tools() -> Vec<Tool> {
                     },
                     "plan": { "type": "array", "items": { "type": "string" },
                         "description": "Ordered steps the team works through" },
+                    "token_budget": { "type": "integer",
+                        "description": "Pause the session once it has spent this many tokens \
+                                        in total across every agent. Omitted means no ceiling." },
                     "agents": {
                         "type": "array",
                         "description": "The team. At least one.",
@@ -64,6 +67,13 @@ pub fn tools() -> Vec<Tool> {
                                 "role": s("Role, e.g. 'engineer' or 'code reviewer'. A role \
                                            containing review/qa/test approves its own work."),
                                 "cli": s("Agent CLI id from list_nodes, e.g. claude, opencode, codex"),
+                                "model": s("Model for this seat, if its CLI can be told, e.g. \
+                                            'claude-opus-4' or 'anthropic/claude-opus-4' for \
+                                            opencode. Omitted means the CLI's default."),
+                                "can": { "type": "array", "items": { "type": "string" },
+                                    "description": "Capability labels teammates can address \
+                                                    instead of guessing from names, e.g. \
+                                                    ['strong','vision']" },
                                 "task": s("What this agent should do"),
                                 "node": s("Node to run it on; omitted means any node with that CLI"),
                                 "mode": { "type": "string", "enum": ["headless", "interactive"],
@@ -115,6 +125,9 @@ pub fn tools() -> Vec<Tool> {
                 "session": s("Session id; omitted means the most recent"),
                 "name": s("Agent name"), "role": s("Role"),
                 "cli": s("Agent CLI id"), "task": s("What it should do"),
+                "model": s("Model for this seat, if its CLI can be told"),
+                "can": { "type": "array", "items": { "type": "string" },
+                    "description": "Capability labels, e.g. ['strong','vision']" },
                 "node": s("Node to run it on"),
                 "mode": { "type": "string", "enum": ["headless", "interactive"] },
                 "workspace": s("Workspace name to join"),
@@ -198,6 +211,27 @@ mod tests {
         n.sort();
         n.dedup();
         assert_eq!(before, n.len());
+    }
+
+    #[test]
+    fn a_team_can_be_composed_of_unequal_agents() {
+        // The orchestrator is where a team is actually built, so if a model or
+        // a capability cannot be stated here, a mixed team cannot be made at
+        // all through the MCP surface -- only through the HTTP API.
+        let t = tools().into_iter().find(|t| t.name == "create_team").unwrap();
+        let agent = &t.schema["properties"]["agents"]["items"]["properties"];
+        assert!(agent.get("model").is_some(), "a seat must be able to name its model");
+        assert!(agent.get("can").is_some(), "a seat must be able to declare capabilities");
+        assert_eq!(agent["can"]["type"], "array");
+        assert!(
+            t.schema["properties"].get("token_budget").is_some(),
+            "a team must be able to carry a spending ceiling"
+        );
+        // And the same on the tool that adds one later, or a team could only
+        // be mixed at creation time.
+        let t = tools().into_iter().find(|t| t.name == "add_agent").unwrap();
+        let p = t.schema["properties"].as_object().unwrap();
+        assert!(p.contains_key("model") && p.contains_key("can"), "{:?}", p.keys());
     }
 
     #[test]

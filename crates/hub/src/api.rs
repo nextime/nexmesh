@@ -27,6 +27,22 @@ fn bad(msg: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     err(StatusCode::BAD_REQUEST, msg)
 }
 
+/// Capability labels, tidied so addressing them is predictable.
+///
+/// Lower-cased and de-duplicated: a teammate asking for "Strong" and one
+/// asking for "strong" must reach the same seats, or the whole point of
+/// addressing by capability is lost to spelling.
+pub(crate) fn normalise_capabilities(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in raw {
+        let c = c.trim().to_lowercase();
+        if !c.is_empty() && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ------------------------------------------------------------- operator ----
 
 pub async fn health() -> Json<Value> {
@@ -57,6 +73,8 @@ pub struct NewSession {
     pub workspaces: Vec<NewWorkspace>,
     #[serde(default)]
     pub plan: Vec<String>,
+    /// Total tokens this session may spend before it is paused. None = no cap.
+    pub token_budget: Option<i64>,
 }
 
 pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSession>) -> ApiResult {
@@ -67,8 +85,9 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
     let now = now_ms();
     let id = format!("se-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
-        "INSERT INTO sessions (id, name, created_at_ms, last_active_ms) VALUES (?,?,?,?)",
-        params![id, req.name, now, now],
+        "INSERT INTO sessions (id, name, token_budget, created_at_ms, last_active_ms)
+         VALUES (?,?,?,?,?)",
+        params![id, req.name, req.token_budget, now, now],
     )
     .map_err(|e| bad(e))?;
 
@@ -154,6 +173,12 @@ pub struct NewSlot {
     pub role_description: Option<String>,
     pub workspace: Option<String>,
     pub task: Option<String>,
+    /// Which model this seat should run, if the CLI can be told. Kept on the
+    /// slot so a respawn after a crash gets the same one.
+    pub model: Option<String>,
+    /// Capability labels teammates can address: "strong", "cheap", "ocr", ...
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub placement: Placement,
     #[serde(default)]
@@ -197,12 +222,16 @@ pub async fn create_slot(
     let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
         "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
-                            placement, display_name, role, role_description, created_at_ms)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            placement, display_name, role, role_description, model,
+                            capabilities, created_at_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             slot_id, session_id, ws_id, req.cli_id, kind, mode,
             serde_json::to_string(&req.placement).unwrap_or_else(|_| "{}".into()),
-            req.display_name, req.role, req.role_description, now_ms()
+            req.display_name, req.role, req.role_description, req.model,
+            serde_json::to_string(&normalise_capabilities(&req.capabilities))
+                .unwrap_or_else(|_| "[]".into()),
+            now_ms()
         ],
     )
     .map_err(|e| bad(e))?;
@@ -419,6 +448,57 @@ pub async fn pause(
         Ok(detail) => Ok(Json(json!({ "ok": true, "detail": detail }))),
         Err(e) => Err(bad(format!("{e:#}"))),
     }
+}
+
+#[derive(Deserialize)]
+pub struct BudgetRequest {
+    /// New ceiling in total tokens; null clears it.
+    pub token_budget: Option<i64>,
+}
+
+/// Set or clear a session's token budget.
+///
+/// Changing it re-arms the guard. Without this the budget could only ever
+/// fire once per session: the crossing is stamped so a released session is
+/// not immediately re-paused, which would otherwise mean raising a budget had
+/// no effect.
+pub async fn set_budget(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<BudgetRequest>,
+) -> ApiResult {
+    if let Some(b) = req.token_budget {
+        if b <= 0 {
+            return Err(bad("a token budget must be positive; omit it to remove the ceiling"));
+        }
+    }
+    let db = st.db.lock().unwrap();
+    let n = db
+        .execute(
+            "UPDATE sessions SET token_budget = ?, budget_hit_at_ms = NULL WHERE id = ?",
+            params![req.token_budget, session_id],
+        )
+        .map_err(|e| bad(e))?;
+    if n == 0 {
+        return Err(bad(format!("no session '{session_id}'")));
+    }
+    let spent: i64 = db
+        .query_row(
+            "SELECT COALESCE(SUM(a.input_tokens + a.output_tokens), 0)
+               FROM agents a JOIN slots s ON s.id = a.slot_id
+              WHERE s.session_id = ?",
+            [&session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    tracing::info!(%session_id, budget = ?req.token_budget, "token budget changed");
+    Ok(Json(json!({
+        "ok": true, "token_budget": req.token_budget, "spent": spent,
+        "detail": match req.token_budget {
+            Some(b) => format!("budget set to {b}; {spent} already spent"),
+            None => format!("budget removed; {spent} spent so far"),
+        }
+    })))
 }
 
 #[derive(Deserialize)]

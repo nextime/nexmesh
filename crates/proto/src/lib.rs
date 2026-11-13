@@ -189,6 +189,11 @@ pub struct SpawnSpec {
     /// For an adopted slot: the tmux target whose terminal to mirror.
     #[serde(default)]
     pub tmux_target: Option<String>,
+    /// The model this seat was asked to run. The node turns it into whatever
+    /// this CLI wants -- a flag, or a field in its own protocol. None means
+    /// the CLI's default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 // --------------------------------------------------------- node -> hub ----
@@ -235,6 +240,16 @@ pub enum NodeToHub {
         agent_id: String,
         slot_id: String,
         handle: String,
+    },
+    /// The model an agent reports it is actually running.
+    ///
+    /// Separate from the one requested, because a CLI may substitute or fall
+    /// back. Without it the per-agent token counts are unreadable: 40k tokens
+    /// means nothing until you know whether an expensive or a cheap model
+    /// spent them.
+    AgentModel {
+        agent_id: String,
+        model: String,
     },
     AgentExited {
         agent_id: String,

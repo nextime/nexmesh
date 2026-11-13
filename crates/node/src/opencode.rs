@@ -107,6 +107,7 @@ pub async fn run(
     first_prompt: String,
     cwd: String,
     resume: Option<String>,
+    want_model: Option<String>,
 ) {
     // The server takes a moment to come up even after printing its URL.
     let mut ready = false;
@@ -127,8 +128,36 @@ pub async fn run(
         // Reusing the id continues the previous conversation.
         body["id"] = json!(id);
     }
+    // `POST /api/session` takes `model: ModelRef { providerID, id }` -- both
+    // required -- so a model is requested as opencode writes it, as
+    // `provider/model`. Anything without the provider is not a ModelRef and
+    // would be silently ignored, so say so instead.
+    if let Some(m) = &want_model {
+        match m.split_once('/') {
+            Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+                body["model"] = json!({ "providerID": provider, "id": id });
+            }
+            _ => tracing::warn!(model = %m,
+                "opencode needs a model as 'provider/model' (e.g. anthropic/claude-sonnet-4); \
+                 ignoring this one and using its default"),
+        }
+    }
     let session = match server.post("/api/session", body).await {
-        Ok(v) => v["data"]["id"].as_str().map(String::from),
+        Ok(v) => {
+            // `Session.model` is `{ id, providerID, variant }` in opencode's
+            // own OpenAPI, and `providerID/id` is how opencode itself writes a
+            // model, so report it that way rather than inventing a format.
+            let m = &v["data"]["model"];
+            if let (Some(p), Some(i)) = (m["providerID"].as_str(), m["id"].as_str()) {
+                let _ = ctx
+                    .send_hub(&proto::NodeToHub::AgentModel {
+                        agent_id: agent_id.clone(),
+                        model: format!("{p}/{i}"),
+                    })
+                    .await;
+            }
+            v["data"]["id"].as_str().map(String::from)
+        }
         Err(e) => {
             tracing::error!(%agent_id, error = %e, "could not create an opencode session");
             return;

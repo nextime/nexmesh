@@ -5,6 +5,7 @@ id = "fakestream"
 display_name = "Fake stream-json agent"
 command = "fakestream"
 version_args = ["--version"]
+model_args = ["--model", "{model}"]
 extra_paths = ["tests/fake-cli"]
 
 [mcp]

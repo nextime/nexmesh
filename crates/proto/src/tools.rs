@@ -39,8 +39,14 @@ fn s(desc: &str) -> Value {
 pub fn team_tools() -> Vec<ToolDef> {
     vec![
         tool("list_peers",
-            "List your teammates: name, role, machine, task state and current summary.",
-            json!({ "role": s("Only peers with this role") }), &[]),
+            "List your teammates: name, role, capabilities, model, machine, task state and \
+             current summary. Use the capability filter to find someone able to do a \
+             particular kind of work rather than guessing from names.",
+            json!({
+                "role": s("Only peers with this role"),
+                "capability": s("Only peers with this capability label, e.g. 'strong', \
+                                 'cheap', 'vision', 'ocr'")
+            }), &[]),
         tool("send_message",
             "Send a message to a teammate by name or role. Delivered wherever they run.",
             json!({ "to": s("Teammate name or role"), "text": s("Message body") }),
@@ -67,6 +73,17 @@ pub fn team_tools() -> Vec<ToolDef> {
         tool("signal_done",
             "Declare your task complete. Triggers review unless you are a reviewer.",
             json!({ "notes": s("What you did, for the reviewer") }), &[]),
+        tool("escalate",
+            "Hand your task to a teammate better suited to it -- more capable, or with a \
+             capability you lack. Say what you tried and why you are stuck: they get that \
+             as the handoff, not just the task. Your own state becomes 'escalated' and \
+             theirs 'working', so nobody waits on you. Use list_peers with a capability \
+             filter to find who to ask.",
+            json!({
+                "to": s("Teammate name, role, or a capability label like 'strong'"),
+                "reason": s("Why you are escalating: what you tried and where it failed"),
+                "task": s("What they should do. Omitted means your own current task")
+            }), &["to", "reason"]),
         tool("submit_feedback",
             "Give review feedback on a teammate's work.",
             json!({ "to": s("Teammate name or role"), "text": s("The feedback"),

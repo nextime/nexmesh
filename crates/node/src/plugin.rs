@@ -31,6 +31,7 @@ pub struct PluginRun {
     pub cwd: String,
     pub prompt: String,
     pub resume: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Drive one agent through a plugin.
@@ -48,7 +49,8 @@ pub async fn run<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    let PluginRun { agent_id, slot_id, cli_id, command, args, cwd, prompt, resume } = spec;
+    let PluginRun { agent_id, slot_id, cli_id, command, args, cwd, prompt, resume, model } =
+        spec;
 
     let mut child = match tokio::process::Command::new(&command)
         .args(&args)
@@ -95,6 +97,7 @@ pub async fn run<R>(
         cwd: cwd.clone(),
         prompt,
         resume,
+        model,
     };
     if pin_tx.send(hello.line()).await.is_err() {
         tracing::error!(agent = %agent_id, "the driver plugin closed its input immediately");
@@ -227,6 +230,15 @@ pub async fn run<R>(
                         agent_id: agent_id.clone(),
                         slot_id: slot_id.clone(),
                         handle,
+                    })
+                    .await;
+            }
+            FromPlugin::Model { model } => {
+                tracing::info!(agent = %agent_id, %model, "plugin reported the model");
+                let _ = ctx
+                    .send_hub(&proto::NodeToHub::AgentModel {
+                        agent_id: agent_id.clone(),
+                        model,
                     })
                     .await;
             }

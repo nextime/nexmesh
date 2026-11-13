@@ -117,6 +117,7 @@ pub async fn run(
     first_prompt: String,
     cwd: String,
     resume: Option<String>,
+    want_model: Option<String>,
 ) {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
     tokio::spawn(async move {
@@ -247,14 +248,38 @@ pub async fn run(
     }
 
     // Resume the previous thread if we have one, else start a fresh one.
+    // `model` is an optional string on ThreadStartParams and
+    // ThreadResumeParams, so codex is asked in its own protocol rather than
+    // through a command-line flag.
     let started = match &resume {
         Some(tid) => {
-            rpc.call("thread/resume", json!({ "threadId": tid, "cwd": cwd,
-                                              "approvalPolicy": "never" }))
-                .await
+            let mut p = json!({ "threadId": tid, "cwd": cwd, "approvalPolicy": "never" });
+            if let Some(m) = &want_model {
+                p["model"] = json!(m);
+            }
+            rpc.call("thread/resume", p).await
         }
-        None => rpc.call("thread/start", json!({ "cwd": cwd, "approvalPolicy": "never" })).await,
+        None => {
+            let mut p = json!({ "cwd": cwd, "approvalPolicy": "never" });
+            if let Some(m) = &want_model {
+                p["model"] = json!(m);
+            }
+            rpc.call("thread/start", p).await
+        }
     };
+    // `model` is a REQUIRED top-level string on both ThreadStartResponse and
+    // ThreadResumeResponse (checked against `codex app-server
+    // generate-json-schema`), beside `modelProvider`.
+    if let Ok(v) = &started {
+        if let Some(model) = v["model"].as_str() {
+            let _ = ctx
+                .send_hub(&proto::NodeToHub::AgentModel {
+                    agent_id: agent_id.clone(),
+                    model: model.to_string(),
+                })
+                .await;
+        }
+    }
     let tid = match started {
         Ok(v) => v["thread"]["id"]
             .as_str()

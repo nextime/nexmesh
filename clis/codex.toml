@@ -5,6 +5,7 @@ id = "codex"
 display_name = "Codex CLI"
 command = "codex"
 version_args = ["--version"]
+# Codex takes the model in thread/start, so no flag here.
 
 [mcp]
 style = "toml_file"

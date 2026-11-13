@@ -249,6 +249,79 @@ refused, because a browser on any page can reach a loopback address.
 > makes *your* CLI the operator of the fleet, where this one makes an external
 > agent a *member* of a team.
 
+## A team of unequal agents
+
+Agents differ. One seat is an expensive model that reasons well, another is
+cheap and fast, a third does OCR and nothing else. nexmesh does not try to be
+a scheduler — it never decides who is more capable — but it does carry the
+facts that let a team work that way.
+
+**Which model is in a seat.** `slots.model` is what the seat was *asked* for
+and survives a respawn; `agents.model` is what the running agent *reported*,
+which is the truth, because a CLI may substitute or fall back. Without the
+second, the token counts next to it are unreadable: 40k tokens means nothing
+until you know whether an expensive or a cheap model spent them. Each driver
+reports it from its own protocol, verified rather than assumed:
+
+| CLI | asked via | reported from |
+|---|---|---|
+| claude, qwen, gemini | `model_args` in the descriptor (`--model {model}`) | `system`/`init` carries `model` |
+| codex | `model` on `thread/start` / `thread/resume` | `model`, a required field on both responses |
+| opencode | `ModelRef {providerID, id}` on `POST /api/session` | `Session.model` |
+| a plugin | the `model` field in its `hello` | the plugin's own `model` frame |
+
+**What a seat can do.** `capabilities` is a list of free-form labels —
+`strong`, `cheap`, `vision`, `ocr` — lower-cased and de-duplicated so that
+addressing them is not a spelling lottery. A list rather than one tier,
+because capability is not a single axis. `list_peers` shows them and filters
+on them, and `send_message` resolves a label the way it resolves a name:
+
+```
+- Iris [code reviewer] on machine-b (cli, running) state=working model=anthropic/claude-opus-4 can=strong,vision
+- Hermes [archivist] on external (external, running) state=idle can=ocr
+```
+
+Name and role win over a capability, and a label several teammates hold is
+**refused rather than guessed** — it tells you to use `list_peers` and choose.
+Sending review feedback to the wrong agent is worse than a retry.
+
+**Handing work up.** `escalate {to, reason, task?}` is the mirror of
+`submit_feedback`: that one hands work back down for rework, this one hands it
+up to someone better equipped. With a mixed team the cheap seat reaching its
+limit is the normal case, not an error, and it needs a move that is neither
+"done" nor "failed". Both ends move — the escalator to `escalated`, the
+receiver to `working` — because leaving either alone is how a task is silently
+dropped between two agents that each think the other has it. The reason and
+the task travel as a `handoff` message.
+
+**A ceiling on the bill.** A session may carry `token_budget`, and reaching it
+**pauses** the session:
+
+```bash
+nexmesh new-session audit --token-budget 2000000
+# ... later, in the hub log:
+#   WARN token budget reached; pausing the session  spent=2004311 budget=2000000
+```
+
+Pausing rather than killing, for three reasons: it is reversible by an
+operator who can look at what was bought, every agent already understands
+pause (it withholds work rather than yanking a process), and terminating
+agents mid-edit destroys work to save money, which is the wrong trade at
+almost any budget. The ceiling is per session, not per agent — with a mixed
+team the number worth capping is what the task cost, not what one seat cost.
+Cache reads are excluded, because charging for them would pause a session for
+being efficient.
+
+The crossing is stamped, so a session an operator deliberately resumes is not
+re-paused by the next token report. Changing the budget
+(`POST /v1/sessions/:id/budget`) re-arms the guard — otherwise raising a
+budget would have no effect.
+
+**What this deliberately is not.** There is no automatic routing by ability,
+no model tiering the hub enforces, and no agent the hub decides is better. An
+agent asks for a capability and the hub routes it, exactly as it routes every
+other message here. Composing the team stays yours.
+
 ## Reaching any CLI from any machine
 
 Two independent axes, deliberately:
@@ -736,7 +809,7 @@ reconnect-with-backoff and identity-checked signalling.
   outlive the process (`nexmesh transcript`).
 - An operator CLI: `nodes`, `sessions`, `new-session`, `add-agent`, `spawn`,
   `status`, `send`, `log`, `transcript`, `attach`, `adopt`, `pause`, `resume`,
-  `release`, `sync`, `pair`, `certs`, `revoke`, `install-orchestrator`.
+  `release`, `budget`, `sync`, `pair`, `certs`, `revoke`, `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
 132 unit tests, plus fifteen end-to-end suites that drive real processes

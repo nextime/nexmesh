@@ -4,6 +4,7 @@ id = "qwen"
 display_name = "Qwen Code"
 command = "qwen"
 version_args = ["--version"]
+model_args = ["--model", "{model}"]
 extra_paths = ["~/.npm-global/bin"]
 
 [mcp]

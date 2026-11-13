@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS issued_certs (
 -- captured session id must not be a credential on its own, and `pending_ack`
 -- holds what was last handed to that client: it is acked when the client
 -- returns, which is the only proof over a network that it arrived.
+-- An optional ceiling on what a session may spend, in total tokens across
+-- every agent in it. Reaching it PAUSES the session rather than killing
+-- anything: pausing is reversible, already understood by every agent, and
+-- leaves the operator to decide. NULL means no ceiling.
+--
+-- Deliberately not a per-agent cap. With a mixed team the interesting number
+-- is what the work cost, not what one seat cost.
+
 CREATE TABLE IF NOT EXISTS mcp_sessions (
   id            TEXT PRIMARY KEY,         -- the Mcp-Session-Id we issued
   agent_id      TEXT NOT NULL REFERENCES agents(id),
@@ -116,7 +124,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   paused_at      INTEGER,
   config         TEXT NOT NULL DEFAULT '{}',
   created_at_ms  INTEGER NOT NULL,
-  last_active_ms INTEGER NOT NULL
+  last_active_ms INTEGER NOT NULL,
+  -- Total tokens this session may spend before it is paused. NULL = no cap.
+  token_budget     INTEGER,
+  budget_hit_at_ms INTEGER
 );
 
 -- A workspace is WHERE work happens. This single table is what lets per-host
@@ -156,6 +167,13 @@ CREATE TABLE IF NOT EXISTS slots (
   display_name      TEXT,
   role              TEXT,
   role_description  TEXT,
+  -- The model this seat was ASKED for, so a respawn gets the same one. NULL
+  -- means whatever the CLI defaults to.
+  model             TEXT,
+  -- Free-form capability labels: "strong", "cheap", "vision", "ocr", ...
+  -- What a teammate can address instead of guessing who is behind a role.
+  -- A list rather than one tier, because capability is not a single axis.
+  capabilities      TEXT NOT NULL DEFAULT '[]',
   -- Last reported status line. On the SLOT, not the agent: it describes the
   -- WORK, so it must survive the process exiting or being respawned on
   -- another machine -- exactly like task_state and queued messages.
@@ -191,6 +209,11 @@ CREATE TABLE IF NOT EXISTS agents (
   pid               INTEGER,
   proc_start_ticks  INTEGER,                   -- /proc/<pid>/stat field 22
   provenance        TEXT NOT NULL,             -- managed | attached | external
+  -- The model this agent REPORTED it is running. Distinct from slots.model,
+  -- which is what was asked for: a CLI may substitute, fall back, or ignore
+  -- the request entirely, and the token counts beside this column only mean
+  -- something if you know which model spent them.
+  model             TEXT,
   -- Whether this agent's driver can take a message mid-turn. Decides whether
   -- the hub pushes to it or waits for its next tool result.
   push_capable      INTEGER NOT NULL DEFAULT 0,

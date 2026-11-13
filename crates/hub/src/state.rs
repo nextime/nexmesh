@@ -43,6 +43,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("sessions", "paused_at", "INTEGER"),
         ("slots", "paused_at", "INTEGER"),
         ("agents", "kind_hint", "TEXT"),
+        ("slots", "model", "TEXT"),
+        ("slots", "capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+        ("agents", "model", "TEXT"),
+        ("sessions", "token_budget", "INTEGER"),
+        ("sessions", "budget_hit_at_ms", "INTEGER"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.
