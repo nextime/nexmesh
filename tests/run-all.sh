@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
         control dashboard orchestrator mtls pairing revoke bind plugin mcpdoor
-        capability)
+        capability memory)
 TIMEOUT=${TIMEOUT:-420}
 failed=()
 

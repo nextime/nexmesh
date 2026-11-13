@@ -119,6 +119,41 @@ pub async fn launch_slot(
     }
     drop(brief);
 
+    // Continuity across sessions. slots.resume_handle only ever covers THIS
+    // session, so a seat that worked here yesterday would otherwise start
+    // from nothing. The identity is the CLI, the workspace and the name --
+    // what makes tomorrow's agent the same agent.
+    let mut resume = row.resume.clone();
+    let cli_for_identity = row.cli_id.clone().unwrap_or_default();
+    let name_for_identity = row.display_name.clone().unwrap_or_default();
+    if !cli_for_identity.is_empty() && !name_for_identity.is_empty() {
+        let found = {
+            let db = st.db.lock().unwrap();
+            crate::memory::continuity(&db, &cli_for_identity, &cwd, &name_for_identity)
+                .ok()
+                .flatten()
+        };
+        if let Some((handle, context)) = found {
+            if resume.is_none() {
+                if let Some(h) = handle {
+                    tracing::info!(slot = %slot_id, cli = %cli_for_identity,
+                        "resuming a conversation from an earlier session");
+                    resume = Some(h);
+                }
+            }
+            // The summary goes in whether or not the handle did: a CLI that
+            // cannot resume at all can still be told what it was doing, and a
+            // handle is opaque so it cannot be read by anything else.
+            if !context.trim().is_empty() {
+                prompt_text = format!(
+                    "[CONTINUING EARLIER WORK]\nWhen you last worked here you wrote: \
+                     {}\n[END]\n\n{prompt_text}",
+                    context.trim()
+                );
+            }
+        }
+    }
+
     let workspace_path = cwd.clone();
     let spec = SpawnSpec {
         slot_id: slot_id.to_string(),
@@ -131,7 +166,7 @@ pub async fn launch_slot(
         display_name: row.display_name,
         prompt: prompt_text,
         env: vec![],
-        resume_handle: row.resume,
+        resume_handle: resume,
         tmux_target: row.tmux_target,
         model: row.model,
     };

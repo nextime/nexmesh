@@ -400,14 +400,20 @@ function viewPlan(d) {
 
 function viewKnowledge(d, now) {
   if (!d.knowledge.length)
-    return empty("Nothing recorded yet. Agents call store_knowledge as they decide things.");
-  return panel(`<table><thead><tr><th>Category</th><th>Key</th><th>Value</th>
+    return empty("Nothing remembered yet. Agents call store_memory as they decide things.");
+  // Scope is shown because it says how far a fact travels: a global
+  // convention and one team's decision deserve different weight.
+  return panel(`<table><thead><tr><th>Category</th><th>Scope</th><th>Key</th><th>Value</th>
       <th class="hide">By</th><th class="num hide">Age</th></tr></thead><tbody>` +
     d.knowledge.map((k) => `<tr>
       <td><span class="badge ${k.category === "decision" ? "info"
           : k.category === "blocker" ? "bad" : ""}">${esc(k.category)}</span></td>
+      <td><span class="badge ${k.scope === "global" ? "warn" : ""}" title="${
+          k.scope === "global" ? "outlives every session" : "this session only"
+        }">${esc(k.scope || "session")}</span></td>
       <td class="mono">${esc(k.key)}</td>
-      <td>${esc(k.value)}</td>
+      <td>${esc(k.value)}${(k.revision || 1) > 1
+          ? `<span class="muted tiny"> rev ${k.revision}</span>` : ""}</td>
       <td class="hide muted tiny">${esc(k.who)}</td>
       <td class="num hide muted tiny">${ago(k.at_ms, now)}</td></tr>`).join("") + "</tbody></table>");
 }

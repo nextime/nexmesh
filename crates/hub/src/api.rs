@@ -451,6 +451,52 @@ pub async fn pause(
 }
 
 #[derive(Deserialize)]
+pub struct GroupRequest {
+    /// Group name. Lower-cased, so membership and scope always agree.
+    pub group: String,
+    /// Agent name, role or slot id.
+    pub who: String,
+    /// True to add, false to remove.
+    #[serde(default = "yes")]
+    pub member: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Put an agent in a memory group, or take it out.
+///
+/// Operator-driven on purpose: membership decides who can read a group's
+/// memory, so an agent must not be able to add itself to one.
+pub async fn set_group(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<GroupRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let slot: Option<String> = db
+        .query_row(
+            "SELECT id FROM slots
+              WHERE session_id = ?1
+                AND (id = ?2 OR LOWER(COALESCE(display_name,'')) = LOWER(?2)
+                     OR LOWER(COALESCE(role,'')) = LOWER(?2))
+              LIMIT 1",
+            params![session_id, req.who],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| bad(e))?;
+    let slot = slot.ok_or_else(|| bad(format!("no agent '{}' in {session_id}", req.who)))?;
+    crate::memory::set_group_member(&db, &req.group, &slot, req.member)
+        .map_err(|e| bad(format!("{e:#}")))?;
+    Ok(Json(json!({
+        "ok": true, "group": req.group.trim().to_lowercase(), "slot": slot,
+        "member": req.member
+    })))
+}
+
+#[derive(Deserialize)]
 pub struct BudgetRequest {
     /// New ceiling in total tokens; null clears it.
     pub token_budget: Option<i64>,

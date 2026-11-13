@@ -60,6 +60,90 @@ fn migrate(conn: &Connection) -> Result<()> {
             last_used_ms  INTEGER
          )",
     )?;
+    // Memory v2 and cross-session continuity. The schema's CREATE TABLE IF NOT
+    // EXISTS covers a fresh database; this covers one that predates them.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope         TEXT NOT NULL,
+            scope_ref     TEXT NOT NULL DEFAULT '',
+            key           TEXT NOT NULL,
+            category      TEXT NOT NULL DEFAULT 'context',
+            value         TEXT NOT NULL,
+            author_slot   TEXT,
+            revision      INTEGER NOT NULL DEFAULT 1,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER,
+            UNIQUE (scope, scope_ref, key)
+         );
+         CREATE INDEX IF NOT EXISTS memory_scope_idx ON memory(scope, scope_ref);
+         CREATE TABLE IF NOT EXISTS memory_groups (
+            group_name  TEXT NOT NULL,
+            slot_id     TEXT NOT NULL,
+            added_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (group_name, slot_id)
+         );
+         CREATE TABLE IF NOT EXISTS memory_history (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id      INTEGER NOT NULL,
+            revision       INTEGER NOT NULL,
+            value          TEXT NOT NULL,
+            author_slot    TEXT,
+            replaced_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS memory_history_idx
+            ON memory_history(memory_id, revision);
+         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+            key, value, content='memory', content_rowid='id'
+         );
+         CREATE TRIGGER IF NOT EXISTS memory_fts_ins AFTER INSERT ON memory BEGIN
+            INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_fts_del AFTER DELETE ON memory BEGIN
+            INSERT INTO memory_fts(memory_fts, rowid, key, value)
+              VALUES ('delete', old.id, old.key, old.value);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_fts_upd AFTER UPDATE ON memory BEGIN
+            INSERT INTO memory_fts(memory_fts, rowid, key, value)
+              VALUES ('delete', old.id, old.key, old.value);
+            INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
+         END;
+         CREATE TABLE IF NOT EXISTS agent_continuity (
+            identity      TEXT PRIMARY KEY,
+            cli_id        TEXT NOT NULL,
+            workspace_key TEXT NOT NULL,
+            name          TEXT NOT NULL,
+            resume_handle TEXT,
+            context       TEXT NOT NULL DEFAULT '',
+            updated_at_ms INTEGER NOT NULL
+         )",
+    )?;
+    // Carry any rows from the original flat `knowledge` table into session
+    // scope. An upgraded hub must not look as though it forgot everything.
+    // Runs once: the INSERT ignores keys memory already has.
+    let has_knowledge: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if has_knowledge {
+        let moved = conn.execute(
+            "INSERT OR IGNORE INTO memory (scope, scope_ref, key, category, value, author_slot,
+                                           created_at_ms, updated_at_ms)
+             SELECT 'session', session_id, key, category, value, author_slot,
+                    updated_at_ms, updated_at_ms
+               FROM knowledge",
+            [],
+        )?;
+        if moved > 0 {
+            tracing::info!(entries = moved, "carried knowledge into scoped memory");
+        }
+    }
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS mcp_sessions (
             id            TEXT PRIMARY KEY,
@@ -681,6 +765,65 @@ impl AppState {
             "no connected node satisfies this placement{}",
             cli_id.map(|c| format!(" with '{c}' installed")).unwrap_or_default()
         )
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    /// A hub that already had the flat `knowledge` table must not look as
+    /// though it forgot everything the moment memory gained scopes.
+    #[test]
+    fn knowledge_is_carried_into_scoped_memory() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The original table, as an older hub created it.
+        conn.execute_batch(
+            "CREATE TABLE knowledge (
+                session_id TEXT NOT NULL, key TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'context', value TEXT NOT NULL,
+                author_slot TEXT, updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (session_id, key));
+             INSERT INTO knowledge VALUES
+                ('s1','db','decision','sqlite with WAL','sl-a',111),
+                ('s1','style','convention','tabs',NULL,222);",
+        )
+        .unwrap();
+        conn.execute_batch(proto::SCHEMA_SQL).unwrap();
+        migrate(&conn).unwrap();
+
+        let mut rows: Vec<(String, String, String, Option<String>)> = conn
+            .prepare("SELECT key, value, scope, author_slot FROM memory
+                       WHERE scope='session' AND scope_ref='s1' ORDER BY key")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        rows.sort();
+        assert_eq!(rows.len(), 2, "both entries must survive the upgrade");
+        assert_eq!(rows[0].0, "db");
+        assert_eq!(rows[0].1, "sqlite with WAL");
+        assert_eq!(rows[0].2, "session", "and land in the session that learned them");
+        assert_eq!(rows[0].3.as_deref(), Some("sl-a"), "keeping their author");
+
+        // Idempotent: migrate runs on every open.
+        migrate(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "a second open must not duplicate them");
+    }
+
+    #[test]
+    fn a_fresh_database_needs_no_carrying_over() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(proto::SCHEMA_SQL).unwrap();
+        migrate(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }
 

@@ -200,19 +200,29 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             vec![]
         });
 
+            // Session memory, plus the global memory this session can see.
+            // Scope is carried through so the page can distinguish a fleet-wide
+            // convention from something this team decided; reading the old flat
+            // `knowledge` table here is what made the dashboard go blank when
+            // memory gained scopes.
             let knowledge: Vec<Value> = db
                 .prepare(
-                    "SELECT k.key, k.category, k.value,
-                            COALESCE(s.display_name, s.role, '?'), k.updated_at_ms
-                     FROM knowledge k LEFT JOIN slots s ON s.id = k.author_slot
-                     WHERE k.session_id = ? ORDER BY k.category, k.key",
+                    "SELECT m.key, m.category, m.value,
+                            COALESCE(s.display_name, s.role, '?'), m.updated_at_ms,
+                            m.scope, m.revision
+                     FROM memory m LEFT JOIN slots s ON s.id = m.author_slot
+                     WHERE (m.scope = 'session' AND m.scope_ref = ?1)
+                        OR m.scope = 'global'
+                       AND (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2)
+                     ORDER BY m.scope, m.category, m.key",
                 )
                 .and_then(|mut stmt| {
-                    stmt.query_map([sid], |r| {
+                    stmt.query_map(rusqlite::params![sid, nexmesh_proto::now_ms()], |r| {
                         Ok(json!({
                             "key": r.get::<_, String>(0)?, "category": r.get::<_, String>(1)?,
                             "value": r.get::<_, String>(2)?, "who": r.get::<_, String>(3)?,
-                            "at_ms": r.get::<_, i64>(4)?,
+                            "at_ms": r.get::<_, i64>(4)?, "scope": r.get::<_, String>(5)?,
+                            "revision": r.get::<_, i64>(6)?,
                         }))
                     })
                     .and_then(|m| m.collect())

@@ -119,7 +119,8 @@ def main():
     import sqlite3
     for _ in range(50):
         con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
-        rows = list(con.execute("SELECT key, value FROM knowledge WHERE session_id=?", (sid,)))
+        rows = list(con.execute(
+            "SELECT key, value FROM memory WHERE scope='session' AND scope_ref=?", (sid,)))
         con.close()
         if rows: break
         time.sleep(0.2)

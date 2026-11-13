@@ -101,14 +101,67 @@ pub fn team_tools() -> Vec<ToolDef> {
         tool("view_file_locks",
             "See active locks and ownership zones for your workspace.", json!({}), &[]),
         tool("store_knowledge",
-            "Record a decision, convention, discovery, blocker or context for the whole team.",
+            "Record a decision, convention, discovery, blocker or context for this session. \
+             Shorthand for store_memory at session scope.",
             json!({ "key": s("Short stable key"), "value": s("The content"),
                     "category": json!({ "type": "string",
                         "enum": ["decision", "convention", "discovery", "blocker", "context"] }) }),
             &["key", "value"]),
         tool("query_knowledge",
-            "Read shared knowledge. Call this when you start.",
+            "Read shared knowledge for this session. Call this when you start. \
+             Shorthand for recall.",
             json!({ "key": s("Exact key"), "category": s("Filter by category") }), &[]),
+        tool("store_memory",
+            "Remember something, choosing who should be able to see it. 'session' (the \
+             default) is this team; 'agent' is private to you; 'group' is a named subset you \
+             belong to; 'global' outlives every session and needs the 'memory-writer' \
+             capability. A nearer scope shadows a wider one for the same key, so a group can \
+             override a global default without editing it.",
+            json!({
+                "key": s("Short stable key"),
+                "value": s("The content"),
+                "category": json!({ "type": "string",
+                    "enum": ["decision", "convention", "discovery", "blocker", "context"] }),
+                "scope": json!({ "type": "string",
+                    "enum": ["agent", "group", "session", "global"],
+                    "description": "Who may see it. Defaults to session." }),
+                "group": s("Group name, required when scope is 'group'"),
+                "ttl_seconds": json!({ "type": "integer",
+                    "description": "Forget it after this long. Omit for permanent." })
+            }), &["key", "value"]),
+        tool("recall",
+            "Search everything you are allowed to see -- your own notes, your groups, this \
+             session and global memory -- by key, by words anywhere in a key or value, or by \
+             category. Prefer this over guessing a key. Call it when you start.",
+            json!({
+                "key": s("Exact key, if you know it"),
+                "search": s("Words to look for anywhere in a key or value"),
+                "category": s("Filter by category"),
+                "scope": json!({ "type": "string",
+                    "enum": ["agent", "group", "session", "global"],
+                    "description": "Look only in this scope. Omitted means all you can see." }),
+                "limit": json!({ "type": "integer", "description": "Most entries to return" })
+            }), &[]),
+        tool("forget",
+            "Remove something you remembered. Needs the same right as writing that scope.",
+            json!({ "key": s("The key to remove"),
+                    "scope": json!({ "type": "string",
+                        "enum": ["agent", "group", "session", "global"] }),
+                    "group": s("Group name, when scope is 'group'") }), &["key"]),
+        tool("save_context",
+            "Write a short summary of what you are doing and what you have learned, kept \
+             against your identity rather than this session. If you are restarted -- even \
+             days later, even on a CLI that cannot resume -- this is what you will be told \
+             you were doing. Keep it current and keep it brief.",
+            json!({ "summary": s("A few sentences: where you are, what matters, what is next") }),
+            &["summary"]),
+        tool("memory_history",
+            "What a key used to say, and who changed it. Two teammates writing one key is \
+             normal; this is how you see it happened.",
+            json!({ "key": s("The key"),
+                    "scope": json!({ "type": "string",
+                        "enum": ["agent", "group", "session", "global"] }),
+                    "group": s("Group name, when scope is 'group'") }), &["key"]),
         tool("publish_work",
             "Share what you have done with the rest of the team. Commits your changes in the \
              shared workspace and pushes them, then everyone else can pull them. Call this when \

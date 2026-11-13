@@ -18,6 +18,7 @@
 //! attach -- is multiplexed over that single socket.
 
 pub mod cli_descriptor;
+pub mod codegraph;
 pub mod identity;
 #[cfg(feature = "pair-client")]
 pub mod pair_client;

@@ -22,9 +22,11 @@ mod control;
 mod dashboard;
 mod delivery;
 mod launch;
+mod leiden;
 mod nodes;
 mod budget;
 mod mcp;
+mod memory;
 mod pairing;
 mod peer;
 mod pki;
@@ -480,6 +482,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
         .route("/v1/sessions/:id/pause", post(api::pause))
         .route("/v1/sessions/:id/budget", post(api::set_budget))
+        .route("/v1/sessions/:id/groups", post(api::set_group))
         .route("/v1/sessions/:id/release", post(api::release))
         .route("/v1/sessions/:id/status", get(api::session_status))
         .route("/v1/sessions/:id/messages", post(api::operator_message))

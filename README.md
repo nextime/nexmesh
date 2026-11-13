@@ -177,7 +177,7 @@ doors:
 | node-supervised command | a program that is not an "agent CLI" | a descriptor |
 
 An external participant joins with `POST /v1/participant/join`, calls the same
-17 tools through the same dispatcher, and shows up in `list_peers` like anyone
+26 tools through the same dispatcher, and shows up in `list_peers` like anyone
 else. It needs no node, no pty and no MCP implementation. Consequently
 `agents.node_id`, `pid` and `proc_start_ticks` are all nullable, and such an
 agent's liveness is a lease it renews -- the same mechanism as a node, for the
@@ -214,7 +214,7 @@ claude mcp add --transport http team \
 
 That is the whole integration. No nexmesh client, no SDK, no node on the
 machine: a token and a URL make anything that speaks MCP a teammate, with the
-same 17 tools and the same delivery. Verified against both `claude` and
+same 26 tools and the same delivery. Verified against both `claude` and
 `opencode`, which each report the endpoint connected and negotiate MCP
 `2025-03-26`.
 
@@ -248,6 +248,74 @@ refused, because a browser on any page can reach a loopback address.
 > Not to be confused with `nexmesh-orch`, which is the mirror image: that one
 > makes *your* CLI the operator of the fleet, where this one makes an external
 > agent a *member* of a team.
+
+## Memory with a scope
+
+The first version of shared memory was one flat table per session: exact-key
+lookup only, last-writer-wins with no trace, and everything destroyed with the
+session that learned it. Useful, and too small to lean on. Three things fixed
+that.
+
+**Who may see it.** Four scopes, resolved nearest-first on a read — `agent`,
+then any `group` the reader belongs to, then `session`, then `global`:
+
+```
+recall {"search": "which hashing did we pick?"}
+
+2 entr(ies):
+- [decision] auth-choice (session): argon2id with a 64MB cost  -- by Iris
+- [convention] style (global): tabs  -- by Scribe
+```
+
+A nearer scope **shadows** a wider one for the same key, so a group can
+override a global default without editing it, and a cheap seat can be given a
+private scratchpad while still reading the team's conventions. Agent scope is
+private and group scope is members-only — and that is enforced by *building*
+the query from the reader's scopes rather than filtering afterwards, so a
+scope the reader cannot see is unreachable by any argument it passes.
+
+**Who may write it.** `agent`, `group` and `session` are open to any teammate.
+`global` outlives every session, so it needs the `memory-writer` capability: a
+confused or experimental seat must not be able to leave something behind for
+every future team. Group membership is operator-driven
+(`POST /v1/sessions/:id/groups`), because membership *is* the access control —
+an agent cannot put itself in a group.
+
+**How it is found.** FTS5 over keys and values, because an agent that must
+already know the key does not have memory, it has a filing cabinet. Queries
+are quoted as phrases before they reach FTS, since agents type questions and a
+stray `AND` or quote should be a search rather than a syntax error.
+
+Overwrites keep the previous revision, with its author. Two agents writing one
+key is normal in a parallel team, and the old table made that invisible:
+
+```
+memory_history {"key": "db"}
+- rev 1 by Scribe: sqlite with WAL
+```
+
+Entries may carry a TTL, and `prune` reclaims them — a fact that was only true
+for a while says so.
+
+### Continuity across sessions
+
+`slots.resume_handle` is cascade-deleted with its session, so yesterday's
+conversation could never be picked up. Handles are now also kept against an
+**identity** — the CLI, the workspace and the name, which is what makes
+tomorrow's agent the same agent — in `agent_continuity`.
+
+A seat also keeps its own rolling summary via `save_context`, and both are
+used on launch:
+
+```
+[CONTINUING EARLIER WORK]
+When you last worked here you wrote: rewrote the tokeniser; next is the parser
+[END]
+```
+
+The summary matters independently of the handle: some CLIs cannot resume at
+all, and a handle is opaque, so it cannot be read by a different CLI picking
+the work up. One rehydrates the conversation, the other rehydrates the intent.
 
 ## A team of unequal agents
 

@@ -295,6 +295,11 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "view_file_locks" => view_file_locks(ctx),
         "store_knowledge" => store_knowledge(ctx, args),
         "query_knowledge" => query_knowledge(ctx, args),
+        "store_memory" => store_memory(ctx, args),
+        "recall" => recall(ctx, args),
+        "forget" => forget_memory(ctx, args),
+        "memory_history" => memory_history(ctx, args),
+        "save_context" => save_context(ctx, args),
         "get_history" => get_history(ctx, args),
         other => bail!("unknown tool '{other}'"),
     }
@@ -724,45 +729,145 @@ fn view_file_locks(ctx: &Ctx) -> Result<String> {
     Ok(out)
 }
 
+/// The original two tools, now a session-scoped path through `memory`.
+///
+/// Kept because agents, prompts and descriptors all name them, and a tool
+/// that disappears is a broken team rather than a migration.
 fn store_knowledge(ctx: &Ctx, args: &Value) -> Result<String> {
-    let key = arg_str(args, "key")?;
-    let value = arg_str(args, "value")?;
-    let category = opt_str(args, "category").unwrap_or_else(|| "context".into());
-    if !["decision", "convention", "discovery", "blocker", "context"].contains(&category.as_str()) {
-        bail!("category must be decision, convention, discovery, blocker or context");
-    }
-    ctx.db.execute(
-        "INSERT INTO knowledge (session_id, key, category, value, author_slot, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(session_id, key) DO UPDATE SET
-            category = ?3, value = ?4, author_slot = ?5, updated_at_ms = ?6",
-        params![ctx.session_id, key, category, value, ctx.slot_id, now_ms()],
-    )?;
-    Ok(format!("Stored '{key}' as {category}."))
+    let scope = crate::memory::Scope::Session(ctx.session_id.to_string());
+    crate::memory::store(
+        ctx.db,
+        &ctx.slot_id,
+        &scope,
+        &arg_str(args, "key")?,
+        &arg_str(args, "value")?,
+        &opt_str(args, "category").unwrap_or_else(|| "context".into()),
+        None,
+    )
 }
 
 fn query_knowledge(ctx: &Ctx, args: &Value) -> Result<String> {
-    let key = opt_str(args, "key");
-    let category = opt_str(args, "category");
-    let mut stmt = ctx.db.prepare(
-        "SELECT k.key, k.category, k.value, COALESCE(s.display_name, s.role, '?')
-         FROM knowledge k LEFT JOIN slots s ON s.id = k.author_slot
-         WHERE k.session_id = ?1
-           AND (?2 IS NULL OR k.key = ?2)
-           AND (?3 IS NULL OR k.category = ?3)
-         ORDER BY k.category, k.key",
-    )?;
-    let rows: Vec<(String, String, String, String)> = stmt
-        .query_map(params![ctx.session_id, key, category], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
+    render_entries(ctx, crate::memory::recall(
+        ctx.db,
+        &ctx.slot_id,
+        &ctx.session_id,
+        opt_str(args, "key").as_deref(),
+        None,
+        opt_str(args, "category").as_deref(),
+        Some("session"),
+        100,
+    )?)
+}
+
+fn scope_of(ctx: &Ctx, args: &Value) -> Result<crate::memory::Scope> {
+    crate::memory::Scope::parse(
+        opt_str(args, "scope").as_deref(),
+        opt_str(args, "group").as_deref(),
+        &ctx.slot_id,
+        &ctx.session_id,
+    )
+}
+
+fn store_memory(ctx: &Ctx, args: &Value) -> Result<String> {
+    let scope = scope_of(ctx, args)?;
+    crate::memory::store(
+        ctx.db,
+        &ctx.slot_id,
+        &scope,
+        &arg_str(args, "key")?,
+        &arg_str(args, "value")?,
+        &opt_str(args, "category").unwrap_or_else(|| "context".into()),
+        args.get("ttl_seconds").and_then(|v| v.as_i64()),
+    )
+}
+
+fn recall(ctx: &Ctx, args: &Value) -> Result<String> {
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(40).clamp(1, 200);
+    render_entries(ctx, crate::memory::recall(
+        ctx.db,
+        &ctx.slot_id,
+        &ctx.session_id,
+        opt_str(args, "key").as_deref(),
+        opt_str(args, "search").as_deref(),
+        opt_str(args, "category").as_deref(),
+        opt_str(args, "scope").as_deref(),
+        limit,
+    )?)
+}
+
+fn render_entries(ctx: &Ctx, rows: Vec<crate::memory::Entry>) -> Result<String> {
     if rows.is_empty() {
-        return Ok("No knowledge recorded yet.".into());
+        return Ok("Nothing remembered that matches.".into());
     }
     let mut out = format!("{} entr(ies):\n", rows.len());
-    for (k, c, v, who) in rows {
-        out.push_str(&format!("- [{c}] {k}: {v}  (by {who})\n"));
+    for e in rows {
+        // The scope is shown because it tells the reader how far the fact
+        // travels: a global convention and somebody's private note deserve
+        // different weight.
+        out.push_str(&format!(
+            "- [{}] {} ({}): {}",
+            e.category, e.key, e.scope, e.value
+        ));
+        // Who wrote the value you are reading. With a shared key this is the
+        // difference between a convention and one teammate's opinion.
+        if let Some(a) = &e.author {
+            out.push_str(&format!("  -- by {}", ctx.label_of(a)));
+        }
+        if e.revision > 1 {
+            out.push_str(&format!(" (rev {})", e.revision));
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn forget_memory(ctx: &Ctx, args: &Value) -> Result<String> {
+    let scope = scope_of(ctx, args)?;
+    crate::memory::forget(ctx.db, &ctx.slot_id, &scope, &arg_str(args, "key")?)
+}
+
+/// Keep a summary against the AGENT's identity, not the session.
+fn save_context(ctx: &Ctx, args: &Value) -> Result<String> {
+    let summary = arg_str(args, "summary")?;
+    let who: Option<(Option<String>, Option<String>, Option<String>)> = ctx
+        .db
+        .query_row(
+            "SELECT s.cli_id, s.display_name,
+                    (SELECT a.cwd FROM agents a WHERE a.slot_id = s.id
+                      ORDER BY a.started_at_ms DESC LIMIT 1)
+               FROM slots s WHERE s.id = ?",
+            [&ctx.slot_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    match who {
+        Some((Some(cli), Some(name), Some(cwd))) => {
+            crate::memory::remember_context(ctx.db, &cli, &cwd, &name, &summary)?;
+            Ok("Saved. If you are restarted you will be told this.".into())
+        }
+        // An external participant has no CLI and no working directory, so
+        // there is no identity to key continuity on. Say so rather than
+        // pretend it was stored.
+        _ => bail!(
+            "this seat has no CLI identity to remember against (an external participant \
+             has no CLI or working directory); use store_memory with scope 'agent' instead"
+        ),
+    }
+}
+
+fn memory_history(ctx: &Ctx, args: &Value) -> Result<String> {
+    let scope = scope_of(ctx, args)?;
+    let key = arg_str(args, "key")?;
+    let rows = crate::memory::history(ctx.db, &scope, &key)?;
+    if rows.is_empty() {
+        return Ok(format!("'{key}' has never been overwritten in {} memory.", scope.name()));
+    }
+    let mut out = format!("{} earlier revision(s) of '{key}':\n", rows.len());
+    for (rev, value, author, _at) in rows {
+        out.push_str(&format!(
+            "- rev {rev} by {}: {value}\n",
+            author.as_deref().map(|a| ctx.label_of(a)).unwrap_or_else(|| "?".into())
+        ));
     }
     Ok(out)
 }

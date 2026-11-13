@@ -239,12 +239,26 @@ async fn handle(
             tracing::info!(node = %node_name, %agent_id, ?code, ?signal, "agent exited");
         }
 
-        NodeToHub::ResumeHandle { slot_id, handle, .. } => {
+        NodeToHub::ResumeHandle { slot_id, handle, agent_id } => {
             let db = st.db.lock().unwrap();
             db.execute(
                 "UPDATE slots SET resume_handle = ? WHERE id = ?",
                 params![handle, slot_id],
             )?;
+            // And durably, against the identity rather than the slot, so the
+            // conversation can be picked up in a later session.
+            let who: Option<(Option<String>, Option<String>, Option<String>)> = db
+                .query_row(
+                    "SELECT s.cli_id, s.display_name, a.cwd
+                       FROM slots s LEFT JOIN agents a ON a.id = ?
+                      WHERE s.id = ?",
+                    params![agent_id, slot_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((Some(cli), Some(name), Some(cwd))) = who {
+                let _ = crate::memory::remember_handle(&db, &cli, &cwd, &name, &handle);
+            }
             tracing::debug!(%slot_id, "stored a resume handle");
         }
 

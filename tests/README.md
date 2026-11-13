@@ -23,6 +23,7 @@ python3 -I tests/e2e_bind.py          # a certificate must name the identity its
 python3 -I tests/e2e_plugin.py        # a CLI nexmesh knows nothing about, driven by an external plugin
 python3 -I tests/e2e_mcpdoor.py       # the MCP front door: a hand-written MCP client joins a team
 python3 -I tests/e2e_capability.py    # models, capability labels, escalation and a token budget
+python3 -I tests/e2e_memory.py        # scoped memory, groups, search, and resuming days later
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

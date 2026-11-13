@@ -64,6 +64,103 @@ CREATE TABLE IF NOT EXISTS issued_certs (
   reason        TEXT
 );
 
+-- ------------------------------------------------------------- memory ----
+--
+-- Shared memory with a scope, replacing the flat per-session `knowledge`
+-- table (which is kept as a view-like path through the same tools).
+--
+-- Four scopes, resolved nearest-first on a read -- agent, then any group the
+-- reader belongs to, then the session, then global. So a cheap seat can be
+-- given a private scratchpad while still reading the team's conventions, and
+-- a convention written once outlives the session that discovered it.
+--
+-- `scope_ref` is '' for global, else the session id, the group name or the
+-- slot id. It is in the uniqueness constraint rather than a separate table
+-- because "one value per key per scope" is the whole contract.
+CREATE TABLE IF NOT EXISTS memory (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope         TEXT NOT NULL,              -- global | session | group | agent
+  scope_ref     TEXT NOT NULL DEFAULT '',
+  key           TEXT NOT NULL,
+  category      TEXT NOT NULL DEFAULT 'context',
+  value         TEXT NOT NULL,
+  author_slot   TEXT,
+  -- Bumped on every overwrite, with the old value kept in memory_history.
+  -- The flat table silently lost the previous value, so two agents writing
+  -- one key meant last-writer-wins with no way to see it had happened.
+  revision      INTEGER NOT NULL DEFAULT 1,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  -- Long-term hygiene: a fact that was only true for a while says so.
+  expires_at_ms INTEGER,
+  UNIQUE (scope, scope_ref, key)
+);
+CREATE INDEX IF NOT EXISTS memory_scope_idx ON memory(scope, scope_ref);
+CREATE INDEX IF NOT EXISTS memory_expiry_idx ON memory(expires_at_ms)
+  WHERE expires_at_ms IS NOT NULL;
+
+-- Who may read a group scope. Membership is explicit: a group is a named
+-- subset of a team, not something inferred from a role, so moving an agent
+-- between groups never silently changes what it can see.
+CREATE TABLE IF NOT EXISTS memory_groups (
+  group_name  TEXT NOT NULL,
+  slot_id     TEXT NOT NULL,
+  added_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (group_name, slot_id)
+);
+
+-- Previous revisions. Capped by a prune, not unbounded: this is an audit
+-- trail for "who changed that and to what", not a version control system.
+CREATE TABLE IF NOT EXISTS memory_history (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id      INTEGER NOT NULL,
+  revision       INTEGER NOT NULL,
+  value          TEXT NOT NULL,
+  author_slot    TEXT,
+  replaced_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_history_idx ON memory_history(memory_id, revision);
+
+-- Full-text search over keys and values.
+--
+-- The flat table could only be read by EXACT key or by listing a category,
+-- so an agent had to already know the key. External-content FTS5 keeps the
+-- index beside the rows rather than duplicating them.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+  key, value, content='memory', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS memory_fts_ins AFTER INSERT ON memory BEGIN
+  INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_fts_del AFTER DELETE ON memory BEGIN
+  INSERT INTO memory_fts(memory_fts, rowid, key, value)
+    VALUES ('delete', old.id, old.key, old.value);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_fts_upd AFTER UPDATE ON memory BEGIN
+  INSERT INTO memory_fts(memory_fts, rowid, key, value)
+    VALUES ('delete', old.id, old.key, old.value);
+  INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
+END;
+
+-- Continuity for one agent identity ACROSS sessions.
+--
+-- slots.resume_handle dies with its session, so a CLI conversation could
+-- never be picked up again the next day. Keyed by what actually identifies a
+-- returning agent -- its CLI, where it works, and what it is called -- rather
+-- than by a slot id, which is new every time.
+--
+-- `context` is a rolling summary the agent maintains itself, so a seat can be
+-- rehydrated even on a CLI with no resume facility at all.
+CREATE TABLE IF NOT EXISTS agent_continuity (
+  identity      TEXT PRIMARY KEY,           -- cli_id|workspace_key|name
+  cli_id        TEXT NOT NULL,
+  workspace_key TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  resume_handle TEXT,
+  context       TEXT NOT NULL DEFAULT '',
+  updated_at_ms INTEGER NOT NULL
+);
+
 -- Live MCP sessions on the participant front door.
 --
 -- An MCP client has no "join" call, so `initialize` seats it and mints the
