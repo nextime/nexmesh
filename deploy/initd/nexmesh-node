@@ -16,10 +16,13 @@ LOGFILE=/var/log/nexmesh/node.log
 CONF=/etc/nexmesh/node.env
 # Runs as a real user, not root: it spawns agent CLIs, which need that user's
 # own tool configuration and credentials.
-USER="${NEXMESH_NODE_USER:-nextime}"
-
 [ -x "$BIN" ] || exit 0
 [ -r "$CONF" ] && . "$CONF"
+
+# AFTER sourcing the config, not before: setting this first meant
+# NEXMESH_NODE_USER in the config file was never read, and the service tried
+# to run as a user that does not exist on every host.
+USER="${NEXMESH_NODE_USER:-nextime}"
 
 : "${NEXMESH_HUB:=}"
 : "${NEXMESH_NAME:=$(hostname -s)}"

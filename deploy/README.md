@@ -122,6 +122,23 @@ NEXMESH_CLIENT_KEY=/etc/nexmesh/pki/zeiss-key.pem
 NEXMESH_NODE_USER=nextime                # it spawns agent CLIs as this user
 ```
 
+The client key must be **owned by the user the node runs as**. A root-owned
+0600 key is unreadable to it, and the node then retries for ever with
+`reading client key ...: Permission denied` — which is honest, and easy to
+miss if you are not reading its log:
+
+```bash
+install -o "$NEXMESH_NODE_USER" -m 600 pki/<name>-key.pem /etc/nexmesh/pki/
+install -o "$NEXMESH_NODE_USER" -m 644 pki/<name>-cert.pem /etc/nexmesh/pki/
+chown "$NEXMESH_NODE_USER" /etc/nexmesh/node.env
+```
+
+That user is the one whose agent CLIs the node will spawn, so it differs per
+host: `nextime` on most, but on a host where the CLI belongs to another
+account, that account. The node reports what it found at startup
+(`detected: claude, codex, opencode, tmux`), which is the quickest way to tell
+you picked the right one.
+
 ```bash
 install -m 755 deploy/initd/nexmesh-node /etc/init.d/nexmesh-node
 update-rc.d nexmesh-node defaults

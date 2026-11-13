@@ -14,10 +14,13 @@ BIN=/usr/local/bin/nexmesh-coderai
 PIDFILE=/var/run/$NAME.pid
 LOGFILE=/var/log/nexmesh/coderai.log
 CONF=/etc/nexmesh/coderai.env
-USER="${NEXMESH_BRIDGE_USER:-nextime}"
-
 [ -x "$BIN" ] || exit 0
 [ -r "$CONF" ] && . "$CONF"
+
+# AFTER sourcing the config, not before: setting this first meant
+# NEXMESH_BRIDGE_USER in the config file was never read, and the service tried
+# to run as a user that does not exist on every host.
+USER="${NEXMESH_BRIDGE_USER:-nextime}"
 
 : "${NEXMESH_HUB:=}"
 : "${CODERAI_URL:=http://127.0.0.1:8000}"
