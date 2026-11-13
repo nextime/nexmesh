@@ -1562,24 +1562,26 @@ pub(crate) fn join_participant(
     let caps = serde_json::to_string(&normalise_capabilities(&req.capabilities))
         .unwrap_or_else(|_| "[]".into());
 
-    // Come back to the seat you had. An external participant is identified
-    // by its NAME -- it has no conversation id and no process the hub can
-    // see -- so a bridge or a hermes agent that restarts was taking a fresh
-    // seat every time and leaving a derelict one behind, under the same
-    // name. That is the duplication that filled a session with teammates
-    // who never answer, and it was fixed everywhere except here.
+    // One name, one seat.
     //
-    // A seat whose agent is still live is left alone: that is a genuinely
-    // concurrent second instance, and it deserves its own.
+    // An external participant is identified by its NAME: it has no
+    // conversation id and no process the hub can see. This first looked only
+    // for a seat whose agent was already GONE, so that a restart would
+    // reclaim it while a concurrent second instance got its own -- and that
+    // test can never work here. A service restarts in a second or two; the
+    // lease deciding whether the old agent is live runs for twenty. The old
+    // agent therefore still looked alive every single time, and every
+    // restart of the capability bridge left another derelict CoderAI behind
+    // -- three times in one afternoon, each cleared by hand.
+    //
+    // Two instances under one name are indistinguishable from a restart
+    // anyway, so the name wins: the seat is taken and whoever was in it is
+    // marked gone. An instance that wants its own seat asks for its own name.
     let existing: Option<String> = db
         .query_row(
             "SELECT s.id FROM slots s
               WHERE s.session_id = ?1 AND s.participant_kind = 'external'
                 AND COALESCE(s.display_name, '') = ?2
-                AND NOT EXISTS (
-                    SELECT 1 FROM agents a
-                     WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL
-                       AND a.status <> 'lost')
               ORDER BY s.created_at_ms DESC LIMIT 1",
             params![session_id, req.name],
             |r| r.get(0),
@@ -1589,6 +1591,14 @@ pub(crate) fn join_participant(
 
     let slot_id = match existing {
         Some(id) => {
+            // Whoever was in this seat is not any more: this is the same
+            // participant, come back.
+            db.execute(
+                "UPDATE agents SET status = 'exited', exited_at_ms = COALESCE(exited_at_ms, ?)
+                  WHERE slot_id = ? AND exited_at_ms IS NULL",
+                params![now, id],
+            )
+            .map_err(bad)?;
             // What it can do may have changed since last time: a bridge
             // probes its service at startup, and a service gains and loses
             // endpoints.

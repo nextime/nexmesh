@@ -451,9 +451,25 @@ def main():
     s2, j2 = http("POST", "/v1/participant/join",
                   {"session": sid, "name": "Bridgey", "role": "bridge",
                    "capabilities": ["ocr"]}, token=ptok)
-    check("a SECOND live instance gets its own seat",
-          s2 == 200 and j2.get("slot_id") != first_slot,
+    # This used to assert that a second LIVE instance got its own seat, on
+    # the reasoning that a restart would find the old agent gone. That test
+    # can never work: a service restarts in a second or two, and the lease
+    # deciding whether the old agent is live runs for twenty, so a restart
+    # always looked concurrent and every one left a derelict seat behind --
+    # three CoderAI seats in one afternoon, each cleared by hand. Two
+    # instances under one name are indistinguishable from a restart anyway.
+    check("joining again under the same name takes the same seat",
+          s2 == 200 and j2.get("slot_id") == first_slot,
           f"{j2.get('slot_id')} vs {first_slot}")
+    seats_now = [a for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+                 if a.get("name") == "Bridgey"]
+    check("so one name is one seat, however often it restarts",
+          len(seats_now) == 1, str([(a["name"], a["status"]) for a in seats_now]))
+    s2b, j2b = http("POST", "/v1/participant/join",
+                    {"session": sid, "name": "Bridgey-two", "role": "bridge",
+                     "capabilities": ["ocr"]}, token=ptok)
+    check("and an instance that wants its own seat asks for its own name",
+          s2b == 200 and j2b.get("slot_id") != first_slot, f"{s2b} {j2b}")
 
     # Let both leases lapse, as they would when a bridge is stopped, then
     # rejoin: that must return to a seat rather than making a third.
@@ -470,12 +486,12 @@ def main():
     s3, j3 = http("POST", "/v1/participant/join",
                   {"session": sid, "name": "Bridgey", "role": "bridge",
                    "capabilities": ["ocr", "transcribe"]}, token=ptok)
-    check("a restart returns to a seat it already had",
-          s3 == 200 and j3.get("slot_id") in (first_slot, j2.get("slot_id")),
-          f"{j3.get('slot_id')} is neither {first_slot} nor {j2.get('slot_id')}")
+    check("a restart returns to the seat it already had",
+          s3 == 200 and j3.get("slot_id") == first_slot,
+          f"{j3.get('slot_id')} vs {first_slot}")
     seats = [a for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
              if a.get("name") == "Bridgey"]
-    check("and no third seat is left behind", len(seats) == 2, str(len(seats)))
+    check("and no second seat is left behind", len(seats) == 1, str(len(seats)))
 
     print("\n=== a live agent can be moved between sessions without restarting ===")
     # Its session is not something the agent carries: a tool call resolves it
