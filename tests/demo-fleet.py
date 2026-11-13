@@ -201,12 +201,11 @@ def main():
     req(f"/v1/sessions/{sid}/messages", optok, "POST",
         {"text": "team: ship the loader today if review passes"})
 
-    print("parsing the code graph (tree-sitter over this repository)")
-    out = req("/v1/participant/tool", pt, "POST", {
-        "agent_id": bridge, "tool": "query_code_graph",
-        "args": {"what": "overview", "workspace": "nexmesh"}})
-    if out[0] != 200:
-        print(f"  (graph unavailable: {out[1]})")
+    print("parsing the code graph (tree-sitter over this repository, ~20s)")
+    # Asked by an agent that sits on the machine holding the workspace. The
+    # parse happens there; the hub only stores the result.
+    out = max_.tool("query_code_graph", {"what": "overview", "workspace": "nexmesh"})
+    print("  " + out.splitlines()[0] if out else "  (no graph)")
 
     time.sleep(1.0)
     print(f"""
@@ -215,6 +214,9 @@ def main():
     {HUB}/
     username  {USER}
     password  {PASS}
+
+    operator token  {optok}
+      e.g.  NEXMESH_HUB={HUB} NEXMESH_TOKEN={optok} nexmesh peers
 
   Two nodes, four agents, one session awaiting review, and a code graph
   parsed from {ROOT}.
