@@ -40,6 +40,42 @@ Rediscovering any one of those would have taken weeks. The credit for the
 system design belongs upstream; what follows is only about running it on more
 than one machine.
 
+### The code graph comes from graphify
+
+**The idea behind [Reading a codebase once](#reading-a-codebase-once-not-once-per-agent)
+is [graphify](https://github.com/Graphify-Labs/graphify) by Graphify Labs**
+(Apache-2.0, also offered under MIT). It was evaluated as a dependency and
+reimplemented instead; what it contributed is the shape of the answer:
+
+- **Parse the codebase deterministically and query the graph**, rather than
+  asking a model to read files. graphify's own framing — tree-sitter, no
+  embeddings, no vector store, nothing leaving the machine — is the reason the
+  code graph here works the same way.
+- **Say which edges are facts and which are guesses.** graphify tags edges
+  `EXTRACTED` or `INFERRED`. `EdgeKind::is_certain` is that distinction, and
+  carrying it all the way to the agent is a direct borrowing: a resolved-by-name
+  call must not read like a syntax fact.
+- **Communities as de facto subsystems.** graphify detects them with Leiden;
+  so does this, for the same purpose — handing an agent one subsystem instead
+  of a repository.
+- **Ingest more than code.** Its coverage of docs, PDFs and images is why the
+  capability bridge exists at all, though the division is different here: that
+  work belongs to an *agent* writing into memory, because nexmesh holds no
+  model credentials.
+
+What was **not** taken: any of its code. graphify is Python; this is Rust, and
+the Leiden implementation, the language table, the storage and the query
+surface were written here. Nothing was copied, adapted or translated, and the
+permissive licence was not relied on to vendor anything.
+
+What is deliberately **not** reimplemented: its LLM semantic pass over PDFs,
+images and audio, and its HTML report. The first needs model credentials,
+which nexmesh refuses to hold; the second is better served by an agent that
+can already read.
+
+If you want a code knowledge graph on its own, use graphify — it is the more
+capable tool at that one job, and it is where this idea comes from.
+
 ## What nexmesh changes
 
 multiagents is single-host by construction — a reasonable choice for its
@@ -88,6 +124,73 @@ port — so starting with two machines does not paint us into a corner.
 | `nexmesh` | anywhere | Operator CLI. |
 | `nexmesh-orch` | wherever you work | The orchestrator, as an MCP server, so **any** MCP-capable CLI can run the fleet. |
 | `nexmesh-coderai` | beside a media/OCR service | A capability bridge: joins as a participant, offers OCR, transcription, speech, embeddings, images. The only component holding that service's token. |
+
+## Building and installing
+
+Rust (stable) and a C compiler. The C compiler is for tree-sitter's grammars,
+which the code graph parses with — without it the grammar crates fail to build
+and every language quietly disappears from the graph.
+
+```bash
+cargo build --release
+cargo test --workspace
+tests/run-all.sh          # the e2e suites; a suite printing no verdict is a failure
+```
+
+Nothing in the test suite spends API credits: every agent CLI it drives is a
+fake in `tests/fake-cli/` that speaks the real protocol.
+
+### A build you can copy to other machines
+
+Build static against musl. This matters more than it sounds: a binary built
+against glibc needs that version or newer at the far end, and a binary built
+with `-C target-cpu=native` dies with `SIGILL` on a host without the
+instructions — one machine in the fleet this was written for is a Celeron with
+no AVX, and the development laptop has a *newer* glibc than two of the servers.
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install -y musl-tools            # the C compiler for the target
+export CC_x86_64_unknown_linux_musl=musl-gcc
+cargo build --release --workspace --target x86_64-unknown-linux-musl
+```
+
+Never add `target-cpu=native` to that. The result is a static PIE, which
+`file` describes as `static-pie linked` rather than `statically linked`; check
+it with `readelf -l <bin> | grep INTERP` returning nothing.
+
+Or take a release tarball from GitHub, built exactly this way by
+`.github/workflows/release.yml` and checked for the same things.
+
+### Installing
+
+Six binaries and two directories of data:
+
+```bash
+install -m 755 target/x86_64-unknown-linux-musl/release/{nexmesh,nexmesh-hub,nexmesh-node,nexmesh-mcpd,nexmesh-orch,nexmesh-coderai} /usr/local/bin/
+mkdir -p /etc/nexmesh
+cp -r clis capabilities /etc/nexmesh/
+```
+
+`clis/` and `capabilities/` are read at runtime, so an install without them is
+not a working one: a node with no descriptors advertises nothing, and the
+capability bridge has nothing to offer.
+
+Then one of:
+
+- **A hub:** `nexmesh-hub --listen 127.0.0.1:7870 serve`, plus
+  `nexmesh-hub operator-token <label>` or `nexmesh-hub dashboard-setup-code`
+  before it will answer off-box. It refuses to serve an unauthenticated
+  operator API on anything but loopback, and says so.
+- **A node:** `NEXMESH_TOKEN=... nexmesh-node --hub wss://hub:7870 --clis /etc/nexmesh/clis`,
+  after `nexmesh-hub enrol <name>` on the hub.
+
+`deploy/` has the rest for a real installation: sysvinit scripts for the hub,
+a node and the bridge, an nginx vhost for the dashboard, and a runbook in
+`deploy/README.md` that covers the fleet CA, mutual TLS, and the two things
+that cost a diagnosis the first time — the client key must be owned by the
+user the node runs as, and the hub must not bind `0.0.0.0` on a host with a
+public address.
 
 ## Supporting any agent CLI
 
@@ -1130,7 +1233,7 @@ reconnect-with-backoff and identity-checked signalling.
   `release`, `budget`, `sync`, `pair`, `certs`, `revoke`, `install-orchestrator`.
 - A web dashboard and an MCP orchestrator server (above).
 
-132 unit tests, plus fifteen end-to-end suites that drive real processes
+326 unit tests, plus twenty-three end-to-end suites that drive real processes
 (`tests/README.md`). None of them spends API credits.
 
 ```bash

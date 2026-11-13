@@ -758,13 +758,57 @@ fn join(
         );
     }
 
-    let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    db.execute(
-        "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
-                            display_name, role, status, created_at_ms)
-         VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?)",
-        params![slot_id, session_id, workspace_id, cli_id, name, role, now],
-    )?;
+    // Reuse the seat this identity already holds, if whatever was in it has
+    // gone. An attached agent is a process somebody runs by hand, and it is
+    // run repeatedly -- restarted, or probed by its own tooling. Taking a
+    // fresh seat each time fills a session with teammates that never answer:
+    // `hermes mcp add` followed by `hermes mcp test` made two before anyone
+    // had started a conversation.
+    //
+    // A seat whose agent is still LIVE is left alone: that is a genuinely
+    // concurrent second instance, and it deserves its own.
+    let existing: Option<String> = db
+        .query_row(
+            "SELECT s.id FROM slots s
+              WHERE s.session_id = ?1 AND s.participant_kind = 'cli'
+                AND COALESCE(s.cli_id,'') = COALESCE(?2,'')
+                AND COALESCE(s.display_name,'') = COALESCE(?3,'')
+                AND NOT EXISTS (
+                    SELECT 1 FROM agents a
+                     WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL
+                       AND a.provenance = 'attached')
+                AND EXISTS (
+                    SELECT 1 FROM agents a
+                     WHERE a.slot_id = s.id AND a.node_id = ?4
+                       AND a.provenance = 'attached')
+              ORDER BY s.created_at_ms DESC LIMIT 1",
+            params![session_id, cli_id, name, node_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let slot_id = match existing {
+        Some(id) => {
+            db.execute(
+                "UPDATE slots SET status = 'connected', workspace_id = COALESCE(?, workspace_id),
+                                  role = COALESCE(?, role)
+                  WHERE id = ?",
+                params![workspace_id, role, id],
+            )?;
+            tracing::info!(slot_id = %id, "an attached agent returned to its seat");
+            id
+        }
+        None => {
+            let id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            db.execute(
+                "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
+                                    display_name, role, status, created_at_ms)
+                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?)",
+                params![id, session_id, workspace_id, cli_id, name, role, now],
+            )?;
+            id
+        }
+    };
     let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
         "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance, status,

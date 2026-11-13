@@ -40,6 +40,8 @@
     border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px;
   }
   button { cursor: pointer; }
+  a { color: var(--accent); }
+  a:hover { color: var(--fg); }
   button:hover { border-color: var(--faint); }
   .spacer { flex: 1; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); display: inline-block; }
@@ -122,11 +124,19 @@
     background: color-mix(in srgb, var(--bad) 14%, var(--panel));
     border: 1px solid color-mix(in srgb, var(--bad) 45%, transparent);
   }
+  /* A class rule beats the UA stylesheet's [hidden], so anything styled
+     display:* below would ignore its own hidden attribute without this. */
+  [hidden] { display: none !important; }
   .gate { max-width: 460px; margin: 60px auto; padding: 22px; }
   .gate h1 { font-size: 17px; margin: 0 0 6px; }
   .gate p { color: var(--dim); }
-  .gate form { display: flex; gap: 8px; margin-top: 14px; }
-  .gate input { flex: 1; font-family: var(--mono); }
+  /* One field per line. Side by side, three fields and a button overflowed
+     the panel and the stray hint paragraph stretched the row. */
+  .gate form { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+  .gate form p { margin: 0 0 2px; }
+  .gate input { width: 100%; font-family: var(--mono); padding: 7px 10px; }
+  .gate button { width: 100%; padding: 8px 10px; font-weight: 600; }
+  .gate .sep { border: 0; border-top: 1px solid var(--line); margin: 18px 0 0; }
   code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
   /* Not .bar: that is already a progress track used elsewhere on this page. */
   .sizebar { height: 8px; border-radius: 4px; background: var(--accent); opacity: .75; min-width: 4px; }
@@ -170,14 +180,14 @@
     </form>
   </div>
 
-  <!-- A hub with operator tokens but no account: the old path still works. -->
+  <!-- Secondary, behind a link: an account is the better path, and offering
+       both as equal forms just made the choice harder. -->
   <div id="gateToken" hidden>
-    <h1>Operator token</h1>
-    <p class="tiny">This hub has no dashboard account. Create one with
-       <code>nexmesh-hub dashboard-setup-code</code>, or paste a token minted with
-       <code>nexmesh-hub operator-token &lt;label&gt;</code>. A token is kept in this browser
-       only; an account is the better path.</p>
-    <form id="gateForm">
+    <hr class="sep">
+    <p class="tiny" style="margin-top:10px"><a href="#" id="showToken">or connect with an operator token</a></p>
+    <form id="gateForm" hidden>
+      <p class="tiny muted">Minted with
+         <code>nexmesh-hub operator-token &lt;label&gt;</code>. Kept in this browser only.</p>
       <input id="tokenInput" type="password" placeholder="operator token" autocomplete="off"
              spellcheck="false">
       <button type="submit">Connect</button>
@@ -208,6 +218,9 @@
 const TABS = ["agents", "messages", "plan", "knowledge", "graph", "files", "fleet"];
 const KEY = "nexmesh.operator.token";
 let token = localStorage.getItem(KEY) || "";
+// Whether a credential was offered in this visit, so a 401 can tell "wrong"
+// apart from "not yet".
+let submitted = false;
 let tab = location.hash.replace("#", "") || "agents";
 if (!TABS.includes(tab)) tab = "agents";
 let session = new URLSearchParams(location.search).get("session") || "";
@@ -253,7 +266,14 @@ async function tick() {
     $("liveDot").className = "dot live";
     render();
   } catch (e) {
-    if (e.code === 401) { showGate("That token was not accepted."); return; }
+    // Only a rejection if something was actually offered. On a first visit
+    // this is simply "you are not signed in yet", and calling that a bad
+    // token sends you looking for a problem with the token.
+    if (e.code === 401) {
+      showGate(submitted ? "That was not accepted." : "");
+      submitted = false;
+      return;
+    }
     failures++;
     $("liveDot").className = "dot stale";
     // One blip is normal during a hub restart; say something only if it persists.
@@ -266,18 +286,23 @@ async function tick() {
 
 // Which of the three gate forms to show, asked of the hub rather than
 // guessed: only it knows whether an account exists.
-async function showGate(msg) {
+async function showGate(msg, known) {
   clearInterval(timer); timer = null;
   $("app").hidden = true; $("gate").hidden = false;
   $("gateErr").textContent = msg || "";
-  let st = { configured: true, tokens_configured: true };
-  try { st = await (await fetch("/v1/auth/state", { cache: "no-store" })).json(); }
-  catch (e) { /* keep the sign-in form: it is the useful default */ }
+  let st = known || { configured: true, tokens_configured: true };
+  if (!known) {
+    try { st = await (await fetch("/v1/auth/state", { cache: "no-store" })).json(); }
+    catch (e) { /* keep the sign-in form: it is the useful default */ }
+  }
   const needSetup = !st.configured;
   $("gateSetup").hidden = !needSetup;
   $("gateLogin").hidden = needSetup;
   // Only offer the token box where it is the only way in.
   $("gateToken").hidden = !(needSetup && st.tokens_configured);
+  // Collapse the token box again, so the account path stays the obvious one.
+  if ($("gateForm")) $("gateForm").hidden = true;
+  if ($("showToken")) $("showToken").parentElement.hidden = false;
   if (needSetup) $("setupCode").focus(); else $("userInput").focus();
 }
 
@@ -287,10 +312,20 @@ function start() {
   if (!timer) timer = setInterval(() => { if (!document.hidden) tick(); }, 1000);
 }
 
+$("showToken").addEventListener("click", (e) => {
+  e.preventDefault();
+  $("gateForm").hidden = false;
+  $("showToken").parentElement.hidden = true;
+  $("tokenInput").focus();
+});
+
 $("gateForm").addEventListener("submit", (e) => {
   e.preventDefault();
-  token = $("tokenInput").value.trim();
+  const v = $("tokenInput").value.trim();
+  if (!v) { $("gateErr").textContent = "Paste a token first."; return; }
+  token = v;
   localStorage.setItem(KEY, token);
+  submitted = true;
   start();
 });
 
@@ -310,6 +345,7 @@ $("loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   $("gateErr").textContent = "";
   try {
+    submitted = true;
     await post("/v1/auth/login", {
       username: $("userInput").value, password: $("passInput").value,
     });
@@ -686,11 +722,22 @@ async function revokeCode(id) {
   tick();
 }
 
-// Try without a token first: a hub with no operator tokens is open, and asking
-// for one that does not exist would be a dead end.
+// Ask the hub who we are before asking it for data. Fetching the snapshot
+// first worked, but a first visit always failed it, leaving a 401 in the
+// console that looks like a fault and is not one.
 (async () => {
-  try { snap = await fetchSnapshot(); start(); }
-  catch (e) { e.code === 401 ? showGate("") : start(); }
+  let st = null;
+  try {
+    st = await (await fetch("/v1/auth/state",
+      { cache: "no-store", credentials: "same-origin" })).json();
+  } catch (e) { /* hub unreachable: let tick() report that properly */ }
+  // Signed in, holding a token, or a hub with no authentication configured
+  // at all (which is open by design on a trusted network).
+  if (!st || st.user || token || (!st.configured && !st.tokens_configured)) {
+    start();
+    return;
+  }
+  showGate("", st);
 })();
 </script>
 </body>

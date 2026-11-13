@@ -55,6 +55,11 @@ async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut agent_id: Option<String> = None;
+    // Whether this shim joined a seat of its own rather than attaching to one
+    // a spawn already created. It decides who reports the exit: a managed
+    // agent's real lifecycle is reported by the spawn path, and saying it
+    // exited here would mark a running CLI dead the moment its shim blinked.
+    let mut attached = false;
 
     async fn reply(w: &mut tokio::net::unix::OwnedWriteHalf, frame: &NodeToMcpd) -> Result<()> {
         let mut s = serde_json::to_string(frame)?;
@@ -78,6 +83,7 @@ async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
 
         match frame {
             McpdToNode::Register { cli_id, pid, cwd, agent_hint, slot_hint, session_hint, role, name } => {
+                attached = agent_hint.is_none();
                 match register(&ctx, cli_id, pid, cwd, agent_hint, slot_hint, session_hint, role, name).await {
                     Ok(frame) => {
                         if let NodeToMcpd::Registered { agent_id: ref a, .. } = frame {
@@ -152,7 +158,30 @@ async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
             McpdToNode::Bye => break,
         }
     }
+    // The loop ended: Bye, or the socket closed because the process went.
+    if attached {
+        if let Some(a) = &agent_id {
+            announce_attached_exit(&ctx, a).await;
+        }
+    }
     Ok(())
+}
+
+/// Tell the hub an attached agent has gone.
+///
+/// Without this an agent somebody ran by hand stays "running" for ever: its
+/// seat looks occupied, it shows as a connected teammate that never answers,
+/// and the next run of the same thing takes another seat instead of coming
+/// back to its own.
+async fn announce_attached_exit(ctx: &Arc<NodeCtx>, agent_id: &str) {
+    tracing::info!(%agent_id, "attached agent's shim closed; reporting it gone");
+    let _ = ctx
+        .send_hub(&proto::NodeToHub::AgentExited {
+            agent_id: agent_id.to_string(),
+            code: None,
+            signal: None,
+        })
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]

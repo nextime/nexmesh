@@ -19,8 +19,20 @@ use serde_json::{json, Value};
 
 const PAGE: &str = include_str!("../static/dashboard.html");
 
-pub async fn page() -> Html<&'static str> {
-    Html(PAGE)
+pub async fn page() -> Response {
+    // no-store, deliberately. The page is one self-contained file that
+    // changes whenever the hub is upgraded, and it carried no cache headers
+    // at all -- so a browser cached it heuristically and kept serving an old
+    // dashboard against a new hub. That is invisible and maddening: the forms
+    // on screen are from a version that no longer exists.
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        Html(PAGE),
+    )
+        .into_response()
 }
 
 /// Tiny inline favicon so the browser stops asking for one.

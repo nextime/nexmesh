@@ -255,6 +255,38 @@ def main():
     s, j = http("GET", f"/v1/sessions/{sid}/status")
     check("session survives an agent dying", s == 200, str(s))
 
+    print("\n=== an attached agent that comes back reuses its seat ===")
+    # Run by hand, so run repeatedly: restarted, or probed by its own
+    # tooling. A fresh seat each time fills a session with teammates that
+    # never answer.
+    before = len(http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", []))
+    env = dict(os.environ, NEXMESH_SOCK=SOCK, NEXMESH_CLI="handmade",
+               NEXMESH_NAME="Handmade", NEXMESH_ROLE="tester",
+               NEXMESH_SESSION=sid)
+    def probe():
+        p = subprocess.Popen([f"{BIN}/nexmesh-mcpd"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, env=env, bufsize=1)
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                  "params": {"protocolVersion": "2024-11-05",
+                                             "capabilities": {},
+                                             "clientInfo": {"name": "probe", "version": "1"}}}) + "\n")
+        p.stdin.flush()
+        p.stdout.readline()
+        p.stdin.close(); p.wait(timeout=20)
+    probe()
+    after_first = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("the first run takes a seat", len(after_first) == before + 1,
+          f"{before} -> {len(after_first)}")
+    # Its process is gone now, so the next run is the same agent returning.
+    probe(); probe()
+    seats = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("running it again reuses that seat rather than taking more",
+          len(seats) == before + 1, f"expected {before + 1}, got {len(seats)}")
+    check("and there is exactly one of it",
+          sum(1 for a in seats if a.get("name") == "Handmade") == 1,
+          str([a.get("name") for a in seats]))
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1

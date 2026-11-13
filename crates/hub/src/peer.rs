@@ -78,18 +78,44 @@ pub fn common_name(der: &[u8]) -> Option<String> {
 pub fn from_proxy(headers: &HeaderMap) -> Option<PeerIdentity> {
     let verify = headers.get("x-client-verify").and_then(|v| v.to_str().ok())?;
     if verify.eq_ignore_ascii_case("success") {
+        // The bare common name where the proxy could extract it, else the
+        // whole subject DN. nginx has no variable for the CN alone, so the
+        // extraction is a regex in its config -- and a regex against a
+        // certificate subject is exactly the thing that quietly stops
+        // matching, so the DN is accepted as a fallback.
         let cn = headers
             .get("x-client-cn")
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| {
+                headers
+                    .get("x-client-dn")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(common_name_from_dn)
+            });
         return Some(PeerIdentity { presented: true, common_name: cn });
     }
     // NONE means the client offered nothing; FAILED means it offered
     // something invalid. Neither is an identity, and FAILED should never have
     // reached us -- nginx was asked to verify.
     Some(PeerIdentity { presented: false, common_name: None })
+}
+
+/// Pull the common name out of a subject DN.
+///
+/// Both orderings appear in the wild -- `CN=machine-b,O=nexmesh` from one
+/// toolchain and `/O=nexmesh/CN=machine-b` from another -- so the separator is
+/// either a comma or a slash.
+pub fn common_name_from_dn(dn: &str) -> Option<String> {
+    dn.split([',', '/'])
+        .map(str::trim)
+        .find_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            k.trim().eq_ignore_ascii_case("cn").then(|| v.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
 }
 
 /// Is this request coming from a proxy the operator nominated?
@@ -233,6 +259,41 @@ mod tests {
         assert_eq!(p.common_name.as_deref(), Some("machine-b"));
         assert!(p.agrees_with("machine-b").is_ok());
         assert!(p.agrees_with("someone-else").is_err());
+    }
+
+    #[test]
+    fn a_subject_dn_is_accepted_when_the_proxy_could_not_extract_the_name() {
+        // nginx has no variable for the CN alone, so its config extracts it
+        // with a regex. A regex against a certificate subject is exactly what
+        // quietly stops matching, so the whole DN is a fallback.
+        for dn in [
+            "CN=machine-b",
+            "CN=machine-b,O=nexmesh",
+            "/O=nexmesh/CN=machine-b",
+            "emailAddress=a@b,CN=machine-b,O=x",
+        ] {
+            let p = from_proxy(&hdr(&[("x-client-verify", "SUCCESS"), ("x-client-dn", dn)]))
+                .unwrap();
+            assert_eq!(p.common_name.as_deref(), Some("machine-b"), "{dn}");
+        }
+    }
+
+    #[test]
+    fn the_extracted_name_is_preferred_over_the_dn() {
+        let p = from_proxy(&hdr(&[
+            ("x-client-verify", "SUCCESS"),
+            ("x-client-cn", "machine-b"),
+            ("x-client-dn", "CN=someone-else"),
+        ]))
+        .unwrap();
+        assert_eq!(p.common_name.as_deref(), Some("machine-b"));
+    }
+
+    #[test]
+    fn a_dn_with_no_common_name_yields_nothing_rather_than_junk() {
+        assert!(common_name_from_dn("O=nexmesh,L=somewhere").is_none());
+        assert!(common_name_from_dn("").is_none());
+        assert!(common_name_from_dn("CN=").is_none());
     }
 
     #[test]
