@@ -172,7 +172,8 @@ doors:
 | Front door | For | Needs |
 |---|---|---|
 | `mcpd` stdio -> node -> hub | agent CLIs | a node on that machine |
-| participant HTTP API | **a hermes agent, a Python daemon, a shell script** | a URL and a token |
+| **MCP over HTTP** | **anything that already speaks MCP** | **a URL and a token** |
+| participant HTTP API | a hermes agent, a Python daemon, a shell script | a URL and a token |
 | node-supervised command | a program that is not an "agent CLI" | a descriptor |
 
 An external participant joins with `POST /v1/participant/join`, calls the same
@@ -195,6 +196,58 @@ curl -H "authorization: Bearer $TOKEN" \
      -d '{"agent_id":"ag-...","tool":"send_message","args":{"to":"Max","text":"corpus indexed"}}' \
      http://hub:7870/v1/participant/tool
 ```
+
+### The MCP front door
+
+The HTTP API above asks a newcomer to implement a protocol that is ours alone.
+But every agent runtime worth integrating already speaks MCP — so that was the
+wrong way round. The hub therefore serves the *same* participant seat over MCP
+itself, at one endpoint:
+
+```bash
+nexmesh-hub participant-token hermes --session se-1234abcd
+
+claude mcp add --transport http team \
+    "https://hub:7870/v1/mcp?name=Hermes&role=archivist" \
+    --header "Authorization: Bearer $TOKEN"
+```
+
+That is the whole integration. No nexmesh client, no SDK, no node on the
+machine: a token and a URL make anything that speaks MCP a teammate, with the
+same 17 tools and the same delivery. Verified against both `claude` and
+`opencode`, which each report the endpoint connected and negotiate MCP
+`2025-03-26`.
+
+The transport is **Streamable HTTP** — POST carries JSON-RPC and the reply
+comes straight back, with an `Mcp-Session-Id` minted by `initialize`. Three
+details are worth knowing, because each one is a decision rather than a
+default:
+
+- **An MCP client has no "join" call**, so `initialize` takes the seat, and
+  per-client settings (`name`, `role`, `session`, `workspace`) ride on the URL
+  — the same place a hosted MCP server takes them. A client that sends no name
+  still has one: its own.
+- **`initialize` is not a one-off.** Clients reconnect, and `claude mcp list`
+  sends one just to check the server is alive. So it reuses the seat this
+  token already holds rather than taking another; the first run against a real
+  client left a new silent teammate behind every time, which is how that was
+  found. `DELETE` releases the seat properly.
+- **The ack waits for proof.** The stdio shim acks as soon as it has written a
+  tool result, because its stdout is a pipe on the same machine. Here the
+  result crosses a network, so the session remembers what it handed over and
+  acks it when that client comes back — its return being the only evidence it
+  arrived. A client that never returns has those messages reclaimed and
+  redelivered. Later, or twice, but never silently lost.
+
+There is no server-initiated stream, so `GET` is answered `405` with an
+explanation rather than left to hang: teammate messages ride back on tool
+results, which needs nothing the client does not already do. A session id is
+useless without the token that opened it, and a cross-origin `POST` is
+refused, because a browser on any page can reach a loopback address.
+
+> Not to be confused with `nexmesh-orch`, which is the mirror image: that one
+> makes *your* CLI the operator of the fleet, where this one makes an external
+> agent a *member* of a team.
 
 ## Reaching any CLI from any machine
 
@@ -726,14 +779,13 @@ dashboard, and the orchestrator as an MCP server so any CLI can run the fleet.
 
 **Done since.** Pausing and releasing agents; pairing with one-time codes;
 mutual TLS; certificate revocation that takes effect during the handshake;
-binding a certificate to the credential sent with it; and the `plugin` driver,
-so a CLI nexmesh has never heard of gets the fast path without a nexmesh
-release.
+binding a certificate to the credential sent with it; the `plugin` driver, so a
+CLI nexmesh has never heard of gets the fast path without a nexmesh release;
+and the MCP front door, so anything that speaks MCP is a teammate with nothing
+but a URL and a token.
 
-**Known gaps**, each deliberate and none of them silent: the participant API
-has no MCP-over-HTTP front door, so an external agent uses the HTTP participant
-API rather than MCP; and `sync = "shared_fs"` is a no-op by design, because a
-shared filesystem already does that job.
+**Known gaps**, deliberate and not silent: `sync = "shared_fs"` is a no-op by
+design, because a shared filesystem already does that job.
 
 Throughout this document, machines are called *machine A*, *machine B* and so
 on; substitute your own.

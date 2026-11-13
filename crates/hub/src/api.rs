@@ -637,7 +637,7 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 /// Authenticate a participant token and return the session it is scoped to, if
 /// any. A participant token can call team tools for its own slot and nothing
 /// else -- it can never cause a process to be spawned on anyone's machine.
-fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::result::Result<Option<String>, (StatusCode, Json<Value>)> {
+pub(crate) fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::result::Result<Option<String>, (StatusCode, Json<Value>)> {
     let token = bearer(headers).ok_or_else(|| {
         err(
             StatusCode::UNAUTHORIZED,
@@ -675,6 +675,20 @@ pub async fn participant_join(
     Json(req): Json<ParticipantJoin>,
 ) -> ApiResult {
     let scoped = auth_participant(&st, &headers)?;
+    Ok(Json(join_participant(&st, req, scoped)?))
+}
+
+/// Seat an external participant: a slot, an agent, and the tool set it may
+/// call.
+///
+/// Shared with the MCP front door, which has to do exactly this when a client
+/// sends `initialize`. One implementation, so the two doors cannot drift into
+/// seating participants differently.
+pub(crate) fn join_participant(
+    st: &AppState,
+    req: ParticipantJoin,
+    scoped: Option<String>,
+) -> std::result::Result<Value, (StatusCode, Json<Value>)> {
     if req.name.trim().is_empty() {
         return Err(bad("name must not be empty"));
     }
@@ -756,13 +770,13 @@ pub async fn participant_join(
     .ok();
     tracing::info!(%slot_id, %agent_id, name = %req.name, "external participant joined");
 
-    Ok(Json(json!({
+    Ok(json!({
         "agent_id": agent_id,
         "slot_id": slot_id,
         "session_id": session_id,
         "heartbeat_ms": proto::HEARTBEAT_INTERVAL_MS,
         "tools": proto::tools::team_tools(),
-    })))
+    }))
 }
 
 #[derive(Deserialize)]
@@ -852,7 +866,7 @@ pub async fn participant_heartbeat(
 
 /// An external agent has no process we can inspect, so its liveness is a lease
 /// it must keep renewing -- the same mechanism as a node, for the same reason.
-fn touch_participant(st: &AppState, agent_id: &str) {
+pub(crate) fn touch_participant(st: &AppState, agent_id: &str) {
     let db = st.db.lock().unwrap();
     let now = now_ms();
     let _ = db.execute(
@@ -864,7 +878,7 @@ fn touch_participant(st: &AppState, agent_id: &str) {
 }
 
 /// A session-scoped token must not act for an agent in another session.
-fn verify_agent_scope(
+pub(crate) fn verify_agent_scope(
     st: &AppState,
     agent_id: &str,
     scoped: &Option<String>,

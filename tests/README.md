@@ -21,6 +21,7 @@ python3 -I tests/e2e_control.py       # pause really withholds work; release rea
 python3 -I tests/e2e_revoke.py        # a revoked certificate fails at the handshake
 python3 -I tests/e2e_bind.py          # a certificate must name the identity its token claims
 python3 -I tests/e2e_plugin.py        # a CLI nexmesh knows nothing about, driven by an external plugin
+python3 -I tests/e2e_mcpdoor.py       # the MCP front door: a hand-written MCP client joins a team
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

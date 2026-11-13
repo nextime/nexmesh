@@ -180,6 +180,16 @@ def main():
     s, j = post("/v1/participant/join", {"session": sid, "name": "X"},
                 optok, certs("operator"))
     check("and an operator token is still not a participant token", s == 401, f"{s} {j}")
+    # The MCP front door is a participant route, so the same guard must cover
+    # it -- a route added to that group must not escape the binding.
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26",
+                       "clientInfo": {"name": "bindtest", "version": "0"}}}
+    s, j = post("/v1/mcp?name=Bound", init, ptok, certs("hermes"))
+    check("an MCP client joins on its own certificate", s == 200 and "result" in j, f"{s} {j}")
+    s, j = post("/v1/mcp?name=Bound", init, ptok, certs("intruder"))
+    check("and the MCP door refuses a stolen token over another certificate", s == 403,
+          f"{s} {j}")
 
     print("\n=== without mutual TLS there is nothing to bind ===")
     db2 = f"{T}/plain.db"

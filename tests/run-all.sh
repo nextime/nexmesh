@@ -8,9 +8,31 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
-        control dashboard orchestrator mtls pairing revoke bind plugin)
+        control dashboard orchestrator mtls pairing revoke bind plugin mcpdoor)
 TIMEOUT=${TIMEOUT:-420}
 failed=()
+
+# Unit tests first, and a build failure in them counts as a failure.
+#
+# They used to be run separately, by hand. A test helper that did not compile
+# then went unnoticed: the e2e suites all passed, because they exercise the
+# binaries rather than the test build, and `cargo test` output was being
+# grepped for results that were never produced. Silence is not success here
+# either.
+if [ "${SKIP_UNIT:-0}" != "1" ]; then
+    printf '%-14s ' "unit"
+    unit=$(cargo test --workspace 2>&1)
+    if [ $? -ne 0 ] || ! printf '%s\n' "$unit" | grep -q "^test result: ok"; then
+        echo "FAILED -- last lines:"
+        printf '%s\n' "$unit" | grep -E "^error|panicked at|test result: FAILED" | tail -6 \
+            | sed 's/^/                 /'
+        failed+=(unit)
+    else
+        total=$(printf '%s\n' "$unit" | grep "^test result: ok" \
+                | awk '{ for (i = 1; i <= NF; i++) if ($i == "passed;") s += $(i-1) } END { print s }')
+        echo "$total unit tests passed"
+    fi
+fi
 
 for t in "${SUITES[@]}"; do
     printf '%-14s ' "$t"

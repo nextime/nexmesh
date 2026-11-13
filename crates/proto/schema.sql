@@ -64,6 +64,24 @@ CREATE TABLE IF NOT EXISTS issued_certs (
   reason        TEXT
 );
 
+-- Live MCP sessions on the participant front door.
+--
+-- An MCP client has no "join" call, so `initialize` seats it and mints the
+-- session id it echoes afterwards. The token hash is kept beside it because a
+-- captured session id must not be a credential on its own, and `pending_ack`
+-- holds what was last handed to that client: it is acked when the client
+-- returns, which is the only proof over a network that it arrived.
+CREATE TABLE IF NOT EXISTS mcp_sessions (
+  id            TEXT PRIMARY KEY,         -- the Mcp-Session-Id we issued
+  agent_id      TEXT NOT NULL REFERENCES agents(id),
+  token_sha256  TEXT NOT NULL,            -- which participant token opened it
+  protocol      TEXT NOT NULL,            -- the MCP revision agreed
+  pending_ack   TEXT NOT NULL DEFAULT '[]',
+  created_at_ms INTEGER NOT NULL,
+  last_seen_ms  INTEGER NOT NULL,
+  closed_at_ms  INTEGER
+);
+
 -- Credentials for operators: the people (and scripts) that drive the fleet.
 -- An operator token is the most powerful credential here -- it can create
 -- sessions, spawn processes on any node and attach to any agent's terminal --

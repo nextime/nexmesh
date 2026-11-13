@@ -23,6 +23,7 @@ mod dashboard;
 mod delivery;
 mod launch;
 mod nodes;
+mod mcp;
 mod pairing;
 mod peer;
 mod pki;
@@ -510,6 +511,11 @@ async fn main() -> Result<()> {
     // added here later. The token itself is still checked per handler, which
     // is where the session scoping lives.
     let participant = Router::new()
+        // The MCP front door: one endpoint, and any MCP client is a teammate.
+        .route(
+            "/v1/mcp",
+            post(mcp::post).get(mcp::get).delete(mcp::delete),
+        )
         .route("/v1/participant/join", post(api::participant_join))
         .route("/v1/participant/tool", post(api::participant_tool))
         .route("/v1/participant/ack", post(api::participant_ack))

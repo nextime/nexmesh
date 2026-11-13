@@ -55,6 +55,18 @@ fn migrate(conn: &Connection) -> Result<()> {
             last_used_ms  INTEGER
          )",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_sessions (
+            id            TEXT PRIMARY KEY,
+            agent_id      TEXT NOT NULL REFERENCES agents(id),
+            token_sha256  TEXT NOT NULL,
+            protocol      TEXT NOT NULL,
+            pending_ack   TEXT NOT NULL DEFAULT '[]',
+            created_at_ms INTEGER NOT NULL,
+            last_seen_ms  INTEGER NOT NULL,
+            closed_at_ms  INTEGER
+         )",
+    )?;
     for (table, column, decl) in wanted {
         // A database old enough to lack the table entirely gets it from the
         // schema's CREATE TABLE IF NOT EXISTS; there is nothing to alter.
