@@ -223,8 +223,13 @@ def main():
 
   Ctrl-C to stop.
 """)
+    # The external participant has no process of its own, so without a
+    # heartbeat the hub rightly marks it lost after a while. A real bridge
+    # polls for work; this stands in for that.
     while True:
-        time.sleep(3600)
+        time.sleep(20)
+        req("/v1/participant/tool", pt, "POST",
+            {"agent_id": bridge, "tool": "list_peers", "args": {}})
 
 
 if __name__ == "__main__":
