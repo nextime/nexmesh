@@ -708,14 +708,26 @@ async fn main() -> Result<()> {
     // Refuse the one combination that cannot be made safe by accident: a fleet
     // API that can spawn processes, reachable off-box, with nobody checking.
     let authed = st.operator_auth_configured();
-    let off_box = addrs.iter().any(|a| !a.ip().is_loopback());
-    if off_box && !authed && !args.allow_anonymous {
+    let off_box_addrs: Vec<SocketAddr> =
+        addrs.iter().copied().filter(|a| !a.ip().is_loopback()).collect();
+    if !off_box_addrs.is_empty() && !authed && !args.allow_anonymous {
         anyhow::bail!(
-            "refusing to serve an UNAUTHENTICATED operator API on {addr}.\n\
+            // Name the addresses that are actually the problem. Naming the
+            // first one sorted said "127.0.0.1" and then advised binding
+            // loopback, which was already the case -- true of every detail
+            // and useless as a whole.
+            "refusing to serve an UNAUTHENTICATED operator API on {}.\n\
              That API can spawn processes on every node and attach to any agent's terminal.\n\
-             Either mint a token:   nexmesh-hub operator-token <label>\n\
-             or bind loopback:      --listen 127.0.0.1:7870\n\
-             or, if something in front already authenticates, pass --allow-anonymous."
+             Either set up access:  nexmesh-hub operator-token <label>\n\
+                               or:  nexmesh-hub dashboard-setup-code\n\
+             or drop {} and keep only a loopback --listen,\n\
+             or, if something in front already authenticates, pass --allow-anonymous.",
+            off_box_addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if off_box_addrs.len() == 1 { "that address" } else { "those addresses" }
         );
     }
     if !authed {

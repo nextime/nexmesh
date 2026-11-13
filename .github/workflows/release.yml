@@ -87,14 +87,24 @@ jobs:
         if: matrix.static
         # A "static" binary that turns out to be dynamically linked is worse
         # than no static build at all: it fails on the host it was made for.
+        #
+        # Checked by the absence of a program interpreter, not by parsing
+        # `file`. Rust's musl target produces a static-PIE, which `file`
+        # calls "static-pie linked" and not "statically linked" -- a check on
+        # that string would have failed every release while the binaries were
+        # perfectly fine.
         run: |
           set -euo pipefail
-          out=$(file "target/${{ matrix.target }}/release/nexmesh-hub")
-          echo "$out"
-          case "$out" in
-            *"statically linked"*) echo "ok: static" ;;
-            *) echo "NOT static -- refusing to publish it"; exit 1 ;;
-          esac
+          bin="target/${{ matrix.target }}/release/nexmesh-hub"
+          file "$bin"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "NOT static: it wants a dynamic loader. Refusing to publish it."
+            readelf -l "$bin" | grep -A1 INTERP
+            exit 1
+          fi
+          ldd "$bin" 2>&1 | grep -qE "statically linked|not a dynamic executable" \
+            || { echo "ldd disagrees that this is static"; ldd "$bin"; exit 1; }
+          echo "ok: no interpreter, statically linked"
 
       - name: Smoke-test the binaries
         # They must at least start on the runner. A tarball of binaries that

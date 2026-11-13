@@ -4,7 +4,7 @@
 Drives mcpd with raw MCP JSON-RPC instead of a real agent CLI, so the whole
 message path is exercised without spending API credits.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, urllib.error
+import shutil, json, os, signal, subprocess, sys, time, urllib.request, urllib.error
 
 import tempfile
 SCR = os.path.dirname(os.path.abspath(__file__))
@@ -111,7 +111,20 @@ def main():
     check("node is online and connected", online)
     s, j = http("GET", "/v1/nodes")
     clis = j["nodes"][0]["clis"] if j.get("nodes") else []
-    check("node advertises its installed CLIs", "claude" in clis and "opencode" in clis, str(clis))
+    # A node advertises only the CLIs whose binaries it can actually resolve,
+    # so what it reports depends on the machine it runs on. Assert the
+    # mechanism always, and the real names only where those binaries exist: a
+    # CI runner has none of them, and a test that needs third-party tools
+    # installed is a test that fails for the wrong reason.
+    installed = [c for c in ("claude", "opencode", "codex", "qwen", "gemini")
+                 if shutil.which(c)]
+    if installed:
+        check("node advertises its installed CLIs",
+              all(c in clis for c in installed), f"want {installed}, got {clis}")
+    else:
+        check("node reports an inventory, empty on a machine with no agent CLI",
+              isinstance(clis, list), str(clis))
+        print("  SKIP  no agent CLI installed here, so there is nothing to advertise")
 
     print("\n=== 2. session with a node-local workspace ===")
     s, j = http("POST", "/v1/sessions", {"name": "e2e",
