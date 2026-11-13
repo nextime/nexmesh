@@ -1,0 +1,70 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          nexmesh-node
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: nexmesh node
+# Description:       Spawns and drives agent CLIs on this machine.
+### END INIT INFO
+
+NAME=nexmesh-node
+BIN=/usr/local/bin/nexmesh-node
+PIDFILE=/var/run/$NAME.pid
+LOGFILE=/var/log/nexmesh/node.log
+CONF=/etc/nexmesh/node.env
+# Runs as a real user, not root: it spawns agent CLIs, which need that user's
+# own tool configuration and credentials.
+USER="${NEXMESH_NODE_USER:-nextime}"
+
+[ -x "$BIN" ] || exit 0
+[ -r "$CONF" ] && . "$CONF"
+
+: "${NEXMESH_HUB:=}"
+: "${NEXMESH_NAME:=$(hostname -s)}"
+: "${NEXMESH_CLIS:=/etc/nexmesh/clis}"
+: "${NEXMESH_SOCK:=/run/nexmesh/node.sock}"
+: "${NEXMESH_MCPD:=/usr/local/bin/nexmesh-mcpd}"
+: "${NEXMESH_CA_CERT:=}"
+: "${NEXMESH_CLIENT_CERT:=}"
+: "${NEXMESH_CLIENT_KEY:=}"
+
+if [ -z "$NEXMESH_HUB" ]; then
+  echo "$NAME: set NEXMESH_HUB in $CONF" >&2
+  exit 6
+fi
+
+ARGS="--hub $NEXMESH_HUB --name $NEXMESH_NAME --clis $NEXMESH_CLIS --sock $NEXMESH_SOCK --mcpd $NEXMESH_MCPD"
+[ -n "$NEXMESH_CA_CERT" ] && ARGS="$ARGS --ca-cert $NEXMESH_CA_CERT"
+[ -n "$NEXMESH_CLIENT_CERT" ] && ARGS="$ARGS --client-cert $NEXMESH_CLIENT_CERT"
+[ -n "$NEXMESH_CLIENT_KEY" ] && ARGS="$ARGS --client-key $NEXMESH_CLIENT_KEY"
+[ -n "$NEXMESH_EXTRA" ] && ARGS="$ARGS $NEXMESH_EXTRA"
+
+mkdir -p "$(dirname "$LOGFILE")" "$(dirname "$NEXMESH_SOCK")"
+chown "$USER" "$(dirname "$LOGFILE")" "$(dirname "$NEXMESH_SOCK")" 2>/dev/null || true
+
+case "$1" in
+  start)
+    echo -n "Starting $NAME: "
+    # NEXMESH_TOKEN comes from the config file, which should be mode 0600:
+    # that token is worth a shell on this machine.
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$PIDFILE" \
+      --chuid "$USER" --startas /bin/sh -- -c \
+      "exec env RUST_LOG=\${RUST_LOG:-info} NEXMESH_TOKEN='$NEXMESH_TOKEN' $BIN $ARGS >> $LOGFILE 2>&1"
+    echo "ok"
+    ;;
+  stop)
+    echo -n "Stopping $NAME: "
+    start-stop-daemon --stop --quiet --retry TERM/20/KILL/5 --pidfile "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo "ok"
+    ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  status)
+    start-stop-daemon --status --pidfile "$PIDFILE" && echo "$NAME running" \
+      || { echo "$NAME not running"; exit 3; }
+    ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac
+exit 0

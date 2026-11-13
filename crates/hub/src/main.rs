@@ -15,6 +15,7 @@
 //! what makes a pid stored in this database harmless.
 
 mod api;
+mod asks;
 mod attach;
 mod auth;
 mod certs;
@@ -35,6 +36,7 @@ mod prompt;
 mod state;
 mod sync;
 mod tools;
+mod webauth;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -49,15 +51,43 @@ use std::net::SocketAddr;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Read a password from an argument or from stdin.
+///
+/// stdin is the default because a password on a command line ends up in shell
+/// history and in `ps` output for anyone on the machine to read.
+fn read_password(given: Option<String>) -> anyhow::Result<String> {
+    if let Some(p) = given {
+        return Ok(p);
+    }
+    eprint!("new password (not echoed by your terminal if it supports it): ");
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let p = line.trim_end_matches(['\n', '\r']).to_string();
+    if p.is_empty() {
+        anyhow::bail!("no password given");
+    }
+    Ok(p)
+}
+
+/// Largest request body the hub accepts. See the note where it is applied.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Parser)]
 #[command(name = "nexmesh-hub", version, about = "nexmesh coordination hub")]
 struct Args {
     #[arg(long, env = "NEXMESH_DB", default_value = "~/.nexmesh/hub.db")]
     db: String,
-    /// Listen address. Bind to loopback or a VPN address; never 0.0.0.0
-    /// without TLS in front, since this API can start processes.
+    /// Listen address, repeatable. Bind to loopback or a LAN/VPN address;
+    /// never 0.0.0.0 without TLS in front, since this API can start
+    /// processes -- and on a host with a public address of its own, 0.0.0.0
+    /// means the internet.
+    ///
+    /// Repeatable because that case is real: loopback for a reverse proxy
+    /// and a LAN address for the machines, without ever offering the public
+    /// interface.
     #[arg(long, env = "NEXMESH_LISTEN", default_value = "127.0.0.1:7870")]
-    listen: String,
+    listen: Vec<String>,
     /// Serve HTTPS/WSS with this certificate chain (PEM). Needs --tls-key.
     #[arg(long, env = "NEXMESH_TLS_CERT")]
     tls_cert: Option<String>,
@@ -69,6 +99,14 @@ struct Args {
     /// the caller also needs a private key that never leaves its machine.
     #[arg(long, env = "NEXMESH_CLIENT_CA")]
     client_ca: Option<String>,
+    /// Believe the X-Client-Verify / X-Client-CN headers from this address,
+    /// so mutual TLS keeps working when nginx terminates it. Repeatable.
+    ///
+    /// Only safe when the hub is unreachable except through that proxy: a
+    /// client able to connect directly could set those headers itself and
+    /// claim any identity. Bind to loopback when you use this.
+    #[arg(long = "trusted-proxy")]
+    trusted_proxies: Vec<std::net::IpAddr>,
     /// Stop requiring a client certificate to name the same identity as the
     /// token sent with it. Only for a fleet whose certificates and tokens were
     /// issued under different names before that check existed: with this on, a
@@ -117,6 +155,25 @@ enum Cmd {
         /// Where to write cert.pem and key.pem.
         #[arg(long, default_value = "~/.nexmesh")]
         out: String,
+    },
+    /// Print a one-time code authorising the first dashboard account.
+    ///
+    /// Needed because a hub may answer on a public address, and whoever
+    /// arrives first must not simply be able to claim it.
+    DashboardSetupCode,
+    /// Set or reset a dashboard account's password. Ends its sessions.
+    DashboardPasswd {
+        username: String,
+        /// The new password. Omitted means read it from stdin, which keeps it
+        /// out of shell history and `ps`.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Add a dashboard account.
+    DashboardUser {
+        username: String,
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Mint a token for an external participant (a hermes agent, a script, ...).
     /// It can call team tools but can never spawn a process.
@@ -238,9 +295,43 @@ async fn main() -> Result<()> {
     let st = AppState::open(&args.db)?
         .with_pki_dir(&args.pki_dir)
         .with_pair_listen(args.pair_listen.clone())
-        .with_identity_binding(!args.no_bind_identity);
+        .with_identity_binding(!args.no_bind_identity)
+        .with_trusted_proxies(args.trusted_proxies.clone());
 
     match args.cmd {
+        Some(Cmd::DashboardSetupCode) => {
+            let db = st.db.lock().unwrap();
+            match webauth::issue_setup_code(&db) {
+                Ok(code) => {
+                    println!("setup code: {code}");
+                    println!();
+                    println!("Open the dashboard and create the first account with it. It works");
+                    println!("once, and this is the only time it is shown.");
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+
+        Some(Cmd::DashboardPasswd { username, password }) => {
+            let password = read_password(password)?;
+            let db = st.db.lock().unwrap();
+            webauth::set_password(&db, &username, &password)?;
+            println!("password set for {username}; any open sessions were ended");
+            return Ok(());
+        }
+
+        Some(Cmd::DashboardUser { username, password }) => {
+            let password = read_password(password)?;
+            let db = st.db.lock().unwrap();
+            let name = webauth::add_user(&db, &username, &password)?;
+            println!("account {name} created");
+            return Ok(());
+        }
+
         Some(Cmd::Enrol { node_name }) => {
             let token = random_token(48);
             let db = st.db.lock().unwrap();
@@ -326,7 +417,7 @@ async fn main() -> Result<()> {
                 println!("no operator tokens: the operator API is UNAUTHENTICATED");
                 println!("mint one with: nexmesh-hub operator-token <label>");
             } else {
-                println!("{:<20} {:<10} {}", "LABEL", "STATE", "LAST USED");
+                println!("{:<20} {:<10} LAST USED", "LABEL", "STATE");
                 for (label, _issued, used, revoked) in rows {
                     println!(
                         "{:<20} {:<10} {}",
@@ -379,7 +470,7 @@ async fn main() -> Result<()> {
                 println!("no certificates issued yet");
                 return Ok(());
             }
-            println!("{:<22} {:<10} {:<9} {}", "NAME", "KIND", "STATE", "SERIAL");
+            println!("{:<22} {:<10} {:<9} SERIAL", "NAME", "KIND", "STATE");
             for c in rows {
                 println!(
                     "{:<22} {:<10} {:<9} {}",
@@ -484,6 +575,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/pause", post(api::pause))
         .route("/v1/sessions/:id/budget", post(api::set_budget))
         .route("/v1/sessions/:id/groups", post(api::set_group))
+        .route("/v1/auth/users", post(webauth::create_user))
         .route("/v1/sessions/:id/release", post(api::release))
         .route("/v1/sessions/:id/status", get(api::session_status))
         .route("/v1/sessions/:id/messages", post(api::operator_message))
@@ -511,6 +603,13 @@ async fn main() -> Result<()> {
         .route("/dashboard", get(dashboard::page))
         .route("/favicon.ico", get(dashboard::favicon))
         .route("/healthz", get(api::health))
+        // Signing in cannot itself require being signed in. These three are
+        // the only unauthenticated write paths on the hub, and each is
+        // guarded by its own evidence: a setup code, or a password.
+        .route("/v1/auth/state", get(webauth::state_of))
+        .route("/v1/auth/setup", post(webauth::setup))
+        .route("/v1/auth/login", post(webauth::sign_in))
+        .route("/v1/auth/logout", post(webauth::sign_out))
         .route("/v1/node/ws", get(nodes::node_ws));
 
     // Participants are a group too, so the certificate check covers a route
@@ -532,7 +631,18 @@ async fn main() -> Result<()> {
             auth::bind_participant,
         ));
 
-    let app = operator.merge(participant).merge(other).with_state(st.clone());
+    let app = operator
+        .merge(participant)
+        .merge(other)
+        // Chosen, not inherited. The default is 2MB, which silently made
+        // base64 payloads impossible: an agent handing a scanned page to a
+        // capability bridge got a 413 from the hub with no explanation, long
+        // before the bridge's own inline limit could say anything useful.
+        // 16MB leaves room for roughly 8MB of base64 plus its JSON envelope;
+        // anything larger belongs in the target service's own blob store,
+        // passed by reference.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(st.clone());
 
     // The pairing listener, if asked for: its own address, no client
     // certificate required, and only the claim endpoint on it.
@@ -582,7 +692,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    let addr: SocketAddr = args.listen.parse().context("parsing --listen")?;
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for a in &args.listen {
+        addrs.push(a.parse().with_context(|| format!("parsing --listen {a}"))?);
+    }
+    addrs.sort();
+    addrs.dedup();
+    let addr = *addrs.first().context("no --listen address")?;
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(c), Some(k)) => Some((state::expand(c), state::expand(k))),
         (None, None) => None,
@@ -592,7 +708,8 @@ async fn main() -> Result<()> {
     // Refuse the one combination that cannot be made safe by accident: a fleet
     // API that can spawn processes, reachable off-box, with nobody checking.
     let authed = st.operator_auth_configured();
-    if !addr.ip().is_loopback() && !authed && !args.allow_anonymous {
+    let off_box = addrs.iter().any(|a| !a.ip().is_loopback());
+    if off_box && !authed && !args.allow_anonymous {
         anyhow::bail!(
             "refusing to serve an UNAUTHENTICATED operator API on {addr}.\n\
              That API can spawn processes on every node and attach to any agent's terminal.\n\
@@ -636,9 +753,11 @@ async fn main() -> Result<()> {
                 client_ca: client_ca.clone(),
             });
             drop(listener);
-            tracing::info!(%addr, version = VERSION, tls = true, authenticated = authed,
-                mutual_tls = client_ca.is_some(),
-                "hub listening (https/wss); dashboard at https://{addr}/");
+            for a in &addrs {
+                tracing::info!(addr = %a, version = VERSION, tls = true, authenticated = authed,
+                    mutual_tls = client_ca.is_some(),
+                    "hub listening (https/wss); dashboard at https://{a}/");
+            }
             if client_ca.is_none() {
                 tracing::warn!(
                     "TLS without --client-ca: a stolen token is enough to reach this hub. \
@@ -654,18 +773,38 @@ async fn main() -> Result<()> {
             // Not `bind_rustls`: the plain acceptor discards the handshake, and
             // with it the peer's certificate. This one keeps the certificate's
             // name on every request of the connection.
-            let acceptor = peer::IdentityAcceptor::new(
-                axum_server::tls_rustls::RustlsAcceptor::new(config),
-            );
-            axum_server::bind(addr)
-                .acceptor(acceptor)
-                .serve(app.into_make_service())
-                .await?;
+            // One server per address, all sharing the same router and state.
+            let mut servers = Vec::new();
+            for a in &addrs {
+                let acceptor = peer::IdentityAcceptor::new(
+                    axum_server::tls_rustls::RustlsAcceptor::new(config.clone()),
+                );
+                let svc = app.clone().into_make_service_with_connect_info::<SocketAddr>();
+                let a = *a;
+                servers.push(tokio::spawn(async move {
+                    axum_server::bind(a).acceptor(acceptor).serve(svc).await
+                }));
+            }
+            // If any one of them stops, stop: a hub half-listening is worse
+            // than a hub that is plainly down, because half the fleet would
+            // still think it was fine.
+            let (first, _, _) = futures_util::future::select_all(servers).await;
+            first??;
         }
         None => {
-            tracing::info!(%addr, version = VERSION, tls = false, authenticated = authed,
-                "hub listening (http/ws); dashboard at http://{addr}/");
-            axum::serve(listener, app).await?;
+            drop(listener);
+            let mut servers = Vec::new();
+            for a in &addrs {
+                tracing::info!(addr = %a, version = VERSION, tls = false,
+                    authenticated = authed, "hub listening (http/ws); dashboard at http://{a}/");
+                let svc = app.clone().into_make_service_with_connect_info::<SocketAddr>();
+                let l = tokio::net::TcpListener::bind(a)
+                    .await
+                    .with_context(|| format!("binding {a}"))?;
+                servers.push(tokio::spawn(async move { axum::serve(l, svc).await }));
+            }
+            let (first, _, _) = futures_util::future::select_all(servers).await;
+            first??;
         }
     }
     Ok(())

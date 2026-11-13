@@ -230,6 +230,29 @@ def main():
           open(f"{T}/node.log").read().count("parsed a workspace") == 2,
           str(open(f"{T}/node.log").read().count("parsed a workspace")))
 
+    print("\n=== and a person can see it, not only an agent ===")
+    # Until the dashboard carried this, an agent could see the shape of a
+    # codebase and a human could not -- and the subsystem map is the part a
+    # human most wants.
+    s, snap = http("GET", f"/v1/dashboard/state?session={sid}")
+    # Per-session data sits under "detail"; the envelope holds the fleet.
+    g = ((snap.get("detail") or {}).get("graph") or [])
+    check("the dashboard snapshot carries the graph", bool(g),
+          str((snap.get("detail") or {}).keys()))
+    if g:
+        w = g[0]
+        check("with the workspace it belongs to", w.get("workspace") == "local", str(w)[:200])
+        check("how much was parsed", w.get("files") == 5, str(w)[:200])
+        check("what kinds of thing are in it",
+              any(c["kind"] == "function" for c in w.get("counts", [])), str(w.get("counts")))
+        subs = w.get("subsystems") or []
+        check("and its subsystems, largest first", len(subs) >= 2, str(subs)[:300])
+        check("each with recognisable members",
+              subs and all(sub.get("members") for sub in subs), str(subs)[:300])
+        check("sorted by size, so the shape reads at a glance",
+              all(subs[i]["n"] >= subs[i+1]["n"] for i in range(len(subs)-1)),
+              str([x["n"] for x in subs]))
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1

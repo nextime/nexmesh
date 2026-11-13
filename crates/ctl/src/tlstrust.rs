@@ -59,31 +59,6 @@ pub fn client_config(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn public_roots_alone_build_a_config() {
-        assert!(client_config(None, None).is_ok());
-    }
-
-    #[test]
-    fn a_missing_ca_file_is_a_clear_error() {
-        let err = client_config(Some("/nonexistent/ca.pem"), None).unwrap_err();
-        assert!(err.to_string().contains("reading CA file"), "{err}");
-    }
-
-    #[test]
-    fn a_pem_with_no_certificates_is_rejected_rather_than_ignored() {
-        let p = std::env::temp_dir().join(format!("nexmesh-noca-{}.pem", std::process::id()));
-        std::fs::write(&p, "not a certificate\n").unwrap();
-        let err = client_config(Some(p.to_str().unwrap()), None).unwrap_err();
-        assert!(err.to_string().contains("no certificates"), "{err}");
-        std::fs::remove_file(&p).ok();
-    }
-}
-
 /// Find a command on PATH, or in the descriptor's extra paths.
 ///
 /// Lives here because the operator CLI has no other place for small path
@@ -110,4 +85,29 @@ pub fn noop_resolve(command: &str, extra: &[String]) -> Option<String> {
         if executable(&c) { return Some(c); }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_roots_alone_build_a_config() {
+        assert!(client_config(None, None).is_ok());
+    }
+
+    #[test]
+    fn a_missing_ca_file_is_a_clear_error() {
+        let err = client_config(Some("/nonexistent/ca.pem"), None).unwrap_err();
+        assert!(err.to_string().contains("reading CA file"), "{err}");
+    }
+
+    #[test]
+    fn a_pem_with_no_certificates_is_rejected_rather_than_ignored() {
+        let p = std::env::temp_dir().join(format!("nexmesh-noca-{}.pem", std::process::id()));
+        std::fs::write(&p, "not a certificate\n").unwrap();
+        let err = client_config(Some(p.to_str().unwrap()), None).unwrap_err();
+        assert!(err.to_string().contains("no certificates"), "{err}");
+        std::fs::remove_file(&p).ok();
+    }
 }

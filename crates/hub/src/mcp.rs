@@ -69,6 +69,10 @@ pub struct DoorParams {
     pub session: Option<String>,
     pub workspace: Option<String>,
     pub kind_hint: Option<String>,
+    /// Capability labels, comma-separated: `?can=ocr,transcribe`. A client
+    /// that bridges to something else says so here, and teammates can then
+    /// address what it does rather than its name.
+    pub can: Option<String>,
 }
 
 fn jerr(id: Value, code: i64, message: impl std::fmt::Display) -> Value {
@@ -359,6 +363,13 @@ async fn initialize(
                     req["params"]["clientInfo"]["name"].as_str().map(|c| format!("mcp:{c}"))
                 }),
                 workspace: params.workspace.clone(),
+                capabilities: params
+                    .can
+                    .as_deref()
+                    .map(|c| {
+                        c.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                    })
+                    .unwrap_or_default(),
             };
             let seated = match api::join_participant(st, join, scoped) {
                 Ok(v) => v,

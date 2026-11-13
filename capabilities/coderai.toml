@@ -1,0 +1,217 @@
+# Capabilities this bridge offers a team, as data.
+#
+# The service behind it registers well over two hundred routes, and both its
+# published capability document and its written documentation are out of date
+# against its own code -- the document omits whole subsystems that are
+# serving. So nothing here is assumed: each capability is PROBED, and only
+# what answers is advertised.
+#
+# Text generation is deliberately absent. Agents already are language models;
+# routing their thinking through another one is a loop with a bill attached.
+# /v1/chat/completions and /v1/completions are not capabilities of this
+# bridge, by choice.
+#
+# ENDPOINTS AND PROBES below were read from the service's own route
+# registrations and are reliable. REQUEST FIELD NAMES in `accepts` were read
+# from the API documentation, which is known to be stale: where one is wrong
+# the service answers with a clear error naming the field it wanted, and the
+# fix is a line here rather than a release. That is the whole reason this is
+# a manifest.
+
+[service]
+name = "coderai"
+capability_document = "/coderai/capabilities"
+# The shape actually served: a flat array under studio.endpoints.
+document_endpoints = ["studio.endpoints[*]"]
+models_endpoint = "/v1/models"
+models_at = ["data[*].id", "models[*].id", "[*].id"]
+
+# --------------------------------------------------------------- documents --
+
+[[capability]]
+label = "ocr"
+summary = "Read text out of an image or a PDF, optionally into a schema"
+endpoint = "/v1/ocr"
+probe = "/v1/ocr/engines"
+models_at = ["data[*].id", "engines[*].id", "[*].id"]
+model_field = "engine"
+# `image` takes a data: URI, bare base64, or an http(s) URL, and a PDF is
+# recognised from the data-URI media type. Verified in the route handler.
+accepts = ["image", "dpi", "lang", "detect", "structured", "schema"]
+required = ["image"]
+text_at = ["text", "data.text", "result.text"]
+
+[[capability]]
+label = "ocr_batch"
+summary = "Read text out of many images or PDFs at once"
+endpoint = "/v1/ocr/batch"
+probe = "/v1/ocr/engines"
+models_at = ["data[*].id", "engines[*].id", "[*].id"]
+model_field = "engine"
+accepts = ["images", "dpi", "lang", "detect", "structured", "schema"]
+required = ["images"]
+text_at = ["results[*].text", "data[*].text"]
+
+# ------------------------------------------------------------------- audio --
+
+[[capability]]
+label = "transcribe"
+summary = "Turn speech in an audio or video file into text"
+endpoint = "/v1/audio/transcriptions"
+model_field = "model"
+accepts = ["file", "audio", "audio_base64", "url", "language", "prompt",
+           "response_format", "timestamp_granularities"]
+text_at = ["text", "data.text", "results[*].text"]
+
+[[capability]]
+label = "diarize"
+summary = "Say who spoke when in an audio file"
+endpoint = "/v1/audio/diarization"
+accepts = ["file", "audio", "audio_base64", "url", "num_speakers"]
+text_at = ["text", "data.text", "segments[*].speaker"]
+
+[[capability]]
+label = "tts"
+summary = "Speak text aloud, returning an audio file"
+endpoint = "/v1/audio/speech"
+probe = "/v1/audio/speech/capabilities"
+models_at = ["data[*].id", "voices[*].name", "engines[*].id", "[*].id"]
+model_field = "model"
+accepts = ["input", "text", "voice", "response_format", "speed"]
+text_at = ["text"]
+file_at = ["url", "data.url", "file", "filename"]
+
+[[capability]]
+label = "audio_stems"
+summary = "Split a recording into vocals and instruments"
+endpoint = "/v1/audio/stems"
+accepts = ["file", "audio", "audio_base64", "url", "stems"]
+file_at = ["url", "files[*].url", "data.url"]
+
+[[capability]]
+label = "audio_clean"
+summary = "Remove noise from a recording"
+endpoint = "/v1/audio/cleanup"
+accepts = ["file", "audio", "audio_base64", "url"]
+file_at = ["url", "data.url"]
+
+# --------------------------------------------------- text, without a model --
+
+[[capability]]
+label = "embed"
+summary = "Turn text into vectors, for similarity and retrieval"
+endpoint = "/v1/embeddings"
+model_field = "model"
+accepts = ["input", "encoding_format", "dimensions"]
+required = ["input"]
+# The vectors themselves are not something to put in a message; the asker
+# gets the shape and should store them where they are useful.
+text_at = ["model", "data[*].index"]
+
+[[capability]]
+label = "rerank"
+summary = "Order documents by how well they answer a query"
+endpoint = "/v1/rerank"
+model_field = "model"
+accepts = ["query", "documents", "top_n", "return_documents"]
+required = ["query", "documents"]
+text_at = ["results[*].document.text", "results[*].index", "data[*].index"]
+
+[[capability]]
+label = "chunk"
+summary = "Split a document into pieces worth embedding"
+endpoint = "/v1/chunk"
+probe = "/v1/chunk/templates"
+models_at = ["data[*].id", "templates[*].name", "[*].name"]
+accepts = ["text", "file", "template", "size", "overlap"]
+text_at = ["chunks[*].text", "data[*].text"]
+
+[[capability]]
+label = "moderate"
+summary = "Flag unsafe content, without a language model"
+endpoint = "/v1/moderation"
+probe = "/v1/moderation/models"
+models_at = ["data[*].id", "models[*].id", "[*].id"]
+model_field = "model"
+accepts = ["input"]
+required = ["input"]
+text_at = ["results[*].flagged", "data[*].flagged"]
+
+# ------------------------------------------------------------------ images --
+
+[[capability]]
+label = "image_generate"
+summary = "Draw an image from a description"
+endpoint = "/v1/images/generations"
+model_field = "model"
+accepts = ["prompt", "size", "n", "negative_prompt", "steps", "seed"]
+required = ["prompt"]
+file_at = ["data[*].url", "url", "files[*].url"]
+
+[[capability]]
+label = "image_edit"
+summary = "Change an existing image from a description"
+endpoint = "/v1/images/edits"
+model_field = "model"
+accepts = ["image", "prompt", "mask", "size", "n"]
+required = ["image", "prompt"]
+file_at = ["data[*].url", "url"]
+
+[[capability]]
+label = "image_upscale"
+summary = "Enlarge an image without it going soft"
+endpoint = "/v1/images/upscale"
+model_field = "model"
+accepts = ["image", "scale"]
+required = ["image"]
+file_at = ["data[*].url", "url"]
+
+[[capability]]
+label = "image_segment"
+summary = "Cut an image into its parts"
+endpoint = "/v1/images/segment"
+accepts = ["image", "prompt", "points"]
+required = ["image"]
+file_at = ["data[*].url", "url"]
+text_at = ["labels[*]", "data[*].label"]
+
+[[capability]]
+label = "image_depth"
+summary = "Estimate how far away each part of an image is"
+endpoint = "/v1/images/depth"
+accepts = ["image"]
+required = ["image"]
+file_at = ["data[*].url", "url"]
+
+# ------------------------------------------------------------------- video --
+
+[[capability]]
+label = "video_subtitle"
+summary = "Add subtitles to a video from its own speech"
+endpoint = "/v1/video/subtitle"
+accepts = ["file", "video", "video_b64", "url", "language", "burn"]
+file_at = ["url", "data.url"]
+# Expensive enough that a wrong "available" wastes real time, so the probe is
+# the only acceptable evidence.
+probe_required = true
+probe = "/v1/video/progress"
+
+[[capability]]
+label = "video_generate"
+summary = "Make a short video from a description"
+endpoint = "/v1/video/generations"
+model_field = "model"
+accepts = ["prompt", "duration", "size", "seed", "image"]
+required = ["prompt"]
+file_at = ["data[*].url", "url"]
+probe_required = true
+probe = "/v1/video/progress"
+
+[[capability]]
+label = "video_upscale"
+summary = "Enlarge a video without it going soft"
+endpoint = "/v1/video/upscale"
+accepts = ["file", "video", "video_b64", "url", "scale"]
+file_at = ["url", "data.url"]
+probe_required = true
+probe = "/v1/video/progress"

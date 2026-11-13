@@ -300,6 +300,8 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "forget" => forget_memory(ctx, args),
         "memory_history" => memory_history(ctx, args),
         "save_context" => save_context(ctx, args),
+        "pending_asks" => pending_asks(ctx),
+        "answer_ask" => answer_ask(ctx, args),
         "get_history" => get_history(ctx, args),
         other => bail!("unknown tool '{other}'"),
     }
@@ -824,6 +826,30 @@ fn render_entries(ctx: &Ctx, rows: Vec<crate::memory::Entry>) -> Result<String> 
 fn forget_memory(ctx: &Ctx, args: &Value) -> Result<String> {
     let scope = scope_of(ctx, args)?;
     crate::memory::forget(ctx.db, &ctx.slot_id, &scope, &arg_str(args, "key")?)
+}
+
+fn pending_asks(ctx: &Ctx) -> Result<String> {
+    let rows = crate::asks::pending_for(ctx.db, &ctx.slot_id)?;
+    if rows.is_empty() {
+        return Ok("Nothing is waiting on you.".into());
+    }
+    let mut out = format!("{} request(s) waiting on you:\n", rows.len());
+    for (id, capability, request, model) in rows {
+        out.push_str(&format!("- {id} [{capability}]"));
+        if let Some(m) = model {
+            out.push_str(&format!(" model={m}"));
+        }
+        out.push_str(&format!("\n  {request}\n"));
+    }
+    out.push_str("Answer each with answer_ask; the asker is blocked until you do.\n");
+    Ok(out)
+}
+
+fn answer_ask(ctx: &Ctx, args: &Value) -> Result<String> {
+    let id = arg_str(args, "ask_id")?;
+    let result = arg_str(args, "result")?;
+    let failed = args.get("failed").and_then(|v| v.as_bool()).unwrap_or(false);
+    crate::asks::answer(ctx.db, &ctx.slot_id, &id, &result, !failed)
 }
 
 /// Keep a summary against the AGENT's identity, not the session.

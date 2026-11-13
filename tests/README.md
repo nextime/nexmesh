@@ -25,6 +25,8 @@ python3 -I tests/e2e_mcpdoor.py       # the MCP front door: a hand-written MCP c
 python3 -I tests/e2e_capability.py    # models, capability labels, escalation and a token budget
 python3 -I tests/e2e_memory.py        # scoped memory, groups, search, and resuming days later
 python3 -I tests/e2e_codegraph.py     # tree-sitter parsing, Leiden subsystems, graph queries
+python3 -I tests/e2e_coderai.py       # capability discovery, asking a teammate, base64 payloads
+python3 -I tests/e2e_webauth.py       # dashboard accounts: first-run setup, sign-in, lockout
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP

@@ -97,7 +97,12 @@ def main():
     check("no external resources are referenced", not external, str(external))
     check("there is no <script src> or <link> at all",
           not re.search(r'<script[^>]+src=', html) and "<link" not in html, str(refs))
-    check("it contains no session data", "operator-token" in html and "sl-" not in html)
+    # What matters is that the PAGE is static: it is served without
+    # authentication, so anything of a session baked into it would be a leak.
+    check("it carries no session data", "sl-" not in html, "no slot ids in the page")
+    check("and it explains how to get in",
+          "dashboard-setup-code" in html and "operator-token" in html,
+          "both ways in should be named")
     s2, _ = req("/dashboard", raw=True)
     check("/dashboard works too", s2 == 200, str(s2))
     s3, _ = req("/favicon.ico", raw=True)

@@ -89,7 +89,7 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
          VALUES (?,?,?,?,?)",
         params![id, req.name, req.token_budget, now, now],
     )
-    .map_err(|e| bad(e))?;
+    .map_err(bad)?;
 
     for w in &req.workspaces {
         if !["node_local", "repo"].contains(&w.kind.as_str()) {
@@ -99,7 +99,7 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
             Some(n) => Some(
                 db.query_row("SELECT id FROM nodes WHERE name = ?", [n], |r| r.get(0))
                     .optional()
-                    .map_err(|e| bad(e))?
+                    .map_err(bad)?
                     .ok_or_else(|| bad(format!("no node named '{n}'")))?,
             ),
             None => None,
@@ -114,18 +114,18 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
             params![ws_id, id, w.name, w.kind, node_id, w.repo_url, w.repo_branch,
                     if w.kind == "repo" { "git" } else { "none" }],
         )
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
         for (node_name, path) in &w.mounts {
             let nid: Option<String> = db
                 .query_row("SELECT id FROM nodes WHERE name = ?", [node_name], |r| r.get(0))
                 .optional()
-                .map_err(|e| bad(e))?;
+                .map_err(bad)?;
             let nid = nid.ok_or_else(|| bad(format!("mount names unknown node '{node_name}'")))?;
             db.execute(
                 "INSERT INTO workspace_mounts (workspace_id, node_id, path) VALUES (?,?,?)",
                 params![ws_id, nid, path],
             )
-            .map_err(|e| bad(e))?;
+            .map_err(bad)?;
         }
     }
 
@@ -134,7 +134,7 @@ pub async fn create_session(State(st): State<AppState>, Json(req): Json<NewSessi
             "INSERT INTO plan_items (session_id, ord, label, updated_at_ms) VALUES (?,?,?,?)",
             params![id, i as i64 + 1, label, now],
         )
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     }
     Ok(Json(json!({ "session_id": id, "name": req.name })))
 }
@@ -194,7 +194,7 @@ pub async fn create_slot(
     let exists: Option<i64> = db
         .query_row("SELECT 1 FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
         .optional()
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     if exists.is_none() {
         return Err(bad(format!("no session '{session_id}'")));
     }
@@ -214,7 +214,7 @@ pub async fn create_slot(
                 |r| r.get(0),
             )
             .optional()
-            .map_err(|e| bad(e))?
+            .map_err(bad)?
             .ok_or_else(|| bad(format!("no workspace '{w}' in this session")))?,
         ),
         None => None,
@@ -234,14 +234,14 @@ pub async fn create_slot(
             now_ms()
         ],
     )
-    .map_err(|e| bad(e))?;
+    .map_err(bad)?;
     if let (Some(ws), false) = (&ws_id, req.file_ownership.is_empty()) {
         for pat in &req.file_ownership {
             db.execute(
                 "INSERT OR IGNORE INTO ownership (workspace_id, slot_id, pattern) VALUES (?,?,?)",
                 params![ws, slot_id, pat],
             )
-            .map_err(|e| bad(e))?;
+            .map_err(bad)?;
         }
     }
     if let Some(t) = &req.task {
@@ -250,7 +250,7 @@ pub async fn create_slot(
              WHERE id = ?",
             params![format!("\n\nTASK: {t}"), slot_id],
         )
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     }
     Ok(Json(json!({ "slot_id": slot_id })))
 }
@@ -293,7 +293,7 @@ pub async fn adopt_slot(
         let exists: Option<i64> = db
             .query_row("SELECT 1 FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
             .optional()
-            .map_err(|e| bad(e))?;
+            .map_err(bad)?;
         if exists.is_none() {
             return Err(bad(format!("no session '{session_id}'")));
         }
@@ -305,7 +305,7 @@ pub async fn adopt_slot(
                     |r| r.get(0),
                 )
                 .optional()
-                .map_err(|e| bad(e))?,
+                .map_err(bad)?,
             None => None,
         };
         db.execute(
@@ -320,12 +320,12 @@ pub async fn adopt_slot(
                 serde_json::json!({ "node": req.node }).to_string(),
                 req.name,
                 req.role,
-                format!("You are an adopted terminal session.\n\nTASK: continue what you were doing."),
+                "You are an adopted terminal session.\n\nTASK: continue what you were doing.".to_string(),
                 req.tmux_target,
                 now_ms()
             ],
         )
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     }
     match crate::launch::launch_slot(&st, &slot_id, None).await {
         Ok((agent_id, node)) => Ok(Json(json!({
@@ -401,10 +401,10 @@ pub async fn sync_workspaces(
                  WHERE session_id = ?1 AND kind = 'repo'
                    AND (?2 IS NULL OR name = ?2 OR id = ?2)",
             )
-            .map_err(|e| bad(e))?;
+            .map_err(bad)?;
         stmt.query_map(params![session_id, req.workspace], |r| r.get(0))
             .and_then(|m| m.collect())
-            .map_err(|e| bad(e))?
+            .map_err(bad)?
     };
     if ids.is_empty() {
         return Err(bad("no shared workspace in this session to sync"));
@@ -486,7 +486,7 @@ pub async fn set_group(
             |r| r.get(0),
         )
         .optional()
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     let slot = slot.ok_or_else(|| bad(format!("no agent '{}' in {session_id}", req.who)))?;
     crate::memory::set_group_member(&db, &req.group, &slot, req.member)
         .map_err(|e| bad(format!("{e:#}")))?;
@@ -524,7 +524,7 @@ pub async fn set_budget(
             "UPDATE sessions SET token_budget = ?, budget_hit_at_ms = NULL WHERE id = ?",
             params![req.token_budget, session_id],
         )
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     if n == 0 {
         return Err(bad(format!("no session '{session_id}'")));
     }
@@ -679,7 +679,7 @@ pub async fn agent_transcript(
     Query(q): Query<TranscriptQuery>,
 ) -> ApiResult {
     let tail = q.tail.unwrap_or(64 * 1024).min(2 * 1024 * 1024);
-    let text = st.read_transcript(&agent_id, tail).map_err(|e| bad(e))?;
+    let text = st.read_transcript(&agent_id, tail).map_err(bad)?;
     Ok(Json(json!({ "agent_id": agent_id, "transcript": text })))
 }
 
@@ -703,7 +703,7 @@ pub async fn resolve_agent(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(|e| bad(e))?;
+        .map_err(bad)?;
     let (agent_id, name) = found.ok_or_else(|| bad(format!("no agent matching '{who}'")))?;
     Ok(Json(json!({ "agent_id": agent_id, "name": name })))
 }
@@ -735,7 +735,7 @@ pub async fn operator_message(
                 |r| r.get(0),
             )
             .optional()
-            .map_err(|e| bad(e))?
+            .map_err(bad)?
             .ok_or_else(|| bad(format!("no slot matching '{t}'")))?,
         ),
         None => None,
@@ -745,7 +745,7 @@ pub async fn operator_message(
          VALUES (?, NULL, ?, 'system', ?, ?)",
         params![session_id, to_slot, req.text, now_ms()],
     )
-    .map_err(|e| bad(e))?;
+    .map_err(bad)?;
     Ok(Json(json!({ "sent": true, "to": to_slot })))
 }
 
@@ -793,6 +793,11 @@ pub struct ParticipantJoin {
     /// Free-form note about what this is: "hermes", "python", ...
     pub kind_hint: Option<String>,
     pub workspace: Option<String>,
+    /// Capability labels this participant offers, so teammates can address
+    /// what it can do rather than its name. A bridge to an external service
+    /// discovers these at startup and declares them here.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 pub async fn participant_join(
@@ -831,7 +836,7 @@ pub(crate) fn join_participant(
                         |r| r.get(0),
                     )
                     .optional()
-                    .map_err(|e| bad(e))?;
+                    .map_err(bad)?;
                 if matches.is_none() {
                     return Err(err(StatusCode::FORBIDDEN, "token is scoped to another session"));
                 }
@@ -843,7 +848,7 @@ pub(crate) fn join_participant(
                     |r| r.get(0),
                 )
                 .optional()
-                .map_err(|e| bad(e))?
+                .map_err(bad)?
                 .ok_or_else(|| bad(format!("no session '{s}'")))?
             }
         }
@@ -851,7 +856,7 @@ pub(crate) fn join_participant(
             let ids: Vec<String> = db
                 .prepare("SELECT id FROM sessions WHERE status = 'active'")
                 .and_then(|mut s| s.query_map([], |r| r.get(0)).and_then(|m| m.collect()))
-                .map_err(|e| bad(e))?;
+                .map_err(bad)?;
             match ids.len() {
                 1 => ids[0].clone(),
                 0 => return Err(bad("no active session to join")),
@@ -868,7 +873,7 @@ pub(crate) fn join_participant(
                 |r| r.get(0),
             )
             .optional()
-            .map_err(|e| bad(e))?,
+            .map_err(bad)?,
         None => None,
     };
 
@@ -876,11 +881,17 @@ pub(crate) fn join_participant(
     let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
         "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
-                            display_name, role, role_description, status, created_at_ms)
-         VALUES (?,?,?, NULL, 'external', 'headless', ?,?,?, 'connected', ?)",
-        params![slot_id, session_id, ws_id, req.name, req.role, req.role_description, now],
+                            display_name, role, role_description, capabilities, status,
+                            created_at_ms)
+         VALUES (?,?,?, NULL, 'external', 'headless', ?,?,?,?, 'connected', ?)",
+        params![
+            slot_id, session_id, ws_id, req.name, req.role, req.role_description,
+            serde_json::to_string(&normalise_capabilities(&req.capabilities))
+                .unwrap_or_else(|_| "[]".into()),
+            now
+        ],
     )
-    .map_err(|e| bad(e))?;
+    .map_err(bad)?;
     let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
         "INSERT INTO agents (id, slot_id, node_id, provenance, status, kind_hint,
@@ -888,7 +899,7 @@ pub(crate) fn join_participant(
          VALUES (?,?, NULL, 'external', 'running', ?, ?, ?, ?)",
         params![agent_id, slot_id, req.kind_hint, now + proto::NODE_LEASE_MS as i64, now, now],
     )
-    .map_err(|e| bad(e))?;
+    .map_err(bad)?;
     db.execute(
         "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?, NULL, 'participant_joined', ?)",
         params![now, req.name, json!({ "slot": slot_id, "agent": agent_id }).to_string()],
@@ -944,7 +955,7 @@ pub async fn participant_ack(
     let scoped = auth_participant(&st, &headers)?;
     verify_agent_scope(&st, &req.agent_id, &scoped)?;
     let db = st.db.lock().unwrap();
-    tools::ack_messages(&db, &req.agent_id, &req.message_ids).map_err(|e| bad(e))?;
+    tools::ack_messages(&db, &req.agent_id, &req.message_ids).map_err(bad)?;
     Ok(Json(json!({ "acked": req.message_ids.len() })))
 }
 
@@ -971,11 +982,11 @@ pub async fn participant_messages(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(|e| bad(e))?
+        .map_err(bad)?
         .ok_or_else(|| bad("unknown agent"))?;
-    let pending = tools::pending_for_slot(&db, &session_id, &slot_id).map_err(|e| bad(e))?;
+    let pending = tools::pending_for_slot(&db, &session_id, &slot_id).map_err(bad)?;
     let ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
-    tools::mark_inflight(&db, &q.agent_id, &ids).map_err(|e| bad(e))?;
+    tools::mark_inflight(&db, &q.agent_id, &ids).map_err(bad)?;
     Ok(Json(json!({ "messages": pending })))
 }
 

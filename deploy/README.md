@@ -1,0 +1,185 @@
+# Deploying nexmesh
+
+The shape this is written for, because it is the one it was built against:
+
+```
+            nexmesh.nexlab.net  (45.221.129.219, bukkake wan0)
+                     |
+                  nginx  ── terminates public TLS, verifies client certs
+                     |
+   bukkake ──── nexmesh-hub  --listen 127.0.0.1:7870
+   (Devuan,                  --listen 192.168.42.44:7870
+    no AVX)                  --trusted-proxy 127.0.0.1
+                     |
+        ┌────────────┼─────────────┐
+     zeiss         lisa          sissy        ← nodes, over the LAN address
+   (RTX 3090)   (web host)      (laptop)
+        |            |
+  nexmesh-coderai   hermes (participant)
+```
+
+Two addresses on the hub on purpose. Loopback is for nginx; the LAN address is
+for the machines. **Not `0.0.0.0`** — bukkake has public addresses on `wan0`,
+so a wildcard bind would put an API that starts processes on the internet.
+
+## 1. Binaries
+
+Built static against musl, generic CPU. bukkake is a Celeron J1900 with **no
+AVX**: a binary built with `-C target-cpu=native` on any other machine here
+dies with `SIGILL` on it.
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install musl-tools          # tree-sitter's grammars are C
+export CC_x86_64_unknown_linux_musl=musl-gcc
+cargo build --release --workspace --target x86_64-unknown-linux-musl
+```
+
+Or take the tarball from a GitHub release, which is built exactly this way.
+
+```bash
+for h in bukkake zeiss lisa; do
+  scp target/x86_64-unknown-linux-musl/release/{nexmesh,nexmesh-hub,nexmesh-node,nexmesh-mcpd,nexmesh-orch,nexmesh-coderai} root@$h:/usr/local/bin/
+  ssh root@$h 'mkdir -p /etc/nexmesh /var/lib/nexmesh /var/log/nexmesh'
+  scp -r clis capabilities root@$h:/etc/nexmesh/
+done
+```
+
+## 2. The fleet CA, on the hub
+
+```bash
+ssh root@bukkake
+nexmesh-hub --db /var/lib/nexmesh/hub.db pki init \
+    --dir /var/lib/nexmesh/pki \
+    --host bukkake --host 192.168.42.44 --host 127.0.0.1 \
+    --host nexmesh.nexlab.net
+# one client certificate per machine, and one for nginx
+for n in zeiss lisa sissy nginx-proxy operator; do
+  nexmesh-hub --db /var/lib/nexmesh/hub.db pki issue "$n" \
+      --dir /var/lib/nexmesh/pki --out /var/lib/nexmesh/pki/issued/"$n"
+done
+```
+
+The CA key never leaves bukkake. Each machine gets `ca-cert.pem` plus its own
+certificate and key, all 0600.
+
+## 3. The hub
+
+`/etc/nexmesh/hub.env`, mode 0600:
+
+```sh
+NEXMESH_DB=/var/lib/nexmesh/hub.db
+NEXMESH_PKI=/var/lib/nexmesh/pki
+NEXMESH_TLS_CERT=/var/lib/nexmesh/pki/server-cert.pem
+NEXMESH_TLS_KEY=/var/lib/nexmesh/pki/server-key.pem
+NEXMESH_CLIENT_CA=/var/lib/nexmesh/pki/ca-cert.pem
+# The pairing listener takes no client certificate -- a machine being paired
+# has none yet -- so it stays on the LAN and never on wan0.
+NEXMESH_PAIR_LISTEN=192.168.42.44:7871
+NEXMESH_EXTRA="--listen 127.0.0.1:7870 --listen 192.168.42.44:7870 --trusted-proxy 127.0.0.1"
+```
+
+```bash
+install -m 755 deploy/initd/nexmesh-hub /etc/init.d/nexmesh-hub
+adduser --system --group --no-create-home nexmesh
+update-rc.d nexmesh-hub defaults          # start at boot
+service nexmesh-hub start
+```
+
+Then the first credentials:
+
+```bash
+nexmesh-hub --db /var/lib/nexmesh/hub.db dashboard-setup-code   # for the browser
+for n in zeiss lisa sissy; do
+  nexmesh-hub --db /var/lib/nexmesh/hub.db enrol "$n"           # one token each
+done
+```
+
+A node token is worth a shell on that machine. Put it straight into the
+machine's own 0600 config and nowhere else.
+
+## 4. nginx, for the public name
+
+See `deploy/nginx/`. The hub is on loopback for this, and
+`--trusted-proxy 127.0.0.1` is what makes the hub believe nginx's verdict
+about a client certificate. Without that flag the headers are ignored and the
+binding is simply not enforced; with it, **the hub must not be reachable
+except through nginx**, which is why it binds loopback and the LAN rather
+than `wan0`.
+
+## 5. Nodes
+
+`/etc/nexmesh/node.env` on each machine, mode 0600:
+
+```sh
+NEXMESH_HUB=wss://192.168.42.44:7870
+NEXMESH_NAME=zeiss                       # or lisa, sissy
+NEXMESH_TOKEN=<the enrol token for this machine>
+NEXMESH_CLIS=/etc/nexmesh/clis
+NEXMESH_CA_CERT=/etc/nexmesh/pki/ca-cert.pem
+NEXMESH_CLIENT_CERT=/etc/nexmesh/pki/zeiss-cert.pem
+NEXMESH_CLIENT_KEY=/etc/nexmesh/pki/zeiss-key.pem
+NEXMESH_NODE_USER=nextime                # it spawns agent CLIs as this user
+```
+
+```bash
+install -m 755 deploy/initd/nexmesh-node /etc/init.d/nexmesh-node
+update-rc.d nexmesh-node defaults
+service nexmesh-node start
+nexmesh nodes                            # from anywhere, to confirm
+```
+
+`wss://` matters: a node refuses to send its enrolment token in cleartext to
+a remote host, and that refusal is deliberate.
+
+## 6. The capability bridge, on zeiss
+
+zeiss has the GPU and the media service, so the bridge belongs there — a local
+connection, and the service token never crosses the network.
+
+```bash
+nexmesh-hub --db /var/lib/nexmesh/hub.db participant-token bridge --session <id>
+```
+
+`/etc/nexmesh/coderai.env`, mode 0600:
+
+```sh
+NEXMESH_HUB=https://192.168.42.44:7870
+NEXMESH_PARTICIPANT_TOKEN=<participant token>
+CODERAI_URL=http://127.0.0.1:8000
+CODERAI_TOKEN=<created in that service's own Admin -> Tokens>
+NEXMESH_CAPABILITIES=/etc/nexmesh/capabilities/coderai.toml
+```
+
+```bash
+nexmesh-coderai --probe-only --service http://127.0.0.1:8000   # check first
+install -m 755 deploy/initd/nexmesh-coderai /etc/init.d/nexmesh-coderai
+update-rc.d nexmesh-coderai defaults
+service nexmesh-coderai start
+```
+
+## 7. hermes on lisa, as a participant
+
+hermes is not an agent CLI and has no node to spawn it, which is exactly what
+the participant API is for. Mint it a token and point it at the hub:
+
+```bash
+nexmesh-hub --db /var/lib/nexmesh/hub.db participant-token hermes --session <id>
+# then, from hermes:
+POST https://192.168.42.44:7870/v1/participant/join
+     {"name": "Hermes", "role": "archivist", "kind_hint": "hermes"}
+```
+
+Or, if it speaks MCP, point it at `/v1/mcp` instead and skip the API
+entirely.
+
+## Checking it
+
+```bash
+nexmesh nodes                       # all three, connected
+service nexmesh-hub status
+curl -sk https://192.168.42.44:7870/healthz
+```
+
+Logs are in `/var/log/nexmesh/`. Every service is `service <name> status` and
+starts at boot through `update-rc.d`.

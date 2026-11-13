@@ -87,6 +87,7 @@ port — so starting with two machines does not paint us into a corner.
 | `nexmesh-mcpd` | per agent, stdio | The MCP shim the CLI loads. Talks to its local node over a unix socket; holds no credentials. |
 | `nexmesh` | anywhere | Operator CLI. |
 | `nexmesh-orch` | wherever you work | The orchestrator, as an MCP server, so **any** MCP-capable CLI can run the fleet. |
+| `nexmesh-coderai` | beside a media/OCR service | A capability bridge: joins as a participant, offers OCR, transcription, speech, embeddings, images. The only component holding that service's token. |
 
 ## Supporting any agent CLI
 
@@ -177,7 +178,7 @@ doors:
 | node-supervised command | a program that is not an "agent CLI" | a descriptor |
 
 An external participant joins with `POST /v1/participant/join`, calls the same
-27 tools through the same dispatcher, and shows up in `list_peers` like anyone
+30 tools through the same dispatcher, and shows up in `list_peers` like anyone
 else. It needs no node, no pty and no MCP implementation. Consequently
 `agents.node_id`, `pid` and `proc_start_ticks` are all nullable, and such an
 agent's liveness is a lease it renews -- the same mechanism as a node, for the
@@ -214,7 +215,7 @@ claude mcp add --transport http team \
 
 That is the whole integration. No nexmesh client, no SDK, no node on the
 machine: a token and a URL make anything that speaks MCP a teammate, with the
-same 27 tools and the same delivery. Verified against both `claude` and
+same 30 tools and the same delivery. Verified against both `claude` and
 `opencode`, which each report the endpoint connected and negotiate MCP
 `2025-03-26`.
 
@@ -248,6 +249,120 @@ refused, because a browser on any page can reach a loopback address.
 > Not to be confused with `nexmesh-orch`, which is the mirror image: that one
 > makes *your* CLI the operator of the fleet, where this one makes an external
 > agent a *member* of a team.
+
+## Asking a teammate for something you cannot do
+
+Messages are the right shape for "here is something you should know" and the
+wrong shape for "read this scanned page and give me the text": the asker
+cannot continue until it has the answer. So there is a second primitive:
+
+```
+ask_capability {"capability": "ocr", "request": {"image": "data:application/pdf;base64,..."}}
+
+CoderAI answered:
+[surya/pdf] INVOICE 2026-11 total 420 EUR
+```
+
+It blocks until the holder answers, and the holder is whoever advertises that
+capability label — `pending_asks` to see what is waiting, `answer_ask` to
+return it. An ask is a **row**, not an in-memory channel, so a holder
+restarted mid-flight leaves it visibly pending rather than leaving the asker
+waiting on something that no longer exists; a holder that exits fails its
+outstanding asks so the asker is told instead of timing out. Only the holder
+an ask was given to may answer it, an idle holder is preferred over a busy
+one, and a capability nobody offers is refused with a pointer to `list_peers`
+rather than a silence.
+
+This knows nothing about any particular service. Whoever advertises a label
+can serve it — which is what lets a bridge to an external service be an
+ordinary participant that holds its own credentials.
+
+## A bridge to senses the team does not have
+
+Agents are language models. They cannot hear an audio file, read a scanned
+page, or look at a diagram. A service that can do those things is therefore
+worth more to a team than another model, and `nexmesh-coderai` joins as an
+ordinary participant offering exactly that:
+
+```bash
+nexmesh-hub participant-token bridge --session se-1234abcd
+CODERAI_TOKEN=... nexmesh-coderai --hub http://hub:7870 --token <participant> \
+    --service http://media-host:8000
+```
+
+```
+16 capability(ies) on http://media-host:8000:
+  ocr          Read text out of an image or a PDF, optionally into a schema [models: paddle, surya]
+  transcribe   Turn speech in an audio or video file into text [service default model]
+  embed        Turn text into vectors, for similarity and retrieval [service default model]
+  ...
+```
+
+`--probe-only` reports that and exits, which is how you check an install
+without joining a team.
+
+**It holds the credential, and nothing else does.** `mcpd` deliberately holds
+none so a compromised agent gains no reach; putting a service token into the
+hub or a node would undo that for every machine in the fleet. Here it lives in
+one process that can do nothing but answer requests for what it advertises.
+
+**No text generation, by choice.** Agents already *are* language models, so
+routing their thinking through another one is a loop with a bill attached. The
+chat and completion endpoints are absent from the manifest deliberately.
+
+### Discovery, not assumption
+
+Capabilities are a **TOML manifest**, for the same reason CLIs are: the
+service behind this one registers well over two hundred routes, and both its
+published capability document and its written documentation are out of date
+against its own code — the document omits whole subsystems that are serving.
+Hard-coding any of that would rot silently. A capability is a row saying where
+to call, how to find out whether it is installed, which models it offers,
+which request fields to pass through, and where the answer is.
+
+Three kinds of evidence, in order, because no single one covers everything:
+
+1. **Its own listing endpoint** — `/v1/ocr/engines` and friends. The strongest
+   evidence, and where the real model list comes from.
+2. **The service's capability document** — a hint, not a source of truth,
+   since it is known to be incomplete.
+3. **The route itself.** A GET at a POST-only route is answered `405` by the
+   framework serving it and `404` when nothing is registered, so the wrong
+   method is a read-only existence check. This is what rescues embeddings,
+   rerank and diarization, which have neither a listing endpoint nor a mention
+   in the document — without it they would be invisible despite working.
+
+Every "where is the answer" is a **list** of candidate paths, tried in order,
+because these response shapes are not reliably documented and a rename should
+cost a fallback rather than the capability. Nothing matched is reported as
+such, with the raw answer, rather than returned as an empty success.
+
+### The model choice is the asker's
+
+`list_peers` shows each holder's capabilities, and the bridge writes what it
+found into shared memory on joining, so a teammate can read what is on offer:
+
+```
+- ocr: Read text out of an image or a PDF (models: paddle, surya)
+```
+
+`ask_capability` takes a `model`, validated against what the install actually
+has — asking for one it lacks is refused *with the real options*, rather than
+passed down to become a confusing error from the service. A capability with no
+model list says "service default" instead of inventing one.
+
+### Binaries
+
+base64 travels inline, because the service takes data URIs and bare base64
+natively and a scanned page is the common case. Two limits are deliberate
+rather than inherited: the hub accepts a 16MB body (the framework default of
+2MB silently made this impossible — an agent got a bare `413` long before the
+bridge could say anything useful), and the bridge refuses anything over 8MB
+inline **with advice**: upload it to the service's own content-addressed blob
+store and pass the reference. Produced files come back as references too; a
+generated video has no business travelling through a message. A served request
+over 64KB is replaced by a note of its size once answered, so the database
+does not grow for no benefit.
 
 ## Reading a codebase once, not once per agent
 
@@ -512,6 +627,68 @@ than editing a config format that may change underneath us; for opencode, whose
 instead. Either way the token never appears in the output, including `--dry-run`.
 
 ## The web dashboard
+
+Served by the hub itself, with no CDN and no external fonts: one page, inline.
+`agents`, `messages`, `plan`, `knowledge`, `graph`, `files` and `fleet`.
+
+### Signing in
+
+The dashboard has **accounts of its own** — a username and a password. An
+account authenticates a *person*; an operator token stays what a script or a
+CLI uses, and a token good for the whole API was a poor thing to keep in a
+browser's `localStorage`.
+
+The first account cannot simply be claimed by whoever arrives first, because
+this hub may answer on a public address. Creating it needs a code the hub
+prints to its own terminal:
+
+```bash
+nexmesh-hub dashboard-setup-code
+# setup code: xK3f...
+```
+
+Paste that into the first-run form with a username and a password, and you are
+in. Afterwards: `nexmesh-hub dashboard-user <name>` to add another,
+`nexmesh-hub dashboard-passwd <name>` to reset one — which also ends that
+account's open sessions, because a password change that leaves them alive
+locks nobody out. Both read the password from stdin by default, since one on a
+command line ends up in shell history and in `ps`.
+
+What is stored: **Argon2id** for passwords, and only the *hash* of a session
+cookie, so the sessions table is not a list of working credentials. The cookie
+is `HttpOnly`, `SameSite=Strict`, and `Secure` whenever the request arrived
+over TLS — marked honestly rather than optimistically, because marking it on a
+plain-HTTP hub would stop the browser sending it at all.
+
+A wrong username and a wrong password give the **same** message, so the form
+cannot be used to learn which accounts exist, and an unknown username still
+pays for a hash rather than answering instantly. Repeated failures lock the
+account for fifteen minutes — reported as rate limiting, not as a bad
+password, because it is not one. Resetting from the host clears it.
+
+Creating an account also **closes the open-hub case**: a hub with no
+credentials at all is deliberately open and loopback-only, and setting a
+password is an explicit statement that this hub has an owner.
+
+### Behind nginx
+
+`deploy/nginx/nexmesh.nexlab.net.conf` is a working vhost, and the thing to
+understand before using it is that terminating TLS at the proxy moves where
+mutual TLS happens. The hub normally reads the client certificate off its own
+handshake; behind a proxy it sees nginx's connection instead, so the
+certificate-to-token binding has nothing to look at.
+
+nginx therefore verifies the client certificate and forwards the result, and
+the hub believes those headers **only** from an address nominated with
+`--trusted-proxy`. `X-Client-Verify` is checked before `X-Client-CN`, because
+nginx forwards a common name even for a certificate it rejected. And the flag
+is why the hub must be bound to loopback: anything that can reach it directly
+could set those headers itself and claim any identity.
+
+The pairing listener is deliberately *not* proxied. A machine being paired has
+no certificate yet, so that endpoint cannot require one — which is exactly why
+it belongs on the LAN or the VPN and never on a public name.
+
 
 ```bash
 nexmesh-hub --listen 127.0.0.1:7870 serve   # then open http://127.0.0.1:7870/
@@ -998,13 +1175,30 @@ CLI nexmesh has never heard of gets the fast path without a nexmesh release;
 and the MCP front door, so anything that speaks MCP is a teammate with nothing
 but a URL and a token.
 
+**Done since.** Scoped memory with cross-session continuity; a code graph
+with Leiden subsystems, visible on the dashboard as well as through a tool; a
+synchronous capability ask; a bridge that gives a team senses it does not
+have; dashboard accounts with a username and a password; GitHub Actions for CI
+and release binaries; and `deploy/` -- sysvinit scripts and an nginx vhost,
+because the hosts this runs on are Devuan and the dashboard belongs behind a
+real name.
+
 **Known gaps**, deliberate and not silent: `sync = "shared_fs"` is a no-op by
-design, because a shared filesystem already does that job.
+design, because a shared filesystem already does that job. And the capability
+manifest's request *field names* were read from documentation that is known to
+be stale -- where one is wrong the service answers naming the field it wanted,
+and the fix is a line of TOML rather than a release, which is the whole reason
+it is a manifest.
 
 Throughout this document, machines are called *machine A*, *machine B* and so
 on; substitute your own.
 
 ## Deployment notes
+
+`deploy/` has the real thing: sysvinit scripts for the hub, a node and the
+bridge, an nginx vhost, and a runbook in `deploy/README.md` for the topology
+this was built against — hub on loopback **and** a LAN address, nginx owning
+the public name, nodes connecting over the LAN.
 
 - Devuan/sysvinit hosts need `/etc/init.d` scripts, not systemd units.
 - Build `--target x86_64-unknown-linux-musl` for a dependency-free drop-in.

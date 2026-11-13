@@ -331,12 +331,103 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             let tout: i64 = agents.iter().filter_map(|a| a["output_tokens"].as_i64()).sum();
             let flapping = agents.iter().filter(|a| a["slot_status"] == "flapping").count();
 
+            // The code graph, per workspace: its subsystems and what is in
+            // them. Until now this existed only behind a tool, so an agent
+            // could see the shape of a codebase and a person could not --
+            // and the subsystem map is the part a person most wants.
+            // Queried from the workspaces table rather than derived from the
+            // array above, which deliberately does not expose internal ids.
+            let session_workspaces: Vec<(String, String)> = db
+                .prepare("SELECT id, name FROM workspaces WHERE session_id = ? ORDER BY name")
+                .and_then(|mut st| {
+                    st.query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+            let graph: Vec<Value> = session_workspaces
+                .iter()
+                .filter_map(|(ws_id, ws_name)| {
+                    let ws_id = ws_id.as_str();
+                    let (built, files, truncated, communities): (i64, i64, i64, i64) = db
+                        .query_row(
+                            "SELECT built_at_ms, files, truncated, communities
+                               FROM code_graph_meta WHERE workspace_id = ?",
+                            [ws_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()?;
+                    let counts: Vec<Value> = db
+                        .prepare(
+                            "SELECT kind, COUNT(*) FROM code_graph_nodes
+                              WHERE workspace_id = ? GROUP BY kind ORDER BY 2 DESC",
+                        )
+                        .and_then(|mut st| {
+                            st.query_map([ws_id], |r| {
+                                Ok(json!({ "kind": r.get::<_, String>(0)?,
+                                           "n": r.get::<_, i64>(1)? }))
+                            })
+                            .and_then(|m| m.collect())
+                        })
+                        .unwrap_or_default();
+                    // Largest first, with a few recognisable members each:
+                    // a list of numbered communities tells a reader nothing.
+                    let subsystems: Vec<Value> = db
+                        .prepare(
+                            "SELECT community, COUNT(*) FROM code_graph_nodes
+                              WHERE workspace_id = ? AND community IS NOT NULL
+                              GROUP BY community ORDER BY 2 DESC LIMIT 24",
+                        )
+                        .and_then(|mut st| {
+                            st.query_map([ws_id], |r| {
+                                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                            })
+                            .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(c, n)| {
+                            let members: Vec<Value> = db
+                                .prepare(
+                                    "SELECT name, path, kind FROM code_graph_nodes
+                                      WHERE workspace_id = ? AND community = ?
+                                      ORDER BY CASE kind WHEN 'type' THEN 0
+                                                         WHEN 'function' THEN 1 ELSE 2 END,
+                                               name LIMIT 8",
+                                )
+                                .and_then(|mut st| {
+                                    st.query_map(rusqlite::params![ws_id, c], |r| {
+                                        Ok(json!({ "name": r.get::<_, String>(0)?,
+                                                   "path": r.get::<_, String>(1)?,
+                                                   "kind": r.get::<_, String>(2)? }))
+                                    })
+                                    .and_then(|m| m.collect())
+                                })
+                                .unwrap_or_default();
+                            json!({ "id": c, "n": n, "members": members })
+                        })
+                        .collect();
+                    Some(json!({
+                        "workspace": ws_name,
+                        "workspace_id": ws_id,
+                        "built_at_ms": built,
+                        "files": files,
+                        "truncated": truncated != 0,
+                        "communities": communities,
+                        "counts": counts,
+                        "subsystems": subsystems,
+                    }))
+                })
+                .collect();
+
             json!({
                 "session": session,
                 "agents": agents,
                 "messages": messages,
                 "plan": plan,
                 "knowledge": knowledge,
+                "graph": graph,
                 "locks": locks,
                 "zones": zones,
                 "workspaces": workspaces,

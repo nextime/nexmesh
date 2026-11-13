@@ -128,6 +128,8 @@
   .gate form { display: flex; gap: 8px; margin-top: 14px; }
   .gate input { flex: 1; font-family: var(--mono); }
   code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+  /* Not .bar: that is already a progress track used elsewhere on this page. */
+  .sizebar { height: 8px; border-radius: 4px; background: var(--accent); opacity: .75; min-width: 4px; }
   @media (max-width: 620px) {
     .msg { grid-template-columns: 52px 14px minmax(0, 1fr); }
     th.hide, td.hide { display: none; }
@@ -136,13 +138,52 @@
 </head>
 <body>
 <div id="gate" class="gate panel" hidden>
-  <h1>Operator token required</h1>
-  <p class="tiny">This hub has operator authentication enabled. Mint a token on the hub with
-     <code>nexmesh-hub operator-token &lt;label&gt;</code>. It is kept in this browser only.</p>
-  <form id="gateForm">
-    <input id="tokenInput" type="password" placeholder="operator token" autocomplete="off" spellcheck="false">
-    <button type="submit">Connect</button>
-  </form>
+  <!-- Sign in. Shown when this hub has an account. -->
+  <div id="gateLogin" hidden>
+    <h1>Sign in</h1>
+    <form id="loginForm">
+      <input id="userInput" type="text" placeholder="username" autocomplete="username"
+             spellcheck="false" autocapitalize="off">
+      <input id="passInput" type="password" placeholder="password"
+             autocomplete="current-password">
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="tiny muted">Forgotten it? On the hub:
+       <code>nexmesh-hub dashboard-passwd &lt;user&gt;</code></p>
+  </div>
+
+  <!-- First run. Creating the first account needs a code the hub printed,
+       because this hub may answer on a public address and whoever arrives
+       first must not simply be able to claim it. -->
+  <div id="gateSetup" hidden>
+    <h1>Set up this dashboard</h1>
+    <p class="tiny">Nobody has an account here yet. Run
+       <code>nexmesh-hub dashboard-setup-code</code> on the hub and paste the code it prints.</p>
+    <form id="setupForm">
+      <input id="setupCode" type="text" placeholder="setup code" autocomplete="off"
+             spellcheck="false">
+      <input id="setupUser" type="text" placeholder="choose a username" autocomplete="off"
+             spellcheck="false" autocapitalize="off">
+      <input id="setupPass" type="password" placeholder="choose a password (12+ characters)"
+             autocomplete="new-password">
+      <button type="submit">Create account</button>
+    </form>
+  </div>
+
+  <!-- A hub with operator tokens but no account: the old path still works. -->
+  <div id="gateToken" hidden>
+    <h1>Operator token</h1>
+    <p class="tiny">This hub has no dashboard account. Create one with
+       <code>nexmesh-hub dashboard-setup-code</code>, or paste a token minted with
+       <code>nexmesh-hub operator-token &lt;label&gt;</code>. A token is kept in this browser
+       only; an account is the better path.</p>
+    <form id="gateForm">
+      <input id="tokenInput" type="password" placeholder="operator token" autocomplete="off"
+             spellcheck="false">
+      <button type="submit">Connect</button>
+    </form>
+  </div>
+
   <p id="gateErr" class="tiny" style="color:var(--bad)"></p>
 </div>
 
@@ -164,7 +205,7 @@
 
 <script>
 "use strict";
-const TABS = ["agents", "messages", "plan", "knowledge", "files", "fleet"];
+const TABS = ["agents", "messages", "plan", "knowledge", "graph", "files", "fleet"];
 const KEY = "nexmesh.operator.token";
 let token = localStorage.getItem(KEY) || "";
 let tab = location.hash.replace("#", "") || "agents";
@@ -197,7 +238,8 @@ function stateClass(s) {
 async function fetchSnapshot() {
   const url = "/v1/dashboard/state" + (session ? "?session=" + encodeURIComponent(session) : "");
   const headers = token ? { authorization: "Bearer " + token } : {};
-  const r = await fetch(url, { headers, cache: "no-store" });
+  // same-origin credentials: the session is a cookie, not a header.
+  const r = await fetch(url, { headers, cache: "no-store", credentials: "same-origin" });
   if (r.status === 401) { const e = new Error("unauthorized"); e.code = 401; throw e; }
   if (!r.ok) throw new Error("hub returned " + r.status);
   return r.json();
@@ -222,11 +264,21 @@ async function tick() {
   }
 }
 
-function showGate(msg) {
+// Which of the three gate forms to show, asked of the hub rather than
+// guessed: only it knows whether an account exists.
+async function showGate(msg) {
   clearInterval(timer); timer = null;
   $("app").hidden = true; $("gate").hidden = false;
   $("gateErr").textContent = msg || "";
-  $("tokenInput").focus();
+  let st = { configured: true, tokens_configured: true };
+  try { st = await (await fetch("/v1/auth/state", { cache: "no-store" })).json(); }
+  catch (e) { /* keep the sign-in form: it is the useful default */ }
+  const needSetup = !st.configured;
+  $("gateSetup").hidden = !needSetup;
+  $("gateLogin").hidden = needSetup;
+  // Only offer the token box where it is the only way in.
+  $("gateToken").hidden = !(needSetup && st.tokens_configured);
+  if (needSetup) $("setupCode").focus(); else $("userInput").focus();
 }
 
 function start() {
@@ -241,9 +293,54 @@ $("gateForm").addEventListener("submit", (e) => {
   localStorage.setItem(KEY, token);
   start();
 });
-$("forget").addEventListener("click", () => {
+
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* an empty body is fine */ }
+  if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
+  return j;
+}
+
+$("loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("gateErr").textContent = "";
+  try {
+    await post("/v1/auth/login", {
+      username: $("userInput").value, password: $("passInput").value,
+    });
+    // The session is a cookie now, so any pasted token is redundant.
+    localStorage.removeItem(KEY); token = "";
+    $("passInput").value = "";
+    start();
+  } catch (err) { $("gateErr").textContent = err.message; }
+});
+
+$("setupForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("gateErr").textContent = "";
+  try {
+    const user = $("setupUser").value;
+    const pass = $("setupPass").value;
+    await post("/v1/auth/setup", {
+      setup_code: $("setupCode").value, username: user, password: pass,
+    });
+    // Straight in: having just chosen the password, asking for it again is
+    // pure ceremony.
+    await post("/v1/auth/login", { username: user, password: pass });
+    $("setupPass").value = ""; $("setupCode").value = "";
+    start();
+  } catch (err) { $("gateErr").textContent = err.message; }
+});
+
+$("forget").addEventListener("click", async () => {
   localStorage.removeItem(KEY); token = "";
-  showGate("Token removed from this browser.");
+  try { await post("/v1/auth/logout", {}); } catch (e) { /* already gone */ }
+  showGate("Signed out.");
 });
 $("sessionSel").addEventListener("change", (e) => {
   session = e.target.value;
@@ -289,6 +386,7 @@ function render() {
   const counts = {
     agents: (d && d.agents || []).length, messages: (d && d.messages || []).length,
     plan: (d && d.plan || []).length, knowledge: (d && d.knowledge || []).length,
+    graph: (d && d.graph || []).reduce((n, g) => n + (g.communities || 0), 0),
     files: ((d && d.locks || []).length + (d && d.zones || []).length),
     fleet: (snap.nodes || []).length + openCodes,
   };
@@ -312,7 +410,8 @@ function render() {
          <code>nexmesh new-session &lt;name&gt;</code>, or pair a machine on the
          <a href="#fleet">fleet</a> tab.</div></div>`
     : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
-         knowledge: viewKnowledge, files: viewFiles, fleet: viewFleet })[tab](d, now);
+         knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
+         fleet: viewFleet })[tab](d, now);
 
   if (keep.name !== null && $("pairName")) {
     $("pairName").value = keep.name;
@@ -396,6 +495,54 @@ function viewPlan(d) {
             : p.status === "in_progress" ? "info" : ""}">${esc(p.status)}</span></td>
         <td>${esc(p.label)}</td>
         <td class="muted tiny">${esc(p.who)}</td></tr>`).join("") + `</tbody></table>`);
+}
+
+// The code graph, as a person wants to read it: subsystems largest first,
+// each with enough members to be recognisable. An agent gets the same thing
+// through query_code_graph; this is so you can see it too.
+function viewGraph(d, now) {
+  const gs = d.graph || [];
+  if (!gs.length)
+    return empty(`No workspace here has been parsed yet. An agent builds the graph the first
+      time it asks about the code, or you can ask for it with
+      <code>query_code_graph</code>.`);
+  return gs.map((g) => {
+    const kinds = (g.counts || [])
+      .map((c) => `${human(c.n)} ${esc(c.kind)}${c.n === 1 ? "" : "s"}`).join(" · ");
+    const head = `<div class="row">
+        <strong>${esc(g.workspace || g.workspace_id)}</strong>
+        <span class="muted tiny">${human(g.files)} file${g.files === 1 ? "" : "s"}
+          · ${g.communities} subsystem${g.communities === 1 ? "" : "s"}
+          · parsed ${ago(g.built_at_ms, now)}</span>
+        ${g.truncated
+          ? `<span class="badge warn" title="the walk hit its file limit">partial</span>` : ""}
+      </div>
+      <div class="muted tiny">${kinds}</div>`;
+    if (!(g.subsystems || []).length)
+      return panel(head + `<div class="empty tiny">Nothing in this workspace connects to
+        anything else, so there are no subsystems to show.</div>`);
+    // Sized by membership, so the shape of the codebase is visible at a glance.
+    const biggest = Math.max(...g.subsystems.map((x) => x.n));
+    const rows = g.subsystems.map((sub) => {
+      const width = Math.max(4, Math.round((sub.n / biggest) * 100));
+      const files = [...new Set(sub.members.map((m) => m.path).filter(Boolean))];
+      return `<tr>
+        <td class="num tiny muted">${sub.id}</td>
+        <td style="width:28%">
+          <div class="sizebar" style="width:${width}%" title="${sub.n} members"></div>
+        </td>
+        <td class="num tiny">${sub.n}</td>
+        <td>${sub.members.map((m) =>
+              `<span class="badge ${m.kind === "type" ? "info" : ""}" title="${esc(m.path)}"
+                >${esc(m.name)}</span>`).join(" ")}</td>
+        <td class="hide muted tiny mono">${esc(files.slice(0, 3).join(", "))}${
+              files.length > 3 ? ` +${files.length - 3}` : ""}</td>
+      </tr>`;
+    }).join("");
+    return panel(head + `<table><thead><tr><th class="num">#</th><th>size</th>
+        <th class="num">members</th><th>what is in it</th>
+        <th class="hide">files</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }).join("");
 }
 
 function viewKnowledge(d, now) {

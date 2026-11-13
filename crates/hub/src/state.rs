@@ -120,6 +120,30 @@ fn migrate(conn: &Connection) -> Result<()> {
          )",
     )?;
     conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dashboard_users (
+            username TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL, last_login_ms INTEGER,
+            failed_count INTEGER NOT NULL DEFAULT 0, locked_until_ms INTEGER);
+         CREATE TABLE IF NOT EXISTS dashboard_sessions (
+            id_sha256 TEXT PRIMARY KEY, username TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL, last_seen_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS dashboard_sessions_user_idx
+            ON dashboard_sessions(username);
+         CREATE TABLE IF NOT EXISTS dashboard_setup (
+            id INTEGER PRIMARY KEY CHECK (id = 1), code_sha256 TEXT NOT NULL,
+            issued_at_ms INTEGER NOT NULL, used_at_ms INTEGER)",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS capability_asks (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, capability TEXT NOT NULL,
+            from_slot TEXT NOT NULL, to_slot TEXT, request TEXT NOT NULL, model TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', result TEXT,
+            asked_at_ms INTEGER NOT NULL, answered_at_ms INTEGER);
+         CREATE INDEX IF NOT EXISTS capability_asks_queue_idx
+            ON capability_asks(to_slot, status)",
+    )?;
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS code_graph_nodes (
             workspace_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
             name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
@@ -278,6 +302,10 @@ pub struct AppState {
     /// Whether a client certificate must agree with the credential presented
     /// alongside it. On by default; see `AppState::identity_binding`.
     bind_identity: Arc<bool>,
+    /// Addresses whose `X-Client-Verify` / `X-Client-CN` headers are believed.
+    /// Empty means none, which is the only safe default: those headers are
+    /// exactly what an attacker would set.
+    trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 }
 
 impl AppState {
@@ -307,6 +335,7 @@ impl AppState {
             tls: Arc::new(Mutex::new(None)),
             kicks: Arc::new(Mutex::new(HashMap::new())),
             bind_identity: Arc::new(true),
+            trusted_proxies: Arc::new(Vec::new()),
         })
     }
 
@@ -328,6 +357,7 @@ impl AppState {
             tls: Arc::new(Mutex::new(None)),
             kicks: Arc::new(Mutex::new(HashMap::new())),
             bind_identity: Arc::new(true),
+            trusted_proxies: Arc::new(Vec::new()),
         })
     }
 
@@ -345,6 +375,13 @@ impl AppState {
         if let Some(tx) = self.sync_waiters.lock().unwrap().remove(&req_id) {
             let _ = tx.send(value);
         }
+    }
+
+    /// Is this hub serving TLS itself? Decides whether a session cookie is
+    /// marked `Secure` -- marking it on a plain-HTTP hub would stop the
+    /// browser sending it at all.
+    pub fn tls_in_use(&self) -> bool {
+        self.tls.lock().unwrap().is_some()
     }
 
     pub fn set_tls(&self, handle: TlsHandle) {
@@ -416,6 +453,16 @@ impl AppState {
     pub fn with_identity_binding(mut self, on: bool) -> Self {
         self.bind_identity = Arc::new(on);
         self
+    }
+
+    /// Reverse proxies whose verified-client headers may be believed.
+    pub fn with_trusted_proxies(mut self, proxies: Vec<std::net::IpAddr>) -> Self {
+        self.trusted_proxies = Arc::new(proxies);
+        self
+    }
+
+    pub fn trusted_proxies(&self) -> &[std::net::IpAddr] {
+        &self.trusted_proxies
     }
 
     pub fn with_pki_dir(mut self, dir: &str) -> Self {
@@ -544,6 +591,10 @@ impl AppState {
 
     /// Has operator authentication EVER been set up on this hub?
     ///
+    /// A dashboard account counts: creating one is an explicit statement that
+    /// this hub has an owner, so it must close the open case too. Otherwise
+    /// setting up a password would leave the API wide open beside it.
+    ///
     /// Deliberately counts revoked tokens too. If it only counted live ones,
     /// revoking your last token -- the thing you do the moment one leaks --
     /// would turn authentication off and leave the fleet wide open. Once auth
@@ -551,7 +602,15 @@ impl AppState {
     /// safe direction to fail.
     pub fn operator_auth_configured(&self) -> bool {
         let db = self.db.lock().unwrap();
-        db.query_row("SELECT 1 FROM operator_tokens LIMIT 1", [], |r| r.get::<_, i64>(0))
+        let tokens = db
+            .query_row("SELECT 1 FROM operator_tokens LIMIT 1", [], |r| r.get::<_, i64>(0))
+            .optional()
+            .unwrap_or(None)
+            .is_some();
+        if tokens {
+            return true;
+        }
+        db.query_row("SELECT 1 FROM dashboard_users LIMIT 1", [], |r| r.get::<_, i64>(0))
             .optional()
             .unwrap_or(None)
             .is_some()

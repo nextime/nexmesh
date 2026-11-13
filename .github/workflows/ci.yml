@@ -1,0 +1,76 @@
+# Build and test every push.
+#
+# The end-to-end suites run here too, not just the unit tests: they are what
+# actually exercises the hub, the nodes and the drivers together, and they
+# need no API credits -- every agent CLI they drive is a fake in
+# tests/fake-cli that speaks the real protocol.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT -C target-cpu=native. A binary built with it on a runner
+  # with AVX dies with SIGILL on a machine without, and this fleet has such a
+  # machine. Generic is the only safe default for anything distributable.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No `cargo fmt --check` gate, deliberately. This codebase is
+      # hand-formatted -- comments carry most of the reasoning and are wrapped
+      # to sit with the code they explain -- and rustfmt would rewrite 568
+      # sites to satisfy a check nobody asked for. Reformat it on purpose one
+      # day if you like, but not as a side effect of adding CI.
+      # Advisory, not a gate. Most of what it reports here is style, and a
+      # few of the dead-code warnings are property checkers used only by
+      # tests -- worth keeping, not worth deleting to quiet a linter. The
+      # gates that matter are below: it must build, and it must pass.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets || true
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      - name: Things the end-to-end suites need
+        # tmux for session adoption; python3 drives the suites and the fakes.
+        # Without tmux the adopt suite skips itself cleanly rather than
+        # failing, but it is cheap to install and worth actually running.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux
+          python3 --version
+          tmux -V
+
+      - name: Build the binaries the suites drive
+        run: cargo build --workspace
+
+      - name: End-to-end suites
+        # SKIP_UNIT because they already ran above, with better output.
+        env:
+          SKIP_UNIT: "1"
+        run: bash tests/run-all.sh
+
+      - name: Keep the logs of anything that failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/nexmesh-*
+          retention-days: 7
+          if-no-files-found: ignore

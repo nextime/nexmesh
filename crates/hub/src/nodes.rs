@@ -19,11 +19,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn node_ws(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
-    peer: Option<Extension<std::sync::Arc<crate::peer::PeerIdentity>>>,
+    own: Option<Extension<std::sync::Arc<crate::peer::PeerIdentity>>>,
+    conn: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     // Captured before the upgrade: once this is a socket, the handshake that
-    // produced it -- and the certificate presented during it -- is out of reach.
-    let peer = peer.map(|Extension(p)| p).unwrap_or_default();
+    // produced it -- and the certificate presented during it -- is out of
+    // reach. Resolved exactly as every other route resolves it, so a node
+    // arriving through a nominated proxy is bound to its certificate too.
+    let peer = crate::peer::resolve_parts(
+        &st,
+        own.map(|Extension(p)| p),
+        conn.map(|c| c.0.ip()),
+        &headers,
+    );
     ws.on_upgrade(move |sock| session(sock, st, peer))
 }
 
@@ -236,6 +245,21 @@ async fn handle(
                  WHERE inflight_agent = ? AND acked_at_ms IS NULL",
                 [&agent_id],
             )?;
+            // And anyone blocked on a request it was serving must be told,
+            // rather than waiting out a timeout on a slot that has gone.
+            if let Some(slot) = db
+                .query_row("SELECT slot_id FROM agents WHERE id = ?", [&agent_id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?
+            {
+                match crate::asks::fail_outstanding(&db, &slot) {
+                    Ok(n) if n > 0 => tracing::warn!(%agent_id, requests = n,
+                        "agent exited holding capability requests; askers told"),
+                    Err(e) => tracing::error!(error = %e, "releasing capability requests"),
+                    _ => {}
+                }
+            }
             tracing::info!(node = %node_name, %agent_id, ?code, ?signal, "agent exited");
         }
 
@@ -393,6 +417,72 @@ async fn handle(
 
 /// Tools that have to talk to a node, so cannot run inside the synchronous
 /// dispatcher.
+/// Ask a teammate and wait for the answer.
+///
+/// Polled rather than notified: the holder may be any kind of participant on
+/// any machine, and a poll on one indexed table is cheap next to the work
+/// being waited for.
+async fn ask_capability_tool(
+    st: &AppState,
+    agent_id: &str,
+    args: &serde_json::Value,
+) -> Result<String> {
+    let (slot_id, _) = slot_and_name(st, agent_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent '{agent_id}'"))?;
+    let capability = args
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing required argument 'capability'"))?;
+    let request = args.get("request").cloned().unwrap_or(serde_json::json!({}));
+    let model = args.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let timeout = args
+        .get("timeout_seconds")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(crate::asks::DEFAULT_TIMEOUT_S)
+        .clamp(1, crate::asks::MAX_TIMEOUT_S);
+
+    let session_id: String = {
+        let db = st.db.lock().unwrap();
+        db.query_row("SELECT session_id FROM slots WHERE id = ?", [&slot_id], |r| r.get(0))?
+    };
+    let (id, _to_slot, label) = {
+        let db = st.db.lock().unwrap();
+        crate::asks::create(
+            &db,
+            &session_id,
+            &slot_id,
+            capability,
+            &serde_json::to_string(&request).unwrap_or_else(|_| "{}".into()),
+            model.as_deref(),
+        )?
+    };
+    tracing::info!(%id, %capability, holder = %label, "capability asked");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout as u64);
+    loop {
+        {
+            let db = st.db.lock().unwrap();
+            if let Some((status, result)) = crate::asks::poll(&db, &id)? {
+                let body = result.unwrap_or_default();
+                return if status == "done" {
+                    Ok(format!("{label} answered:\n{body}"))
+                } else {
+                    // A failure the asker can read beats a timeout it cannot
+                    // explain.
+                    Ok(format!("{label} could not do it: {body}"))
+                };
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(format!(
+                "{label} has not answered within {timeout}s. The request is still pending as \
+                 {id}; ask again or try another holder."
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+}
+
 fn is_workspace_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -407,6 +497,9 @@ pub async fn run_tool_async(
     tool: &str,
     args: &serde_json::Value,
 ) -> Result<(String, Vec<proto::Envelope>)> {
+    if tool == "ask_capability" {
+        return ask_capability_tool(st, agent_id, args).await.map(|t| (t, vec![]));
+    }
     if is_workspace_tool(tool) {
         return workspace_tool(st, agent_id, tool, args).await;
     }

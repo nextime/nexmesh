@@ -490,7 +490,7 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             // EOF and shuts down cleanly, finishing whatever it was writing.
             ctx.close_agent_input(&agent_id);
             tracing::info!(%agent_id, grace_ms, "released; closed its input");
-            let ctx = ctx.clone();
+            let _ctx = ctx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
                 // Still there after the grace period: it is not going to leave
@@ -725,6 +725,14 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
     }
 }
 
+/// Distinguishes "the node restarted" from "the machine rebooted" -- after a
+/// reboot every pid the hub remembers is meaningless, start_ticks included.
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{absolutize_mcpd, check_transport};
@@ -788,12 +796,4 @@ mod tests {
         assert!(absolutize_mcpd("sh").unwrap().starts_with('/'));
         assert_eq!(absolutize_mcpd("nexmesh-definitely-absent").unwrap(), "nexmesh-definitely-absent");
     }
-}
-
-/// Distinguishes "the node restarted" from "the machine rebooted" -- after a
-/// reboot every pid the hub remembers is meaningless, start_ticks included.
-fn boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
 }

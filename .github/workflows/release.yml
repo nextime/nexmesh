@@ -1,0 +1,135 @@
+# Build distributable binaries and attach them to a GitHub release.
+#
+# Tag a commit `v0.2.0` and push the tag; this builds, packages and publishes.
+# `workflow_dispatch` builds the same artifacts without releasing, for
+# checking a change to this file.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The ordinary build, for a host with a matching glibc.
+          - target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+            static: false
+          # The one worth having: a dependency-free drop-in, which is what a
+          # Devuan/sysvinit host or an old box actually needs.
+          - target: x86_64-unknown-linux-musl
+            label: linux-x86_64-musl
+            static: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: A C toolchain for the musl target
+        if: matrix.static
+        # tree-sitter's grammars are C, so the target needs a C compiler too,
+        # not just a Rust one. Without this the grammar crates fail to build
+        # and the code graph silently loses every language.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "AR_x86_64_unknown_linux_musl=ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        # No target-cpu=native: see the note in ci.yml. A distributable binary
+        # must run on the oldest machine in the fleet, not the newest runner.
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [ "$version" = "$GITHUB_REF_NAME" ] && version="$(git rev-parse --short HEAD)"
+          name="nexmesh-${version}-${{ matrix.label }}"
+          dir="dist/${name}"
+          mkdir -p "$dir"
+          for b in nexmesh nexmesh-hub nexmesh-node nexmesh-mcpd nexmesh-orch nexmesh-coderai; do
+            cp "target/${{ matrix.target }}/release/$b" "$dir/"
+          done
+          strip "$dir"/* || true
+          # The descriptors and the capability manifest are DATA the binaries
+          # read at runtime, so a tarball without them is not a usable install.
+          cp -r clis capabilities "$dir/"
+          cp README.md LICENSE "$dir/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Check the musl build really is static
+        if: matrix.static
+        # A "static" binary that turns out to be dynamically linked is worse
+        # than no static build at all: it fails on the host it was made for.
+        run: |
+          set -euo pipefail
+          out=$(file "target/${{ matrix.target }}/release/nexmesh-hub")
+          echo "$out"
+          case "$out" in
+            *"statically linked"*) echo "ok: static" ;;
+            *) echo "NOT static -- refusing to publish it"; exit 1 ;;
+          esac
+
+      - name: Smoke-test the binaries
+        # They must at least start on the runner. A tarball of binaries that
+        # cannot run is the one thing a release must never contain.
+        run: |
+          set -euo pipefail
+          d="dist/${{ steps.package.outputs.name }}"
+          "$d/nexmesh-hub" --version
+          "$d/nexmesh-node" --version
+          "$d/nexmesh" --version
+          "$d/nexmesh-orch" --version
+          "$d/nexmesh-coderai" --version
+          "$d/nexmesh-mcpd" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

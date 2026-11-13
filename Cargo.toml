@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/hub", "crates/node", "crates/mcpd", "crates/ctl", "crates/orch"]
+members = ["crates/proto", "crates/hub", "crates/node", "crates/mcpd", "crates/coderai",
+    "crates/ctl", "crates/orch"]
 
 [workspace.package]
 version = "0.1.0"
@@ -41,6 +42,8 @@ rustls-pemfile = "2"
 x509-parser = "0.16"
 # Deterministic parsing for the code graph. C grammars, so each node compiles
 # them once; nothing leaves the machine and no model is involved.
+argon2 = { version = "0.6", features = ["rand_core"] }
+base64 = "0.22"
 tempfile = "3"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"

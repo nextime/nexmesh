@@ -162,6 +162,34 @@ pub fn team_tools() -> Vec<ToolDef> {
                     "scope": json!({ "type": "string",
                         "enum": ["agent", "group", "session", "global"] }),
                     "group": s("Group name, when scope is 'group'") }), &["key"]),
+        tool("ask_capability",
+            "Ask a teammate that can do something you cannot -- OCR a page, transcribe audio, \
+             embed text, generate an image -- and WAIT for the result. Use list_peers with a \
+             capability filter to see what is on offer and which models each holder has. This \
+             blocks until the answer comes back, so expect it to take as long as the work does.",
+            json!({
+                "capability": s("What you need, e.g. 'ocr', 'transcribe', 'embed'"),
+                "request": json!({ "type": "object",
+                    "description": "What to do, in the shape that capability documents. For \
+                                    binary input, pass base64 or a path the holder can read.",
+                    "additionalProperties": true }),
+                "model": s("Which of the holder's models to use, when it offers several"),
+                "timeout_seconds": json!({ "type": "integer",
+                    "description": "How long to wait. Default 180." })
+            }), &["capability", "request"]),
+        tool("pending_asks",
+            "Requests other teammates have sent you for a capability you offer. Answer each \
+             with answer_ask. Only for an agent that advertises a capability.",
+            json!({}), &[]),
+        tool("answer_ask",
+            "Return the result of a request from pending_asks. Say plainly if it failed -- the \
+             asker is blocked until you answer, and a failure it can read beats a timeout it \
+             cannot explain.",
+            json!({ "ask_id": s("The id from pending_asks"),
+                    "result": s("The answer, or why it could not be done"),
+                    "failed": json!({ "type": "boolean",
+                        "description": "True if the work could not be done" }) }),
+            &["ask_id", "result"]),
         tool("query_code_graph",
             "Ask about this workspace's code without reading it: what calls a function, what a \
              file imports, where a symbol is defined, which subsystem something belongs to. \

@@ -1,0 +1,67 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          nexmesh-hub
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: nexmesh hub
+# Description:       Holds all fleet state. Never signals a process.
+### END INIT INFO
+#
+# Devuan/sysvinit. No systemd here, by design.
+
+NAME=nexmesh-hub
+BIN=/usr/local/bin/nexmesh-hub
+PIDFILE=/var/run/$NAME.pid
+LOGFILE=/var/log/nexmesh/hub.log
+USER=nexmesh
+CONF=/etc/nexmesh/hub.env
+
+[ -x "$BIN" ] || exit 0
+[ -r "$CONF" ] && . "$CONF"
+
+: "${NEXMESH_DB:=/var/lib/nexmesh/hub.db}"
+: "${NEXMESH_LISTEN:=127.0.0.1:7870}"
+: "${NEXMESH_PKI:=/var/lib/nexmesh/pki}"
+# TLS and mutual TLS are not optional on anything reachable off-box. Leave
+# these unset only for a loopback hub.
+: "${NEXMESH_TLS_CERT:=}"
+: "${NEXMESH_TLS_KEY:=}"
+: "${NEXMESH_CLIENT_CA:=}"
+# The pairing listener must NOT share the public address: a machine being
+# paired has no certificate yet, so that endpoint cannot require one.
+: "${NEXMESH_PAIR_LISTEN:=}"
+
+ARGS="--db $NEXMESH_DB --listen $NEXMESH_LISTEN --pki-dir $NEXMESH_PKI"
+[ -n "$NEXMESH_TLS_CERT" ] && ARGS="$ARGS --tls-cert $NEXMESH_TLS_CERT"
+[ -n "$NEXMESH_TLS_KEY" ] && ARGS="$ARGS --tls-key $NEXMESH_TLS_KEY"
+[ -n "$NEXMESH_CLIENT_CA" ] && ARGS="$ARGS --client-ca $NEXMESH_CLIENT_CA"
+[ -n "$NEXMESH_PAIR_LISTEN" ] && ARGS="$ARGS --pair-listen $NEXMESH_PAIR_LISTEN"
+[ -n "$NEXMESH_EXTRA" ] && ARGS="$ARGS $NEXMESH_EXTRA"
+
+mkdir -p "$(dirname "$LOGFILE")" "$(dirname "$NEXMESH_DB")" "$NEXMESH_PKI"
+chown -R "$USER" "$(dirname "$LOGFILE")" "$(dirname "$NEXMESH_DB")" "$NEXMESH_PKI" 2>/dev/null || true
+
+case "$1" in
+  start)
+    echo -n "Starting $NAME: "
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$PIDFILE" \
+      --chuid "$USER" --startas /bin/sh -- -c \
+      "exec env RUST_LOG=\${RUST_LOG:-info} $BIN $ARGS serve >> $LOGFILE 2>&1"
+    echo "ok"
+    ;;
+  stop)
+    echo -n "Stopping $NAME: "
+    start-stop-daemon --stop --quiet --retry TERM/20/KILL/5 --pidfile "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo "ok"
+    ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  status)
+    start-stop-daemon --status --pidfile "$PIDFILE" && echo "$NAME running" \
+      || { echo "$NAME not running"; exit 3; }
+    ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac
+exit 0

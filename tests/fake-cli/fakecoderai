@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""A stand-in for the media/OCR service, speaking its real shapes.
+
+Shapes copied from the service's own route registrations and live capability
+document, so the bridge is tested against what it will actually meet: a
+capability document that is INCOMPLETE (it omits ocr, chunk, embeddings and
+moderation, exactly as the real one does), engine catalogues per subsystem,
+and a 401 on everything but the health check.
+
+Some capabilities are deliberately absent so the bridge has to discover that
+rather than assume it.
+"""
+import base64, json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+TOKEN = os.environ.get("FAKE_CODERAI_TOKEN", "secret-token")
+
+# Mirrors the real document: studio.endpoints lists SOME of what is served.
+# ocr, chunk, embeddings, moderation and rerank are all served and all absent
+# from it -- which is why the bridge must probe.
+CAPABILITY_DOC = {
+    "server": "codai",
+    "version": "2.0.0",
+    "transports": ["websocket"],
+    "tunnel_only": True,
+    "openai_compat": {"chat_completions": True, "models": True},
+    "studio": {
+        "supported": True,
+        "endpoints": [
+            "v1/audio/speech", "v1/audio/transcriptions", "v1/audio/stems",
+            "v1/audio/cleanup", "v1/images/generations", "v1/images/edits",
+            "v1/images/upscale", "v1/images/segment", "v1/images/depth",
+        ],
+    },
+    "hardware": {"gpus": [{"index": 0, "name": "FAKE GPU", "total_vram_mb": 24576}]},
+}
+
+# Per-subsystem engine catalogues, the shape the OCR manager returns.
+OCR_ENGINES = {"data": [
+    {"id": "paddle", "kind": "engine", "enabled": True, "returns": ["text", "boxes"]},
+    {"id": "surya", "kind": "pipeline", "enabled": True, "returns": ["text", "layout"]},
+]}
+SPEECH_CAPS = {"data": [{"id": "kokoro"}, {"id": "piper"}]}
+CHUNK_TEMPLATES = {"data": [{"id": "prose"}, {"id": "code"}]}
+MODERATION_MODELS = {"data": [{"id": "guard-1"}]}
+MODELS = {"object": "list", "data": [
+    {"id": "bge-m3", "object": "model"},
+    {"id": "whisper-large", "object": "model"},
+]}
+
+# The POST-only routes this install serves. Everything not here, and not a
+# GET route above, is genuinely absent.
+POST_ROUTES = {
+    "/v1/ocr", "/v1/ocr/batch", "/v1/embeddings", "/v1/rerank", "/v1/chunk",
+    "/v1/moderation", "/v1/audio/speech", "/v1/audio/transcriptions",
+    "/v1/audio/diarization", "/v1/audio/stems", "/v1/audio/cleanup",
+    "/v1/images/generations", "/v1/images/edits", "/v1/images/upscale",
+    "/v1/images/segment", "/v1/images/depth",
+}
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        if self.path == "/v1/health":
+            return True
+        got = self.headers.get("authorization", "")
+        if got == f"Bearer {TOKEN}":
+            return True
+        self._send(401, {"error": {"message": "Missing or invalid API key. Send "
+                                              "'Authorization: Bearer <token>'.",
+                                   "code": "invalid_api_key"}})
+        return False
+
+    def do_GET(self):
+        if not self._auth():
+            return
+        routes = {
+            "/v1/health": {"ok": True},
+            "/coderai/capabilities": CAPABILITY_DOC,
+            "/v1/models": MODELS,
+            "/v1/ocr/engines": OCR_ENGINES,
+            "/v1/audio/speech/capabilities": SPEECH_CAPS,
+            "/v1/chunk/templates": CHUNK_TEMPLATES,
+            "/v1/moderation/models": MODERATION_MODELS,
+        }
+        if self.path in routes:
+            return self._send(200, routes[self.path])
+        # A GET at a POST-only route is 405, exactly as the framework serving
+        # the real API answers it. That is what lets the bridge discover a
+        # capability with no listing endpoint of its own.
+        if self.path in POST_ROUTES:
+            self.send_response(405)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        # Everything else is genuinely not installed here, including the whole
+        # video subsystem, so the bridge must not advertise it.
+        self._send(404, {"error": {"message": f"no route {self.path}"}})
+
+    def do_POST(self):
+        if not self._auth():
+            return
+        n = int(self.headers.get("content-length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            body = {}
+
+        if self.path == "/v1/ocr":
+            img = body.get("image", "")
+            if not img:
+                return self._send(400, {"error": {"message": "image is required"}})
+            engine = body.get("engine", "paddle")
+            if engine not in ("paddle", "surya"):
+                return self._send(400, {"error": {"message": f"unknown engine {engine}"}})
+            # Decode what we were handed, so the test proves base64 really
+            # travelled rather than a placeholder.
+            raw = img.split(",", 1)[1] if img.startswith("data:") else img
+            try:
+                text = base64.b64decode(raw).decode("utf8", "replace")
+            except Exception:
+                text = "<undecodable>"
+            kind = "pdf" if img.startswith("data:application/pdf") else "image"
+            return self._send(200, {"text": f"[{engine}/{kind}] {text}",
+                                    "structured": body.get("structured", False)})
+
+        if self.path == "/v1/embeddings":
+            inp = body.get("input")
+            if inp is None:
+                return self._send(400, {"error": {"message": "input is required"}})
+            items = inp if isinstance(inp, list) else [inp]
+            return self._send(200, {"object": "list", "model": body.get("model", "bge-m3"),
+                                    "data": [{"index": i, "embedding": [0.1, 0.2]}
+                                             for i, _ in enumerate(items)]})
+
+        if self.path == "/v1/chunk":
+            text = body.get("text", "")
+            size = int(body.get("size") or 10)
+            chunks = [text[i:i+size] for i in range(0, len(text), size)] or [""]
+            return self._send(200, {"chunks": [{"text": c} for c in chunks]})
+
+        if self.path == "/v1/rerank":
+            docs = body.get("documents") or []
+            if not body.get("query") or not docs:
+                return self._send(400, {"error": {"message": "query and documents are required"}})
+            order = sorted(range(len(docs)), key=lambda i: -len(str(docs[i])))
+            return self._send(200, {"results": [{"index": i,
+                                                 "document": {"text": str(docs[i])}}
+                                                for i in order]})
+
+        if self.path == "/v1/audio/diarization":
+            return self._send(200, {"segments": [{"speaker": "A"}, {"speaker": "B"}]})
+
+        if self.path == "/v1/moderation":
+            return self._send(200, {"results": [{"flagged": "bomb" in
+                                                 str(body.get("input", "")).lower()}]})
+
+        if self.path == "/v1/audio/speech":
+            if not (body.get("input") or body.get("text")):
+                return self._send(400, {"error": {"message": "input is required"}})
+            return self._send(200, {"url": "/v1/files/spoken.wav"})
+
+        if self.path == "/v1/audio/transcriptions":
+            return self._send(200, {"text": "transcribed: " +
+                                            str(body.get("url") or body.get("file") or "")})
+
+        if self.path == "/v1/images/generations":
+            if not body.get("prompt"):
+                return self._send(400, {"error": {"message": "prompt is required"}})
+            return self._send(200, {"data": [{"url": "/v1/files/drawn.png"}]})
+
+        self._send(404, {"error": {"message": f"no route {self.path}"}})
+
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+srv = HTTPServer(("127.0.0.1", port), H)
+print(f"fakecoderai on http://127.0.0.1:{srv.server_address[1]}", flush=True)
+srv.serve_forever()

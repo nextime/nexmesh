@@ -331,7 +331,7 @@ pub fn recall(
         }
         seen.push(e.key.clone());
         kept.push(e);
-        if kept.len() as usize >= limit.max(1) as usize {
+        if kept.len() >= limit.max(1) as usize {
             break;
         }
     }

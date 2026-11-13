@@ -1,0 +1,63 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          nexmesh-coderai
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: nexmesh capability bridge
+# Description:       Offers a team OCR, transcription, speech, embeddings.
+### END INIT INFO
+
+NAME=nexmesh-coderai
+BIN=/usr/local/bin/nexmesh-coderai
+PIDFILE=/var/run/$NAME.pid
+LOGFILE=/var/log/nexmesh/coderai.log
+CONF=/etc/nexmesh/coderai.env
+USER="${NEXMESH_BRIDGE_USER:-nextime}"
+
+[ -x "$BIN" ] || exit 0
+[ -r "$CONF" ] && . "$CONF"
+
+: "${NEXMESH_HUB:=}"
+: "${CODERAI_URL:=http://127.0.0.1:8000}"
+: "${NEXMESH_CAPABILITIES:=/etc/nexmesh/capabilities/coderai.toml}"
+: "${NEXMESH_BRIDGE_NAME:=CoderAI}"
+
+if [ -z "$NEXMESH_HUB" ] || [ -z "$NEXMESH_PARTICIPANT_TOKEN" ]; then
+  echo "$NAME: set NEXMESH_HUB and NEXMESH_PARTICIPANT_TOKEN in $CONF" >&2
+  exit 6
+fi
+
+ARGS="--hub $NEXMESH_HUB --service $CODERAI_URL --manifest $NEXMESH_CAPABILITIES --name $NEXMESH_BRIDGE_NAME"
+[ -n "$NEXMESH_SESSION" ] && ARGS="$ARGS --session $NEXMESH_SESSION"
+[ -n "$NEXMESH_EXTRA" ] && ARGS="$ARGS $NEXMESH_EXTRA"
+
+mkdir -p "$(dirname "$LOGFILE")"
+chown "$USER" "$(dirname "$LOGFILE")" 2>/dev/null || true
+
+case "$1" in
+  start)
+    echo -n "Starting $NAME: "
+    # Both tokens come from the 0600 config file. CODERAI_TOKEN is the only
+    # service credential anywhere in nexmesh, and it lives here and nowhere
+    # else on purpose.
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$PIDFILE" \
+      --chuid "$USER" --startas /bin/sh -- -c \
+      "exec env RUST_LOG=\${RUST_LOG:-info} NEXMESH_PARTICIPANT_TOKEN='$NEXMESH_PARTICIPANT_TOKEN' CODERAI_TOKEN='$CODERAI_TOKEN' $BIN $ARGS >> $LOGFILE 2>&1"
+    echo "ok"
+    ;;
+  stop)
+    echo -n "Stopping $NAME: "
+    start-stop-daemon --stop --quiet --retry TERM/20/KILL/5 --pidfile "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo "ok"
+    ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  status)
+    start-stop-daemon --status --pidfile "$PIDFILE" && echo "$NAME running" \
+      || { echo "$NAME not running"; exit 3; }
+    ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac
+exit 0

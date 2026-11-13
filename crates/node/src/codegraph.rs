@@ -323,7 +323,7 @@ fn collect(
                     // The last path segment: `foo::bar::baz` or `self.baz` is
                     // recorded as `baz`, which is all a name match can use.
                     let short = callee
-                        .rsplit(|c| c == ':' || c == '.' || c == '>')
+                        .rsplit([':', '.', '>'])
                         .next()
                         .unwrap_or(&callee)
                         .trim()
@@ -563,7 +563,7 @@ fn helper(s: &str) -> usize { s.len() }
 
     #[test]
     fn a_type_node_records_where_it_is() {
-        let d = scratch(&["src/a.rs"].iter().map(|f| (*f, "\n\npub fn third_line() {}\n")).collect::<Vec<_>>().as_slice());
+        let d = scratch(["src/a.rs"].iter().map(|f| (*f, "\n\npub fn third_line() {}\n")).collect::<Vec<_>>().as_slice());
         let g = scan(d.path(), &Limits::default());
         let n = g.nodes.iter().find(|n| n.name == "third_line").expect("found");
         assert_eq!(n.line, 3, "1-based, as an editor counts");

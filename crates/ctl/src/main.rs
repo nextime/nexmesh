@@ -576,7 +576,7 @@ async fn main() -> Result<()> {
                 println!("no nodes enrolled");
                 return Ok(());
             }
-            println!("{:<12} {:<11} {:<14} {}", "NAME", "STATE", "ARCH", "CLIS");
+            println!("{:<12} {:<11} {:<14} CLIS", "NAME", "STATE", "ARCH");
             for n in nodes {
                 let state = if n["connected"].as_bool() == Some(true) {
                     "connected"
@@ -602,7 +602,7 @@ async fn main() -> Result<()> {
                 println!("no sessions");
                 return Ok(());
             }
-            println!("{:<14} {:<22} {:<10} {}", "ID", "NAME", "STATUS", "SLOTS");
+            println!("{:<14} {:<22} {:<10} SLOTS", "ID", "NAME", "STATUS");
             for s in rows {
                 println!(
                     "{:<14} {:<22} {:<10} {}",
@@ -705,8 +705,8 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<12} {:<14} {:<9} {:<9} {:<20} {:>9} {}",
-                "NAME", "ROLE", "HOST", "KIND", "STATE", "TOKENS", "SUMMARY"
+                "{:<12} {:<14} {:<9} {:<9} {:<20} {:>9} SUMMARY",
+                "NAME", "ROLE", "HOST", "KIND", "STATE", "TOKENS"
             );
             for a in rows {
                 let tin = a["input_tokens"].as_i64().unwrap_or(0);
@@ -743,7 +743,7 @@ async fn main() -> Result<()> {
                 println!("no certificates issued yet");
                 return Ok(());
             }
-            println!("{:<22} {:<10} {:<9} {}", "NAME", "KIND", "STATE", "SERIAL");
+            println!("{:<22} {:<10} {:<9} SERIAL", "NAME", "KIND", "STATE");
             for x in rows {
                 println!("{:<22} {:<10} {:<9} {}",
                     x["name"].as_str().unwrap_or("?"), x["kind"].as_str().unwrap_or("?"),
@@ -823,7 +823,7 @@ async fn main() -> Result<()> {
                 println!("no messages yet in {session}");
                 return Ok(());
             }
-            println!("{:<8} {:<1} {:>12}    {:<12} {}", "TIME", "", "FROM", "TO", "MESSAGE");
+            println!("{:<8} {:<1} {:>12}    {:<12} MESSAGE", "TIME", "", "FROM", "TO");
             let mut last = 0i64;
             for m in &msgs {
                 print_message(m);

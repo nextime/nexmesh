@@ -12,6 +12,7 @@
 //! off the presented certificate and attaches it to every request on that
 //! connection.
 
+use axum::http::HeaderMap;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsAcceptor;
 use std::{future::Future, io, pin::Pin, sync::Arc, task::{Context, Poll}};
@@ -60,6 +61,91 @@ pub fn common_name(der: &[u8]) -> Option<String> {
     let attr = subject.iter_common_name().next()?;
     let name = attr.as_str().ok()?.to_string();
     Some(name)
+}
+
+/// Read the identity a trusted reverse proxy verified.
+///
+/// Behind a proxy the hub sees the proxy's connection, not the client's, so
+/// the certificate it would otherwise inspect is not there. nginx can verify
+/// the client certificate itself and forward the result, which keeps the
+/// binding working -- but a header is only evidence if nothing else can set
+/// it, so this is used only for requests arriving from an address the
+/// operator nominated with `--trusted-proxy`.
+///
+/// `X-Client-Verify` is checked before `X-Client-CN` deliberately: nginx
+/// forwards a common name even for a certificate it rejected, so taking the
+/// name alone would accept an untrusted certificate's claim.
+pub fn from_proxy(headers: &HeaderMap) -> Option<PeerIdentity> {
+    let verify = headers.get("x-client-verify").and_then(|v| v.to_str().ok())?;
+    if verify.eq_ignore_ascii_case("success") {
+        let cn = headers
+            .get("x-client-cn")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        return Some(PeerIdentity { presented: true, common_name: cn });
+    }
+    // NONE means the client offered nothing; FAILED means it offered
+    // something invalid. Neither is an identity, and FAILED should never have
+    // reached us -- nginx was asked to verify.
+    Some(PeerIdentity { presented: false, common_name: None })
+}
+
+/// Is this request coming from a proxy the operator nominated?
+pub fn is_trusted_proxy(trusted: &[std::net::IpAddr], peer: Option<std::net::IpAddr>) -> bool {
+    match peer {
+        Some(ip) => trusted.iter().any(|t| *t == ip),
+        // No socket address to check means this cannot be established, and
+        // guessing in the permissive direction would make the flag worthless.
+        None => false,
+    }
+}
+
+/// Who this request is from: its own certificate, or the one a nominated
+/// proxy verified.
+///
+/// The connection's own certificate wins when there is one. A proxy's headers
+/// are consulted only when the request arrives from an address the operator
+/// nominated, because those headers are trivially forgeable by anyone who can
+/// reach the hub directly -- which is why nominating a proxy also means
+/// binding the hub where only that proxy can reach it.
+pub fn resolve<B>(st: &crate::state::AppState, req: &axum::http::Request<B>)
+    -> std::sync::Arc<PeerIdentity>
+{
+    let own = req.extensions().get::<std::sync::Arc<PeerIdentity>>().cloned();
+    let from = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    resolve_parts(st, own, from, req.headers())
+}
+
+/// The same, from pieces an extractor can supply.
+///
+/// A WebSocket handler cannot take the whole request and the upgrade at once,
+/// so it takes these instead; both paths must resolve identity identically or
+/// a node arriving through a proxy would be bound differently from every
+/// other route.
+pub fn resolve_parts(
+    st: &crate::state::AppState,
+    own: Option<std::sync::Arc<PeerIdentity>>,
+    from: Option<std::net::IpAddr>,
+    headers: &HeaderMap,
+) -> std::sync::Arc<PeerIdentity> {
+    // A nominated proxy's verdict comes FIRST, before the connection's own
+    // certificate. Where nginx terminates TLS and talks to the hub over its
+    // own mutual-TLS connection, that connection legitimately presents
+    // nginx's certificate -- and binding a client's token to the proxy's name
+    // would reject every request. The proxy is trusted precisely to say who
+    // the client is, so that is what is believed.
+    let trusted = st.trusted_proxies();
+    if !trusted.is_empty() && is_trusted_proxy(trusted, from) {
+        if let Some(p) = from_proxy(headers) {
+            return std::sync::Arc::new(p);
+        }
+    }
+    own.unwrap_or_default()
 }
 
 /// A TLS acceptor that records who connected.
@@ -127,6 +213,121 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn a_proxy_verified_certificate_is_an_identity() {
+        let p = from_proxy(&hdr(&[("x-client-verify", "SUCCESS"), ("x-client-cn", "machine-b")]))
+            .unwrap();
+        assert!(p.presented);
+        assert_eq!(p.common_name.as_deref(), Some("machine-b"));
+        assert!(p.agrees_with("machine-b").is_ok());
+        assert!(p.agrees_with("someone-else").is_err());
+    }
+
+    #[test]
+    fn a_certificate_the_proxy_rejected_is_not_an_identity() {
+        // nginx forwards the common name even for a certificate it refused,
+        // so reading the name without the verdict would accept it.
+        let p = from_proxy(&hdr(&[
+            ("x-client-verify", "FAILED:self signed certificate"),
+            ("x-client-cn", "intruder"),
+        ]))
+        .unwrap();
+        assert!(!p.presented, "a rejected certificate asserts nothing");
+        assert_eq!(p.common_name, None);
+    }
+
+    #[test]
+    fn no_certificate_through_a_proxy_is_simply_no_certificate() {
+        let p = from_proxy(&hdr(&[("x-client-verify", "NONE")])).unwrap();
+        assert!(!p.presented);
+        // So the token stands alone, as on a hub without mutual TLS.
+        assert!(p.agrees_with("anyone").is_ok());
+    }
+
+    #[test]
+    fn without_the_verify_header_there_is_no_proxy_identity_at_all() {
+        // A bare X-Client-CN must never be believed: that is precisely the
+        // header an attacker would set.
+        assert!(from_proxy(&hdr(&[("x-client-cn", "machine-b")])).is_none());
+        assert!(from_proxy(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn a_nominated_proxy_speaks_for_the_client_not_for_itself() {
+        // The case that made this necessary: nginx terminates public TLS and
+        // reaches the hub over its own mutual-TLS connection. That connection
+        // really does present nginx's certificate, so preferring the
+        // connection's own identity would bind every client's token to the
+        // name "nginx" and refuse the lot.
+        let st = crate::state::AppState::in_memory()
+            .unwrap()
+            .with_trusted_proxies(vec!["127.0.0.1".parse().unwrap()]);
+        let nginx_own = std::sync::Arc::new(PeerIdentity {
+            presented: true,
+            common_name: Some("nginx-proxy".into()),
+        });
+        let got = resolve_parts(
+            &st,
+            Some(nginx_own.clone()),
+            Some("127.0.0.1".parse().unwrap()),
+            &hdr(&[("x-client-verify", "SUCCESS"), ("x-client-cn", "machine-b")]),
+        );
+        assert_eq!(got.common_name.as_deref(), Some("machine-b"));
+
+        // From anywhere else, the headers are ignored and the connection's
+        // own certificate is what counts.
+        let got = resolve_parts(
+            &st,
+            Some(nginx_own),
+            Some("10.0.0.9".parse().unwrap()),
+            &hdr(&[("x-client-verify", "SUCCESS"), ("x-client-cn", "machine-b")]),
+        );
+        assert_eq!(
+            got.common_name.as_deref(),
+            Some("nginx-proxy"),
+            "a header from an un-nominated address must not be believed"
+        );
+    }
+
+    #[test]
+    fn with_no_proxy_nominated_only_the_connection_counts() {
+        let st = crate::state::AppState::in_memory().unwrap();
+        let own = std::sync::Arc::new(PeerIdentity {
+            presented: true,
+            common_name: Some("machine-a".into()),
+        });
+        let got = resolve_parts(
+            &st,
+            Some(own),
+            Some("127.0.0.1".parse().unwrap()),
+            &hdr(&[("x-client-verify", "SUCCESS"), ("x-client-cn", "impostor")]),
+        );
+        assert_eq!(got.common_name.as_deref(), Some("machine-a"));
+    }
+
+    #[test]
+    fn only_a_nominated_proxy_address_is_trusted() {
+        let trusted: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap()];
+        assert!(is_trusted_proxy(&trusted, Some("127.0.0.1".parse().unwrap())));
+        assert!(!is_trusted_proxy(&trusted, Some("10.0.0.9".parse().unwrap())));
+        assert!(!is_trusted_proxy(&trusted, None));
+        assert!(
+            !is_trusted_proxy(&[], Some("127.0.0.1".parse().unwrap())),
+            "with no proxy nominated, nothing is trusted"
+        );
+    }
 
     #[test]
     fn no_certificate_means_nothing_to_bind() {

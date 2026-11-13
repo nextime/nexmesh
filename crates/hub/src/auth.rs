@@ -11,7 +11,7 @@
 //! Where mutual TLS is in use the token is checked against the certificate
 //! that carried it, so the two must name the same operator. See `peer.rs`.
 
-use crate::{peer::PeerIdentity, state::AppState};
+use crate::state::AppState;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
@@ -37,24 +37,48 @@ pub async fn require_operator(
     req: Request,
     next: Next,
 ) -> Response {
-    // The certificate that carried this request, where there was one.
-    let peer = req
-        .extensions()
-        .get::<std::sync::Arc<PeerIdentity>>()
-        .cloned()
-        .unwrap_or_default();
+    // The certificate that carried this request, where there was one -- or
+    // the one a trusted proxy verified on our behalf.
+    let peer = crate::peer::resolve(&st, &req);
     // With no operator tokens minted, the API is open. That is only allowed on
     // loopback, which `main` enforces at startup, so this cannot silently
     // expose a fleet.
     if !st.operator_auth_configured() {
         return next.run(req).await;
     }
+    // A signed-in dashboard session counts. The account authenticates a
+    // person; a bearer token is what a script uses. Either is an operator,
+    // and the identity it claims is the username or the token's label.
+    if bearer(&headers).is_none() {
+        if let Some(c) = crate::webauth::cookie_value(&headers, crate::webauth::COOKIE) {
+            let who = {
+                let db = st.db.lock().unwrap();
+                crate::webauth::whoami(&db, &c)
+            };
+            if let Some(user) = who {
+                if st.identity_binding() {
+                    if let Err(why) = peer.agrees_with(&user) {
+                        tracing::warn!(%user, path = %req.uri().path(),
+                            "rejected: certificate does not match the signed-in account");
+                        return (StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({ "error": why }))).into_response();
+                    }
+                }
+                tracing::debug!(%user, path = %req.uri().path(), "authorised by session");
+                return next.run(req).await;
+            }
+        }
+    }
     let Some(token) = bearer(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
-                "error": "operator authentication required; send 'Authorization: Bearer <token>' \
-                          (mint one with `nexmesh-hub operator-token <label>`)"
+                // Two audiences read this: a person in a browser and a
+                // script holding a token. It names both ways in, and keeps
+                // the wording a CLI user already knows.
+                "error": "operator authentication required: sign in to the dashboard, or send \
+                          'Authorization: Bearer <token>' (mint one with `nexmesh-hub \
+                          operator-token <label>`)"
             })),
         )
             .into_response();
@@ -103,11 +127,7 @@ pub async fn bind_participant(
     if !st.identity_binding() {
         return next.run(req).await;
     }
-    let peer = req
-        .extensions()
-        .get::<std::sync::Arc<PeerIdentity>>()
-        .cloned()
-        .unwrap_or_default();
+    let peer = crate::peer::resolve(&st, &req);
     // No certificate, or no token yet: nothing to bind. An absent or invalid
     // token is the handler's business, and it gives the better message.
     if !peer.presented {

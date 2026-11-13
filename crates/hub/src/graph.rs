@@ -14,7 +14,7 @@ use crate::{leiden, state::AppState};
 use anyhow::{Context, Result};
 use nexmesh_proto::{
     self as proto,
-    codegraph::{CodeGraph, EdgeKind, NodeKind},
+    codegraph::{CodeGraph, EdgeKind},
     now_ms,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -452,7 +452,7 @@ pub fn exists(db: &Connection, workspace_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexmesh_proto::codegraph::{GraphEdge, GraphNode};
+    use nexmesh_proto::codegraph::{GraphEdge, GraphNode, NodeKind};
 
     fn n(id: &str, name: &str, kind: NodeKind) -> GraphNode {
         GraphNode {

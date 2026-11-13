@@ -93,7 +93,7 @@ pub fn parse_server_url(line: &str) -> Option<String> {
         .collect();
     let url = url.trim_end_matches(['.', ',', ')']).to_string();
     // A bare scheme with no host is not a usable URL.
-    let rest = url.splitn(2, "://").nth(1)?;
+    let rest = url.split_once("://")?.1;
     (!rest.is_empty() && rest.contains(':')).then_some(url)
 }
 

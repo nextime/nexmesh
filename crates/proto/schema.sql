@@ -64,6 +64,80 @@ CREATE TABLE IF NOT EXISTS issued_certs (
   reason        TEXT
 );
 
+-- -------------------------------------------------- dashboard accounts ----
+--
+-- The dashboard used to want an operator token pasted into the browser. That
+-- works, but it means handling a fleet-wide credential by hand every time,
+-- and a token good for the whole API is a poor thing to keep in a browser.
+--
+-- So the dashboard has accounts of its own: a username and a password, set up
+-- on first use. The account authenticates a PERSON; operator tokens remain
+-- what a script or a CLI uses.
+--
+-- The first account cannot simply be claimed by whoever arrives first -- this
+-- hub may be on a public address -- so creating it needs a setup code the hub
+-- prints to its own log. Same reasoning as a pairing code: bound in advance,
+-- single use, and shown where only someone with access to the host can read
+-- it.
+CREATE TABLE IF NOT EXISTS dashboard_users (
+  username      TEXT PRIMARY KEY,
+  -- Argon2id PHC string. Never a reversible encoding, never a bare digest.
+  password_hash TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_login_ms INTEGER,
+  -- Consecutive failures, and when the account stops accepting attempts.
+  -- A public hub needs a wrong password to cost something.
+  failed_count  INTEGER NOT NULL DEFAULT 0,
+  locked_until_ms INTEGER
+);
+
+-- Browser sessions. The cookie holds a random id; only its hash is stored, so
+-- the table is not a list of working credentials.
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+  id_sha256     TEXT PRIMARY KEY,
+  username      TEXT NOT NULL REFERENCES dashboard_users(username) ON DELETE CASCADE,
+  created_at_ms INTEGER NOT NULL,
+  last_seen_ms  INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dashboard_sessions_user_idx ON dashboard_sessions(username);
+
+-- The one-time code that authorises creating the first account.
+CREATE TABLE IF NOT EXISTS dashboard_setup (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  code_sha256   TEXT NOT NULL,
+  issued_at_ms  INTEGER NOT NULL,
+  used_at_ms    INTEGER
+);
+
+-- ------------------------------------------------------ capability asks ----
+--
+-- A synchronous request from one teammate to another.
+--
+-- Messages are the right shape for "here is something you should know" and
+-- the wrong shape for "OCR this and give me the text": the asker needs the
+-- answer before it can continue. So a capability ask is a row with a reply
+-- slot, which the asker waits on and the holder fills in.
+--
+-- Rows rather than an in-memory channel, so an ask survives the holder being
+-- restarted mid-flight: it is still pending, and visible.
+CREATE TABLE IF NOT EXISTS capability_asks (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  capability    TEXT NOT NULL,
+  from_slot     TEXT NOT NULL,
+  to_slot       TEXT,                     -- NULL until one is chosen
+  request       TEXT NOT NULL,            -- JSON the holder understands
+  -- Which of the holder's models to use, when it offers more than one.
+  model         TEXT,
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending|done|failed
+  result        TEXT,
+  asked_at_ms   INTEGER NOT NULL,
+  answered_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS capability_asks_queue_idx
+  ON capability_asks(to_slot, status);
+
 -- --------------------------------------------------------- code graph ----
 --
 -- One workspace's parsed structure, kept so a codebase is read once rather
