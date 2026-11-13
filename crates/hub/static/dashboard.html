@@ -211,6 +211,10 @@
   </header>
 
   <div id="err" class="err" hidden></div>
+  <!-- Separate from #err on purpose: the poll clears that one every few
+       seconds, which wiped any message a button tried to show before it
+       could be read. -->
+  <div id="notice" class="err" hidden></div>
   <div class="stats" id="stats"></div>
   <nav id="tabs"></nav>
   <!-- Outside #view deliberately: that is replaced wholesale on every poll,
@@ -253,6 +257,28 @@ let session = new URLSearchParams(location.search).get("session") || "";
 // there means "whatever the hub shows by default", and reading it as "no
 // session" made every button that acts on one refuse to work until you had
 // picked from the dropdown.
+// The combined view is not a session, so anything that writes to one has to
+// say which. Refusing with a reason beats a request against a session id of
+// "*", which the hub would rightly not find.
+function isAll() {
+  return currentSession() === "*";
+}
+
+let noticeTimer = null;
+function note(text) {
+  const el = $("notice");
+  el.hidden = false;
+  el.textContent = text;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { el.hidden = true; }, 8000);
+}
+
+function needOneSession(what) {
+  if (!isAll()) return true;
+  note(`Pick a session first: ${what} applies to one team, and the selector is on all of them.`);
+  return false;
+}
+
 function currentSession() {
   if (session) return session;
   const sel = $("sessionSel");
@@ -457,6 +483,7 @@ function editSessionName(current, placeholder, commit) {
 // A fleet gets named before anyone knows what it is for. Renaming it should
 // not mean recreating it.
 $("renameBtn").addEventListener("click", () => {
+  if (!needOneSession("renaming a session")) return;
   const sid = currentSession();
   if (!sid) return;
   const current = (snap && (snap.sessions || []).find((x) => x.id === sid) || {}).name || "";
@@ -494,6 +521,7 @@ function fillAddAgentClis() {
 }
 
 $("addBtn").addEventListener("click", () => {
+  if (!needOneSession("adding an agent")) return;
   if (!currentSession()) {
     $("err").hidden = false;
     $("err").textContent = "Make a session first: press new.";
@@ -581,9 +609,14 @@ function render() {
   const want = (snap.sessions || []).map((s) => s.id).join("|");
   if (sel.dataset.sig !== want) {
     sel.dataset.sig = want;
-    sel.innerHTML = (snap.sessions || [])
-      .map((s) => `<option value="${esc(s.id)}">${esc(s.name)} — ${esc(s.id)}</option>`).join("")
-      || `<option value="">no sessions</option>`;
+    // "all sessions" first, because a fleet is usually several teams and the
+    // question you arrive with -- is anything stuck anywhere? -- is about all
+    // of them. Picking one narrows; the default should not.
+    const opts = (snap.sessions || [])
+      .map((s) => `<option value="${esc(s.id)}">${esc(s.name)} — ${esc(s.id)}</option>`).join("");
+    sel.innerHTML = opts
+      ? `<option value="*">all sessions (${(snap.sessions || []).length})</option>` + opts
+      : `<option value="">no sessions</option>`;
   }
   if (d && d.session) sel.value = d.session.id;
 
@@ -655,9 +688,12 @@ const panel = (inner) => `<div class="panel">${inner}</div>`;
 const empty = (msg) => panel(`<div class="empty">${esc(msg)}</div>`);
 
 function viewAgents(d, now) {
-  if (!d.agents.length) return empty("No agents in this session yet.");
+  const all = isAll();
+  if (!d.agents.length)
+    return empty(all ? "No agents anywhere yet." : "No agents in this session yet.");
   return panel(`<table><thead><tr>
-      <th>Agent</th><th>Role</th><th>Where</th><th class="hide">How</th>
+      <th>Agent</th>${all ? "<th>Session</th>" : ""}<th>Role</th><th>Where</th>
+      <th class="hide">How</th>
       <th>State</th><th class="num hide">Tokens</th><th>Summary</th></tr></thead><tbody>` +
     d.agents.map((a) => {
       const flap = a.slot_status === "flapping";
@@ -666,6 +702,7 @@ function viewAgents(d, now) {
         <td><span class="mono">${esc(a.name)}</span>
             ${flap ? ' <span class="badge bad">flapping</span>' : ""}
             ${a.restarts ? ` <span class="badge warn" title="restarts">↻${a.restarts}</span>` : ""}</td>
+        ${all ? `<td><span class="badge info">${esc(a.session)}</span></td>` : ""}
         <td class="muted">${esc(a.role)}</td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}</td>
@@ -689,12 +726,14 @@ function viewMessages(d, now) {
     const title = m.delivered ? "delivered to the model"
       : (m.in_flight ? "handed over, not yet confirmed" : "the recipient has not seen this yet");
     const kind = m.kind === "text" ? "" : `<span class="badge tiny">${esc(m.kind)}</span> `;
+    const where = isAll() && m.session
+      ? `<span class="badge info tiny">${esc(m.session)}</span> ` : "";
     return `<div class="msg ${cls}">
       <div class="t">${hhmmss(m.at_ms)}</div>
       <div class="mark" title="${esc(title)}">${mark}</div>
       <div><span class="who">${esc(m.from)}</span> <span class="arrow">→</span>
            <span class="who">${esc(m.to)}</span><br>
-           <span class="body">${kind}${esc(m.body)}</span></div>
+           <span class="body">${where}${kind}${esc(m.body)}</span></div>
     </div>`;
   }).join("");
   return panel(`<div class="feed" onscroll="this.dataset.stick=

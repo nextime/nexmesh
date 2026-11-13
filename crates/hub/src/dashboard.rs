@@ -118,6 +118,11 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         .filter(|s| !s.is_empty())
         .or_else(|| sessions.first().and_then(|s| s["id"].as_str().map(String::from)));
 
+    // `*` means every session at once. A fleet is usually several teams, and
+    // the thing a person most wants at a glance -- is anything stuck? -- was
+    // the one thing the dashboard could not answer without clicking through
+    // each session in turn.
+    const ALL: &str = "*";
     let detail = match &sid {
         None => Value::Null,
         Some(sid) => {
@@ -126,6 +131,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id),
                             COALESCE(s.role, '-'), s.participant_kind, COALESCE(s.cli_id, '-'),
                             s.task_state, s.summary, s.status, s.restarts,
+                            COALESCE(sx.name, ''),
                             COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
                             COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external'
                                                   ELSE '-' END),
@@ -133,11 +139,12 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
                             a.id, s.mode, s.paused
                      FROM slots s
+                     LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
                         SELECT id FROM agents WHERE slot_id = s.id
                         ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
                      LEFT JOIN nodes n ON n.id = a.node_id
-                     WHERE s.session_id = ? ORDER BY 2",
+                     WHERE (?1 = '*' OR s.session_id = ?1) ORDER BY 2",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -146,14 +153,16 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "role": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
                             "cli": r.get::<_, String>(4)?, "task_state": r.get::<_, String>(5)?,
                             "summary": r.get::<_, String>(6)?, "slot_status": r.get::<_, String>(7)?,
-                            "restarts": r.get::<_, i64>(8)?, "provenance": r.get::<_, String>(9)?,
-                            "status": r.get::<_, String>(10)?, "host": r.get::<_, String>(11)?,
-                            "input_tokens": r.get::<_, i64>(12)?, "output_tokens": r.get::<_, i64>(13)?,
-                            "cache_read_tokens": r.get::<_, i64>(14)?,
-                            "push_capable": r.get::<_, i64>(15)? == 1,
-                            "agent_id": r.get::<_, Option<String>>(16)?,
-                            "mode": r.get::<_, String>(17)?,
-                            "paused": r.get::<_, i64>(18)? == 1,
+                            "restarts": r.get::<_, i64>(8)?,
+                            "session": r.get::<_, String>(9)?,
+                            "provenance": r.get::<_, String>(10)?,
+                            "status": r.get::<_, String>(11)?, "host": r.get::<_, String>(12)?,
+                            "input_tokens": r.get::<_, i64>(13)?, "output_tokens": r.get::<_, i64>(14)?,
+                            "cache_read_tokens": r.get::<_, i64>(15)?,
+                            "push_capable": r.get::<_, i64>(16)? == 1,
+                            "agent_id": r.get::<_, Option<String>>(17)?,
+                            "mode": r.get::<_, String>(18)?,
+                            "paused": r.get::<_, i64>(19)? == 1,
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -169,11 +178,13 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             COALESCE(sf.display_name, sf.role, 'operator'),
                             CASE WHEN m.to_slot IS NULL THEN '(team)'
                                  ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
-                            m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL
+                            m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL,
+                            COALESCE(mx.name, '')
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
-                     WHERE m.session_id = ? ORDER BY m.id DESC LIMIT 120",
+                     LEFT JOIN sessions mx ON mx.id = m.session_id
+                     WHERE (?1 = '*' OR m.session_id = ?1) ORDER BY m.id DESC LIMIT 120",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -182,6 +193,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "kind": r.get::<_, String>(2)?, "body": r.get::<_, String>(3)?,
                             "from": r.get::<_, String>(4)?, "to": r.get::<_, String>(5)?,
                             "delivered": r.get::<_, bool>(6)?, "in_flight": r.get::<_, bool>(7)?,
+                            "session": r.get::<_, String>(8)?,
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -196,7 +208,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     "SELECT p.ord, p.label, p.status,
                             COALESCE(s.display_name, s.role, '')
                      FROM plan_items p LEFT JOIN slots s ON s.id = p.assignee_slot
-                     WHERE p.session_id = ? ORDER BY p.ord",
+                     WHERE (?1 = '*' OR p.session_id = ?1) ORDER BY p.ord",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -223,7 +235,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             COALESCE(s.display_name, s.role, '?'), m.updated_at_ms,
                             m.scope, m.revision
                      FROM memory m LEFT JOIN slots s ON s.id = m.author_slot
-                     WHERE (m.scope = 'session' AND m.scope_ref = ?1)
+                     WHERE (m.scope = 'session' AND (?1 = '*' OR m.scope_ref = ?1))
                         OR m.scope = 'global'
                        AND (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2)
                      ORDER BY m.scope, m.category, m.key",
@@ -249,7 +261,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     "SELECT l.scope, l.path, COALESCE(s.display_name, s.role, l.held_by_slot),
                             COALESCE(l.purpose, ''), l.expires_at_ms
                      FROM locks l LEFT JOIN slots s ON s.id = l.held_by_slot
-                     WHERE l.session_id = ? ORDER BY l.scope, l.path",
+                     WHERE (?1 = '*' OR l.session_id = ?1) ORDER BY l.scope, l.path",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -272,7 +284,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                      FROM ownership o
                      JOIN workspaces w ON w.id = o.workspace_id
                      LEFT JOIN slots s ON s.id = o.slot_id
-                     WHERE w.session_id = ? ORDER BY w.name, o.pattern",
+                     WHERE (?1 = '*' OR w.session_id = ?1) ORDER BY w.name, o.pattern",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -295,7 +307,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                              FROM workspace_mounts m JOIN nodes nn ON nn.id = m.node_id
                              WHERE m.workspace_id = w.id)
                      FROM workspaces w LEFT JOIN nodes n ON n.id = w.node_id
-                     WHERE w.session_id = ? ORDER BY w.name",
+                     WHERE (?1 = '*' OR w.session_id = ?1) ORDER BY w.name",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -314,7 +326,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
 
             let session = db
                 .query_row(
-                    "SELECT id, name, status, created_at_ms FROM sessions WHERE id = ?",
+                    "SELECT id, name, status, created_at_ms FROM sessions
+                      WHERE id = ?1 AND ?1 <> '*'",
                     [sid],
                     |r| {
                         Ok(json!({
@@ -325,7 +338,14 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 )
                 .optional()
                 .unwrap_or(None)
-                .unwrap_or(Value::Null);
+                .unwrap_or_else(|| {
+                    if sid == ALL {
+                        json!({ "id": ALL, "name": "all sessions", "status": "active",
+                                "created_at_ms": 0 })
+                    } else {
+                        Value::Null
+                    }
+                });
 
             // The numbers worth a glance: who is working, and what is stuck.
             let working = agents.iter().filter(|a| a["task_state"] == "working").count();
@@ -350,7 +370,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             // Queried from the workspaces table rather than derived from the
             // array above, which deliberately does not expose internal ids.
             let session_workspaces: Vec<(String, String)> = db
-                .prepare("SELECT id, name FROM workspaces WHERE session_id = ? ORDER BY name")
+                .prepare(
+                    "SELECT id, name FROM workspaces WHERE (?1 = '*' OR session_id = ?1)
+                      ORDER BY name",
+                )
                 .and_then(|mut st| {
                     st.query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))
                         .and_then(|m| m.collect())

@@ -188,6 +188,40 @@ def main():
     check("no session argument still returns a detail",
           (d2.get("detail") or {}).get("session", {}).get("id") == sid, str(d2.get("detail", {}).get("session")))
 
+    print("\n=== all sessions at once ===")
+    # A fleet is usually several teams, and the question you arrive with --
+    # is anything stuck anywhere? -- is about all of them. Clicking through
+    # each session in turn was the only way to answer it.
+    s, j = req("/v1/sessions", optok, "POST", {"name": "second-team"})
+    sid2 = j.get("session_id")
+    req(f"/v1/sessions/{sid2}/slots", optok, "POST",
+        {"cli_id": "handmade", "display_name": "Solo", "role": "tester",
+         "mode": "interactive"})
+    s, da = req("/v1/dashboard/state?session=*", optok)
+    det_a = da.get("detail") or {}
+    check("the combined view returns a detail", s == 200 and bool(det_a), f"{s} {str(det_a)[:120]}")
+    check("and names itself rather than pretending to be a session",
+          (det_a.get("session") or {}).get("name") == "all sessions",
+          str(det_a.get("session")))
+    names = sorted(a["name"] for a in det_a.get("agents", []))
+    check("every team's agents are in it",
+          names == ["Hermes", "Iris", "Max", "Solo"], str(names))
+    check("and each row says which session it is from",
+          all(a.get("session") for a in det_a.get("agents", [])),
+          str([(a["name"], a.get("session")) for a in det_a.get("agents", [])]))
+    sessions_seen = {a.get("session") for a in det_a.get("agents", [])}
+    check("rows come from more than one session", len(sessions_seen) == 2, str(sessions_seen))
+    st_a = det_a.get("stats") or {}
+    check("stats aggregate across the fleet", st_a.get("slots") == 4, str(st_a))
+    check("and still surface what is stuck", st_a.get("awaiting_review") == 1, str(st_a))
+    msgs = det_a.get("messages", [])
+    check("messages carry their session too",
+          msgs and all("session" in m for m in msgs), str(msgs[:1])[:200])
+    # Narrowing must still narrow.
+    s, dn = req(f"/v1/dashboard/state?session={sid2}", optok)
+    only = sorted(a["name"] for a in (dn.get("detail") or {}).get("agents", []))
+    check("picking one session still shows only that one", only == ["Solo"], str(only))
+
     print("\n=== an unknown session is not a crash ===")
     s, d3 = req("/v1/dashboard/state?session=se-nope", optok)
     check("unknown session returns 200 with an empty detail",

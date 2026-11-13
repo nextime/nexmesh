@@ -1246,6 +1246,20 @@ There are **no external fonts, scripts or stylesheets**. A fleet hub may sit on
 a network with no route to the internet, and a dashboard that needs a CDN to
 render is a dashboard that fails exactly when you need it.
 
+#### All sessions at once
+
+A fleet is usually several teams, and the question you arrive with — is
+anything stuck anywhere? — is about all of them. The session selector's first
+entry is **all sessions**, which draws every team together.
+
+![Every team in one view, each row badged with the session it belongs to](images/dashboard-all-sessions.png)
+
+Each agent and message carries the session it came from, the stat tiles
+aggregate across the fleet, and picking a single session narrows as before.
+The controls that write to one team — rename, add agent — refuse while the
+combined view is selected and say why, rather than sending a request against
+a session id of `*`.
+
 #### What it shows
 
 Messages carry their delivery state, because "I told the reviewer" and "the
