@@ -103,6 +103,19 @@ async fn session(
         }
     };
 
+    // Before anything else on this connection: settle what this node still
+    // has. A node that restarted lists nothing, which retires the agents its
+    // predecessor spawned instead of leaving their seats held by processes
+    // that no longer exist. Done here, ahead of the first `AgentUp`, so a
+    // reconnecting node's own agents are never caught by it.
+    if let NodeToHub::Hello { live_agents: Some(live), .. } = &hello {
+        let gone = st.reconcile_node_agents(&node_id, live);
+        if !gone.is_empty() {
+            tracing::info!(node = %issued, retired = gone.len(), kept = live.len(),
+                "node reconnected without these agents; their seats are free");
+        }
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(512);
     st.attach_node(&node_id, tx.clone());
     // A revoked machine must lose the connection it already has, not just be
@@ -857,6 +870,17 @@ fn join(
         .optional()?,
     };
 
+    // A person starting a CLI by hand has no name to give, and a nameless
+    // seat is useless to read: every view shows a blank where a teammate
+    // should be, and two conversations on one machine are indistinguishable.
+    // So name it after what it is and where it is -- `Claude-sissy` -- and
+    // number it only when that is taken, which is what happens when the same
+    // CLI is open twice on one machine.
+    let name = match name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => Some(n),
+        None => mint_seat_name(&db, &session_id, cli_id.as_deref(), node_id).ok(),
+    };
+
     let slot_id = match existing {
         Some(id) => {
             db.execute(
@@ -890,6 +914,15 @@ fn join(
             id
         }
     };
+    // Whatever the seat is actually called is what this agent is called. It
+    // matters for a seat that was already named: reporting back the name that
+    // was asked for would have the node, the shim and every log line using a
+    // name no command can address.
+    let name: Option<String> = db
+        .query_row("SELECT display_name FROM slots WHERE id = ?", [&slot_id], |r| r.get(0))
+        .optional()?
+        .flatten();
+
     let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
         "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance, status,
@@ -908,6 +941,46 @@ fn join(
     )?;
     tracing::info!(%slot_id, %agent_id, "attached agent joined");
     Ok((slot_id, session_id, agent_id, name, role))
+}
+
+/// A readable name for a seat nobody named: the CLI, on this machine.
+///
+/// `claude-nextime` on `sissy` becomes `Claude-sissy`, matching how these
+/// seats are named by hand, and a second one on the same machine becomes
+/// `Claude-sissy-2` rather than a duplicate -- a duplicate name is the one
+/// thing that makes a session impossible to reason about, because every
+/// command that addresses an agent addresses it by name.
+fn mint_seat_name(
+    db: &rusqlite::Connection,
+    session_id: &str,
+    cli_id: Option<&str>,
+    node_id: &str,
+) -> Result<String> {
+    let node: String = db
+        .query_row("SELECT name FROM nodes WHERE id = ?", [node_id], |r| r.get(0))
+        .optional()?
+        .unwrap_or_else(|| "node".to_string());
+    // The part before the first dash is the CLI itself; what follows names
+    // one of several accounts for it, which is not interesting in a seat name.
+    let family = cli_id.unwrap_or("agent").split('-').next().unwrap_or("agent");
+    let mut c = family.chars();
+    let pretty = match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => "Agent".to_string(),
+    };
+    let base = format!("{pretty}-{node}");
+    for n in 1..100 {
+        let candidate = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+        let taken: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM slots WHERE session_id = ? AND display_name = ?)",
+            params![session_id, candidate],
+            |r| r.get(0),
+        )?;
+        if !taken {
+            return Ok(candidate);
+        }
+    }
+    Ok(format!("{base}-{}", &uuid::Uuid::new_v4().to_string()[..4]))
 }
 
 /// Pick the workspace whose mount contains `cwd`, preferring the most

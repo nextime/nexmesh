@@ -13,7 +13,7 @@
 mod install;
 mod tlstrust;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -260,6 +260,38 @@ enum Cmd {
         /// Path to nexmesh-orch; defaults to a sibling of this binary.
         #[arg(long)]
         orch: Option<String>,
+        /// Print what would be done without doing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Make one of your own agent CLIs a member of a team: every conversation
+    /// you start in it takes a seat, wherever you are running it.
+    InstallSeat {
+        /// CLI to install into, as its descriptor names it.
+        #[arg(long = "cli")]
+        cli_id: String,
+        /// Directory of CLI descriptors.
+        #[arg(long, env = "NEXMESH_CLIS", default_value = "/etc/nexmesh/clis")]
+        clis: String,
+        /// Name the server appears under inside that CLI.
+        #[arg(long, default_value = "nexmesh")]
+        name: String,
+        /// Session to join, by id or name.
+        #[arg(long)]
+        session: Option<String>,
+        /// Role these seats take, unless the session says otherwise.
+        #[arg(long)]
+        role: Option<String>,
+        /// Seat name. Leave unset: the hub names each conversation as it
+        /// arrives, and a fixed name makes them all ask for the same seat.
+        #[arg(long = "seat-name")]
+        seat_name: Option<String>,
+        /// The local node's socket.
+        #[arg(long, env = "NEXMESH_SOCK", default_value = nexmesh_proto::localsock::DEFAULT_SOCKET)]
+        sock: String,
+        /// Path to nexmesh-mcpd; defaults to a sibling of this binary.
+        #[arg(long)]
+        mcpd: Option<String>,
         /// Print what would be done without doing it.
         #[arg(long)]
         dry_run: bool,
@@ -930,7 +962,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::InstallOrchestrator { cli_id, clis, name, orch, dry_run } => {
-            let msg = install::install(install::Opts {
+            let msg = install::install_orchestrator(install::OrchOpts {
                 cli_id: &cli_id,
                 clis_dir: &clis,
                 server_name: &name,
@@ -947,6 +979,47 @@ async fn main() -> Result<()> {
                     println!(
                         "NOTE: no operator token was passed, so the orchestrator will only work \
                          against a hub that has none. Re-run with --token once you mint one."
+                    );
+                }
+            }
+        }
+
+        Cmd::InstallSeat {
+            cli_id, clis, name, session, role, seat_name, sock, mcpd, dry_run,
+        } => {
+            // A session that does not exist is worth catching here: the
+            // alternative is a CLI that starts, fails to join, and says so
+            // only in a log the person is not reading.
+            if let Some(s) = session.as_deref() {
+                let v = get(&c, format!("{base}/v1/sessions")).await?;
+                let known = v["sessions"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|r| r["id"] == *s || r["name"] == *s)
+                });
+                if !known {
+                    bail!("no session '{s}' on this hub; `nexmesh sessions` lists them");
+                }
+            }
+            let msg = install::install_seat(install::SeatOpts {
+                cli_id: &cli_id,
+                clis_dir: &clis,
+                server_name: &name,
+                mcpd: mcpd.as_deref(),
+                sock: &sock,
+                session: session.as_deref(),
+                role: role.as_deref(),
+                name: seat_name.as_deref(),
+                dry_run,
+            })?;
+            println!("{msg}");
+            if !dry_run {
+                println!(
+                    "Every NEW conversation in {cli_id} on this machine now takes a seat; \
+                     ones already open pick it up when they restart."
+                );
+                if session.is_none() {
+                    println!(
+                        "NOTE: no --session, so each conversation joins the session whose \
+                         workspace holds its directory, and refuses if that is ambiguous."
                     );
                 }
             }

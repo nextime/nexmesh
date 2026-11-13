@@ -377,6 +377,18 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
     };
     let (mut sink, mut stream) = ws.split();
 
+    // What this node can still vouch for. On a hub restart the processes are
+    // all still here and this list keeps their seats; on a node restart it is
+    // empty, which is exactly what tells the hub those seats are free. A pid
+    // alone would not do: it is checked together with its start time, so a
+    // reused pid cannot pass for the agent that used to own it.
+    let live_agents: Vec<String> = {
+        let map = ctx.agents.lock().unwrap();
+        map.values()
+            .filter(|a| proc::is_same_process(a.proc.pid, a.proc.start_ticks))
+            .map(|a| a.agent_id.clone())
+            .collect()
+    };
     let hello = NodeToHub::Hello {
         protocol: proto::PROTOCOL_VERSION,
         token: args.token.clone().unwrap_or_default(),
@@ -387,6 +399,7 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
         boot_id: boot_id(),
         labels: args.labels.clone(),
         clis: detected.to_vec(),
+        live_agents: Some(live_agents),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?)).await?;
 

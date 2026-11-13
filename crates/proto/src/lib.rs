@@ -220,6 +220,18 @@ pub enum NodeToHub {
         boot_id: String,
         labels: Vec<String>,
         clis: Vec<DetectedCli>,
+        /// Every agent this node still holds a live process for, verified
+        /// against /proc as the connection is made.
+        ///
+        /// `None` means "I am not telling you", and the hub leaves its own
+        /// record alone. `Some` is authoritative: an agent the hub believes
+        /// is on this node and that is not in this list has gone, and saying
+        /// so is the only way a seat is ever freed after a node restart --
+        /// the node keeps its agent table in memory, so a restarted node
+        /// knows nothing of the processes its predecessor spawned and will
+        /// never heartbeat them again.
+        #[serde(default)]
+        live_agents: Option<Vec<String>>,
     },
     Heartbeat {
         seq: u64,

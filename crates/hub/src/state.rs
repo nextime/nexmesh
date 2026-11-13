@@ -741,6 +741,20 @@ impl AppState {
                AND provenance = 'external' AND lease_expires_ms IS NOT NULL AND lease_expires_ms < ?",
             [now],
         );
+        // Nothing may read `running` that nothing has vouched for. A node
+        // confirms its agents against /proc every heartbeat, so a gap of a
+        // whole lease means no node is claiming this process -- either it
+        // died, or the node that knew about it was replaced by one that does
+        // not. Without this a hub restart froze whatever status happened to
+        // be in the table, and an agent stayed `running` for as long as the
+        // hub stayed up: the one state that makes the fleet lie rather than
+        // merely look stale.
+        let _ = db.execute(
+            "UPDATE agents SET status = 'lost'
+             WHERE exited_at_ms IS NULL AND status = 'running'
+               AND provenance <> 'external' AND last_seen_ms < ?",
+            [now - proto::NODE_LEASE_MS as i64],
+        );
         let _ = db.execute(
             "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
              WHERE acked_at_ms IS NULL AND inflight_agent IN
@@ -784,6 +798,31 @@ impl AppState {
                 (SELECT id FROM agents WHERE node_id = ? AND status = 'lost')",
             [node_id],
         );
+    }
+
+    /// At startup, no node has connected yet, so no agent has been confirmed
+    /// by anyone. Whatever the table says is a claim from before the restart.
+    pub fn demote_running_agents(&self) -> usize {
+        demote_running(&self.db.lock().unwrap())
+    }
+
+    /// Believe a reconnecting node about which of its agents are still here.
+    ///
+    /// The hub's record of a node's agents outlives the node; the node's own
+    /// record does not. A restarted node therefore arrives knowing nothing of
+    /// the processes its predecessor spawned, and nothing it ever sends will
+    /// mention them again -- so before this they were kept for ever: `lost`
+    /// if a lease sweep had caught them, `running` if the hub had itself
+    /// restarted in between. Either way the seat stayed occupied by a process
+    /// that no longer existed.
+    ///
+    /// An agent the node does not list has gone. Marking it exited is both
+    /// the truth and the thing that frees its seat for the next connection.
+    /// A managed process that somehow outlived its node is included in that:
+    /// the hub can no longer reach it, and a seat it cannot drive is worth
+    /// less than a seat the next agent can claim.
+    pub fn reconcile_node_agents(&self, node_id: &str, live: &[String]) -> Vec<String> {
+        reconcile_agents(&self.db.lock().unwrap(), node_id, live)
     }
 
     pub fn nodes_json(&self) -> serde_json::Value {
@@ -939,9 +978,213 @@ mod upgrade_tests {
     }
 }
 
+pub fn reconcile_agents(db: &Connection, node_id: &str, live: &[String]) -> Vec<String> {
+    let mut sql = String::from(
+        "SELECT id FROM agents WHERE node_id = ? AND exited_at_ms IS NULL",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(node_id.to_string())];
+    if !live.is_empty() {
+        sql.push_str(" AND id NOT IN (");
+        sql.push_str(&vec!["?"; live.len()].join(","));
+        sql.push(')');
+        for id in live {
+            args.push(Box::new(id.clone()));
+        }
+    }
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
+    let Ok(mut stmt) = db.prepare(&sql) else { return Vec::new() };
+    let Ok(rows) = stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    let gone: Vec<String> = rows.filter_map(Result::ok).collect();
+    let now = now_ms();
+    for id in &gone {
+        let _ = db.execute(
+            "UPDATE agents SET status = 'exited', exited_at_ms = ? WHERE id = ?",
+            params![now, id],
+        );
+        // Work handed to it but never acked goes back in the queue, and
+        // anyone blocked on a request it was serving is told, exactly as
+        // if the node had reported the exit itself.
+        let _ = db.execute(
+            "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
+             WHERE inflight_agent = ? AND acked_at_ms IS NULL",
+            [id],
+        );
+        if let Ok(Some(slot)) = db
+            .query_row("SELECT slot_id FROM agents WHERE id = ?", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+        {
+            let _ = crate::asks::fail_outstanding(&db, &slot);
+        }
+    }
+    gone
+}
+
+/// At startup nothing is connected, so nothing has been confirmed by anyone.
+pub fn demote_running(db: &Connection) -> usize {
+    db.execute(
+        "UPDATE agents SET status = 'lost'
+         WHERE exited_at_ms IS NULL AND status = 'running' AND provenance <> 'external'",
+        [],
+    )
+    .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database with one node and two agents on it, both live.
+    fn fleet() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(nexmesh_proto::SCHEMA_SQL).unwrap();
+        db.execute(
+            "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,last_seen_ms,
+                                 lease_expires_ms)
+             VALUES ('nd-1','machine-a','linux','x86_64','0.1.0','online',1,1,9999999999999)",
+            [],
+        )
+        .unwrap();
+        for (slot, agent, prov) in [
+            ("sl-a", "ag-a", "managed"),
+            ("sl-b", "ag-b", "attached"),
+        ] {
+            db.execute(
+                "INSERT INTO slots (id,session_id,display_name,created_at_ms) VALUES (?,'s1',?,1)",
+                params![slot, slot],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO agents (id,slot_id,node_id,provenance,status,started_at_ms,last_seen_ms)
+                 VALUES (?,?,'nd-1',?,'running',1,?)",
+                params![agent, slot, prov, now_ms()],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn status_of(db: &Connection, agent: &str) -> (String, Option<i64>) {
+        db.query_row("SELECT status, exited_at_ms FROM agents WHERE id = ?", [agent], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_node_that_comes_back_with_nothing_frees_every_seat_it_held() {
+        // The bug: a node keeps its agent table in memory, so a restarted
+        // node never mentions the processes its predecessor spawned. Nothing
+        // then resolved those agents, and their seats stayed occupied by
+        // processes that no longer existed -- for as long as the hub ran.
+        let db = fleet();
+        let gone = reconcile_agents(&db, "nd-1", &[]);
+        assert_eq!(gone.len(), 2, "both agents are unaccounted for");
+        for a in ["ag-a", "ag-b"] {
+            let (status, exited) = status_of(&db, a);
+            assert_eq!(status, "exited");
+            assert!(exited.is_some(), "a freed seat must have an exit time");
+        }
+    }
+
+    #[test]
+    fn an_agent_the_node_still_has_is_left_alone() {
+        let db = fleet();
+        let gone = reconcile_agents(&db, "nd-1", &["ag-b".to_string()]);
+        assert_eq!(gone, vec!["ag-a".to_string()]);
+        assert_eq!(status_of(&db, "ag-b").0, "running");
+        assert!(status_of(&db, "ag-b").1.is_none());
+    }
+
+    #[test]
+    fn reconciling_one_node_does_not_touch_another() {
+        let db = fleet();
+        db.execute(
+            "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,last_seen_ms,
+                                 lease_expires_ms)
+             VALUES ('nd-2','machine-b','linux','x86_64','0.1.0','online',1,1,9999999999999)",
+            [],
+        )
+        .unwrap();
+        db.execute("UPDATE agents SET node_id = 'nd-2' WHERE id = 'ag-b'", []).unwrap();
+        reconcile_agents(&db, "nd-1", &[]);
+        assert_eq!(status_of(&db, "ag-b").0, "running", "the other machine is none of its business");
+    }
+
+    #[test]
+    fn work_handed_to_a_freed_agent_goes_back_in_the_queue() {
+        let db = fleet();
+        db.execute(
+            "INSERT INTO messages (id,session_id,from_slot,to_slot,body,sent_at_ms,
+                                   inflight_agent,inflight_at_ms)
+             VALUES (1,'s1','sl-b','sl-a','do the thing',1,'ag-a',1)",
+            [],
+        )
+        .unwrap();
+        reconcile_agents(&db, "nd-1", &[]);
+        let inflight: Option<String> = db
+            .query_row("SELECT inflight_agent FROM messages WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(inflight.is_none(), "an unacked message must not stay in flight to a dead agent");
+    }
+
+    #[test]
+    fn an_already_exited_agent_is_not_reported_as_newly_gone() {
+        let db = fleet();
+        reconcile_agents(&db, "nd-1", &[]);
+        assert!(reconcile_agents(&db, "nd-1", &[]).is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn a_restart_demotes_agents_nothing_has_confirmed() {
+        // What made the worse half of the bug: on a hub restart the stored
+        // status was taken as fact, so an agent read `running` hours after
+        // its process died -- the one state that makes the fleet lie rather
+        // than merely look stale.
+        let db = fleet();
+        db.execute(
+            "INSERT INTO agents (id,slot_id,provenance,status,started_at_ms,last_seen_ms,
+                                 lease_expires_ms)
+             VALUES ('ag-x','sl-a','external','running',1,?,?)",
+            params![now_ms(), now_ms() + 60_000],
+        )
+        .unwrap();
+        assert_eq!(demote_running(&db), 2);
+        assert_eq!(status_of(&db, "ag-a").0, "lost");
+        assert_eq!(status_of(&db, "ag-b").0, "lost");
+        assert_eq!(
+            status_of(&db, "ag-x").0,
+            "running",
+            "an external agent keeps its own lease and is not a node's to demote"
+        );
+        // Demotion is not death: nothing is marked exited, so a node that
+        // still has the process says so and it is running again.
+        assert!(status_of(&db, "ag-a").1.is_none());
+    }
+
+    #[test]
+    fn expiring_leases_cannot_leave_a_running_agent_nobody_confirmed() {
+        let db = fleet();
+        let stale = now_ms() - proto::NODE_LEASE_MS as i64 - 1;
+        db.execute("UPDATE agents SET last_seen_ms = ? WHERE id = 'ag-a'", [stale]).unwrap();
+        db.execute(
+            "UPDATE agents SET status = 'lost'
+             WHERE exited_at_ms IS NULL AND status = 'running'
+               AND provenance <> 'external' AND last_seen_ms < ?",
+            [now_ms() - proto::NODE_LEASE_MS as i64],
+        )
+        .unwrap();
+        assert_eq!(status_of(&db, "ag-a").0, "lost");
+        assert_eq!(status_of(&db, "ag-b").0, "running");
+    }
 
     #[test]
     fn migration_adds_a_column_missing_from_an_older_database() {

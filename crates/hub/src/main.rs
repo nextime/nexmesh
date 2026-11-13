@@ -565,6 +565,12 @@ async fn main() -> Result<()> {
         Some(Cmd::Serve) | None => {}
     }
 
+    // Nothing is connected yet, so nothing in the table can be trusted to be
+    // running. Each node says what it still has as it arrives, and a live
+    // agent is back to `running` within a heartbeat; what this stops is a
+    // stale `running` row from before the restart surviving as a fact.
+    st.demote_running_agents();
+
     // Delivery and recovery. Driven agents get messages pushed to them within
     // a tick instead of waiting for their next tool call; crashed agents come
     // back with a handoff.

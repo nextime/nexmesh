@@ -719,6 +719,35 @@ its own. For a long-lived assistant that publishes no id of its own, pin one:
 set `NEXMESH_CLI_SESSION=hermes-lisa` and every reconnect reclaims that seat
 instead of taking another.
 
+A seat nobody named is named after what it is and where it is — `Claude-sissy`,
+then `Claude-sissy-2` when the same CLI is open twice on one machine. Nothing
+is left blank and nothing is named twice, because every command that addresses
+an agent addresses it by name.
+
+### Making your own CLI a team member
+
+You do not have to let the hub spawn an agent to have one. Register the shim
+in a CLI you already use and every conversation you start in it takes its own
+seat:
+
+```bash
+nexmesh install-seat --cli claude --session fleet --role engineer
+```
+
+That is `managed` versus `attached` as a choice rather than an accident, and
+`attached` is usually the better one for the machines you work on yourself:
+
+- a managed agent is a process the hub started, so it dies with the node that
+  started it, and its seat is only as durable as that process;
+- an attached agent is the conversation you are already having. Its seat is
+  keyed on the CLI's conversation id, so it survives a restart, a `/resume`,
+  and the node being restarted underneath it.
+
+The shim holds no credentials and never speaks to the hub — it finds the node
+on its own machine over a unix socket, and the node asks for the seat — so a
+seat costs the CLI nothing but one MCP server, and a compromised agent gains
+no fleet access. Conversations already open pick it up when they restart.
+
 A pinned identity is one process, so joining somewhere marks it gone
 everywhere else — which is what lets it **move**: point it at another session
 and it takes, or returns to, its seat there.
@@ -757,6 +786,22 @@ Messages are addressed **slot to slot**, not process to process, so a message
 queued for a slot is still there for whatever agent next occupies it, on
 whatever machine. The original keys the inbox on the peer and has to graft it
 onto a respawned agent.
+
+### Nothing claims to be running that nothing has vouched for
+
+A node checks each of its agents against `/proc` every heartbeat, and says
+which it still has as it connects. That inventory is what retires a seat: a
+node keeps its agent table in memory, so one that restarts knows nothing of
+the processes its predecessor spawned and will never mention them again. Told
+nothing, the hub kept them for ever — and a hub restart froze whatever status
+happened to be in the table, so a seat could report a live teammate hours
+after its process had died.
+
+So: an agent the node does not list has gone, and its seat is free. An agent
+nothing has confirmed for a whole lease is `lost` rather than `running`,
+whether the hub noticed the node leave or was itself restarted. A `lost`
+managed agent may still be alive — its node can adopt it back — but it is no
+longer something the fleet claims to be driving.
 
 ## Running the fleet from whatever CLI you use
 

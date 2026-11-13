@@ -1,10 +1,17 @@
-//! `nexmesh install-orchestrator` -- make the orchestrator available inside
-//! whichever agent CLI you actually use.
+//! Registering one of our MCP servers inside whichever agent CLI you use.
 //!
-//! Running a fleet should not require one particular CLI, so this registers
-//! `nexmesh-orch` as an MCP server in any of them. Where a CLI offers its own
-//! `mcp add`, that is used in preference to editing its config by hand: it is
-//! the CLI's own format to change.
+//! Two things get installed this way, and they are not the same thing:
+//!
+//! * the ORCHESTRATOR (`nexmesh-orch`), which gives a CLI the tools to drive
+//!   the fleet -- create sessions, add agents, move them about;
+//! * a SEAT (`nexmesh-mcpd`), which makes the CLI itself a member of a team.
+//!   Every conversation that loads it takes its own seat, keyed on the CLI's
+//!   own conversation id, and goes on answering from wherever it is running.
+//!
+//! Running a fleet should not require one particular CLI, so either can go
+//! into any of them. Where a CLI offers its own `mcp add`, that is used in
+//! preference to editing its config by hand: it is the CLI's own format to
+//! change.
 
 use anyhow::{bail, Context, Result};
 use nexmesh_proto::cli_descriptor::{render_entry, set_pointer, CliDescriptor, UserInstall};
@@ -18,7 +25,7 @@ fn expand(p: &str) -> String {
 }
 
 /// Absolute, because the CLI that launches it will not share our directory.
-fn orch_path(given: Option<&str>) -> Result<String> {
+fn binary_path(given: Option<&str>, name: &str, flag: &str) -> Result<String> {
     if let Some(p) = given {
         let abs = std::fs::canonicalize(expand(p))
             .with_context(|| format!("{p} does not exist"))?;
@@ -26,12 +33,12 @@ fn orch_path(given: Option<&str>) -> Result<String> {
     }
     let sibling = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("nexmesh-orch")))
+        .and_then(|p| p.parent().map(|d| d.join(name)))
         .filter(|p| p.exists());
     match sibling {
         Some(p) => Ok(std::fs::canonicalize(&p)?.to_string_lossy().to_string()),
         None => bail!(
-            "cannot find nexmesh-orch next to this binary; pass --orch <path> \
+            "cannot find {name} next to this binary; pass {flag} <path> \
              (it must be an absolute path the CLI can run)"
         ),
     }
@@ -41,11 +48,89 @@ pub struct Opts<'a> {
     pub cli_id: &'a str,
     pub clis_dir: &'a str,
     pub server_name: &'a str,
+    /// Absolute path to the binary the CLI will launch as its MCP server.
+    pub command: String,
+    /// Environment the CLI must pass to it. Values are redacted when echoed.
+    pub env: Vec<(String, String)>,
+    pub dry_run: bool,
+}
+
+/// `nexmesh install-orchestrator`: the fleet's tools, inside your CLI.
+pub struct OrchOpts<'a> {
+    pub cli_id: &'a str,
+    pub clis_dir: &'a str,
+    pub server_name: &'a str,
     pub orch: Option<&'a str>,
     pub hub: &'a str,
     pub token: Option<&'a str>,
     pub ca_cert: Option<&'a str>,
     pub dry_run: bool,
+}
+
+pub fn install_orchestrator(o: OrchOpts) -> Result<String> {
+    let mut env: Vec<(String, String)> = vec![("NEXMESH_HUB_HTTP".into(), o.hub.to_string())];
+    if let Some(t) = o.token {
+        env.push(("NEXMESH_OPERATOR_TOKEN".into(), t.to_string()));
+    }
+    if let Some(c) = o.ca_cert {
+        env.push(("NEXMESH_CA_CERT".into(), expand(c)));
+    }
+    install(Opts {
+        cli_id: o.cli_id,
+        clis_dir: o.clis_dir,
+        server_name: o.server_name,
+        command: binary_path(o.orch, "nexmesh-orch", "--orch")?,
+        env,
+        dry_run: o.dry_run,
+    })
+}
+
+/// `nexmesh install-seat`: this CLI becomes a team member.
+///
+/// Deliberately thin. The shim holds no credentials and never speaks to the
+/// hub -- it finds the node on this machine over a unix socket, and the node
+/// asks for the seat. So there is nothing here to leak, and a conversation
+/// started by hand joins on exactly the same footing as one the hub spawned.
+pub struct SeatOpts<'a> {
+    pub cli_id: &'a str,
+    pub clis_dir: &'a str,
+    pub server_name: &'a str,
+    pub mcpd: Option<&'a str>,
+    pub sock: &'a str,
+    /// Session id or name. Worth setting: without it a CLI started outside
+    /// any workspace has to guess, and refuses when more than one session is
+    /// active.
+    pub session: Option<&'a str>,
+    pub role: Option<&'a str>,
+    /// Usually left alone. A fixed name makes every conversation in this CLI
+    /// ask for the SAME seat, which is the duplication it looks like a fix
+    /// for; unset, the hub names each one as it arrives.
+    pub name: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+pub fn install_seat(o: SeatOpts) -> Result<String> {
+    let mut env: Vec<(String, String)> = vec![
+        ("NEXMESH_SOCK".into(), o.sock.to_string()),
+        ("NEXMESH_CLI".into(), o.cli_id.to_string()),
+    ];
+    if let Some(s) = o.session {
+        env.push(("NEXMESH_SESSION".into(), s.to_string()));
+    }
+    if let Some(r) = o.role {
+        env.push(("NEXMESH_ROLE".into(), r.to_string()));
+    }
+    if let Some(n) = o.name {
+        env.push(("NEXMESH_NAME".into(), n.to_string()));
+    }
+    install(Opts {
+        cli_id: o.cli_id,
+        clis_dir: o.clis_dir,
+        server_name: o.server_name,
+        command: binary_path(o.mcpd, "nexmesh-mcpd", "--mcpd")?,
+        env,
+        dry_run: o.dry_run,
+    })
 }
 
 pub fn install(o: Opts) -> Result<String> {
@@ -61,14 +146,8 @@ pub fn install(o: Opts) -> Result<String> {
                                  o.cli_id))?
         .clone();
 
-    let orch = orch_path(o.orch)?;
-    let mut env: Vec<(String, String)> = vec![("NEXMESH_HUB_HTTP".into(), o.hub.to_string())];
-    if let Some(t) = o.token {
-        env.push(("NEXMESH_OPERATOR_TOKEN".into(), t.to_string()));
-    }
-    if let Some(c) = o.ca_cert {
-        env.push(("NEXMESH_CA_CERT".into(), expand(c)));
-    }
+    let orch = o.command.clone();
+    let env = o.env.clone();
 
     match install {
         UserInstall::Command { argv, env_flag } => {
@@ -90,11 +169,31 @@ pub fn install(o: Opts) -> Result<String> {
                     rendered.push(a.replace("{command}", &orch).replace("{name}", o.server_name));
                 }
             }
-            if o.dry_run {
-                return Ok(format!("would run: {bin} {}", redact(&rendered).join(" ")));
+            // The descriptor's own environment has to be applied, because it
+            // is what makes a named configuration a configuration: a second
+            // Claude account is the same binary pointed at another config
+            // directory, and `mcp add` run without that writes the
+            // registration into the FIRST account's file -- reporting
+            // success, in the wrong place, for an account that never gets a
+            // seat.
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.args(&rendered);
+            for (k, v) in &d.cli.env {
+                cmd.env(k, expand(v));
             }
-            let out = std::process::Command::new(&bin)
-                .args(&rendered)
+            for k in &d.cli.env_unset {
+                cmd.env_remove(k);
+            }
+            if o.dry_run {
+                let shown = d
+                    .cli
+                    .env
+                    .iter()
+                    .map(|(k, v)| format!("{k}={} ", expand(v)))
+                    .collect::<String>();
+                return Ok(format!("would run: {shown}{bin} {}", redact(&rendered).join(" ")));
+            }
+            let out = cmd
                 .output()
                 .with_context(|| format!("running {bin} {}", redact(&rendered).join(" ")))?;
             if !out.status.success() {
