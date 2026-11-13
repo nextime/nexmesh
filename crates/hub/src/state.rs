@@ -119,6 +119,30 @@ fn migrate(conn: &Connection) -> Result<()> {
             updated_at_ms INTEGER NOT NULL
          )",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_graph_nodes (
+            workspace_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
+            name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
+            lang TEXT NOT NULL, community INTEGER,
+            PRIMARY KEY (workspace_id, id));
+         CREATE INDEX IF NOT EXISTS code_graph_name_idx
+            ON code_graph_nodes(workspace_id, name);
+         CREATE INDEX IF NOT EXISTS code_graph_comm_idx
+            ON code_graph_nodes(workspace_id, community);
+         CREATE TABLE IF NOT EXISTS code_graph_edges (
+            workspace_id TEXT NOT NULL, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+            kind TEXT NOT NULL, PRIMARY KEY (workspace_id, from_id, to_id, kind));
+         CREATE INDEX IF NOT EXISTS code_graph_from_idx
+            ON code_graph_edges(workspace_id, from_id);
+         CREATE INDEX IF NOT EXISTS code_graph_to_idx
+            ON code_graph_edges(workspace_id, to_id);
+         CREATE TABLE IF NOT EXISTS code_graph_meta (
+            workspace_id TEXT PRIMARY KEY, built_at_ms INTEGER NOT NULL,
+            files INTEGER NOT NULL, skipped TEXT NOT NULL DEFAULT '[]',
+            truncated INTEGER NOT NULL DEFAULT 0,
+            communities INTEGER NOT NULL DEFAULT 0)",
+    )?;
+
     // Carry any rows from the original flat `knowledge` table into session
     // scope. An upgraded hub must not look as though it forgot everything.
     // Runs once: the INSERT ignores keys memory already has.

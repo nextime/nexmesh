@@ -162,6 +162,23 @@ pub fn team_tools() -> Vec<ToolDef> {
                     "scope": json!({ "type": "string",
                         "enum": ["agent", "group", "session", "global"] }),
                     "group": s("Group name, when scope is 'group'") }), &["key"]),
+        tool("query_code_graph",
+            "Ask about this workspace's code without reading it: what calls a function, what a \
+             file imports, where a symbol is defined, which subsystem something belongs to. \
+             Parsed from the real syntax tree, so it is exact and costs you no context. Start \
+             with what='overview'. Call edges are resolved by name, so they are a strong hint \
+             rather than proof.",
+            json!({
+                "what": json!({ "type": "string",
+                    "enum": ["overview", "find", "callers", "calls", "imports", "importers",
+                             "defines", "subsystem", "subsystems", "path"],
+                    "description": "The question to ask. 'overview' first if unsure." }),
+                "target": s("The symbol or file to ask about, e.g. 'parse_header' or 'src/a.rs'"),
+                "to": s("The other end, for what='path'"),
+                "rebuild": json!({ "type": "boolean",
+                    "description": "Re-parse the workspace first. Needed after large changes; \
+                                    it is built automatically the first time." })
+            }), &["what"]),
         tool("publish_work",
             "Share what you have done with the rest of the team. Commits your changes in the \
              shared workspace and pushes them, then everyone else can pull them. Call this when \

@@ -242,6 +242,12 @@ pub enum NodeToHub {
         slot_id: String,
         handle: String,
     },
+    /// A workspace's parsed code graph, answering BuildCodeGraph.
+    CodeGraphResult {
+        req_id: u64,
+        workspace_id: String,
+        graph: crate::codegraph::CodeGraph,
+    },
     /// The model an agent reports it is actually running.
     ///
     /// Separate from the one requested, because a CLI may substitute or fall
@@ -431,6 +437,13 @@ pub enum HubToNode {
         data: Vec<u8>,
     },
     /// Act on a shared workspace's checkout on this node.
+    /// Parse a workspace and send its code graph back. The node does this
+    /// because the node is where the files are.
+    BuildCodeGraph {
+        req_id: u64,
+        workspace_id: String,
+        path: String,
+    },
     SyncWorkspace {
         req_id: u64,
         workspace_id: String,

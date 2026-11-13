@@ -20,6 +20,7 @@
 //! inbound port.
 
 mod cli_detect;
+mod codegraph;
 mod codex;
 mod ctx;
 mod driver;
@@ -624,6 +625,25 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                         .await;
                 }
             }
+        }
+
+        HubToNode::BuildCodeGraph { req_id, workspace_id, path } => {
+            // Parsing a large tree is CPU work; off the session loop so one
+            // scan does not stall this machine's spawns and attach traffic.
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let root = std::path::PathBuf::from(&path);
+                let graph = tokio::task::spawn_blocking(move || {
+                    codegraph::scan(&root, &codegraph::Limits::default())
+                })
+                .await
+                .unwrap_or_default();
+                tracing::info!(%workspace_id, files = graph.files, nodes = graph.nodes.len(),
+                    "parsed a workspace");
+                let _ = ctx
+                    .send_hub(&NodeToHub::CodeGraphResult { req_id, workspace_id, graph })
+                    .await;
+            });
         }
 
         HubToNode::SyncWorkspace {

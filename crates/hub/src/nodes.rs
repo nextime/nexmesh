@@ -262,6 +262,12 @@ async fn handle(
             tracing::debug!(%slot_id, "stored a resume handle");
         }
 
+        NodeToHub::CodeGraphResult { req_id, graph, .. } => {
+            // Hand it to whoever asked, through the same waiter the workspace
+            // sync round-trip uses.
+            st.complete_sync(req_id, serde_json::to_value(graph).unwrap_or_default());
+        }
+
         NodeToHub::AgentModel { agent_id, model } => {
             let db = st.db.lock().unwrap();
             db.execute("UPDATE agents SET model = ? WHERE id = ?", params![model, agent_id])?;
@@ -388,7 +394,10 @@ async fn handle(
 /// Tools that have to talk to a node, so cannot run inside the synchronous
 /// dispatcher.
 fn is_workspace_tool(tool: &str) -> bool {
-    matches!(tool, "publish_work" | "sync_workspace" | "workspace_status")
+    matches!(
+        tool,
+        "publish_work" | "sync_workspace" | "workspace_status" | "query_code_graph"
+    )
 }
 
 /// Run a tool, including the ones that need a round trip to a machine.
@@ -425,6 +434,37 @@ fn slot_and_name(st: &AppState, agent_id: &str) -> Option<(String, String)> {
     .flatten()
 }
 
+/// Answer a code-graph question, parsing the workspace first if need be.
+async fn code_graph_tool(
+    st: &AppState,
+    ws_id: &str,
+    node_id: &str,
+    path: &str,
+    args: &serde_json::Value,
+) -> Result<String> {
+    let what = args
+        .get("what")
+        .and_then(|v| v.as_str())
+        .unwrap_or("overview")
+        .to_string();
+    let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Built on first use rather than requiring anyone to remember: an agent
+    // asking a question should get an answer, not an instruction.
+    let have = { crate::graph::exists(&st.db.lock().unwrap(), ws_id) };
+    let mut preamble = String::new();
+    if rebuild || !have {
+        preamble = format!("{}\n", crate::graph::build(st, ws_id, node_id, path).await?);
+    }
+    let answer = {
+        let db = st.db.lock().unwrap();
+        crate::graph::query(&db, ws_id, &what, &target, &to)?
+    };
+    Ok(format!("{preamble}{answer}"))
+}
+
 async fn workspace_tool(
     st: &AppState,
     agent_id: &str,
@@ -433,6 +473,20 @@ async fn workspace_tool(
 ) -> Result<(String, Vec<proto::Envelope>)> {
     let (slot_id, who) = slot_and_name(st, agent_id)
         .ok_or_else(|| anyhow::anyhow!("unknown agent '{agent_id}'"))?;
+
+    // The code graph needs a directory, not a git remote, so it is answered
+    // for any workspace -- including a node-local one.
+    if tool == "query_code_graph" {
+        let Some((ws_id, node_id, path)) = crate::sync::workspace_host(st, &slot_id) else {
+            return Ok((
+                "You have no workspace on a connected machine, so there are no files to parse."
+                    .into(),
+                vec![],
+            ));
+        };
+        return code_graph_tool(st, &ws_id, &node_id, &path, args).await.map(|t| (t, vec![]));
+    }
+
     let Some((ws_id, node_id, path)) = crate::sync::slot_workspace(st, &slot_id) else {
         return Ok((
             "You are not in a shared workspace: your files are local to this machine, so there \

@@ -154,6 +154,36 @@ pub fn slot_workspace(st: &AppState, slot_id: &str) -> Option<(String, String, S
     .flatten()
 }
 
+/// A workspace and a machine that can read it, for anything that needs the
+/// FILES rather than git.
+///
+/// Two differences from `slot_workspace`, both of which were bugs when the
+/// code graph used that instead. It does not require a repo workspace, since
+/// parsing only needs a directory. And it resolves the machine from the
+/// WORKSPACE's mounts rather than from the asking agent's own node: an
+/// external participant has no node at all, so asking where *it* runs gave
+/// "you have no workspace" in answer to a question about the code.
+///
+/// Ordered, so repeated calls pick the same machine and the graph stays
+/// consistent between questions.
+pub fn workspace_host(st: &AppState, slot_id: &str) -> Option<(String, String, String)> {
+    let db = st.db.lock().unwrap();
+    db.query_row(
+        "SELECT w.id, m.node_id, m.path
+         FROM slots s
+         JOIN workspaces w ON w.id = s.workspace_id
+         JOIN workspace_mounts m ON m.workspace_id = w.id
+         JOIN nodes n ON n.id = m.node_id
+         WHERE s.id = ? AND n.status = 'online'
+         ORDER BY m.node_id LIMIT 1",
+        [slot_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 /// Render a sync result as something to tell an agent.
 pub fn describe(v: &Value) -> String {
     if let Some(results) = v["results"].as_array() {

@@ -177,7 +177,7 @@ doors:
 | node-supervised command | a program that is not an "agent CLI" | a descriptor |
 
 An external participant joins with `POST /v1/participant/join`, calls the same
-26 tools through the same dispatcher, and shows up in `list_peers` like anyone
+27 tools through the same dispatcher, and shows up in `list_peers` like anyone
 else. It needs no node, no pty and no MCP implementation. Consequently
 `agents.node_id`, `pid` and `proc_start_ticks` are all nullable, and such an
 agent's liveness is a lease it renews -- the same mechanism as a node, for the
@@ -214,7 +214,7 @@ claude mcp add --transport http team \
 
 That is the whole integration. No nexmesh client, no SDK, no node on the
 machine: a token and a URL make anything that speaks MCP a teammate, with the
-same 26 tools and the same delivery. Verified against both `claude` and
+same 27 tools and the same delivery. Verified against both `claude` and
 `opencode`, which each report the endpoint connected and negotiate MCP
 `2025-03-26`.
 
@@ -248,6 +248,79 @@ refused, because a browser on any page can reach a loopback address.
 > Not to be confused with `nexmesh-orch`, which is the mirror image: that one
 > makes *your* CLI the operator of the fleet, where this one makes an external
 > agent a *member* of a team.
+
+## Reading a codebase once, not once per agent
+
+Every agent that joins a codebase starts by reading it, and a cheap seat
+spends its context doing badly what a parser does exactly. So the node parses
+the workspace — it has the files — and the hub keeps the result for the whole
+team:
+
+```
+query_code_graph {"what": "callers", "target": "make_session"}
+
+src/auth.rs#make_session is called by:
+- src/auth.rs#sign_in [function] src/auth.rs:4
+(Call edges are resolved by name, so they are a strong hint rather than proof.)
+```
+
+`overview`, `find`, `callers`, `calls`, `imports`, `importers`, `defines`,
+`subsystem`, `subsystems` and `path`. It is built on first use, so an agent
+asking a question gets an answer rather than an instruction, and `rebuild`
+re-parses after large changes.
+
+Parsing is **tree-sitter**: deterministic, no model, no network, nothing
+leaving the machine. Languages are a table rather than code — Rust, Python,
+JavaScript, TypeScript, Go, PHP and Bash today, and another is a row plus a
+grammar crate, the same reasoning as the CLI descriptors. Dependency and build
+directories are never walked, because burying a project's own code under
+`node_modules` would poison every answer drawn from the graph.
+
+**Derived, never authored.** The graph is regenerated from the files and holds
+no opinions, which is exactly why it can be thrown away; anything an agent
+*concluded* goes in `memory`, which is attributed and scoped. Keeping them
+apart is what lets a rebuild be free. A rebuild replaces rather than merges,
+so a symbol that no longer exists is never offered as though it did.
+
+**A guess is never dressed as a fact.** `Defines` and `Imports` come straight
+off the syntax tree. `Calls` and `References` are resolved by name, which is
+a guess wherever a language lets two things share one — so they are labelled
+that way all the way to the agent, and an ambiguous call produces *no* edge at
+all, because a wrong edge is worse than a missing one in something an agent
+reasons from. Imports that leave the workspace become module nodes, so "what
+does this depend on" is answerable rather than silently pruned.
+
+### Subsystems, found rather than labelled
+
+Communities come from a native **Leiden** implementation. Louvain optimises
+the same quality function and is simpler, but it can return a community that
+is *internally disconnected* — a node acting as the only bridge gets moved out
+and the orphaned remainder keeps the label. A "subsystem" whose members cannot
+reach each other would be actively misleading as agent context, so the
+refinement phase that prevents it is the whole reason for choosing Leiden, and
+a test asserts the property directly rather than trusting it.
+
+It is deliberately **deterministic** — the published algorithm randomises
+among well-connected candidates, and here the same codebase must yield the
+same subsystems on every machine, or two agents would be told different
+things.
+
+Only `Calls` and `Imports` carry weight. Weighting `Defines` would tie every
+symbol to its own file and make each file a community, which says nothing a
+directory listing does not. A symbol with no relational edges belongs to no
+subsystem and says so, rather than becoming a subsystem of one and burying the
+real ones.
+
+```
+query_code_graph {"what": "subsystems"}
+
+2 subsystem(s), largest first:
+- subsystem 0: 5 member(s) — Session, hash_token, make_session, sign_in (in src/auth.rs, src/store.rs)
+- subsystem 1: 3 member(s) — draw_page, header, layout (in src/render.rs)
+```
+
+That last one is what makes context budgeting possible: hand a cheap seat the
+subsystem it needs instead of the repository.
 
 ## Memory with a scope
 

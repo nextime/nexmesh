@@ -21,6 +21,7 @@ mod certs;
 mod control;
 mod dashboard;
 mod delivery;
+mod graph;
 mod launch;
 mod leiden;
 mod nodes;
