@@ -10,15 +10,15 @@ include letsencrypt's shared TLS options, one log pair per vhost.
 # `map` must live in the http block, not in a vhost
 cp nexmesh-upgrade.conf /etc/nginx/conf.d/
 
-cp nexmesh.nexlab.net.conf /etc/nginx/sites-available/
-ln -sf ../sites-available/nexmesh.nexlab.net.conf /etc/nginx/sites-enabled/
+cp nexmesh.example.net.conf /etc/nginx/sites-available/
+ln -sf ../sites-available/nexmesh.example.net.conf /etc/nginx/sites-enabled/
 nginx -t && service nginx reload
 ```
 
 The certificate first, since the vhost references it:
 
 ```bash
-certbot certonly --webroot -w /var/www/html -d nexmesh.nexlab.net
+certbot certonly --webroot -w /var/www/html -d nexmesh.example.net
 ```
 
 nginx also needs its own client certificate for the hub:
@@ -41,7 +41,7 @@ hub is started with `--trusted-proxy 127.0.0.1` and believes the forwarded
 ignored and the certificate-to-token binding is simply not enforced. With it,
 **the hub must not be reachable except through nginx or over the LAN** -- a
 client that could reach it directly could set those headers itself. That is
-why it binds `127.0.0.1` and `192.168.42.44` and never `wan0`.
+why it binds `127.0.0.1` and `10.0.0.10` and never `wan0`.
 
 Pairing is not proxied, on purpose: a machine being paired has no certificate
 yet, so that endpoint cannot require one. It lives on the LAN address only.

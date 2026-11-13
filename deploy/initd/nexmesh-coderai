@@ -20,7 +20,7 @@ CONF=/etc/nexmesh/coderai.env
 # AFTER sourcing the config, not before: setting this first meant
 # NEXMESH_BRIDGE_USER in the config file was never read, and the service tried
 # to run as a user that does not exist on every host.
-USER="${NEXMESH_BRIDGE_USER:-nextime}"
+USER="${NEXMESH_BRIDGE_USER:-agentuser}"
 
 : "${NEXMESH_HUB:=}"
 : "${CODERAI_URL:=http://127.0.0.1:8000}"

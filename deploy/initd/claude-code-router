@@ -22,7 +22,7 @@ CONF=/etc/nexmesh/router.env
 
 [ -r "$CONF" ] && . "$CONF"
 
-: "${ROUTER_USER:=nextime}"
+: "${ROUTER_USER:=agentuser}"
 : "${ROUTER_PORT:=3456}"
 # `ccr start` is the usual entry point; override for LiteLLM or another proxy.
 : "${ROUTER_CMD:=ccr start}"

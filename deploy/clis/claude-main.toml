@@ -1,13 +1,20 @@
 # Claude Code. Verified against the binary on machine-b.
 [cli]
-id = "claude-thinkdifferent"
-display_name = "Claude Code (thinkdifferent)"
+id = "claude-main"
+display_name = "Claude Code (agentuser)"
 command = "claude"
 version_args = ["--version"]
-# A second account, same binary and same user. The directory must already
-# hold a logged-in configuration:
-#   CLAUDE_CONFIG_DIR=~/.claude-thinkdifferent claude
-env = { CLAUDE_CONFIG_DIR = "~/.claude-thinkdifferent" }
+# NO env here, deliberately.
+#
+# Setting CLAUDE_CONFIG_DIR=~/.claude looks equivalent to the default and is
+# not. When the variable is set, claude keeps .claude.json INSIDE that
+# directory; when it is unset, this install keeps it at ~/.claude.json. On
+# this machine ~/.claude/.claude.json exists but is months stale, so naming
+# the default explicitly would have pointed agents at an old session instead
+# of the live account -- quietly, and looking correct.
+#
+# Leaving it unset makes this id exactly what `claude` does at a terminal,
+# which is the whole claim being made.
 model_args = ["--model", "{model}"]
 extra_paths = ["~/.local/bin", "~/.npm-global/bin"]
 

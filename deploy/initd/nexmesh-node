@@ -18,7 +18,7 @@
 # are: the same hardware, different capability.
 #
 # Instance name comes from this script's own filename, so
-# /etc/init.d/nexmesh-node-lisa reads /etc/nexmesh/node-lisa.env and runs as
+# /etc/init.d/nexmesh-node-machine-d reads /etc/nexmesh/node-machine-d.env and runs as
 # whatever that file names. A plain nexmesh-node keeps the old paths.
 NAME=$(basename "$0")
 INSTANCE="${NAME#nexmesh-node}"
@@ -40,11 +40,11 @@ fi
 # AFTER sourcing the config, not before: setting this first meant
 # NEXMESH_NODE_USER in the config file was never read, and the service tried
 # to run as a user that does not exist on every host.
-USER="${NEXMESH_NODE_USER:-nextime}"
+USER="${NEXMESH_NODE_USER:-agentuser}"
 
 : "${NEXMESH_HUB:=}"
 # Default name distinguishes instances, so two nodes on one machine do not
-# both try to be "zeiss" -- the second would be refused, since the token is
+# both try to be "machine-b" -- the second would be refused, since the token is
 # issued to a name.
 if [ -n "$INSTANCE" ]; then
   : "${NEXMESH_NAME:=$(hostname -s)-$INSTANCE}"

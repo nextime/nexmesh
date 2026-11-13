@@ -1209,7 +1209,7 @@ password is an explicit statement that this hub has an owner.
 
 #### Behind nginx
 
-`deploy/nginx/nexmesh.nexlab.net.conf` is a working vhost, and the thing to
+`deploy/nginx/nexmesh.example.net.conf` is a working vhost, and the thing to
 understand before using it is that terminating TLS at the proxy moves where
 mutual TLS happens. The hub normally reads the client certificate off its own
 handshake; behind a proxy it sees nginx's connection instead, so the
