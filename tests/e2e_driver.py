@@ -129,7 +129,18 @@ def main():
     check("it resumed the SAME session id, not a fresh one",
           rh in nodelog, f"expected {rh} in the relaunch args")
     if newagent:
-        tr3 = until(lambda: http("GET", f"/v1/agents/{newagent['id']}/transcript?tail=65536")[1].get("transcript") or None, seconds=20) or ""
+        # Wait for the LINE being asserted, not merely for the transcript to
+        # be non-empty. The replacement's init JSON lands before its stderr
+        # does, so the old wait returned as soon as anything appeared and then
+        # asserted something still in flight -- which passed on a fast machine
+        # and failed on a slow one.
+        tr3 = ""
+        for _ in range(140):
+            tr3 = http("GET", f"/v1/agents/{newagent['id']}/transcript?tail=65536")[1] \
+                      .get("transcript") or ""
+            if "resumed=True" in tr3:
+                break
+            time.sleep(0.25)
         check("the agent confirms it resumed", "resumed=True" in tr3, tr3[:400])
         check("the handoff prompt told it it was restarted",
               "restarted" in tr3 or "resum" in tr3.lower(), tr3[:400])

@@ -1,0 +1,38 @@
+#!/bin/sh
+# claude, on the thinkdifferent account.
+#
+# For your own use at a terminal, and for the one-off interactive login that
+# has to happen before nexmesh can spawn an agent on this account:
+#
+#   claude-thinkdifferent            # log in the first time, then use normally
+#
+# nexmesh does not go through this wrapper. Its descriptor sets
+# CLAUDE_CONFIG_DIR itself, so a node can spawn the account whether or not
+# this file exists -- one less thing to be missing on a machine. The two agree
+# on the directory, and that is the only thing they need to agree on.
+set -e
+
+: "${CLAUDE_THINKDIFFERENT_DIR:=$HOME/.claude-thinkdifferent}"
+export CLAUDE_CONFIG_DIR="$CLAUDE_THINKDIFFERENT_DIR"
+
+if [ ! -d "$CLAUDE_CONFIG_DIR" ]; then
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+    echo "claude-thinkdifferent: created $CLAUDE_CONFIG_DIR — log in when prompted." >&2
+fi
+
+# Find the real claude without recursing into this wrapper: a login shell has
+# ~/.local/bin on PATH but a service or a cron job does not.
+for c in "$HOME/.local/bin/claude" "$HOME/.npm-global/bin/claude" /usr/local/bin/claude \
+         /usr/bin/claude; do
+    [ -x "$c" ] && exec "$c" "$@"
+done
+# Last resort: PATH, minus wherever this wrapper lives, so `exec claude` cannot
+# find this script again and loop.
+self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$self_dir" | paste -sd: -)
+export PATH
+command -v claude >/dev/null 2>&1 || {
+    echo "claude-thinkdifferent: cannot find the claude binary" >&2
+    exit 127
+}
+exec claude "$@"

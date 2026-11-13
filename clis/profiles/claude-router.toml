@@ -1,0 +1,57 @@
+# Claude Code pointed at a local router (claude-code-router, LiteLLM, or any
+# other Anthropic-shaped proxy), so this seat can be served by whatever model
+# the router decides.
+#
+# WHY A DESCRIPTOR AND NOT A FEATURE
+#
+# Claude Code speaks the Anthropic Messages API and nothing else -- there is
+# no OpenAI-shaped path in the binary. Reaching an OpenAI-compatible provider
+# therefore needs a translating proxy, and that proxy holds the provider keys.
+#
+# nexmesh deliberately holds no model credentials: the MCP shim holds none so
+# a compromised agent gains no reach, and the capability bridge is the only
+# process anywhere with a service token. Putting a gateway inside the hub or a
+# node would undo that on every machine and put nexmesh on the hot path of
+# every token, to duplicate something LiteLLM and ccr already do. So the
+# integration is a line of configuration, which is the right size for it.
+#
+# The division of labour: the router decides which model answers a request;
+# nexmesh decides which seat does which work, and records which model actually
+# answered (agents.model, reported by the driver from the CLI's own protocol).
+[cli]
+id = "claude-router"
+display_name = "Claude Code (via a local router)"
+command = "claude"
+version_args = ["--version"]
+extra_paths = ["~/.local/bin", "~/.npm-global/bin"]
+# ANTHROPIC_AUTH_TOKEN is usually a placeholder: a local router does not check
+# it, and the real provider keys live in the router's own config, 0600. That
+# is deliberate -- it keeps this file, which is shared across machines, free
+# of secrets.
+env = { ANTHROPIC_BASE_URL = "http://127.0.0.1:3456", ANTHROPIC_AUTH_TOKEN = "router", CLAUDE_CONFIG_DIR = "~/.claude-router" }
+
+[mcp]
+style = "inline_flag"
+flag = "--mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages", "--mcp-config", "{mcp_config}"]
+prompt_on_stdin = true
+resume_args = ["--resume", "{resume}"]
+attachable = false
+
+[modes.interactive]
+args = ["--mcp-config", "{mcp_config}"]
+attachable = true
+
+[driver]
+kind = "stream_json"
+replay_user_messages = true
+
+[user_install]
+style = "command"
+argv = ["claude", "mcp", "add", "--scope", "user", "nexmesh", "--", "{mcpd}"]
+env_flag = "-e"

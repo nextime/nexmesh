@@ -1,0 +1,43 @@
+# Codex CLI. Not installed on machine-b -- descriptor shipped so a node that has it
+# is picked up automatically, with no hub change.
+[cli]
+id = "codex-work"
+# A second login for codex, as the same user on the same machine. The
+# directory must already hold a logged-in configuration -- nexmesh points a
+# CLI at credentials, it does not create them:
+#   CODEX_HOME=~/.codex-work codex
+env = { CODEX_HOME = "~/.codex-work" }
+display_name = "Codex CLI"
+command = "codex"
+version_args = ["--version"]
+# Installed via npm here, like qwen. Without this a node only finds it when it
+# happens to be on the service's PATH, which a start-stop-daemon environment is not.
+extra_paths = ["~/.npm-global/bin", "~/.local/bin"]
+# Codex takes the model in thread/start, so no flag here.
+
+[mcp]
+style = "toml_file"
+path = "~/.codex/config.toml"
+key = "mcp_servers.nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+# The prompt is NOT passed here or on stdin: it becomes the first
+# `turn/start`, which the app_server driver issues after the handshake.
+args = ["app-server"]
+attachable = false
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "app_server"
+
+[user_install]
+style = "toml_file"
+path = "~/.codex/config.toml"
+key = "mcp_servers.{name}"
+env_key = "env"
+entry = { command = "{command}", args = [] }

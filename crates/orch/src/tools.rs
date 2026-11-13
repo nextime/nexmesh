@@ -96,7 +96,7 @@ pub fn tools() -> Vec<Tool> {
             description: "Every agent in a session: role, machine, task state, token use and \
                           current summary.",
             schema: json!({ "type": "object",
-                "properties": { "session": s("Session id; omitted means the most recent") },
+                "properties": { "session": s("Session id or name. Required when more than one session exists") },
                 "additionalProperties": false }),
         },
         Tool {
@@ -105,7 +105,7 @@ pub fn tools() -> Vec<Tool> {
                           actually reached its recipient. An unseen message is usually why a team \
                           looks stuck.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "limit": { "type": "integer", "description": "How many recent messages (default 40)" }
             }, "additionalProperties": false }),
         },
@@ -113,7 +113,7 @@ pub fn tools() -> Vec<Tool> {
             name: "message_team",
             description: "Send a message to the whole team or one agent, as the operator.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "to": s("Agent name or role; omitted means everyone"),
                 "text": s("What to say")
             }, "required": ["text"], "additionalProperties": false }),
@@ -122,7 +122,7 @@ pub fn tools() -> Vec<Tool> {
             name: "add_agent",
             description: "Add one more agent to a running session and start it.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "name": s("Agent name"), "role": s("Role"),
                 "cli": s("Agent CLI id"), "task": s("What it should do"),
                 "model": s("Model for this seat, if its CLI can be told"),
@@ -140,7 +140,7 @@ pub fn tools() -> Vec<Tool> {
                           and driven from anywhere. It becomes attachable; it does NOT become a \
                           team member unless the CLI inside it loads the nexmesh shim.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "node": s("Node whose tmux server holds it"),
                 "tmux_target": s("tmux session, window or pane, e.g. 'work' or 'work:1.0'"),
                 "name": s("What to call it"), "role": s("Role")
@@ -152,7 +152,7 @@ pub fn tools() -> Vec<Tool> {
                           turn already running finishes -- this means 'take on nothing further', \
                           not 'stop this instant'.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "who": s("Agent name or role; omitted means everyone"),
                 "reason": s("Why, so the agents can be told")
             }, "additionalProperties": false }),
@@ -162,7 +162,7 @@ pub fn tools() -> Vec<Tool> {
             description: "Start sending work again, to one agent or the whole team. Anything \
                           queued while they were paused is delivered.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "who": s("Agent name or role; omitted means everyone")
             }, "additionalProperties": false }),
         },
@@ -173,7 +173,7 @@ pub fn tools() -> Vec<Tool> {
                           this is how that hold is lifted. Omit the name to release the team and \
                           end the session's work.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "who": s("Agent name or role; omitted means everyone"),
                 "note": s("A word to the agent about why")
             }, "additionalProperties": false }),
@@ -183,7 +183,7 @@ pub fn tools() -> Vec<Tool> {
             description: "What one agent's process actually printed. Use this when an agent is \
                           behaving oddly or died: it outlives the process.",
             schema: json!({ "type": "object", "properties": {
-                "session": s("Session id; omitted means the most recent"),
+                "session": s("Session id or name. Required when more than one session exists"),
                 "who": s("Agent name, role or id"),
                 "tail": { "type": "integer", "description": "Bytes from the end (default 8000)" }
             }, "required": ["who"], "additionalProperties": false }),

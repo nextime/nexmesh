@@ -180,6 +180,21 @@ def main():
     check("and gives advice the model can act on, not an HTTP header",
           "NEXMESH_OPERATOR_TOKEN" in out and "Authorization" not in out, out[:260])
 
+    print("\n=== one orchestrator, several projects ===")
+    # The normal case for a fleet: one orchestrator driving a session per
+    # project. Omitting `session` used to take whichever sorted first, which
+    # is how an agent gets added to the wrong project.
+    s, j = http("POST", "/v1/sessions", {"name": "project-two"}, tok=optok)
+    assert j.get("session_id"), j
+    out = o.tool("team_status", {})
+    check("with several sessions, omitting one is an error",
+          "session' is required" in out, out[:200])
+    check("and it names the candidates so you can choose",
+          "project-two" in out, out[:300])
+    check("naming one works",
+          "session' is required" not in o.tool("team_status", {"session": "project-two"}),
+          o.tool("team_status", {"session": "project-two"})[:200])
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1

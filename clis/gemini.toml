@@ -4,6 +4,9 @@ id = "gemini"
 display_name = "Gemini CLI"
 command = "gemini"
 version_args = ["--version"]
+# Installed via npm here, like qwen. Without this a node only finds it when it
+# happens to be on the service's PATH, which a start-stop-daemon environment is not.
+extra_paths = ["~/.npm-global/bin", "~/.local/bin"]
 model_args = ["--model", "{model}"]
 
 [mcp]

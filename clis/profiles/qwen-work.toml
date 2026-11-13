@@ -1,0 +1,41 @@
+# Qwen Code (gemini-cli lineage). Verified against 'qwen --help'.
+[cli]
+id = "qwen-work"
+# A second login for qwen, as the same user on the same machine. The
+# directory must already hold a logged-in configuration -- nexmesh points a
+# CLI at credentials, it does not create them:
+#   QWEN_CONFIG_DIR=~/.qwen-work qwen
+env = { QWEN_CONFIG_DIR = "~/.qwen-work" }
+display_name = "Qwen Code"
+command = "qwen"
+version_args = ["--version"]
+model_args = ["--model", "{model}"]
+extra_paths = ["~/.npm-global/bin"]
+
+[mcp]
+style = "json_file"
+path = "~/.qwen/settings.json"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+# Positional prompt is one-shot. --approval-mode yolo because an unattended
+# agent cannot answer a confirmation prompt.
+args = ["--approval-mode", "yolo", "--session-id", "{session}", "{prompt}"]
+resume_args = ["--resume", "{resume}"]
+attachable = false
+
+[modes.interactive]
+args = ["--approval-mode", "auto-edit", "--prompt-interactive", "{prompt}"]
+resume_args = ["--resume", "{resume}"]
+attachable = true
+
+[driver]
+kind = "mcp_only"
+
+[user_install]
+# Same shape as Claude's: `qwen mcp add [-s scope] <name> -- <command>`.
+style = "command"
+argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
+env_flag = "-e"

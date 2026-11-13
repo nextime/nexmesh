@@ -21,7 +21,8 @@ def call(method, params=None):
 call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                     "clientInfo": {"name": "fakecli", "version": "1"}})
 tools = [t["name"] for t in call("tools/list")["result"]["tools"]]
-print(f"[fakecli] prompt={prompt[:40]!r} tools={len(tools)}", file=sys.stderr)
+print(f"[fakecli] prompt={prompt[:40]!r} tools={len(tools)} "
+      f"profile={os.environ.get('FAKE_PROFILE', '-')}", file=sys.stderr)
 r = call("tools/call", {"name": "set_summary", "arguments": {"summary": "spawned and reporting in"}})
 print("[fakecli] set_summary:", r["result"]["content"][0]["text"], file=sys.stderr)
 r = call("tools/call", {"name": "store_knowledge", "arguments":

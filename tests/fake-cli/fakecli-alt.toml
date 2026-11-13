@@ -1,0 +1,30 @@
+# A test-only descriptor: proves the managed spawn path end to end without
+# spending API credits. Exercises exactly the same code a real CLI does.
+[cli]
+id = "fakecli-alt"
+# A named configuration: the SAME binary and the same user, pointed at a
+# different login by its own environment. This is how two accounts for one
+# CLI coexist on a machine.
+env = { FAKE_PROFILE = "alternate" }
+display_name = "Fake CLI"
+command = "fakecli"
+version_args = ["--version"]
+extra_paths = ["../tests/fake-cli", "tests/fake-cli"]
+
+[mcp]
+style = "inline_flag"
+flag = "--mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+args = ["--mcp-config", "{mcp_config}", "{prompt}"]
+attachable = false
+
+[modes.interactive]
+args = ["--mcp-config", "{mcp_config}"]
+attachable = true
+
+[driver]
+kind = "mcp_only"

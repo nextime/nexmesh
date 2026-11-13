@@ -55,6 +55,31 @@ fn shim_env(spec: &SpawnSpec, sock_path: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// A descriptor's own environment, with `~/` expanded.
+///
+/// This is what lets two named configurations run the same binary as the same
+/// user against different logins: each points at its own config directory.
+/// The NEXMESH_* variables are applied after these and win, because they are
+/// how the shim finds its node -- a descriptor that could overwrite them
+/// would produce an agent that cannot join the team it was spawned for.
+fn descriptor_env(d: &nexmesh_proto::cli_descriptor::CliDescriptor) -> Vec<(String, String)> {
+    d.cli
+        .env
+        .iter()
+        .map(|(k, v)| {
+            let v = if let Some(rest) = v.strip_prefix("~/") {
+                match std::env::var("HOME") {
+                    Ok(home) => format!("{}/{}", home.trim_end_matches('/'), rest),
+                    Err(_) => v.clone(),
+                }
+            } else {
+                v.clone()
+            };
+            (k.clone(), v)
+        })
+        .collect()
+}
+
 /// Merge our MCP server entry into whichever config this CLI reads, and return
 /// a path to pass on the command line if it takes one.
 ///
@@ -224,7 +249,9 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     }
 
     std::fs::create_dir_all(&state_dir).ok();
-    let env = shim_env(&spec, &ctx.sock_path);
+    // Descriptor environment first, the shim's own afterwards so it wins.
+    let mut env = descriptor_env(&d);
+    env.extend(shim_env(&spec, &ctx.sock_path));
 
     tracing::info!(cli = %spec.cli_id, agent = %spec.agent_id, mode = mode_name,
         cwd = %spec.cwd, "spawning: {} {}", bin, args.join(" "));

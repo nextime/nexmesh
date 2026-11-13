@@ -1,0 +1,65 @@
+# opencode. Verified against 'opencode --help' / 'run --help' / 'serve --help'.
+#
+# opencode already has a client/server split of its own, and that turns out to
+# be the best driver of the three. `opencode serve` exposes a documented API
+# (OpenAPI at /doc) whose prompt endpoint takes delivery = "steer" | "queue" --
+# native mid-turn steering, no stdio protocol to parse and no pty to hold.
+#
+# Verified against opencode 1.19.5 by reading /doc and calling the server:
+#   POST /api/session                      -> { data: { id, tokens, cost } }
+#   POST /api/session/{id}/prompt          { prompt: { text }, delivery }
+#   GET  /api/event                        text/event-stream, 88 event types
+#   POST /api/session/{id}/permission/{r}/reply  { reply: once|always|reject }
+#   GET  /api/health                       -> { healthy }
+# Auth is HTTP Basic with the username "opencode" and OPENCODE_SERVER_PASSWORD;
+# without it the server warns that it is unsecured, and anyone with a shell on
+# the machine could drive the agent through its loopback port.
+[cli]
+id = "opencode-work"
+# A second login for opencode, as the same user on the same machine. The
+# directory must already hold a logged-in configuration -- nexmesh points a
+# CLI at credentials, it does not create them:
+#   OPENCODE_CONFIG_DIR=~/.config/opencode-work opencode
+env = { OPENCODE_CONFIG_DIR = "~/.config/opencode-work" }
+display_name = "opencode"
+command = "opencode"
+version_args = ["--version"]
+# opencode takes a ModelRef on POST /api/session, so no flag here.
+extra_paths = ["~/.opencode/bin"]
+
+[mcp]
+# Shape verified against https://opencode.ai/config.json: servers live under
+# mcp.servers.<name> (the flat mcp.<name> form is deprecated), `command` is an
+# ARRAY, and env goes under `environment`. A relative path makes this a project
+# file in the workspace, so the user's global config is left alone.
+style = "json_file"
+path = "opencode.json"
+pointer = "/mcp/servers/nexmesh"
+env_key = "environment"
+entry = { type = "local", command = ["{mcpd}"], enabled = true }
+
+[modes.headless]
+# Not `run`: a one-shot run cannot be steered. The server can.
+args = ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+attachable = true   # `opencode attach` opens a real TUI onto the same session
+
+[modes.interactive]
+args = ["{cwd}"]
+resume_args = ["--session", "{resume}"]
+attachable = true
+
+[driver]
+kind = "http_server"
+basic_auth_user = "opencode"
+password_env = "OPENCODE_SERVER_PASSWORD"
+attach_args = ["attach", "{url}"]
+
+[user_install]
+# `opencode mcp add` is interactive, so it cannot be driven from a script;
+# write the documented config instead. Shape verified against
+# https://opencode.ai/config.json.
+style = "json_file"
+path = "~/.config/opencode/opencode.json"
+pointer = "/mcp/servers/{name}"
+env_key = "environment"
+entry = { type = "local", command = ["{command}"], enabled = true }

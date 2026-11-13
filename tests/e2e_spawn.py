@@ -15,6 +15,12 @@ _fake = open(f"{SCR}/fake-cli/fakecli.toml").read()
 _fake = _fake.replace('extra_paths = ["../tests/fake-cli", "tests/fake-cli"]',
                       f'extra_paths = ["{SCR}/fake-cli"]')
 open(f"{CLIS}/fakecli.toml", "w").write(_fake)
+# A named configuration of the same CLI: same binary, same user, its own
+# environment. This is how two logins for one tool coexist on a machine.
+_alt = open(f"{SCR}/fake-cli/fakecli-alt.toml").read()
+_alt = _alt.replace('extra_paths = ["../tests/fake-cli", "tests/fake-cli"]',
+                    f'extra_paths = ["{SCR}/fake-cli"]')
+open(f"{CLIS}/fakecli-alt.toml", "w").write(_alt)
 PORT = 17881; HUB = f"http://127.0.0.1:{PORT}"
 _T = tempfile.mkdtemp(prefix="nexmesh-spawn-")
 DB = f"{_T}/spawn.db"; SOCK = f"{_T}/node.sock"; WS = f"{_T}/ws"
@@ -176,6 +182,33 @@ def main():
         env = cfg["mcpServers"]["nexmesh"]["env"]
         check("the config carries the agent identity and socket",
               env.get("NEXMESH_AGENT_ID") and env.get("NEXMESH_SOCK") == SOCK, str(env))
+
+    print("\n=== a named configuration runs the same binary, its own login ===")
+    # Two accounts for one CLI on one machine, as the same user: the
+    # difference is the environment the descriptor carries.
+    s, j = http("GET", "/v1/nodes")
+    clis = j["nodes"][0]["clis"] if j.get("nodes") else []
+    check("both configurations are advertised separately",
+          "fakecli" in clis and "fakecli-alt" in clis, str(clis))
+    s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "fakecli-alt",
+        "mode": "headless", "display_name": "Alt", "role": "engineer",
+        "workspace": "local", "task": "prove the profile", "placement": {"node": "machine-b"}})
+    alt_slot = j.get("slot_id")
+    check("a slot can choose one of them", bool(alt_slot), str(j))
+    http("POST", f"/v1/slots/{alt_slot}/spawn")
+    alt_agent, tr = None, ""
+    for _ in range(120):
+        # The same way the suite resolves Max: by the name the slot was given.
+        s, r = http("GET", f"/v1/sessions/{sid}/resolve/Alt")
+        alt_agent = r.get("agent_id")
+        if alt_agent:
+            tr = http("GET", f"/v1/agents/{alt_agent}/transcript?tail=65536")[1].get("transcript", "")
+            if "profile=" in tr:
+                break
+        time.sleep(0.25)
+    check("it spawned", bool(alt_agent), str(alt_agent))
+    check("the descriptor's environment reached the child",
+          "profile=alternate" in tr, tr[-250:])
 
     print()
     if fails:

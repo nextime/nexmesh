@@ -50,6 +50,21 @@ pub struct CliMeta {
     /// protocol instead, and a plugin may do the same.
     #[serde(default)]
     pub model_args: Vec<String>,
+    /// Environment to SET for this CLI.
+    ///
+    /// What makes a named configuration possible: two descriptors can run the
+    /// same binary as the same user against different credentials, by pointing
+    /// each at its own config directory. `CLAUDE_CONFIG_DIR` for Claude Code,
+    /// `CODEX_HOME` for Codex, or `HOME` as the blunt instrument that works
+    /// for anything.
+    ///
+    /// A leading `~/` is expanded against the spawning user's home, because a
+    /// descriptor is shared across machines and an absolute path is not.
+    ///
+    /// It cannot override the NEXMESH_* variables the shim needs to find its
+    /// node: those are applied afterwards and win.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     /// Environment variables to CLEAR for this CLI. A node started from inside
     /// tmux inherits `$TMUX`, and a tmux client that sees it refuses to run
     /// ("sessions should be nested with care"), so adoption would fail
@@ -373,6 +388,33 @@ replay_user_messages = true
 "#;
 
     #[test]
+    fn a_descriptor_can_carry_its_own_environment() {
+        // Two named configurations, one binary, one user, different logins.
+        let d = CliDescriptor::parse(
+            r#"
+[cli]
+id = "claude-work"
+display_name = "Claude Code (work account)"
+command = "claude"
+env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+[modes.interactive]
+args = []
+attachable = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(d.cli.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+                   Some("~/.claude-work"));
+        assert_eq!(d.cli.command, "claude", "the same binary");
+    }
+
+    #[test]
+    fn a_descriptor_with_no_environment_is_still_valid() {
+        let d = CliDescriptor::parse(CLAUDE).unwrap();
+        assert!(d.cli.env.is_empty());
+    }
+
+    #[test]
     fn parses_a_real_descriptor() {
         let d = CliDescriptor::parse(CLAUDE).unwrap();
         assert_eq!(d.cli.id, "claude");
@@ -581,6 +623,44 @@ mod shipped_descriptors {
             seen += 1;
         }
         assert!(seen >= 5, "expected the shipped descriptors, found {seen}");
+    }
+
+    /// The named-configuration examples are not loaded by a node -- `clis/`
+    /// is not scanned recursively -- so nothing else would catch a typo in
+    /// them until somebody copied one and it was skipped at startup.
+    #[test]
+    fn every_example_profile_parses_and_carries_an_environment() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../clis/profiles");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(dir).expect("clis/profiles must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let d = CliDescriptor::parse(&text)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(
+                Some(d.cli.id.as_str()),
+                path.file_stem().and_then(|s| s.to_str()),
+                "{}: cli.id must match the filename, since the id is what a slot names",
+                path.display()
+            );
+            assert!(
+                !d.cli.env.is_empty(),
+                "{}: a named configuration with no environment is the same login twice",
+                path.display()
+            );
+            // The whole point is a different config directory for the same
+            // binary, so it must not have been renamed too.
+            assert!(
+                !d.cli.command.contains("-work"),
+                "{}: it should run the real binary, not a renamed one",
+                path.display()
+            );
+            seen += 1;
+        }
+        assert!(seen >= 4, "expected an example per CLI, found {seen}");
     }
 
     #[test]

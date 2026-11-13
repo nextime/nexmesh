@@ -139,15 +139,46 @@ impl Hub {
 
     /// Most tools take an optional session; default to the most recent so the
     /// caller does not have to carry an id around in conversation.
+    /// Which session a tool call is about.
+    ///
+    /// With one session, omitting it is a convenience. With several it was a
+    /// silent pick of whichever sorted first -- and one orchestrator driving
+    /// two projects is the normal case, so that is how an agent gets added to
+    /// the wrong one. Ambiguity is an error here, as it is everywhere else
+    /// that resolves a name in this system.
     async fn resolve_session(&self, given: Option<&str>) -> Result<String> {
         if let Some(s) = given.filter(|s| !s.is_empty()) {
             return Ok(s.to_string());
         }
         let v = self.get("/v1/sessions").await?;
-        v["sessions"][0]["id"]
-            .as_str()
-            .map(String::from)
-            .context("there are no sessions yet; create one with create_team")
+        let empty = vec![];
+        let sessions = v["sessions"].as_array().unwrap_or(&empty);
+        let active: Vec<&Value> = sessions
+            .iter()
+            .filter(|s| s["status"].as_str().unwrap_or("active") != "ended")
+            .collect();
+        match active.len() {
+            0 => anyhow::bail!("there are no sessions yet; create one with create_team"),
+            1 => Ok(active[0]["id"].as_str().unwrap_or_default().to_string()),
+            _ => {
+                let names: Vec<String> = active
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{} ({})",
+                            s["name"].as_str().unwrap_or("?"),
+                            s["id"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                anyhow::bail!(
+                    "there are {} sessions, so 'session' is required: {}. Naming one is the \
+                     difference between adding an agent to the right project and the wrong one.",
+                    active.len(),
+                    names.join(", ")
+                )
+            }
+        }
     }
 }
 

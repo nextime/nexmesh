@@ -1,0 +1,47 @@
+# Claude Code. Verified against the binary on machine-b.
+[cli]
+id = "claude-thinkdifferent"
+display_name = "Claude Code (thinkdifferent)"
+command = "claude"
+version_args = ["--version"]
+# A second account, same binary and same user. The directory must already
+# hold a logged-in configuration:
+#   CLAUDE_CONFIG_DIR=~/.claude-thinkdifferent claude
+env = { CLAUDE_CONFIG_DIR = "~/.claude-thinkdifferent" }
+model_args = ["--model", "{model}"]
+extra_paths = ["~/.local/bin", "~/.npm-global/bin"]
+
+[mcp]
+# --mcp-config takes a file path, so we never touch ~/.claude.json. A session
+# the user starts by hand is unaffected by anything nexmesh does.
+style = "inline_flag"
+flag = "--mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.headless]
+# --verbose is REQUIRED with --output-format=stream-json: without it claude
+# exits with "requires --verbose" before doing anything. Verified against 2.1.322.
+args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
+        "--verbose", "--replay-user-messages", "--mcp-config", "{mcp_config}"]
+prompt_on_stdin = true
+resume_args = ["--resume", "{resume}"]
+attachable = false   # stream-json is a protocol, not a terminal
+
+[modes.interactive]
+args = ["--mcp-config", "{mcp_config}"]
+resume_args = ["--resume", "{resume}"]
+attachable = true
+
+[driver]
+kind = "stream_json"
+replay_user_messages = true
+
+[user_install]
+# Verified: `claude mcp add [-s scope] [-e K=V]... <name> -- <command>`.
+# Using the CLI's own command rather than editing ~/.claude.json by hand, so a
+# change to that file's layout cannot break us.
+style = "command"
+argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
+env_flag = "-e"

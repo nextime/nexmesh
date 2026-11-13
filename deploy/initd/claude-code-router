@@ -1,0 +1,54 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          claude-code-router
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Anthropic-shaped model router for Claude Code
+# Description:       Serves an Anthropic API locally and forwards to whichever
+#                    provider its own config chooses. Holds the provider keys;
+#                    nexmesh holds none.
+### END INIT INFO
+#
+# Supervised like everything else here so it comes back at boot, because a
+# router that is down makes every agent placed on it fail in a way that looks
+# like the agent's fault.
+
+NAME=claude-code-router
+PIDFILE=/var/run/$NAME.pid
+LOGFILE=/var/log/nexmesh/router.log
+CONF=/etc/nexmesh/router.env
+
+[ -r "$CONF" ] && . "$CONF"
+
+: "${ROUTER_USER:=nextime}"
+: "${ROUTER_PORT:=3456}"
+# `ccr start` is the usual entry point; override for LiteLLM or another proxy.
+: "${ROUTER_CMD:=ccr start}"
+
+mkdir -p "$(dirname "$LOGFILE")"
+chown "$ROUTER_USER" "$(dirname "$LOGFILE")" 2>/dev/null || true
+
+case "$1" in
+  start)
+    echo -n "Starting $NAME: "
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$PIDFILE" \
+      --chuid "$ROUTER_USER" --startas /bin/sh -- -lc \
+      "exec $ROUTER_CMD >> $LOGFILE 2>&1"
+    echo "ok"
+    ;;
+  stop)
+    echo -n "Stopping $NAME: "
+    start-stop-daemon --stop --quiet --retry TERM/15/KILL/5 --pidfile "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo "ok"
+    ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  status)
+    start-stop-daemon --status --pidfile "$PIDFILE" && echo "$NAME running" \
+      || { echo "$NAME not running"; exit 3; }
+    ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac
+exit 0
