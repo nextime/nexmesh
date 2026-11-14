@@ -32,21 +32,86 @@ pub const MIN_PATIENCE_MS: i64 = 120_000;
 /// How long a seat waits at the very most, in ms.
 pub const MAX_PATIENCE_MS: i64 = 3_600_000;
 
-/// The seat's agent word, for a query that has `slots s` LEFT JOINed to the
-/// seat's newest `agents a`. Drops in where `COALESCE(a.status,
-/// 'disconnected')` used to be.
-pub const AGENT_WORD_SQL: &str = "CASE WHEN a.exited_at_ms IS NOT NULL
-             AND a.provenance = 'attached'
-             AND COALESCE(s.cli_session,'') <> ''
-             AND COALESCE(s.task_state,'') <> 'released'
+/// The test that says a seat is between turns rather than empty, for a query
+/// with the seat as `{s}` and its newest agent as `{a}`.
+const WAITING_SQL: &str = "{a}.exited_at_ms IS NOT NULL
+             AND {a}.provenance = 'attached'
+             AND COALESCE({s}.cli_session,'') <> ''
+             AND COALESCE({s}.task_state,'') <> 'released'
              AND EXISTS (SELECT 1 FROM agents p
-                          WHERE p.slot_id = s.id AND p.started_at_ms < a.started_at_ms)
-             AND (CAST(strftime('%s','now') AS INTEGER) * 1000) - a.exited_at_ms <
+                          WHERE p.slot_id = {s}.id AND p.started_at_ms < {a}.started_at_ms)
+             AND (CAST(strftime('%s','now') AS INTEGER) * 1000) - {a}.exited_at_ms <
                  MAX(120000, MIN(3600000, 4 * COALESCE((
-                     SELECT a.started_at_ms - p.started_at_ms FROM agents p
-                      WHERE p.slot_id = s.id AND p.started_at_ms < a.started_at_ms
-                      ORDER BY p.started_at_ms DESC LIMIT 1), 0)))
-        THEN 'waiting' ELSE COALESCE(a.status, 'disconnected') END";
+                     SELECT {a}.started_at_ms - p.started_at_ms FROM agents p
+                      WHERE p.slot_id = {s}.id AND p.started_at_ms < {a}.started_at_ms
+                      ORDER BY p.started_at_ms DESC LIMIT 1), 0)))";
+
+/// Is this seat between turns? A condition, for a WHERE clause.
+pub fn waiting(slots: &str, agents: &str) -> String {
+    WAITING_SQL.replace("{s}", slots).replace("{a}", agents)
+}
+
+/// The seat's agent word, for a query with the seat as `slots` and its newest
+/// agent as `agents`. Drops in where `COALESCE(a.status, 'disconnected')`
+/// used to be.
+pub fn agent_word(slots: &str, agents: &str) -> String {
+    format!(
+        "CASE WHEN {cond} THEN 'waiting' ELSE COALESCE({agents}.status, 'disconnected') END",
+        cond = waiting(slots, agents)
+    )
+}
+
+/// How many seats a team message is for: everyone in its session who could
+/// still see it, bar whoever sent it.
+///
+/// This exists because "delivered" was a single flag on the message, set by
+/// the FIRST ack -- and a capability bridge, which is handed team chat it
+/// cannot answer, acks everything at once. So an operator's question to a
+/// team of three read as delivered the moment the bridge took it, while the
+/// two seats that could actually answer had never been handed it at all.
+/// That is the worst kind of wrong: the fleet looked like it was ignoring
+/// her, rather than like it had not heard.
+///
+/// A seat counts if something is there to read it: a live process, or a seat
+/// between turns, which will read it on its next one. A seat with no process
+/// and no rhythm cannot see anything, and counting it would mean a team
+/// message was never delivered to anybody.
+pub fn audience(m: &str) -> String {
+    format!(
+        "(SELECT COUNT(*) FROM slots s2
+           LEFT JOIN agents a2 ON a2.id = (
+               SELECT id FROM agents WHERE slot_id = s2.id
+               ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+          WHERE s2.session_id = {m}.session_id
+            AND ({m}.from_slot IS NULL OR s2.id <> {m}.from_slot)
+            AND COALESCE(s2.task_state,'') <> 'released'
+            AND a2.id IS NOT NULL
+            AND (a2.exited_at_ms IS NULL OR ({cond})))",
+        cond = waiting("s2", "a2")
+    )
+}
+
+/// How many seats have actually seen it. Per seat, because one teammate
+/// acking a broadcast must not count for the rest.
+pub fn seen(m: &str) -> String {
+    format!(
+        "(SELECT COUNT(*) FROM message_recipients r
+           WHERE r.message_id = {m}.id AND r.acked_at_ms IS NOT NULL)"
+    )
+}
+
+/// Whether everyone it was for has seen it. A message addressed to one seat
+/// is its own business; a team message is not delivered until the team has
+/// it, and a team nobody is in has not received anything.
+pub fn delivered(m: &str) -> String {
+    format!(
+        "CASE WHEN {m}.to_slot IS NULL
+              THEN ({a} > 0 AND {sn} >= {a})
+              ELSE {m}.acked_at_ms IS NOT NULL END",
+        a = audience(m),
+        sn = seen(m)
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -100,9 +165,10 @@ mod tests {
     }
 
     fn word(db: &Connection) -> String {
+        let w = agent_word("s", "a");
         db.query_row(
             &format!(
-                "SELECT {AGENT_WORD_SQL} FROM slots s
+                "SELECT {w} FROM slots s
                  LEFT JOIN agents a ON a.id = (
                      SELECT id FROM agents WHERE slot_id = s.id
                      ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
@@ -180,7 +246,8 @@ mod tests {
     fn the_patience_bounds_are_the_ones_the_sql_uses() {
         // The numbers are inlined in the SQL, where they can be read in
         // place; these constants are how everything else talks about them.
-        assert!(AGENT_WORD_SQL.contains(&MIN_PATIENCE_MS.to_string()));
-        assert!(AGENT_WORD_SQL.contains(&MAX_PATIENCE_MS.to_string()));
+        let w = agent_word("s", "a");
+        assert!(w.contains(&MIN_PATIENCE_MS.to_string()));
+        assert!(w.contains(&MAX_PATIENCE_MS.to_string()));
     }
 }

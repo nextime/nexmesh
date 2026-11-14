@@ -1484,7 +1484,7 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
              ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
          LEFT JOIN nodes n ON n.id = a.node_id
          WHERE s.session_id = ? ORDER BY 2",
-        word = crate::seat::AGENT_WORD_SQL,
+        word = crate::seat::agent_word("s", "a"),
     )) else {
         return Json(json!({ "agents": [] }));
     };
@@ -1545,19 +1545,23 @@ pub async fn session_log(
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     let after = q.after.unwrap_or(0);
     let db = st.db.lock().unwrap();
-    let Ok(mut stmt) = db.prepare(
+    let Ok(mut stmt) = db.prepare(&format!(
         "SELECT m.id, m.sent_at_ms, m.kind, m.body,
                 COALESCE(sf.display_name, sf.role, 'operator'),
                 CASE WHEN m.to_slot IS NULL THEN '(team)'
                      ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
-                m.acked_at_ms IS NOT NULL,
-                m.inflight_at_ms IS NOT NULL
+                {delivered},
+                m.inflight_at_ms IS NOT NULL,
+                {seen}, {audience}
          FROM messages m
          LEFT JOIN slots sf ON sf.id = m.from_slot
          LEFT JOIN slots st2 ON st2.id = m.to_slot
          WHERE m.session_id = ?1 AND m.id > ?2
          ORDER BY m.id ASC LIMIT ?3",
-    ) else {
+        delivered = crate::seat::delivered("m"),
+        seen = crate::seat::seen("m"),
+        audience = crate::seat::audience("m"),
+    )) else {
         return Json(json!({ "messages": [] }));
     };
     let rows: Vec<Value> = stmt
@@ -1571,6 +1575,11 @@ pub async fn session_log(
                 "to": r.get::<_, String>(5)?,
                 "delivered": r.get::<_, bool>(6)?,
                 "in_flight": r.get::<_, bool>(7)?,
+                // How many of the seats it was for have seen it, out of how
+                // many could. For a team message these are the numbers that
+                // matter: one teammate acking is not the team hearing you.
+                "seen": r.get::<_, i64>(8)?,
+                "audience": r.get::<_, i64>(9)?,
             }))
         })
         .and_then(|m| m.collect())
@@ -1709,7 +1718,47 @@ pub async fn operator_message(
         params![session_id, to_slot, req.text, now_ms()],
     )
     .map_err(bad)?;
-    Ok(Json(json!({ "sent": true, "to": to_slot })))
+    // Who it is for, and by what route it can reach them.
+    //
+    // "Sent" is not "heard". A seat the hub can drive, type at, or that polls
+    // the hub itself gets a message in seconds. A CLI somebody started by
+    // hand in a plain terminal has none of those: nothing can interrupt it,
+    // and it will see this when it next calls a tool -- which, sitting at a
+    // prompt with nothing to do, may be never. A question asked into a room
+    // of those reads as ignored, and the operator had no way to tell. Now
+    // the answer comes back with the send.
+    let seats: Vec<Value> = db
+        .prepare(&format!(
+            "SELECT COALESCE(s.display_name, s.role, s.id),
+                    CASE WHEN a.provenance = 'external' THEN 'polls'
+                         WHEN a.push_capable = 1 THEN 'driven'
+                         WHEN s.terminal_via IS NOT NULL THEN 'terminal'
+                         ELSE 'next tool call' END,
+                    {word}
+               FROM slots s
+               LEFT JOIN agents a ON a.id = (
+                   SELECT id FROM agents WHERE slot_id = s.id
+                   ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+              WHERE s.session_id = ?1 AND (?2 IS NULL OR s.id = ?2)
+                AND COALESCE(s.task_state,'') <> 'released'
+                AND a.id IS NOT NULL
+                AND (a.exited_at_ms IS NULL OR ({waiting}))
+              ORDER BY 1",
+            word = crate::seat::agent_word("s", "a"),
+            waiting = crate::seat::waiting("s", "a"),
+        ))
+        .and_then(|mut q| {
+            q.query_map(params![session_id, to_slot], |r| {
+                Ok(json!({
+                    "name": r.get::<_, String>(0)?,
+                    "route": r.get::<_, String>(1)?,
+                    "status": r.get::<_, String>(2)?,
+                }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .unwrap_or_default();
+    Ok(Json(json!({ "sent": true, "to": to_slot, "seats": seats })))
 }
 
 // ---------------------------------------------------------- participant ----

@@ -150,6 +150,9 @@
   .msg .body { white-space: pre-wrap; word-break: break-word; }
   .msg .mark { text-align: center; font-family: var(--mono); color: var(--faint); }
   .msg.undelivered .mark { color: var(--bad); font-weight: 700; }
+  /* How many of the room have read a team message, when not all of them have. */
+  .chatline .seen { font-size: 10px; padding: 0 4px; border-radius: 6px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
   .msg.inflight .mark { color: var(--warn); }
   /* Nobody has claimed it. Reading no longer clears a message, so this is
      the mark that matters: what is still waiting on somebody. */
@@ -1414,6 +1417,23 @@ const empty = (msg) => panel(`<div class="empty">${esc(msg)}</div>`);
 // minute. Nothing is running in it this second, and it is nobody's derelict.
 const present = (s) => s === "running" || s === "waiting";
 
+// What a message's delivery state actually is. A team message is not
+// delivered because one teammate took it: a capability bridge is handed team
+// chat it cannot answer and acks everything, so an operator's question read
+// as delivered while the only seats that could answer had never been handed
+// it. `seen` and `audience` are the honest numbers.
+const seenOf = (m) => (m.to === "(team)" && typeof m.audience === "number")
+  ? `seen by ${m.seen || 0} of ${m.audience} seat${m.audience === 1 ? "" : "s"}`
+  : null;
+const deliveryTitle = (m) => {
+  const s = seenOf(m);
+  if (m.claimed) return `claimed by ${m.claimed_by || "someone"}` + (s ? ` \u00b7 ${s}` : "");
+  if (s) return s + (m.delivered ? ", nobody has claimed it" : "");
+  return m.delivered ? "delivered, but nobody has claimed it"
+       : (m.in_flight ? "handed over, not yet confirmed"
+                      : "the recipient has not seen this yet");
+};
+
 function viewAgents(d, now) {
   const all = isAll();
   if (!d.agents.length)
@@ -1835,14 +1855,16 @@ function renderChat(d) {
     const cls = [sys ? "sys" : "", (!m.hist && !m.claimed) ? "unclaimed" : ""]
                 .filter(Boolean).join(" ");
     const mark = (!m.hist && !m.claimed) ? "\u25cf" : "";
-    const title = m.hist ? "from this channel's log"
-      : (m.claimed ? `claimed by ${m.claimed_by || "someone"}`
-         : (m.delivered ? "delivered, but nobody has claimed it"
-            : (m.in_flight ? "handed over, not yet confirmed"
-               : "the recipient has not seen this yet")));
+    const title = m.hist ? "from this channel's log" : deliveryTitle(m);
     const to = m.to && m.to !== "(team)" ? `<span class="to">\u2192 ${esc(m.to)}</span> ` : "";
     const ch = chatChan === "*" && m.session
       ? `<span class="ch">#${esc(m.session)}</span> ` : "";
+    // Who in the room has actually read it. Said out loud rather than left
+    // to a hover, because on a phone there is no hover and this is the
+    // difference between "they are ignoring me" and "they have not heard".
+    const tally = (!m.hist && m.to === "(team)" && typeof m.audience === "number"
+                   && (m.seen || 0) < m.audience)
+      ? ` <span class="seen" title="${esc(seenOf(m))}">${m.seen || 0}/${m.audience}</span>` : "";
     return `<div class="chatline ${cls}" data-id="${m.id}"
                  data-from="${esc(m.from)}" data-slot="${esc(m.from_slot || "")}"
                  data-body="${esc(m.body)}">
@@ -1850,7 +1872,7 @@ function renderChat(d) {
       <span class="t">${hhmmss(m.at_ms)}</span>
       <span class="m" title="${esc(title)}">${mark}</span>
       <span class="txt">${ch}<span class="nick" style="color:${nickColor(m.from)}"
-        >&lt;${esc(m.from)}&gt;</span> ${to}${renderBody(m.body)}</span>
+        >&lt;${esc(m.from)}&gt;</span> ${to}${renderBody(m.body)}${tally}</span>
     </div>`;
   }).join("");
   const feed = $("chatFeed");
@@ -2246,15 +2268,25 @@ async function sendChatText(raw) {
     : [chanId(chatChan)].filter(Boolean);
   if (!targets.length) { note("No session to send to."); return false; }
   const failed = [];
+  // Seats that cannot be interrupted: a CLI somebody started by hand in a
+  // plain terminal has no keyboard the hub can reach, so it reads this when
+  // it next calls a tool -- which, idle at a prompt, may be never. Saying so
+  // at the moment of asking is the difference between "they are ignoring me"
+  // and "they have not heard me".
+  const deaf = [];
   for (const t of targets) {
     try {
       const body = to ? { text, to } : { text };
       const r = await post(`/v1/sessions/${encodeURIComponent(t)}/messages`, body);
       if (r && r.error) throw new Error(r.error);
+      for (const st of (r && r.seats) || [])
+        if (st.route === "next tool call") deaf.push(st.name);
     } catch (e) { failed.push(t); }
   }
   if (failed.length === targets.length) { note("Could not send that."); return false; }
   if (failed.length) note(`Sent, except to ${failed.length} session(s).`);
+  else if (deaf.length) note(`Sent. ${deaf.join(", ")} ${deaf.length === 1 ? "sees" : "see"}`
+    + ` it on their next tool call \u2014 nothing can interrupt a hand-started CLI.`);
   chatStick = true;
   tick();
   return true;
@@ -2279,11 +2311,7 @@ function viewMessages(d, now) {
                  m.delivered ? "" : (m.in_flight ? "inflight" : "undelivered")]
                 .filter(Boolean).join(" ");
     const mark = !m.claimed ? "\u25cf" : "";
-    const title = m.claimed
-      ? `claimed by ${m.claimed_by || "someone"}`
-      : (m.delivered ? "delivered, but nobody has claimed it"
-                     : (m.in_flight ? "handed over, not yet confirmed"
-                                    : "the recipient has not seen this yet"));
+    const title = deliveryTitle(m);
     const kind = m.kind === "text" ? "" : `<span class="badge tiny">${esc(m.kind)}</span> `;
     const chan = all && m.session
       ? `<span class="chan" title="session">#${esc(m.session)}</span> ` : "";

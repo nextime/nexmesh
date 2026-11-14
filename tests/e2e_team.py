@@ -258,6 +258,45 @@ def main():
     check("a new message appears exactly once when following",
           [m["body"] for m in j3.get("messages", [])] == ["follow-test"], str(j3)[:200])
 
+    print("\n=== 10b. a team message is not delivered because ONE seat took it ===")
+    # The bug this pins cost an afternoon on the real fleet. "Delivered" was
+    # one flag on the message, set by the FIRST ack -- and a capability
+    # bridge, handed team chat it cannot answer, acks everything at once. So
+    # the operator's question to a team of three read as delivered the moment
+    # the bridge took it, while the only seats that could answer had never
+    # been handed it. The fleet looked like it was ignoring her.
+    s, j = http("POST", f"/v1/sessions/{sid}/messages", {"text": "who is awake in here?"})
+    check("the send says which seats it is for and how it reaches them",
+          isinstance(j.get("seats"), list) and len(j["seats"]) >= 2
+          and all("route" in x for x in j["seats"]), str(j)[:300])
+
+    def team_msg():
+        s, j = http("GET", f"/v1/sessions/{sid}/log?limit=100")
+        rows = [m for m in j.get("messages", []) if m["body"] == "who is awake in here?"]
+        return rows[-1] if rows else {}
+
+    m = team_msg()
+    check("it is addressed to the whole team and counts an audience",
+          m.get("to") == "(team)" and m.get("audience", 0) >= 2, str(m)[:300])
+    check("nobody has seen it yet", m.get("seen") == 0 and m.get("delivered") is False,
+          str(m)[:300])
+
+    # The external participant reads and acks it -- the bridge's behaviour.
+    s, pj = http("GET", f"/v1/participant/messages?agent_id={hermes}", token=ptok)
+    ids = [x["id"] for x in pj.get("messages", []) if x["body"] == "who is awake in here?"]
+    http("POST", "/v1/participant/ack", {"agent_id": hermes, "message_ids": ids}, token=ptok)
+    m = team_msg()
+    check("one seat acking does not make it delivered to the team",
+          m.get("seen") == 1 and m.get("audience", 0) >= 2 and m.get("delivered") is False,
+          str(m)[:300])
+
+    # And when the CLI seat reads it too, the team really has heard it.
+    t = max_.tool("check_team_status")
+    check("the CLI seat still gets its own copy", "who is awake in here?" in t, t[:300])
+    m = team_msg()
+    check("once every seat has seen it, it is delivered",
+          m.get("seen") == m.get("audience") and m.get("delivered") is True, str(m)[:300])
+
     print("\n=== 11. node death returns in-flight messages to the queue ===")
     s, j = http("POST", f"/v1/sessions/{sid}/messages", {"to": "Max", "text": "operator ping"})
     check("operator can message a slot", j.get("sent"), str(j))

@@ -301,7 +301,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
                      LEFT JOIN nodes n ON n.id = a.node_id
                      WHERE (?1 = '*' OR s.session_id = ?1) ORDER BY 2",
-                    word = crate::seat::AGENT_WORD_SQL,
+                    word = crate::seat::agent_word("s", "a"),
                 ))
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -336,21 +336,25 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         });
 
             let messages: Vec<Value> = db
-                .prepare(
+                .prepare(&format!(
                     "SELECT m.id, m.sent_at_ms, m.kind, m.body,
                             COALESCE(sf.display_name, sf.role, 'operator'),
                             CASE WHEN m.to_slot IS NULL THEN '(team)'
                                  ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
-                            m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL,
+                            {delivered}, m.inflight_at_ms IS NOT NULL,
                             COALESCE(mx.name, ''),
                             m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, ''),
-                            COALESCE(m.from_slot, ''), COALESCE(m.to_slot, '')
+                            COALESCE(m.from_slot, ''), COALESCE(m.to_slot, ''),
+                            {seen}, {audience}
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
                      LEFT JOIN sessions mx ON mx.id = m.session_id
                      WHERE (?1 = '*' OR m.session_id = ?1) ORDER BY m.id DESC LIMIT 120",
-                )
+                    delivered = crate::seat::delivered("m"),
+                    seen = crate::seat::seen("m"),
+                    audience = crate::seat::audience("m"),
+                ))
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
                         Ok(json!({
@@ -363,6 +367,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "claimed_by": r.get::<_, String>(10)?,
                             "from_slot": r.get::<_, String>(11)?,
                             "to_slot": r.get::<_, String>(12)?,
+                            "seen": r.get::<_, i64>(13)?,
+                            "audience": r.get::<_, i64>(14)?,
                         }))
                     })
                     .and_then(|m| m.collect())

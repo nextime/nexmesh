@@ -564,6 +564,12 @@ fn hhmmss(ms: i64) -> String {
 /// One line per message. The delivery marker matters: a message that was sent
 /// but not acked is one the recipient's model has NOT seen yet, which is
 /// usually the answer to "why is this team stuck?".
+///
+/// For a team message the TO column carries the count, because "delivered"
+/// on a broadcast used to mean one teammate had taken it -- and a capability
+/// bridge, which is handed team chat it cannot answer, acks everything. An
+/// operator's question read as delivered while the only seats that could
+/// answer had never been handed it: `(team 1/3)` is the line that says so.
 fn print_message(m: &Value) {
     let mark = if m["delivered"].as_bool() == Some(true) {
         " "
@@ -574,12 +580,19 @@ fn print_message(m: &Value) {
     };
     let kind = m["kind"].as_str().unwrap_or("text");
     let kind = if kind == "text" { String::new() } else { format!("[{kind}] ") };
+    let to = match (m["to"].as_str(), m["audience"].as_i64()) {
+        (Some("(team)"), Some(n)) => {
+            format!("(team {}/{n})", m["seen"].as_i64().unwrap_or(0))
+        }
+        (Some(t), _) => t.to_string(),
+        _ => "?".to_string(),
+    };
     println!(
         "{} {} {:>12} -> {:<12} {}{}",
         hhmmss(m["at_ms"].as_i64().unwrap_or(0)),
         mark,
         m["from"].as_str().unwrap_or("?"),
-        m["to"].as_str().unwrap_or("?"),
+        to,
         kind,
         m["body"].as_str().unwrap_or("").replace('\n', " / "),
     );
@@ -1248,7 +1261,11 @@ async fn main() -> Result<()> {
                 last = last.max(m["id"].as_i64().unwrap_or(0));
             }
             if !follow {
-                println!("\n  ( ! = recipient has not seen it yet, ~ = delivery in flight )");
+                println!(
+                    "\n  ( ! = somebody it was for has not seen it yet, \
+                     ~ = delivery in flight,\n    (team n/m) = how many of the \
+                     seats it was for have seen it )"
+                );
                 return Ok(());
             }
             loop {
@@ -1366,7 +1383,32 @@ async fn main() -> Result<()> {
             if let Some(t) = to { body["to"] = json!(t); }
             let v = post(&c, format!("{base}/v1/sessions/{session}/messages"), body).await?;
             bail_on_error(&v)?;
-            println!("sent");
+            // Sent is not heard. Who it is for, and by what route it reaches
+            // them -- because a CLI started by hand in a plain terminal
+            // cannot be interrupted, and will see this when it next calls a
+            // tool. A question asked into a room of those reads as ignored,
+            // and there was no way to tell from here.
+            let empty = vec![];
+            let seats = v["seats"].as_array().unwrap_or(&empty);
+            if seats.is_empty() {
+                println!("sent -- but no seat in this session can see it yet");
+            } else {
+                println!("sent, queued for {} seat(s):", seats.len());
+                for s in seats {
+                    let how = match s["route"].as_str().unwrap_or("") {
+                        "driven" => "in seconds -- the hub drives it",
+                        "terminal" => "in seconds -- the hub types at its terminal",
+                        "polls" => "in seconds -- it polls the hub",
+                        _ => "when it next calls a tool -- nothing can interrupt it",
+                    };
+                    println!(
+                        "  {:<16} {:<13} {}",
+                        s["name"].as_str().unwrap_or("?"),
+                        s["status"].as_str().unwrap_or("-"),
+                        how
+                    );
+                }
+            }
         }
     }
     Ok(())
