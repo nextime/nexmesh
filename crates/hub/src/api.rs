@@ -596,9 +596,20 @@ pub async fn list_sessions(
     let scope = op.and_then(|Extension(o)| o.session.clone());
     let db = st.db.lock().unwrap();
     let Ok(mut stmt) = db.prepare(
-        "SELECT s.id, s.name, s.status, s.created_at_ms,
-                (SELECT COUNT(*) FROM slots WHERE session_id = s.id)
-         FROM sessions s WHERE (?1 IS NULL OR s.id = ?1) ORDER BY s.created_at_ms DESC",
+        // Seats you can talk to, and -- separately -- the windows onto them.
+        // Counting both together said `10` for a team of five with a
+        // keyboard each, which is the plumbing showing through: every other
+        // listing already leaves adopted terminals out.
+        &format!(
+            "SELECT s.id, s.name, s.status, s.created_at_ms,
+                    (SELECT COUNT(*) FROM slots x
+                      WHERE x.session_id = s.id AND NOT {term}),
+                    (SELECT COUNT(*) FROM slots x
+                      WHERE x.session_id = s.id AND {term})
+             FROM sessions s WHERE (?1 IS NULL OR s.id = ?1)
+             ORDER BY s.created_at_ms DESC",
+            term = crate::seat::is_terminal("x")
+        ),
     ) else {
         return Json(json!({ "sessions": [] }));
     };
@@ -608,6 +619,7 @@ pub async fn list_sessions(
                 "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
                 "status": r.get::<_, String>(2)?, "created_at_ms": r.get::<_, i64>(3)?,
                 "slots": r.get::<_, i64>(4)?,
+                "terminals": r.get::<_, i64>(5)?,
             }))
         })
         .and_then(|m| m.collect())

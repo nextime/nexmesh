@@ -158,8 +158,13 @@ pub fn session_exists(name: &str) -> bool {
 }
 
 /// Create the tmux session if it is not there, and say whether it was made.
-pub fn ensure_session(name: &str, cwd: &str, label: &str) -> Result<bool> {
+pub fn ensure_session(name: &str, cwd: &str, label: &str, title: &str) -> Result<bool> {
     if session_exists(name) {
+        // The status line is not re-asserted on a session that was already
+        // there -- but the window title is, because it belongs to whoever is
+        // LOOKING, and a pane adopted before this existed would otherwise go
+        // on calling itself whatever the CLI inside it says.
+        set_title(name, title);
         return Ok(false);
     }
     // A generous default size: the pane exists before any terminal attaches,
@@ -178,7 +183,18 @@ pub fn ensure_session(name: &str, cwd: &str, label: &str) -> Result<bool> {
     let _ = tmux_ok(&["set-option", "-t", name, "status-right",
                       " #{?client_prefix,PREFIX,Ctrl-B d detach} "]);
     let _ = tmux_ok(&["set-option", "-t", name, "status-left-length", "60"]);
+    set_title(name, title);
     Ok(true)
+}
+
+/// What the WINDOW says it is, for a terminal attached to this tmux session.
+///
+/// tmux sets the outer title itself when it is told to, which also settles the
+/// argument with the CLI inside the pane: its own title writes land on the
+/// pane title, and the window keeps saying `session:agent`.
+pub fn set_title(name: &str, title: &str) {
+    let _ = tmux_ok(&["set-option", "-t", name, "set-titles", "on"]);
+    let _ = tmux_ok(&["set-option", "-t", name, "set-titles-string", title]);
 }
 
 /// What is running in the pane right now.
@@ -279,7 +295,9 @@ with. Pass --cmd to say what to run in the pane.",
         return Ok(());
     }
 
-    let made = ensure_session(&p.tmux_name, &p.cwd, &name)?;
+    let title = crate::windowtitle::of(
+        &crate::session_name(c, base, o.session).await, &p.seat_name);
+    let made = ensure_session(&p.tmux_name, &p.cwd, &name, &title)?;
     println!(
         "{} tmux session {}",
         if made { "created" } else { "using the existing" },

@@ -72,6 +72,17 @@ pub fn agent_word(slots: &str, agents: &str) -> String {
 /// That is the worst kind of wrong: the fleet looked like it was ignoring
 /// her, rather than like it had not heard.
 ///
+/// An adopted terminal: a window onto somebody else's CLI, with a seat of its
+/// own so it can be attached to and driven, but no model behind it.
+///
+/// It is never an agent for the purposes of counting a team, addressing a
+/// teammate or delivering a message -- whatever is SITTING in it has its own
+/// seat, and that is the one that answers. Written once, because every place
+/// that forgets it reports a team twice its real size.
+pub fn is_terminal(s: &str) -> String {
+    format!("(COALESCE({s}.cli_id,'') = 'tmux' OR {s}.tmux_target IS NOT NULL)")
+}
+
 /// A seat counts if something is there to read it: a live process, or a seat
 /// between turns, which will read it on its next one. A seat with no process
 /// and no rhythm cannot see anything, and counting it would mean a team
@@ -114,12 +125,12 @@ fn audience_seats(m: &str, extra: &str) -> String {
            -- in a session with one stayed undelivered for ever. Whatever is
            -- SITTING in that terminal has a seat of its own, and that seat
            -- is counted.
-           AND COALESCE(s2.cli_id,'') <> 'tmux'
-           AND s2.tmux_target IS NULL
+           AND NOT {term}
            AND a2.id IS NOT NULL
            AND (a2.exited_at_ms IS NULL OR ({cond}))
            {extra}",
-        cond = waiting("s2", "a2")
+        cond = waiting("s2", "a2"),
+        term = is_terminal("s2")
     )
 }
 
@@ -400,6 +411,45 @@ mod tests {
         .unwrap();
         let (_, audience_n, _) = tally(&db);
         assert_eq!(audience_n, 2, "the terminal is not a teammate");
+    }
+
+    #[test]
+    fn a_session_counts_seats_and_windows_apart() {
+        // `nexmesh sessions` said SLOTS 10 for five CLIs with a keyboard
+        // each. Five teammates, five windows onto them.
+        let db = room();
+        for i in 1..=2 {
+            db.execute(
+                "INSERT INTO slots (id,session_id,display_name,cli_id,tmux_target,created_at_ms)
+                 VALUES (?,'s1',?,'tmux',?,1)",
+                params![format!("sl-t{i}"), format!("term-{i}"), format!("nexmesh-{i}")],
+            )
+            .unwrap();
+        }
+        // And one whose cli_id is the CLI's but which is still a window: the
+        // tmux_target is what says so.
+        db.execute(
+            "INSERT INTO slots (id,session_id,display_name,cli_id,tmux_target,created_at_ms)
+             VALUES ('sl-t3','s1','term-3','claude','nexmesh-3',1)",
+            [],
+        )
+        .unwrap();
+        let term = is_terminal("x");
+        let seats: i64 = db
+            .query_row(
+                &format!("SELECT COUNT(*) FROM slots x WHERE x.session_id='s1' AND NOT {term}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let windows: i64 = db
+            .query_row(
+                &format!("SELECT COUNT(*) FROM slots x WHERE x.session_id='s1' AND {term}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((seats, windows), (3, 3), "three teammates, three windows");
     }
 
     #[test]

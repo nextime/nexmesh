@@ -214,9 +214,18 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
 
     let mut sessions: Vec<Value> = db
         .prepare(
-            "SELECT s.id, s.name, s.status, s.created_at_ms, s.last_active_ms,
-                    (SELECT COUNT(*) FROM slots WHERE session_id = s.id)
-             FROM sessions s ORDER BY s.last_active_ms DESC",
+            // Seats, not windows: an adopted terminal has a slot so it can
+            // be attached to, and counting it told the operator a team of
+            // five was a team of ten.
+            &format!(
+                "SELECT s.id, s.name, s.status, s.created_at_ms, s.last_active_ms,
+                        (SELECT COUNT(*) FROM slots x
+                          WHERE x.session_id = s.id AND NOT {term}),
+                        (SELECT COUNT(*) FROM slots x
+                          WHERE x.session_id = s.id AND {term})
+                 FROM sessions s ORDER BY s.last_active_ms DESC",
+                term = crate::seat::is_terminal("x")
+            ),
         )
         .and_then(|mut stmt| {
             stmt.query_map([], |r| {
@@ -224,6 +233,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
                     "status": r.get::<_, String>(2)?, "created_at_ms": r.get::<_, i64>(3)?,
                     "last_active_ms": r.get::<_, i64>(4)?, "slots": r.get::<_, i64>(5)?,
+                    "terminals": r.get::<_, i64>(6)?,
                 }))
             })
             .and_then(|m| m.collect())

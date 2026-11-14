@@ -14,6 +14,7 @@ mod install;
 mod seatcmd;
 mod tlstrust;
 mod tui;
+mod windowtitle;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -789,6 +790,29 @@ impl StatusBar {
     }
 }
 
+/// The session's NAME, whichever way it was addressed.
+///
+/// Every command takes a session id or a session name, and a title that read
+/// `se-2d00687a:Nexmesh-dev` would be naming the plumbing at the one moment
+/// the operator is trying to tell two windows apart.
+async fn session_name(c: &reqwest::Client, base: &str, session: &str) -> String {
+    if !session.starts_with("se-") {
+        return session.to_string();
+    }
+    if let Ok(v) = get(c, format!("{base}/v1/sessions")).await {
+        if let Some(rows) = v["sessions"].as_array() {
+            for s in rows {
+                if s["id"].as_str() == Some(session) {
+                    if let Some(n) = s["name"].as_str() {
+                        return n.to_string();
+                    }
+                }
+            }
+        }
+    }
+    session.to_string()
+}
+
 async fn attach(
     base: &str,
     c: &reqwest::Client,
@@ -826,6 +850,8 @@ async fn attach(
         _ => (120, 40),
     };
     let host = r["host"].as_str().unwrap_or("");
+    // `session:agent`, the way the title and every other command say it.
+    let session_label = session_name(c, base, session).await;
     // A seat whose CLI sits in an adopted terminal is reached THROUGH that
     // terminal: the hub says so rather than refusing, and the bar says so
     // rather than pretending the pty is the agent's own.
@@ -889,6 +915,15 @@ async fn attach(
         let _ = out.flush().await;
     }
 
+    // And the window says which seat it is showing, for as long as we have
+    // it. What was there before goes on the terminal's title stack.
+    {
+        let mut out = tokio::io::stdout();
+        let _ = out.write_all(windowtitle::PUSH).await;
+        let _ = out.write_all(&windowtitle::set(&windowtitle::of(&session_label, &name))).await;
+        let _ = out.flush().await;
+    }
+
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
 
     // Hub -> our terminal.
@@ -896,9 +931,14 @@ async fn attach(
         let quit_tx = quit_tx.clone();
         tokio::spawn(async move {
             let mut out = tokio::io::stdout();
+            // The agent sets the title to something about itself; this window
+            // is saying which seat it shows, so those writes come out here
+            // rather than being fought over.
+            let mut strip = windowtitle::Strip::default();
             while let Some(Ok(msg)) = stream.next().await {
                 match msg {
                     WsMessage::Binary(data) => {
+                        let data = strip.pass(&data);
                         if out.write_all(&data).await.is_err() || out.flush().await.is_err() {
                             break;
                         }
@@ -1004,6 +1044,11 @@ async fn attach(
     if let Some(b) = &bar {
         let mut out = tokio::io::stdout();
         let _ = out.write_all(&b.release()).await;
+        let _ = out.flush().await;
+    }
+    {
+        let mut out = tokio::io::stdout();
+        let _ = out.write_all(windowtitle::POP).await;
         let _ = out.flush().await;
     }
     drop(_guard);
@@ -1126,14 +1171,22 @@ async fn main() -> Result<()> {
                 println!("no sessions");
                 return Ok(());
             }
-            println!("{:<14} {:<22} {:<10} SLOTS", "ID", "NAME", "STATUS");
+            // SEATS is who is on the team; TERMINALS is how many of them have
+            // a window adopted onto them. One number covering both read as a
+            // team twice its size.
+            println!("{:<14} {:<22} {:<10} {:>5}  {}", "ID", "NAME", "STATUS", "SEATS",
+                     "TERMINALS");
             for s in rows {
                 println!(
-                    "{:<14} {:<22} {:<10} {}",
+                    "{:<14} {:<22} {:<10} {:>5}  {}",
                     s["id"].as_str().unwrap_or("?"),
                     s["name"].as_str().unwrap_or("?"),
                     s["status"].as_str().unwrap_or("?"),
-                    s["slots"].as_i64().unwrap_or(0)
+                    s["slots"].as_i64().unwrap_or(0),
+                    match s["terminals"].as_i64().unwrap_or(0) {
+                        0 => "-".to_string(),
+                        n => n.to_string(),
+                    }
                 );
             }
         }
