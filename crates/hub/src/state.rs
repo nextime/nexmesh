@@ -66,6 +66,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         // the walk and one of source files that exhausts the clock want
         // opposite answers.
         ("code_graph_meta", "truncated_reason", "TEXT"),
+        // The dashboard's view of a graph, computed when the graph is
+        // stored. It was computed per poll, which for a large workspace is
+        // half a minute of SQL against a page that asks every few seconds.
+        ("code_graph_meta", "summary_json", "TEXT"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.
@@ -207,6 +211,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             files INTEGER NOT NULL, skipped TEXT NOT NULL DEFAULT '[]',
             truncated INTEGER NOT NULL DEFAULT 0,
             truncated_reason TEXT,
+            summary_json TEXT,
             communities INTEGER NOT NULL DEFAULT 0)",
     )?;
 
@@ -366,6 +371,10 @@ pub struct AppState {
     /// Outstanding workspace-sync requests, awaiting the node's answer.
     sync_waiters: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     sync_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Code graphs arriving in pieces, keyed by the request they answer.
+    /// Dropped if the node goes away mid-stream: half a graph is worse than
+    /// none, because nothing about it says which half is missing.
+    graph_parts: Arc<Mutex<HashMap<u64, (i64, nexmesh_proto::codegraph::CodeGraph)>>>,
     /// How to rebuild and swap the live TLS configuration, so revoking a
     /// certificate does not have to wait for a restart.
     tls: Arc<Mutex<Option<TlsHandle>>>,
@@ -413,6 +422,7 @@ impl AppState {
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
+            graph_parts: Arc::new(Mutex::new(HashMap::new())),
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tls: Arc::new(Mutex::new(None)),
             kicks: Arc::new(Mutex::new(HashMap::new())),
@@ -435,6 +445,7 @@ impl AppState {
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
+            graph_parts: Arc::new(Mutex::new(HashMap::new())),
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tls: Arc::new(Mutex::new(None)),
             kicks: Arc::new(Mutex::new(HashMap::new())),
@@ -451,6 +462,23 @@ impl AppState {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sync_waiters.lock().unwrap().insert(id, tx);
         (id, rx)
+    }
+
+    /// Take in one piece of a code graph, and return the whole thing once
+    /// the last piece lands.
+    ///
+    /// Pieces from an abandoned stream would otherwise sit here for ever, so
+    /// anything older than a quarter of an hour is dropped whenever a new
+    /// stream starts: a node that died mid-graph is not coming back to
+    /// finish it.
+    pub fn take_graph_piece(
+        &self,
+        req_id: u64,
+        piece: nexmesh_proto::codegraph::CodeGraph,
+        last: bool,
+    ) -> Option<nexmesh_proto::codegraph::CodeGraph> {
+        let mut parts = self.graph_parts.lock().unwrap();
+        assemble_piece(&mut parts, req_id, piece, last, nexmesh_proto::now_ms())
     }
 
     /// Hand a node's answer to whoever asked. False when nobody is there to
@@ -1110,9 +1138,113 @@ pub fn demote_running(db: &Connection) -> usize {
     .unwrap_or(0)
 }
 
+/// Add one piece to a graph being assembled, and return the whole thing once
+/// the last piece lands.
+///
+/// Separate from the state it lives in so the assembly itself can be tested:
+/// the failure it exists to prevent -- half a graph stored as though it were
+/// all of one -- is silent, and a silent failure needs a test more than a
+/// loud one does.
+fn assemble_piece(
+    parts: &mut HashMap<u64, (i64, nexmesh_proto::codegraph::CodeGraph)>,
+    req_id: u64,
+    piece: nexmesh_proto::codegraph::CodeGraph,
+    last: bool,
+    now: i64,
+) -> Option<nexmesh_proto::codegraph::CodeGraph> {
+    parts.retain(|_, (at, _)| now - *at < 15 * 60 * 1000);
+    let entry = parts.entry(req_id).or_insert_with(|| (now, Default::default()));
+    entry.0 = now;
+    entry.1.nodes.extend(piece.nodes);
+    entry.1.edges.extend(piece.edges);
+    if !last {
+        return None;
+    }
+    let (_, mut whole) = parts.remove(&req_id)?;
+    // The counts describe the scan, not the piece, so they come from the one
+    // that completes it.
+    whole.files = piece.files;
+    whole.skipped = piece.skipped;
+    whole.truncated = piece.truncated;
+    whole.truncated_reason = piece.truncated_reason;
+    Some(whole)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod graph_pieces {
+        use super::*;
+        use nexmesh_proto::codegraph::{CodeGraph, GraphNode, NodeKind};
+
+        fn piece(names: &[&str]) -> CodeGraph {
+            CodeGraph {
+                nodes: names
+                    .iter()
+                    .map(|n| GraphNode {
+                        id: n.to_string(),
+                        kind: NodeKind::Function,
+                        name: n.to_string(),
+                        path: "a.rs".into(),
+                        line: 1,
+                        lang: "rust".into(),
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn nothing_comes_out_until_the_last_piece_is_in() {
+            let mut parts = HashMap::new();
+            assert!(assemble_piece(&mut parts, 1, piece(&["a"]), false, 1000).is_none());
+            assert!(assemble_piece(&mut parts, 1, piece(&["b"]), false, 1001).is_none());
+            let whole = assemble_piece(&mut parts, 1, piece(&["c"]), true, 1002)
+                .expect("the last piece completes it");
+            let names: Vec<&str> = whole.nodes.iter().map(|n| n.name.as_str()).collect();
+            assert_eq!(names, ["a", "b", "c"], "in the order they were sent");
+            assert!(parts.is_empty(), "a finished graph is not left behind");
+        }
+
+        #[test]
+        fn the_counts_come_from_the_piece_that_finishes_it() {
+            // They describe the whole scan, and until it ends there is
+            // nothing to describe.
+            let mut parts = HashMap::new();
+            assemble_piece(&mut parts, 7, piece(&["a"]), false, 1000);
+            let mut tail = piece(&["b"]);
+            tail.files = 12;
+            tail.truncated = true;
+            tail.truncated_reason = Some("the parse ran out of time".into());
+            let whole = assemble_piece(&mut parts, 7, tail, true, 1001).unwrap();
+            assert_eq!(whole.files, 12);
+            assert!(whole.truncated);
+            assert_eq!(whole.truncated_reason.as_deref(), Some("the parse ran out of time"));
+            assert_eq!(whole.nodes.len(), 2);
+        }
+
+        #[test]
+        fn two_graphs_arriving_at_once_do_not_mix() {
+            let mut parts = HashMap::new();
+            assemble_piece(&mut parts, 1, piece(&["mine"]), false, 1000);
+            assemble_piece(&mut parts, 2, piece(&["yours"]), false, 1000);
+            let first = assemble_piece(&mut parts, 1, piece(&["mine2"]), true, 1001).unwrap();
+            let names: Vec<&str> = first.nodes.iter().map(|n| n.name.as_str()).collect();
+            assert_eq!(names, ["mine", "mine2"]);
+        }
+
+        #[test]
+        fn a_stream_that_was_abandoned_is_not_kept_for_ever() {
+            // A node that died halfway is not coming back to finish, and
+            // half a graph held in memory helps nobody.
+            let mut parts = HashMap::new();
+            assemble_piece(&mut parts, 1, piece(&["orphan"]), false, 1000);
+            assemble_piece(&mut parts, 2, piece(&["later"]), false, 1000 + 16 * 60 * 1000);
+            assert!(!parts.contains_key(&1), "the abandoned one is dropped");
+            assert!(parts.contains_key(&2));
+        }
+    }
 
     /// A database with one node and two agents on it, both live.
     fn fleet() -> Connection {

@@ -646,16 +646,54 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let root = std::path::PathBuf::from(&path);
-                let graph = tokio::task::spawn_blocking(move || {
+                let mut graph = tokio::task::spawn_blocking(move || {
                     codegraph::scan(&root, &codegraph::Limits::default())
                 })
                 .await
                 .unwrap_or_default();
                 tracing::info!(%workspace_id, files = graph.files, nodes = graph.nodes.len(),
                     "parsed a workspace");
-                let _ = ctx
-                    .send_hub(&NodeToHub::CodeGraphResult { req_id, workspace_id, graph })
-                    .await;
+                // In pieces, because the whole thing in one message is
+                // megabytes and the far end resets the connection rather
+                // than accept it -- which loses the answer completely and
+                // leaves the caller waiting for something that no longer
+                // exists. Roughly two megabytes a piece.
+                const PER_PIECE: usize = 8000;
+                let nodes = std::mem::take(&mut graph.nodes);
+                let edges = std::mem::take(&mut graph.edges);
+                let pieces = std::cmp::max(
+                    1,
+                    std::cmp::max(nodes.len().div_ceil(PER_PIECE),
+                                  edges.len().div_ceil(PER_PIECE)),
+                );
+                let mut nodes = nodes.into_iter();
+                let mut edges = edges.into_iter();
+                for seq in 0..pieces {
+                    let last = seq + 1 == pieces;
+                    let mut part = proto::codegraph::CodeGraph {
+                        nodes: nodes.by_ref().take(PER_PIECE).collect(),
+                        edges: edges.by_ref().take(PER_PIECE).collect(),
+                        ..Default::default()
+                    };
+                    // The counts and the truncation notice describe the
+                    // whole scan, so they ride on the piece that completes
+                    // it -- there is nothing to describe until then.
+                    if last {
+                        part.files = graph.files;
+                        part.skipped = std::mem::take(&mut graph.skipped);
+                        part.truncated = graph.truncated;
+                        part.truncated_reason = graph.truncated_reason.take();
+                    }
+                    let _ = ctx
+                        .send_hub(&NodeToHub::CodeGraphResult {
+                            req_id,
+                            workspace_id: workspace_id.clone(),
+                            graph: part,
+                            seq: seq as u32,
+                            last,
+                        })
+                        .await;
+                }
             });
         }
 

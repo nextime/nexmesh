@@ -181,8 +181,11 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
     // may name a file that has not been walked yet.
     let mut imports: Vec<(String, String)> = Vec::new();
 
-    let deadline = std::time::Instant::now() + limits.budget;
+    let started = std::time::Instant::now();
+    let deadline = started + limits.budget;
     let files = walk(root, limits, deadline, &mut graph);
+    let walked = started.elapsed();
+    let candidates = files.len();
     for abs in files {
         // The budget covers the parse too, and this is where it is usually
         // spent: 4,000 source files can take several minutes, and a graph
@@ -253,7 +256,9 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
         );
     }
 
+    let parsed = started.elapsed();
     resolve_imports(&mut graph, imports);
+    let resolved = started.elapsed();
 
     // Resolve calls by name. Ambiguity is dropped rather than guessed: two
     // functions sharing a name means an edge to either could be wrong, and a
@@ -271,8 +276,25 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
         }
     }
 
+    let called = started.elapsed();
     graph.prune_dangling();
     graph.dedup_edges();
+    // Where a scan's time actually went. Guessing at this cost an afternoon:
+    // the walk was blamed, then the parse, then import resolution, and the
+    // only way to stop guessing is for the thing to say so itself.
+    tracing::info!(
+        candidates,
+        files = graph.files,
+        nodes = graph.nodes.len(),
+        edges = graph.edges.len(),
+        walk_ms = walked.as_millis() as u64,
+        parse_ms = (parsed - walked).as_millis() as u64,
+        imports_ms = (resolved - parsed).as_millis() as u64,
+        calls_ms = (called - resolved).as_millis() as u64,
+        tidy_ms = (started.elapsed() - called).as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "scanned a workspace"
+    );
     graph
 }
 
@@ -390,21 +412,49 @@ fn collect(
 /// External modules therefore become nodes of their own, so "what does this
 /// file depend on" is answerable.
 fn resolve_imports(graph: &mut CodeGraph, imports: Vec<(String, String)>) {
-    // path and stem of every file already in the graph
-    let files: Vec<(String, String)> = graph
-        .nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::File)
-        .map(|n| {
-            let stem = Path::new(&n.path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (n.path.clone(), stem)
-        })
-        .collect();
+    // Indexed, not searched. This was a linear scan of every file for every
+    // import, with a `format!` inside the predicate -- so a workspace of
+    // 3,000 files and 30,000 imports did ninety million string comparisons
+    // and as many allocations, and a scan that should take seconds took five
+    // minutes. It was the walk and the parse that got blamed for that, and
+    // both were innocent.
+    //
+    // One map, keyed by every way a file can be named by an import: its path,
+    // and each suffix of that path starting at a directory boundary. The
+    // value is the file's position, so a lookup returns what scanning in file
+    // order used to return -- the earliest match, whichever rule matched it.
+    let mut by_name: HashMap<String, (usize, String)> = HashMap::new();
+    let mut by_stem: HashMap<String, (usize, String)> = HashMap::new();
+    for (i, n) in graph.nodes.iter().filter(|n| n.kind == NodeKind::File).enumerate() {
+        let path = n.path.clone();
+        // With the extension and without it. An import is normalised by
+        // turning its punctuation into slashes, which means `use
+        // crate::deep::util` arrives as `deep/util` and can never equal a
+        // path ending in `.rs`. Indexing the extensionless form is what
+        // lets the directories in an import count: two files named `util`
+        // are told apart by the one the import actually named.
+        let bare = path.rsplit_once('.').map(|(b, _)| b.to_string());
+        let mut keys = vec![path.clone()];
+        for (at, _) in path.match_indices('/') {
+            keys.push(path[at + 1..].to_string());
+        }
+        if let Some(bare) = bare {
+            for (at, _) in bare.match_indices('/') {
+                keys.push(bare[at + 1..].to_string());
+            }
+            keys.push(bare);
+        }
+        for k in keys {
+            by_name.entry(k).or_insert_with(|| (i, path.clone()));
+        }
+        if let Some(stem) = Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_string()) {
+            if !stem.is_empty() {
+                by_stem.entry(stem).or_insert_with(|| (i, path.clone()));
+            }
+        }
+    }
 
-    let mut external: Vec<String> = Vec::new();
+    let mut external: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     for (from, raw) in imports {
         let target = normalise_import(&raw);
@@ -413,21 +463,19 @@ fn resolve_imports(graph: &mut CodeGraph, imports: Vec<(String, String)>) {
         }
         // The last segment is what a file is usually named after:
         // `crate::ocr::manager` -> `manager`, `./util` -> `util`.
-        let last = target.rsplit('/').next().unwrap_or(&target).to_string();
-        let hit = files
-            .iter()
-            .find(|(path, _)| path == &target || path.ends_with(&format!("/{target}")))
-            .or_else(|| files.iter().find(|(_, stem)| stem == &last && !last.is_empty()));
+        let last = target.rsplit('/').next().unwrap_or(&target);
+        let hit = by_name
+            .get(&target)
+            .or_else(|| if last.is_empty() { None } else { by_stem.get(last) });
         match hit {
-            Some((path, _)) if path != &from => {
+            Some((_, path)) if path != &from => {
                 edges.push(GraphEdge { from, to: path.clone(), kind: EdgeKind::Imports });
             }
             // Either outside the workspace, or the file importing itself.
             Some(_) => {}
             None => {
                 let id = format!("module:{target}");
-                if !external.contains(&target) {
-                    external.push(target.clone());
+                if external.insert(target.clone()) {
                     graph.nodes.push(GraphNode {
                         id: id.clone(),
                         kind: NodeKind::Module,
@@ -733,6 +781,75 @@ fn helper(s: &str) -> usize { s.len() }
             g.truncated_reason.as_deref().unwrap_or("").contains("files"),
             "which limit it hit decides what to do about it: {:?}",
             g.truncated_reason
+        );
+    }
+
+    fn file_node(path: &str) -> GraphNode {
+        GraphNode {
+            id: path.to_string(),
+            kind: NodeKind::File,
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            path: path.to_string(),
+            line: 1,
+            lang: "rust".into(),
+        }
+    }
+
+    #[test]
+    fn the_directories_in_an_import_decide_which_file_it_means() {
+        // An import is normalised into a slash path with no extension, so
+        // `crate::deep::util` arrives as `deep/util`. Two files are named
+        // `util` here, and the one the import actually named is the one
+        // that should win -- matching on the bare filename alone would pick
+        // whichever came first and be right by luck.
+        let mut g = CodeGraph {
+            nodes: vec![
+                file_node("src/other/util.rs"),
+                file_node("src/deep/util.rs"),
+                file_node("src/main.rs"),
+            ],
+            ..Default::default()
+        };
+        resolve_imports(&mut g, vec![("src/main.rs".into(), "crate::deep::util".into())]);
+        assert_eq!(g.edges.len(), 1, "{:?}", g.edges);
+        assert_eq!(g.edges[0].to, "src/deep/util.rs");
+        assert_eq!(g.edges[0].kind, EdgeKind::Imports);
+    }
+
+    #[test]
+    fn an_import_that_could_match_two_files_takes_the_first_in_order() {
+        // Ambiguity resolved the same way twice is worth more than ambiguity
+        // resolved well once: the graph has to be reproducible.
+        let mut g = CodeGraph {
+            nodes: vec![file_node("a/util.rs"), file_node("b/util.rs")],
+            ..Default::default()
+        };
+        resolve_imports(&mut g, vec![("c.rs".into(), "util".into())]);
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].to, "a/util.rs");
+    }
+
+    #[test]
+    fn resolving_imports_does_not_cost_files_times_imports() {
+        // It used to: a linear scan of every file for every import, with a
+        // string allocation inside the predicate. Three thousand files and
+        // thirty thousand imports turned a scan that should take seconds
+        // into one the hub gave up waiting for. The numbers here are a
+        // twentieth of that and would still take minutes the old way.
+        let n = 1500;
+        let mut g = CodeGraph {
+            nodes: (0..n).map(|i| file_node(&format!("src/pkg{i}/mod{i}.rs"))).collect(),
+            ..Default::default()
+        };
+        let imports: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("src/pkg{i}/mod{i}.rs"), format!("nowhere::missing{i}")))
+            .collect();
+        let started = std::time::Instant::now();
+        resolve_imports(&mut g, imports);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "resolving {n} imports against {n} files took {took:?}"
         );
     }
 

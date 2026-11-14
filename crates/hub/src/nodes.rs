@@ -299,7 +299,12 @@ async fn handle(
             tracing::debug!(%slot_id, "stored a resume handle");
         }
 
-        NodeToHub::CodeGraphResult { req_id, workspace_id, graph } => {
+        NodeToHub::CodeGraphResult { req_id, workspace_id, graph, seq: _, last } => {
+            // A graph arrives in pieces; there is nothing to do with one
+            // until the last lands.
+            let Some(graph) = st.take_graph_piece(req_id, graph, last) else {
+                return Ok(());
+            };
             // Hand it to whoever asked, through the same waiter the workspace
             // sync round-trip uses.
             let taken =
@@ -310,7 +315,7 @@ async fn handle(
                 // throwing it away leaves the workspace with no graph at all
                 // -- so the next ask starts from nothing and times out in the
                 // same place, for ever.
-                match crate::graph::store(st, &workspace_id, &graph) {
+                match crate::graph::store_off_thread(st, &workspace_id, graph).await {
                     Ok(summary) => tracing::info!(%workspace_id, %summary,
                         "stored a code graph that arrived after its caller had gone"),
                     Err(e) => tracing::warn!(%workspace_id, error = %e,

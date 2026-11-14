@@ -18,6 +18,7 @@ use nexmesh_proto::{
     now_ms,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
 
 /// Ask the node holding a workspace to parse it, then store what comes back.
 pub async fn build(st: &AppState, workspace_id: &str, node_id: &str, path: &str) -> Result<String> {
@@ -42,12 +43,31 @@ pub async fn build(st: &AppState, workspace_id: &str, node_id: &str, path: &str)
 
     let graph: CodeGraph =
         serde_json::from_value(answer).context("the node sent a graph we cannot read")?;
-    store(st, workspace_id, &graph)
+    store_off_thread(st, workspace_id, graph).await
+}
+
+/// Store a graph without blocking the runtime.
+///
+/// Grouping tens of thousands of symbols into subsystems is seconds of
+/// solid CPU, and running that on an async worker is how a single large
+/// workspace stopped the hub answering anything at all -- including
+/// `/healthz`, including the dashboard, for every other machine on the
+/// fleet. It belongs on a blocking thread.
+pub async fn store_off_thread(
+    st: &AppState,
+    workspace_id: &str,
+    graph: CodeGraph,
+) -> Result<String> {
+    let st = st.clone();
+    let ws = workspace_id.to_string();
+    tokio::task::spawn_blocking(move || store(&st, &ws, &graph))
+        .await
+        .context("storing a code graph")?
 }
 
 /// Replace a workspace's graph and recompute its communities.
 pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<String> {
-    let communities = assign_communities(graph);
+    let (communities, grouped_fully) = assign_communities(graph);
     let db = st.db.lock().unwrap();
     // One transaction for the lot. A large workspace is 200,000 symbols, and
     // committing each of those separately is the difference between seconds
@@ -98,6 +118,15 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
         ],
     )?;
     tx.commit()?;
+    // The dashboard's view of this graph, worked out now rather than on
+    // every poll of a page that asks every few seconds.
+    if let Some(view) = summarise(&db, workspace_id, "") {
+        db.execute(
+            "UPDATE code_graph_meta SET summary_json = ? WHERE workspace_id = ?",
+            params![view.to_string(), workspace_id],
+        )
+        .ok();
+    }
     let mut out = format!(
         "Parsed {} file(s): {} symbols, {} relationships, {} subsystem(s).",
         graph.files,
@@ -105,6 +134,11 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
         graph.edges.len(),
         distinct
     );
+    if !grouped_fully {
+        out.push_str(
+            " Grouping into subsystems ran out of time, so the subsystems are provisional.",
+        );
+    }
     if graph.truncated {
         out.push_str(&format!(
             " This graph is partial: {}.",
@@ -122,10 +156,10 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
 /// Only `Calls` and `Imports` carry weight: `Defines` would tie every symbol
 /// to its own file and so make each file a community, which says nothing a
 /// directory listing does not already say.
-fn assign_communities(graph: &CodeGraph) -> Vec<Option<usize>> {
+fn assign_communities(graph: &CodeGraph) -> (Vec<Option<usize>>, bool) {
     let n = graph.nodes.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     let index: std::collections::HashMap<&str, usize> =
         graph.nodes.iter().enumerate().map(|(i, nd)| (nd.id.as_str(), i)).collect();
@@ -142,7 +176,22 @@ fn assign_communities(graph: &CodeGraph) -> Vec<Option<usize>> {
             g.add_edge(a, b, w);
         }
     }
-    let comms = leiden::communities(&g, &leiden::Options::default());
+    // Bounded, and the bound is wall-clock. See `leiden::within`: a graph
+    // that keeps this running is not a graph worth waiting for, and it used
+    // to take the hub off the air entirely.
+    let started = std::time::Instant::now();
+    let (comms, complete) = leiden::within(
+        &g,
+        &leiden::Options::default(),
+        Some(started + std::time::Duration::from_secs(45)),
+    );
+    tracing::info!(
+        nodes = n,
+        edges = graph.edges.len(),
+        complete,
+        took_ms = started.elapsed().as_millis() as u64,
+        "grouped a code graph into subsystems"
+    );
     // A node with no relational edge is not in a subsystem, and saying it is
     // one of its own would fill the answer with noise: a file node, once
     // Defines is excluded, connects to nothing.
@@ -156,15 +205,170 @@ fn assign_communities(graph: &CodeGraph) -> Vec<Option<usize>> {
             degree[b] += 1;
         }
     }
-    comms
+    let out = comms
         .into_iter()
         .enumerate()
         .map(|(i, c)| if degree[i] > 0 { Some(c) } else { None })
-        .collect()
+        .collect();
+    (out, complete)
 }
 
 fn kind_label(k: &str) -> &str {
     k
+}
+
+
+/// Everything the dashboard shows about one workspace's graph, as JSON.
+///
+/// Computed once, when the graph is stored, and kept -- because it used to
+/// be computed on every poll of the dashboard. For a workspace of fifty
+/// thousand symbols that is half a minute of SQL per poll, against a page
+/// that polls every few seconds, so the hub spent all of its time rebuilding
+/// an answer that only changes when somebody re-parses. It stopped serving
+/// anything else at all.
+pub fn summarise(db: &Connection, ws_id: &str, ws_name: &str) -> Option<Value> {
+    let (built, files, truncated, truncated_why, communities):
+        (i64, i64, i64, Option<String>, i64) = db
+        .query_row(
+            "SELECT built_at_ms, files, truncated, truncated_reason, communities
+               FROM code_graph_meta WHERE workspace_id = ?",
+            [ws_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let counts: Vec<Value> = db
+        .prepare(
+            "SELECT kind, COUNT(*) FROM code_graph_nodes
+              WHERE workspace_id = ? GROUP BY kind ORDER BY 2 DESC",
+        )
+        .and_then(|mut st| {
+            st.query_map([ws_id], |r| {
+                Ok(json!({ "kind": r.get::<_, String>(0)?,
+                           "n": r.get::<_, i64>(1)? }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .unwrap_or_default();
+    // Largest first, with a few recognisable members each:
+    // a list of numbered communities tells a reader nothing.
+    let subsystems: Vec<Value> = db
+        .prepare(
+            "SELECT community, COUNT(*) FROM code_graph_nodes
+              WHERE workspace_id = ? AND community IS NOT NULL
+              GROUP BY community ORDER BY 2 DESC LIMIT 24",
+        )
+        .and_then(|mut st| {
+            st.query_map([ws_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(c, n)| {
+            let members: Vec<Value> = db
+                .prepare(
+                    "SELECT name, path, kind FROM code_graph_nodes
+                      WHERE workspace_id = ? AND community = ?
+                      ORDER BY CASE kind WHEN 'type' THEN 0
+                                         WHEN 'function' THEN 1 ELSE 2 END,
+                               name LIMIT 8",
+                )
+                .and_then(|mut st| {
+                    st.query_map(params![ws_id, c], |r| {
+                        Ok(json!({ "name": r.get::<_, String>(0)?,
+                                   "path": r.get::<_, String>(1)?,
+                                   "kind": r.get::<_, String>(2)? }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+            // What to call a subsystem nobody named. The
+            // file most of it lives in beats the alphabetically
+            // first function in it, which is how a community
+            // came to be labelled after a test.
+            let path: Option<String> = db
+                .query_row(
+                    // Skip the empty path: an external
+                    // import is a `module:` node with no file
+                    // of its own, and a community full of them
+                    // would otherwise be labelled "".
+                    "SELECT path FROM code_graph_nodes
+                      WHERE workspace_id = ? AND community = ?
+                        AND path <> ''
+                      GROUP BY path ORDER BY COUNT(*) DESC, path LIMIT 1",
+                    params![ws_id, c],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            json!({ "id": c, "n": n, "members": members, "path": path })
+        })
+        .collect();
+    // How the subsystems depend on each other. A table of
+    // communities says what exists; only this says what the
+    // thing is SHAPED like, which is the question a person
+    // opens a code graph to answer.
+    //
+    // Aggregated to community level deliberately: 1400 symbols
+    // drawn at once is a hairball, 19 subsystems is a map.
+    let mut agg: std::collections::BTreeMap<(i64, i64), (i64, bool)> =
+        Default::default();
+    if let Ok(mut st) = db.prepare(
+        "SELECT a.community, b.community, e.kind, COUNT(*)
+           FROM code_graph_edges e
+           JOIN code_graph_nodes a
+             ON a.workspace_id = e.workspace_id AND a.id = e.from_id
+           JOIN code_graph_nodes b
+             ON b.workspace_id = e.workspace_id AND b.id = e.to_id
+          WHERE e.workspace_id = ?
+            AND a.community IS NOT NULL AND b.community IS NOT NULL
+            AND a.community <> b.community
+          GROUP BY 1, 2, 3",
+    ) {
+        let rows = st.query_map([ws_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (a, b, kind, n) = row;
+                // `defines` and `imports` are read off the
+                // tree; a call resolved by name is a guess,
+                // and the drawing says which is which.
+                let certain = kind == "defines" || kind == "imports";
+                let e = agg.entry((a, b)).or_insert((0, false));
+                e.0 += n;
+                e.1 |= certain;
+            }
+        }
+    }
+    let links: Vec<Value> = agg
+        .into_iter()
+        .map(|((a, b), (n, certain))| {
+            json!({ "a": a, "b": b, "n": n, "certain": certain })
+        })
+        .collect();
+
+    Some(json!({
+        "workspace": ws_name,
+        "workspace_id": ws_id,
+        "built_at_ms": built,
+        "files": files,
+        "truncated": truncated != 0,
+        "truncated_reason": truncated_why,
+        "communities": communities,
+        "counts": counts,
+        "subsystems": subsystems,
+        "links": links,
+    }))
 }
 
 /// Answer one question about the graph.
@@ -563,9 +767,29 @@ mod tests {
         // Weighting them would make every file its own community, which says
         // nothing a directory listing does not.
         let g = sample();
-        let comms = assign_communities(&g);
+        let (comms, complete) = assign_communities(&g);
+        assert!(complete, "a graph this small has no excuse for running out of time");
         let distinct: std::collections::HashSet<usize> = comms.iter().filter_map(|c| *c).collect();
         assert_eq!(distinct.len(), 2, "got {distinct:?} from {comms:?}");
+    }
+
+    #[test]
+    fn grouping_stops_when_its_time_is_up_and_says_so() {
+        // The grouping used to be bounded only by iteration count, which let
+        // one real workspace hold the hub at full CPU until it was
+        // restarted. Whatever it has when the clock runs out is what the
+        // caller gets, labelled as provisional.
+        let mut g = leiden::Graph::with_nodes(64);
+        for i in 0..64u64 {
+            g.add_edge(i as usize, ((i + 1) % 64) as usize, 1.0);
+        }
+        let (comms, complete) = leiden::within(
+            &g,
+            &leiden::Options::default(),
+            Some(std::time::Instant::now()),
+        );
+        assert!(!complete, "no time at all means it cannot have finished");
+        assert_eq!(comms.len(), 64, "every node still gets an answer");
     }
 
     #[test]

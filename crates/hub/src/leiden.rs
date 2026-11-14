@@ -100,13 +100,32 @@ impl Default for Options {
 
 /// Community index per node, renumbered from 0 and stable across runs.
 pub fn communities(g: &Graph, opts: &Options) -> Vec<usize> {
+    within(g, opts, None).0
+}
+
+/// The same, but it stops at `deadline` and says whether it finished.
+///
+/// Every loop here is bounded by a count, which is not the same as being
+/// bounded in time: one real graph of 64,000 symbols kept this at full
+/// tilt long enough to take the whole hub down with it, because a hub that
+/// is computing cannot answer anything else. A coarser grouping delivered
+/// on time is worth more than a perfect one that costs the fleet its
+/// coordinator, so the levels stop when the clock says so and the caller is
+/// told the grouping is provisional.
+pub fn within(
+    g: &Graph,
+    opts: &Options,
+    deadline: Option<std::time::Instant>,
+) -> (Vec<usize>, bool) {
+    let out_of_time =
+        || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     if g.n == 0 {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     if g.total <= 0.0 {
         // No edges: every node is its own community, which is the honest
         // answer rather than one community containing everything.
-        return (0..g.n).collect();
+        return ((0..g.n).collect(), true);
     }
 
     // Membership of the ORIGINAL nodes, refined level by level.
@@ -115,7 +134,12 @@ pub fn communities(g: &Graph, opts: &Options) -> Vec<usize> {
     // Which original nodes each current node stands for.
     let mut level_map: Vec<Vec<usize>> = (0..g.n).map(|v| vec![v]).collect();
 
+    let mut complete = true;
     for _ in 0..opts.max_levels {
+        if out_of_time() {
+            complete = false;
+            break;
+        }
         // 1. Local moving: the Louvain step.
         let partition = local_move(&graph, opts.resolution);
         let distinct = count_distinct(&partition);
@@ -145,7 +169,7 @@ pub fn communities(g: &Graph, opts: &Options) -> Vec<usize> {
         level_map = next_map;
     }
 
-    renumber(&membership)
+    (renumber(&membership), complete)
 }
 
 /// Move each node to the neighbouring community that most improves

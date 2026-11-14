@@ -30,6 +30,13 @@ use serde::{Deserialize, Serialize};
 pub use tools::ToolDef;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// serde default for a flag that is true unless a sender says otherwise.
+/// A message from a build that predates the flag means the old behaviour,
+/// which here is "this is the whole thing".
+fn yes() -> bool {
+    true
+}
 pub const DEFAULT_HUB_PORT: u16 = 7870;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 /// A node is presumed lost after this long without a heartbeat. The hub then
@@ -261,10 +268,25 @@ pub enum NodeToHub {
         handle: String,
     },
     /// A workspace's parsed code graph, answering BuildCodeGraph.
+    ///
+    /// Sent in pieces. A real workspace is tens of thousands of symbols and
+    /// as many relationships, which is megabytes of JSON, and one websocket
+    /// message that size is refused by the far end: the connection is reset,
+    /// the node reconnects, and the answer is simply gone -- while the
+    /// caller waits out its whole timeout for a result that was destroyed
+    /// seconds after it was made. Each piece carries some of the nodes and
+    /// edges; the last one carries the counts and the truncation notice.
+    ///
+    /// `seq` and `last` default to a single final piece, so a node built
+    /// before this still speaks to a hub built after it.
     CodeGraphResult {
         req_id: u64,
         workspace_id: String,
         graph: crate::codegraph::CodeGraph,
+        #[serde(default)]
+        seq: u32,
+        #[serde(default = "crate::yes")]
+        last: bool,
     },
     /// The model an agent reports it is actually running.
     ///

@@ -469,148 +469,36 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 .iter()
                 .filter_map(|(ws_id, ws_name)| {
                     let ws_id = ws_id.as_str();
-                    let (built, files, truncated, truncated_why, communities):
-                        (i64, i64, i64, Option<String>, i64) = db
+                    // Read, not recomputed. The view is built when the graph
+                    // is stored; a graph stored by an older build has none
+                    // yet, so the first read after an upgrade builds it once
+                    // and keeps it.
+                    let cached: Option<String> = db
                         .query_row(
-                            "SELECT built_at_ms, files, truncated, truncated_reason, communities
-                               FROM code_graph_meta WHERE workspace_id = ?",
+                            "SELECT summary_json FROM code_graph_meta WHERE workspace_id = ?",
                             [ws_id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                            |r| r.get(0),
                         )
                         .optional()
                         .ok()
-                        .flatten()?;
-                    let counts: Vec<Value> = db
-                        .prepare(
-                            "SELECT kind, COUNT(*) FROM code_graph_nodes
-                              WHERE workspace_id = ? GROUP BY kind ORDER BY 2 DESC",
-                        )
-                        .and_then(|mut st| {
-                            st.query_map([ws_id], |r| {
-                                Ok(json!({ "kind": r.get::<_, String>(0)?,
-                                           "n": r.get::<_, i64>(1)? }))
-                            })
-                            .and_then(|m| m.collect())
-                        })
-                        .unwrap_or_default();
-                    // Largest first, with a few recognisable members each:
-                    // a list of numbered communities tells a reader nothing.
-                    let subsystems: Vec<Value> = db
-                        .prepare(
-                            "SELECT community, COUNT(*) FROM code_graph_nodes
-                              WHERE workspace_id = ? AND community IS NOT NULL
-                              GROUP BY community ORDER BY 2 DESC LIMIT 24",
-                        )
-                        .and_then(|mut st| {
-                            st.query_map([ws_id], |r| {
-                                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                            })
-                            .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
-                        })
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(c, n)| {
-                            let members: Vec<Value> = db
-                                .prepare(
-                                    "SELECT name, path, kind FROM code_graph_nodes
-                                      WHERE workspace_id = ? AND community = ?
-                                      ORDER BY CASE kind WHEN 'type' THEN 0
-                                                         WHEN 'function' THEN 1 ELSE 2 END,
-                                               name LIMIT 8",
-                                )
-                                .and_then(|mut st| {
-                                    st.query_map(rusqlite::params![ws_id, c], |r| {
-                                        Ok(json!({ "name": r.get::<_, String>(0)?,
-                                                   "path": r.get::<_, String>(1)?,
-                                                   "kind": r.get::<_, String>(2)? }))
-                                    })
-                                    .and_then(|m| m.collect())
-                                })
-                                .unwrap_or_default();
-                            // What to call a subsystem nobody named. The
-                            // file most of it lives in beats the alphabetically
-                            // first function in it, which is how a community
-                            // came to be labelled after a test.
-                            let path: Option<String> = db
-                                .query_row(
-                                    // Skip the empty path: an external
-                                    // import is a `module:` node with no file
-                                    // of its own, and a community full of them
-                                    // would otherwise be labelled "".
-                                    "SELECT path FROM code_graph_nodes
-                                      WHERE workspace_id = ? AND community = ?
-                                        AND path <> ''
-                                      GROUP BY path ORDER BY COUNT(*) DESC, path LIMIT 1",
-                                    rusqlite::params![ws_id, c],
-                                    |r| r.get(0),
-                                )
-                                .optional()
-                                .ok()
-                                .flatten();
-                            json!({ "id": c, "n": n, "members": members, "path": path })
-                        })
-                        .collect();
-                    // How the subsystems depend on each other. A table of
-                    // communities says what exists; only this says what the
-                    // thing is SHAPED like, which is the question a person
-                    // opens a code graph to answer.
-                    //
-                    // Aggregated to community level deliberately: 1400 symbols
-                    // drawn at once is a hairball, 19 subsystems is a map.
-                    let mut agg: std::collections::BTreeMap<(i64, i64), (i64, bool)> =
-                        Default::default();
-                    if let Ok(mut st) = db.prepare(
-                        "SELECT a.community, b.community, e.kind, COUNT(*)
-                           FROM code_graph_edges e
-                           JOIN code_graph_nodes a
-                             ON a.workspace_id = e.workspace_id AND a.id = e.from_id
-                           JOIN code_graph_nodes b
-                             ON b.workspace_id = e.workspace_id AND b.id = e.to_id
-                          WHERE e.workspace_id = ?
-                            AND a.community IS NOT NULL AND b.community IS NOT NULL
-                            AND a.community <> b.community
-                          GROUP BY 1, 2, 3",
-                    ) {
-                        let rows = st.query_map([ws_id], |r| {
-                            Ok((
-                                r.get::<_, i64>(0)?,
-                                r.get::<_, i64>(1)?,
-                                r.get::<_, String>(2)?,
-                                r.get::<_, i64>(3)?,
-                            ))
-                        });
-                        if let Ok(rows) = rows {
-                            for row in rows.flatten() {
-                                let (a, b, kind, n) = row;
-                                // `defines` and `imports` are read off the
-                                // tree; a call resolved by name is a guess,
-                                // and the drawing says which is which.
-                                let certain = kind == "defines" || kind == "imports";
-                                let e = agg.entry((a, b)).or_insert((0, false));
-                                e.0 += n;
-                                e.1 |= certain;
-                            }
+                        .flatten();
+                    let mut view: Value = match cached.as_deref().map(serde_json::from_str) {
+                        Some(Ok(v)) => v,
+                        _ => {
+                            let built = crate::graph::summarise(&db, ws_id, ws_name)?;
+                            db.execute(
+                                "UPDATE code_graph_meta SET summary_json = ? WHERE workspace_id = ?",
+                                rusqlite::params![built.to_string(), ws_id],
+                            )
+                            .ok();
+                            built
                         }
-                    }
-                    let links: Vec<Value> = agg
-                        .into_iter()
-                        .map(|((a, b), (n, certain))| {
-                            json!({ "a": a, "b": b, "n": n, "certain": certain })
-                        })
-                        .collect();
-
-                    Some(json!({
-                        "workspace": ws_name,
-                        "workspace_id": ws_id,
-                        "built_at_ms": built,
-                        "files": files,
-                        "truncated": truncated != 0,
-                        "truncated_reason": truncated_why,
-                        "communities": communities,
-                        "counts": counts,
-                        "subsystems": subsystems,
-                        "links": links,
-                    }))
+                    };
+                    // The name lives with the workspace, not with the graph,
+                    // so a rename does not need the graph parsed again.
+                    view["workspace"] = json!(ws_name);
+                    view["workspace_id"] = json!(ws_id);
+                    Some(view)
                 })
                 .collect();
 
