@@ -1224,6 +1224,34 @@ A CLI you start by hand still *joins* — it registers through `mcpd`, takes a
 seat, sends and receives, holds locks. What it cannot have is a screen anyone
 else can see.
 
+### Where an attach's bytes actually go
+
+The hub decides *who may attach to what*. It does not have to be the wire, and
+when it is, it costs: attaching from sissy to an agent on sissy sent every
+keystroke to the hub machine and back — two network hops and a relay in
+between, measured at 2.8 ms per round trip on an idle LAN, for bytes that never
+needed to leave the host.
+
+So `nexmesh attach` takes the shortest route available:
+
+1. **Straight to the node**, when the agent is on the machine you are typing
+   on. The hub mints a one-time ticket, pushes it to that node over the
+   connection it already holds, and hands it to you; you present it on the
+   node's own socket (`/run/nexmesh/attach.sock`, mode 0600) and the terminal
+   is relayed there. The bar says `direct`.
+2. **Through the hub**, otherwise — and whenever anything about the first route
+   does not work. From outside the fleet's network that is the only route, and
+   it keeps working exactly as before.
+
+The ticket is worth nothing on its own: only the node the hub sent it to will
+honour it, only for the agent it names, only once, and only for the next thirty
+seconds. One left unspent costs nothing.
+
+Node-to-node is the same ticket and the same framing over TLS, so attaching
+from sissy to zeiss can skip the hub too — that needs the node to advertise an
+address the hub can pass on, and is the next piece rather than something to
+guess from a hostname.
+
 ### Crash recovery
 
 A managed agent that dies with work outstanding is respawned on a placed node —

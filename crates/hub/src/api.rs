@@ -1898,6 +1898,92 @@ pub async fn resolve_agent(
 }
 
 #[derive(Deserialize)]
+pub struct DirectAttach {
+    /// The agent whose terminal is wanted -- its id, as `resolve` returns it.
+    pub agent: String,
+}
+
+/// Authorise an attach that does not go through the hub.
+///
+/// The hub stays the only thing that decides WHO may attach to WHAT. What it
+/// need not be is the wire: a keystroke typed on sissy for an agent on sissy
+/// made two network hops and a relay on a hub elsewhere. So this mints a
+/// one-time ticket, pushes it to the node holding that terminal over the
+/// connection it already has, and returns it to the operator, who presents it
+/// to the node directly. See `proto::attachsock`.
+///
+/// The ticket is worth nothing on its own: only the node the hub sent it to
+/// will honour it, only for the agent it names, only once, and only for the
+/// next few seconds. An operator who cannot reach the node falls back to
+/// attaching through the hub, which is why that path remains.
+pub async fn attach_ticket(
+    State(st): State<AppState>,
+    op: Option<Extension<std::sync::Arc<crate::state::Operator>>>,
+    Json(req): Json<DirectAttach>,
+) -> ApiResult {
+    let who = op
+        .as_ref()
+        .map(|Extension(o)| o.label.clone())
+        .unwrap_or_else(|| "operator".into());
+    let scope = op.and_then(|Extension(o)| o.session.clone());
+    let found: Option<(Option<String>, Option<i64>, String)> = {
+        let db = st.db.lock().unwrap();
+        db.query_row(
+            "SELECT a.node_id, a.exited_at_ms, s.session_id
+               FROM agents a JOIN slots s ON s.id = a.slot_id
+              WHERE a.id = ?",
+            [&req.agent],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(bad)?
+    };
+    let Some((node_id, exited, session_id)) = found else {
+        return Err(bad("no such agent, or it has no seat"));
+    };
+    // A scoped orchestrator may not reach outside its own session, here as
+    // everywhere else.
+    if let Some(only) = &scope {
+        if only != &session_id {
+            return Err(bad("that agent is in another session"));
+        }
+    }
+    if exited.is_some() {
+        return Err(bad("that agent has exited; read its transcript instead"));
+    }
+    let Some(node_id) = node_id else {
+        return Err(bad("that agent has no machine: an external participant has no terminal"));
+    };
+    if !st.node_is_connected(&node_id) {
+        return Err(bad("the agent's node is not connected, so it cannot be told about this"));
+    }
+    let node_name: String = {
+        let db = st.db.lock().unwrap();
+        db.query_row("SELECT name FROM nodes WHERE id = ?", [&node_id], |r| r.get(0))
+            .optional()
+            .map_err(bad)?
+            .unwrap_or_default()
+    };
+    let ticket = uuid::Uuid::new_v4().to_string();
+    let expires_at_ms = now_ms() + nexmesh_proto::attachsock::TICKET_TTL_MS;
+    st.send_to_node(
+        &node_id,
+        &nexmesh_proto::HubToNode::AttachTicket {
+            ticket: ticket.clone(),
+            agent_id: req.agent.clone(),
+            expires_at_ms,
+            operator: who,
+        },
+    )
+    .await
+    .map_err(bad)?;
+    Ok(Json(json!({
+        "ticket": ticket, "node": node_name, "agent": req.agent,
+        "expires_at_ms": expires_at_ms,
+    })))
+}
+
+#[derive(Deserialize)]
 pub struct SessionForPath {
     /// Node name, as `nexmesh nodes` lists it.
     pub node: String,

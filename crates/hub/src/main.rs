@@ -719,6 +719,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/log", get(api::session_log))
         .route("/v1/sessions/:sid/resolve/:who", get(api::resolve_agent))
         .route("/v1/session-for", get(api::session_for_path))
+        .route("/v1/attach/ticket", post(api::attach_ticket))
         .route("/v1/agents/:id/transcript", get(api::agent_transcript))
         .route("/v1/slots/:id/spawn", post(api::spawn_slot))
         .route("/v1/slots/:id/move", post(api::move_slot))

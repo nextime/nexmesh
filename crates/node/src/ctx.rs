@@ -294,6 +294,13 @@ pub struct NodeCtx {
     viewers: Mutex<HashMap<String, Arc<crate::viewer::Viewer>>>,
     tool_waiters: Mutex<HashMap<String, oneshot::Sender<ToolOutcome>>>,
     join_waiters: Mutex<HashMap<u64, oneshot::Sender<JoinOutcome>>>,
+    /// Attaches whose other end is on THIS machine, keyed by attach id. A
+    /// frame for one of these never reaches the hub: see `send_hub`.
+    local_attaches: Mutex<HashMap<String, mpsc::Sender<proto::attachsock::Frame>>>,
+    /// Tickets the hub has minted for direct attaches: ticket -> (agent,
+    /// expiry). Nothing else lets an operator attach without the hub as the
+    /// wire, and each is good once.
+    tickets: Mutex<HashMap<String, (String, i64)>>,
     seq: AtomicU64,
 }
 
@@ -316,6 +323,8 @@ impl NodeCtx {
             viewers: Mutex::new(HashMap::new()),
             tool_waiters: Mutex::new(HashMap::new()),
             join_waiters: Mutex::new(HashMap::new()),
+            local_attaches: Mutex::new(HashMap::new()),
+            tickets: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         })
     }
@@ -329,11 +338,99 @@ impl NodeCtx {
     }
 
     pub async fn send_hub(&self, frame: &proto::NodeToHub) -> anyhow::Result<()> {
+        // An attach whose other end is on this machine is answered here, not
+        // in the hub. Every part of the node that relays a terminal already
+        // goes through this one function, so routing it here means the pty
+        // code, the viewer and the spawn path need to know nothing about how
+        // the operator got here.
+        if let Some(attach_id) = attach_id_of(frame) {
+            let local = { self.local_attaches.lock().unwrap().get(attach_id).cloned() };
+            if let Some(tx) = local {
+                let ends = matches!(
+                    frame,
+                    proto::NodeToHub::AttachClosed { .. } | proto::NodeToHub::AttachRejected { .. }
+                );
+                if let Some(f) = local_frame(frame) {
+                    let _ = tx.send(f).await;
+                }
+                if ends {
+                    self.local_attaches.lock().unwrap().remove(attach_id);
+                }
+                return Ok(());
+            }
+        }
         let tx = { self.hub_tx.lock().unwrap().clone() };
         let tx = tx.ok_or_else(|| anyhow::anyhow!("not connected to the hub"))?;
         tx.send(serde_json::to_string(frame)?).await?;
         Ok(())
     }
+
+    // ------------------------------------------------- direct attaches ----
+
+    /// Remember a ticket the hub minted. Expired ones are dropped on the way
+    /// past, which is the only pruning this map needs: it is only ever as
+    /// large as the attaches somebody is in the middle of starting.
+    pub fn add_ticket(&self, ticket: String, agent_id: String, expires_at_ms: i64) {
+        let now = proto::now_ms();
+        let mut t = self.tickets.lock().unwrap();
+        t.retain(|_, (_, exp)| *exp > now);
+        t.insert(ticket, (agent_id, expires_at_ms));
+    }
+
+    /// Spend a ticket: the agent it was for, or why not. Good once -- a second
+    /// use of the same string is somebody replaying it.
+    pub fn spend_ticket(&self, ticket: &str) -> std::result::Result<String, &'static str> {
+        let mut t = self.tickets.lock().unwrap();
+        match t.remove(ticket) {
+            None => Err("that ticket is not one the hub gave this machine, or it has been used"),
+            Some((_, exp)) if exp <= proto::now_ms() => Err("that ticket has expired"),
+            Some((agent, _)) => Ok(agent),
+        }
+    }
+
+    pub fn add_local_attach(
+        &self,
+        attach_id: String,
+        tx: mpsc::Sender<proto::attachsock::Frame>,
+    ) {
+        self.local_attaches.lock().unwrap().insert(attach_id, tx);
+    }
+
+    pub fn drop_local_attach(&self, attach_id: &str) {
+        self.local_attaches.lock().unwrap().remove(attach_id);
+    }
+}
+
+/// The attach a node-to-hub frame belongs to, when it belongs to one.
+fn attach_id_of(frame: &proto::NodeToHub) -> Option<&str> {
+    match frame {
+        proto::NodeToHub::AttachOpened { attach_id, .. }
+        | proto::NodeToHub::AttachRejected { attach_id, .. }
+        | proto::NodeToHub::AttachData { attach_id, .. }
+        | proto::NodeToHub::AttachClosed { attach_id, .. } => Some(attach_id),
+        _ => None,
+    }
+}
+
+/// The same thing, said on a direct connection.
+fn local_frame(frame: &proto::NodeToHub) -> Option<proto::attachsock::Frame> {
+    use proto::attachsock::{Control, Frame};
+    Some(match frame {
+        proto::NodeToHub::AttachOpened { read_only, cols, rows, .. } => {
+            Frame::Control(Control::Opened { read_only: *read_only, cols: *cols, rows: *rows })
+        }
+        proto::NodeToHub::AttachRejected { reason, .. } => {
+            Frame::Control(Control::Error { message: reason.clone() })
+        }
+        proto::NodeToHub::AttachData { data, .. } => Frame::Data(data.clone()),
+        proto::NodeToHub::AttachClosed { reason, .. } => {
+            Frame::Control(Control::Closed { reason: reason.clone() })
+        }
+        _ => return None,
+    })
+}
+
+impl NodeCtx {
 
     // -------------------------------------------------- hub round-trips ----
 

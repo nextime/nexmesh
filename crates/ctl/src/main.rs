@@ -15,6 +15,7 @@ mod runcmd;
 mod seatcmd;
 mod tlstrust;
 mod tui;
+mod wire;
 mod windowtitle;
 
 use anyhow::{Context, Result};
@@ -861,6 +862,19 @@ async fn session_name(c: &reqwest::Client, base: &str, session: &str) -> String 
     session.to_string()
 }
 
+/// A one-time ticket for attaching straight to the node holding a terminal.
+///
+/// The hub decides; this is it saying yes, and telling the node so over the
+/// connection it already holds. See `proto::attachsock`.
+async fn get_ticket(c: &reqwest::Client, base: &str, agent: &str) -> Result<String> {
+    let v = post(c, format!("{base}/v1/attach/ticket"), json!({ "agent": agent })).await?;
+    bail_on_error(&v)?;
+    v["ticket"]
+        .as_str()
+        .map(String::from)
+        .context("the hub did not return a ticket")
+}
+
 async fn attach(
     base: &str,
     c: &reqwest::Client,
@@ -870,9 +884,7 @@ async fn attach(
     ca_cert: Option<&str>,
     identity: Option<(&str, &str)>,
 ) -> Result<String> {
-    use futures_util::{SinkExt, StreamExt};
     use tokio::io::AsyncWriteExt;
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     let r = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
     bail_on_error(&r)?;
@@ -906,10 +918,11 @@ async fn attach(
     let via = r["via"].as_str().map(|v| format!("  \u{00b7}  via {v}")).unwrap_or_default();
     let mut bar = StatusBar::new(
         format!(
-            " nexmesh \u{203a} {name}{}{}{}  \u{00b7}  Ctrl-] detach",
+            " nexmesh \u{203a} {name}{}{}{}{}  \u{00b7}  Ctrl-] detach",
             if host.is_empty() || host == "-" { String::new() } else { format!(" on {host}") },
             format!("  \u{00b7}  {session}"),
-            via
+            via,
+            ""
         ),
         cols,
         rows,
@@ -918,36 +931,40 @@ async fn attach(
     // is the size the hub is told. Without this the bar is painted over by
     // anything that fills the screen.
     let agent_rows = bar.as_ref().map(|b| b.agent_rows()).unwrap_or(rows);
+    // The data path: straight to the node when the agent is on this machine
+    // and that node is listening for a direct attach, and through the hub
+    // when it is not. The hub authorises either way -- a direct attach needs
+    // a ticket it minted, which it pushes to the node itself.
+    let mut wire = None;
+    if let Some(socket) = wire::local_socket_for(host, &runcmd::this_node(None)) {
+        match get_ticket(c, base, &agent).await {
+            Ok(ticket) => {
+                match wire::open_local(&socket, &ticket, &agent, cols, agent_rows, replay).await {
+                    Ok(w) => wire = Some(w),
+                    // Not fatal: the hub can carry it, and saying why once is
+                    // worth more than failing an attach that has a route.
+                    Err(e) => eprintln!("(direct attach unavailable: {e:#}; going through the hub)"),
+                }
+            }
+            Err(e) => eprintln!("(no direct ticket: {e:#}; going through the hub)"),
+        }
+    }
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
     let url = format!(
         "{ws_base}/v1/attach/ws?agent={agent}&cols={cols}&rows={agent_rows}&replay={replay}"
     );
-    // The attach upgrade needs the operator token too. It goes in a header,
-    // never the query string: URLs land in proxy logs and shell history.
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = url.as_str().into_client_request().context("building the attach request")?;
-    if let Some(t) = token() {
-        req.headers_mut().insert(
-            "authorization",
-            format!("Bearer {t}").parse().context("building the auth header")?,
-        );
-    }
-    let (ws, _) = if url.starts_with("wss://") {
-        let tls = tlstrust::client_config(ca_cert, identity)?;
-        tokio_tungstenite::connect_async_tls_with_config(
-            req,
-            None,
-            false,
-            Some(tokio_tungstenite::Connector::Rustls(tls)),
-        )
-        .await
-        .with_context(|| format!("attaching to {name}"))?
-    } else {
-        tokio_tungstenite::connect_async(req)
-            .await
-            .with_context(|| format!("attaching to {name}"))?
+    let mut wire = match wire {
+        Some(w) => w,
+        None => wire::open_hub(&url, token().cloned(), ca_cert, identity, &name).await?,
     };
-    let (mut sink, mut stream) = ws.split();
+    // Said out loud, because "why is this slow" should be answerable by
+    // looking at the screen.
+    if wire.direct {
+        if let Some(b) = &mut bar {
+            b.text = b.text.replace("  \u{00b7}  Ctrl-] detach", "  \u{00b7}  direct  \u{00b7}  Ctrl-] detach");
+        }
+    }
+
 
     println!("attached to {name} ({agent}) -- Ctrl-] to detach");
 
@@ -974,45 +991,36 @@ async fn attach(
 
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
 
-    // Hub -> our terminal.
+    // The agent's terminal -> ours, whichever way the bytes came.
     let reader = {
         let quit_tx = quit_tx.clone();
+        let mut rx = std::mem::replace(&mut wire.rx, tokio::sync::mpsc::channel(1).1);
         tokio::spawn(async move {
             let mut out = tokio::io::stdout();
             // The agent sets the title to something about itself; this window
             // is saying which seat it shows, so those writes come out here
             // rather than being fought over.
             let mut strip = windowtitle::Strip::default();
-            while let Some(Ok(msg)) = stream.next().await {
+            while let Some(msg) = rx.recv().await {
                 match msg {
-                    WsMessage::Binary(data) => {
+                    wire::In::Data(data) => {
                         let data = strip.pass(&data);
                         if out.write_all(&data).await.is_err() || out.flush().await.is_err() {
                             break;
                         }
                     }
-                    WsMessage::Text(t) => {
-                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
-                        match v["t"].as_str() {
-                            Some("opened") => {
-                                if v["read_only"].as_bool() == Some(true) {
-                                    let _ = out.write_all(
-                                        b"\r\n[nexmesh] headless agent: view-only.\r\n").await;
-                                    let _ = out.flush().await;
-                                }
-                            }
-                            Some("closed") | Some("error") => {
-                                let why = v["reason"].as_str()
-                                    .or(v["message"].as_str())
-                                    .unwrap_or("session ended");
-                                let _ = quit_tx.send(why.to_string()).await;
-                                break;
-                            }
-                            _ => {}
+                    wire::In::Opened { read_only } => {
+                        if read_only {
+                            let _ = out
+                                .write_all(b"\r\n[nexmesh] headless agent: view-only.\r\n")
+                                .await;
+                            let _ = out.flush().await;
                         }
                     }
-                    WsMessage::Close(_) => break,
-                    _ => {}
+                    wire::In::Ended(why) => {
+                        let _ = quit_tx.send(why).await;
+                        break;
+                    }
                 }
             }
             let _ = quit_tx.send("connection closed".into()).await;
@@ -1058,11 +1066,11 @@ async fn attach(
                 if let Some(pos) = buf[..n].iter().position(|b| *b == DETACH_BYTE) {
                     // Send anything typed before the detach key, then leave.
                     if pos > 0 {
-                        let _ = sink.send(WsMessage::Binary(buf[..pos].to_vec())).await;
+                        let _ = wire.tx.send(wire::Out::Data(buf[..pos].to_vec())).await;
                     }
                     break "detached".to_string();
                 }
-                if sink.send(WsMessage::Binary(buf[..n].to_vec())).await.is_err() {
+                if wire.tx.send(wire::Out::Data(buf[..n].to_vec())).await.is_err() {
                     break "connection lost".to_string();
                 }
             }
@@ -1079,15 +1087,13 @@ async fn attach(
                     let _ = out.write_all(&b.paint()).await;
                     let _ = out.flush().await;
                 }
-                let msg = json!({ "t": "resize", "cols": c, "rows": agent_r }).to_string();
-                let _ = sink.send(WsMessage::Text(msg)).await;
+                let _ = wire.tx.send(wire::Out::Resize { cols: c, rows: agent_r }).await;
             }
             Some(why) = quit_rx.recv() => break why,
         }
     };
 
-    let _ = sink.send(WsMessage::Text(json!({ "t": "close" }).to_string())).await;
-    let _ = sink.close().await;
+    let _ = wire.tx.send(wire::Out::Close).await;
     reader.abort();
     if let Some(b) = &bar {
         let mut out = tokio::io::stdout();

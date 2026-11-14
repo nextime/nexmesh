@@ -22,6 +22,7 @@ pub mod codegraph;
 pub mod identity;
 #[cfg(feature = "pair-client")]
 pub mod pair_client;
+pub mod attachsock;
 pub mod localsock;
 pub mod plugin;
 pub mod tools;
@@ -574,6 +575,18 @@ pub enum HubToNode {
     },
     AttachResize { attach_id: String, cols: u16, rows: u16 },
     AttachClose { attach_id: String },
+    /// An operator may attach to this agent directly, bypassing the hub as a
+    /// wire -- see `attachsock`. The hub has already decided they may; this
+    /// says so to the node that holds the terminal, and is the only reason a
+    /// node accepts a direct attach at all.
+    AttachTicket {
+        ticket: String,
+        agent_id: String,
+        /// Wall-clock milliseconds after which it is worth nothing.
+        expires_at_ms: i64,
+        /// Who it was minted for, for the node's log.
+        operator: String,
+    },
     Ping { seq: u64 },
 }
 

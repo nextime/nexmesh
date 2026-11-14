@@ -19,6 +19,7 @@
 //! works unchanged on a roaming machine, behind NAT, or on a public host with no
 //! inbound port.
 
+mod attachsock;
 mod cli_detect;
 mod codegraph;
 mod codex;
@@ -334,6 +335,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // And the socket an operator on this machine attaches through, so a
+    // keystroke typed on this host never leaves it. The hub still decides who
+    // may: nothing is served here without a ticket it minted.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = attachsock::serve(ctx).await {
+                tracing::error!(error = %e, "attach socket died");
+            }
+        });
+    }
+
     // Reconnect forever with capped backoff: a hub restart or a VPN flap must
     // not need a human to restart nodes.
     let mut backoff = 1u64;
@@ -549,121 +562,19 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
         }
 
         HubToNode::AttachOpen { attach_id, agent_id, cols, rows, replay_bytes } => {
-            let Some(io) = ctx.agent_io(&agent_id) else {
-                // "not running on this node" was true of what the node has
-                // and false of what the operator reads: the agent is very
-                // often running perfectly well, in a terminal this node
-                // never owned. An attach can only reach a terminal the node
-                // holds, and the two cases want different advice -- wait,
-                // versus adopt the pane it is sitting in.
-                let known = ctx.agent(&agent_id).is_some();
-                let reason = if known {
-                    format!(
-                        "no terminal here for {agent_id}: its CLI was started by hand, \
-                         so only its own shim reaches it"
-                    )
-                } else {
-                    format!(
-                        "this node is not running {agent_id}: it may have restarted since \
-                         that agent started, or the agent belongs to another machine"
-                    )
-                };
-                let _ = ctx
-                    .send_hub(&NodeToHub::AttachRejected { attach_id, reason })
-                    .await;
-                return;
-            };
-            // An agent with no pty of its own but a server to connect to gets
-            // a terminal client started just for this viewer.
-            if let (true, Some((bin, args))) = (!io.read_only() && !io.has_pty(),
-                                                io.attach_command()) {
-                let cwd = ctx
-                    .agent(&agent_id)
-                    .and_then(|_| std::env::var("PWD").ok())
-                    .unwrap_or_else(|| "/".into());
-                match viewer::open(ctx.clone(), attach_id.clone(), agent_id.clone(),
-                                   bin, args, cwd, cols, rows).await
-                {
-                    Ok(()) => {
-                        io.add_attach(&attach_id);
-                        let _ = ctx
-                            .send_hub(&NodeToHub::AttachOpened {
-                                attach_id,
-                                agent_id,
-                                read_only: false,
-                                cols,
-                                rows,
-                            })
-                            .await;
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = ctx
-                            .send_hub(&NodeToHub::AttachRejected {
-                                attach_id,
-                                reason: format!("could not open a terminal: {e:#}"),
-                            })
-                            .await;
-                        return;
-                    }
-                }
-            }
+            attachsock::open(&ctx, attach_id, agent_id, cols, rows, replay_bytes).await;
+        }
 
-            // Size the pty to the viewer's terminal before replaying, so a TUI
-            // redraws at the right dimensions rather than wrapping oddly.
-            io.resize(cols, rows);
-            io.add_attach(&attach_id);
-            let _ = ctx
-                .send_hub(&NodeToHub::AttachOpened {
-                    attach_id: attach_id.clone(),
-                    agent_id: agent_id.clone(),
-                    read_only: io.read_only(),
-                    cols,
-                    rows,
-                })
-                .await;
-            // Replay scrollback so the viewer does not start at a blank screen.
-            let back = io.scrollback(replay_bytes.min(256 * 1024));
-            if !back.is_empty() {
-                let _ = ctx
-                    .send_hub(&NodeToHub::AttachData { attach_id, data: back })
-                    .await;
-            }
-            // And for an adopted tmux pane, ask tmux to paint the screen.
-            // The replay alone is not enough there: tmux writes only what
-            // changed, and it rewrites its status line every second, so on a
-            // pane that has been still the recent scrollback is all status
-            // ticks and the screen itself has scrolled out of it. That is the
-            // "it attaches but the terminal is black" this fixes.
-            if let Some(view) = ctx.agent(&agent_id).and_then(|r| r.tmux_view.clone()) {
-                crate::tmux::repaint(&view);
-            }
-            tracing::info!(%agent_id, read_only = io.read_only(), "viewer attached");
+        HubToNode::AttachTicket { ticket, agent_id, expires_at_ms, operator } => {
+            // The hub has decided this operator may attach to this agent. The
+            // node holds the ticket until it is spent or it expires; the data
+            // then goes straight between them. See `proto::attachsock`.
+            tracing::info!(%agent_id, %operator, "a direct attach is authorised");
+            ctx.add_ticket(ticket, agent_id, expires_at_ms);
         }
 
         HubToNode::AttachData { attach_id, data } => {
-            // A terminal client opened for this viewer takes the keystrokes.
-            if let Some(v) = ctx.viewer(&attach_id) {
-                let _ = v.input.send(data).await;
-                return;
-            }
-            let Some(io) = ctx.io_for_attach(&attach_id) else { return };
-            match &io.input {
-                Some(tx) => {
-                    let _ = tx.send(data).await;
-                }
-                // Typing at a headless agent would go nowhere; say so once
-                // rather than silently swallowing the keystrokes.
-                None => {
-                    let _ = ctx
-                        .send_hub(&NodeToHub::AttachData {
-                            attach_id,
-                            data: b"\r\n[nexmesh] this agent is headless: view-only, input ignored\r\n"
-                                .to_vec(),
-                        })
-                        .await;
-                }
-            }
+            attachsock::input(&ctx, attach_id, data).await;
         }
 
         HubToNode::BuildCodeGraph { req_id, workspace_id, path } => {
@@ -754,22 +665,11 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
         }
 
         HubToNode::AttachResize { attach_id, cols, rows } => {
-            if let Some(v) = ctx.viewer(&attach_id) {
-                v.resize(cols, rows);
-            } else if let Some(io) = ctx.io_for_attach(&attach_id) {
-                io.resize(cols, rows);
-            }
+            attachsock::resize(&ctx, &attach_id, cols, rows);
         }
 
         HubToNode::AttachClose { attach_id } => {
-            // Closing a window onto a server leaves the agent running.
-            if let Some(v) = ctx.remove_viewer(&attach_id) {
-                v.close();
-            }
-            if let Some(io) = ctx.io_for_attach(&attach_id) {
-                io.remove_attach(&attach_id);
-                tracing::info!(%attach_id, "viewer detached");
-            }
+            attachsock::close(&ctx, &attach_id);
         }
 
         HubToNode::Inject { agent_id, messages, expect_cli } => {

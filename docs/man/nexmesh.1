@@ -410,6 +410,15 @@ or
 it first.
 .RS
 .PP
+The bytes take the shortest route there is. When the agent is on the machine
+you are typing on, they go straight to its node over a local socket and never
+touch the network; otherwise they are relayed by the hub, which is what makes
+attach work from outside the fleet's network at all. The hub authorises either
+way \(em a direct attach needs a one-time ticket it minted and pushed to the
+node itself \(em and the bar says
+.I direct
+when that is the route.
+.PP
 .EX
 nexmesh attach payments Reviewer
 .EE
