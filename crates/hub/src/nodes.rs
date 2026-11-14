@@ -954,10 +954,11 @@ fn join(
     //   - **no name was given.** A registration that names itself says which
     //     seat it wants, and two named conversations deliberately get two
     //     seats -- that is what `NEXMESH_NAME` is for.
-    //   - **the last agent EXITED.** An ending somebody reported, not a
-    //     connection the hub lost: `disconnected` is precisely the case
-    //     where the CLI is usually still sitting there, and taking its seat
-    //     would hand one terminal's conversation to another.
+    //   - **the last agent was written off.** It has an exit time: either
+    //     it reported an ending, or the node it lived on went and the hub
+    //     recorded that there is no process left to come back to that seat.
+    //     An agent that is merely out of touch has no exit time and counts
+    //     as live, so its seat is never taken from under it.
     //   - **it was an attached agent.** A managed seat belongs to whoever
     //     spawned it, and recovery may be about to bring it back.
     //   - **same session, same CLI, same directory**, and nothing live in
@@ -981,13 +982,32 @@ fn join(
                         AND EXISTS (
                             SELECT 1 FROM agents a
                              WHERE a.slot_id = s.id
-                               AND a.status = 'exited'
+                               -- Written off, by whichever route. `exited`
+                               -- is an ending somebody reported; a seat
+                               -- emptied by a NODE restart keeps the word
+                               -- `disconnected` and gets an exit TIME --
+                               -- the hub saying there is no process left to
+                               -- come back to it. Requiring the word was
+                               -- too strict, and on a fleet where deploys
+                               -- restart nodes it is the common case: the
+                               -- seat everyone addresses stayed empty and
+                               -- the CLI that meant to be in it took a
+                               -- sibling. An agent that is merely out of
+                               -- touch has no exit time, and is treated as
+                               -- live by the clause above.
+                               AND a.exited_at_ms IS NOT NULL
                                AND a.provenance = 'attached'
                                AND COALESCE(a.cwd,'') = COALESCE(?3,'')
                                AND a.started_at_ms = (
                                    SELECT MAX(b.started_at_ms) FROM agents b
                                     WHERE b.slot_id = s.id))
-                      ORDER BY s.created_at_ms DESC LIMIT 1",
+                      -- Where you last were, not the newest seat: a folder
+                      -- with two empty seats usually has the one you have
+                      -- been using and the twin a restart minted beside it,
+                      -- and coming back to the twin would keep the wrong
+                      -- name alive.
+                      ORDER BY (SELECT MAX(b.started_at_ms) FROM agents b
+                                 WHERE b.slot_id = s.id) DESC LIMIT 1",
                     params![session_id, cli_id, cwd],
                     |r| r.get(0),
                 )

@@ -490,6 +490,27 @@ def main():
           len(named) == 1 and named[0]["slot_id"] != first_seat, str(named)[:200])
     check("and it was told so", seat_of(r3) != first_seat, f"{seat_of(r3)} vs {first_seat}")
 
+    # The case a deploy actually produces: a NODE restart empties the seat.
+    # The agent keeps the word `disconnected` -- nobody reported an ending --
+    # but gets an exit time, which is the hub saying there is no process left
+    # to come back to it. Requiring the word `exited` left that seat standing
+    # empty while the CLI that meant to be in it took a sibling, which is
+    # what twenty agents in a fleet view are made of.
+    import sqlite3 as _sq
+    q4seat = seat_of(r2)
+    q2.close() if hasattr(q2, "close") else q2.p.terminate()
+    time.sleep(1.5)
+    _c = _sq.connect(DB)
+    _c.execute("UPDATE agents SET status = 'disconnected' WHERE slot_id = ? "
+               "AND exited_at_ms IS NOT NULL", (q4seat,))
+    _c.commit(); _c.close()
+    q5 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_CLI_SESSION": "conv-quiet-5"}, cwd=quiet_dir)
+    r5 = q5.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "q", "version": "1"}})
+    check("a seat emptied by a node restart is reclaimed too",
+          seat_of(r5) == q4seat, f"{seat_of(r5)} vs {q4seat}")
+
     # And a conversation that is merely out of touch keeps its seat: taking
     # it would hand one terminal's conversation to another.
     q4 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
@@ -497,7 +518,7 @@ def main():
     r4 = q4.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                 "clientInfo": {"name": "q", "version": "1"}})
     check("a second LIVE conversation in the same folder gets its own seat",
-          seat_of(r4) not in (None, first_seat), f"{seat_of(r4)} vs {first_seat}")
+          seat_of(r4) not in (None, q4seat), f"{seat_of(r4)} vs {q4seat}")
 
     print("\n=== an external participant comes back to its own seat ===")
     # A bridge or a hermes agent has no conversation id and no process the
