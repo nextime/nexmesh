@@ -760,7 +760,17 @@ async fn attach(
     let _ = sink.close().await;
     reader.abort();
     drop(_guard);
-    println!("{reason}. The agent is still running.");
+    // "the agent exited. The agent is still running." was printed as one
+    // line, and read as nonsense. The reassurance belongs only to a detach
+    // the viewer chose: if the agent has gone, saying it is running is the
+    // opposite of true.
+    let gone = reason.contains("exited") || reason.contains("closed the connection")
+        || reason.contains("node disconnected");
+    if gone {
+        println!("{reason}.");
+    } else {
+        println!("{reason}. The agent is still running.");
+    }
     Ok(())
 }
 

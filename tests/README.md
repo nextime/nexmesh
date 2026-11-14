@@ -27,6 +27,10 @@ python3 -I tests/e2e_memory.py        # scoped memory, groups, search, and resum
 python3 -I tests/e2e_codegraph.py     # tree-sitter parsing, Leiden subsystems, graph queries
 python3 -I tests/e2e_coderai.py       # capability discovery, asking a teammate, base64 payloads
 python3 -I tests/e2e_webauth.py       # dashboard accounts: first-run setup, sign-in, lockout
+python3 -I tests/e2e_reconnect.py     # a node restart must not strand the CLIs attached to it
+python3 -I tests/e2e_ptyinject.py     # typing a message at an interactive seat, and never at a dialog
+python3 -I tests/e2e_termlink.py      # a hand-started CLI reached through the tmux pane it sits in
+node tests/term_test.js               # the browser terminal's VT parser, with a stubbed DOM
 ```
 
 Neither spends API credits. `e2e_team.py` drives `nexmesh-mcpd` with raw MCP
@@ -47,7 +51,21 @@ real stream-json protocol -- the event shapes were copied from an actual
 so the driver is tested against the protocol it will meet. `fakecrash` always
 dies, for flap detection.
 
-`e2e_adopt.py` needs `tmux`; it skips cleanly without it.
+`e2e_adopt.py` and `e2e_termlink.py` need `tmux`; both skip cleanly without
+it. `e2e_termlink.py` also kills any session group a previous run left behind
+before it starts: `tmux new-session -t X` leaves a second session holding X's
+group open, and a later run that creates an X of its own then collides with
+the leftover — which made the suite pass or fail depending on what ran before
+it.
+
+`e2e_ptyinject.py` drives `tests/fake-cli/faketyped`, an interactive agent
+with a real driver, and makes it put a permission dialog on its own screen so
+the guard that refuses to type over one is exercised rather than asserted.
+
+`term_test.js` needs `node`, and `tests/run-all.sh` skips it cleanly without
+one. It loads the very `term.js` the hub serves, with a forty-line DOM stub,
+and drives the escape sequences an agent CLI actually emits: a VT state
+machine is exactly the kind of code where "it looked right" is not evidence.
 
 `e2e_codex.py` drives `tests/fake-cli/fakecodex`, which implements the real
 app-server protocol (shapes from `codex app-server generate-json-schema`),

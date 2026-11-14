@@ -286,10 +286,15 @@ pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Res
                 m.to_slot, m.kind, m.body, m.sent_at_ms
          FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
          WHERE m.session_id = ?1
-           AND (m.to_slot = ?2 OR m.to_slot IS NULL)
            AND m.from_slot IS NOT ?2
-           AND m.acked_at_ms IS NULL
-           AND m.inflight_at_ms IS NULL
+           -- Addressed to me: the message's own state is the whole story.
+           -- Addressed to the team: MY copy is, because one teammate acking
+           -- must not take it from the rest.
+           AND ((m.to_slot = ?2 AND m.acked_at_ms IS NULL AND m.inflight_at_ms IS NULL)
+                OR (m.to_slot IS NULL AND NOT EXISTS (
+                      SELECT 1 FROM message_recipients r
+                       WHERE r.message_id = m.id AND r.slot_id = ?2
+                         AND (r.acked_at_ms IS NOT NULL OR r.inflight_at_ms IS NOT NULL))))
          ORDER BY m.id ASC LIMIT 50",
     )?;
     let out = stmt
@@ -309,12 +314,25 @@ pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Res
     Ok(out)
 }
 
-/// Mark messages handed to an agent but not yet confirmed. An in-flight
-/// message is never handed to a second agent, and `reclaim_stale_inflight`
+/// Mark messages handed to a SEAT but not yet confirmed. An in-flight
+/// message is never handed to that seat twice, and `reclaim_stale_inflight`
 /// frees it if the agent dies before acking.
-pub fn mark_inflight(db: &Connection, agent_id: &str, ids: &[i64]) -> Result<()> {
+///
+/// Per seat, not per message, because a broadcast has several recipients and
+/// one of them taking it must not take it from the others. The message-level
+/// columns are kept alongside, because they are what the log and the
+/// dashboard show: "in flight" there means somebody has it, which is still
+/// the useful thing to read.
+pub fn mark_inflight(db: &Connection, agent_id: &str, slot_id: &str, ids: &[i64]) -> Result<()> {
     let now = now_ms();
     for id in ids {
+        db.execute(
+            "INSERT INTO message_recipients (message_id, slot_id, inflight_agent, inflight_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(message_id, slot_id) DO UPDATE SET
+                inflight_agent = ?3, inflight_at_ms = ?4",
+            params![id, slot_id, agent_id, now],
+        )?;
         db.execute(
             "UPDATE messages SET inflight_agent = ?, inflight_at_ms = ? WHERE id = ?",
             params![agent_id, now, id],
@@ -323,9 +341,40 @@ pub fn mark_inflight(db: &Connection, agent_id: &str, ids: &[i64]) -> Result<()>
     Ok(())
 }
 
+/// The seat an agent is sitting in, which is who a message was really for.
+fn slot_of(db: &Connection, agent_id: &str) -> Option<String> {
+    db.query_row("SELECT slot_id FROM agents WHERE id = ?", [agent_id], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// A message reached a model. Recorded for that SEAT.
+///
+/// This used to set one `acked_at_ms` on the message and be done, which
+/// meant the first agent to answer a broadcast consumed it for the whole
+/// team: everybody else's copy vanished unread. "I told the team and only
+/// one of them knew" is a hard thing to notice and a worse thing to debug,
+/// and a capability bridge -- which is handed team chat it cannot answer --
+/// made it happen every time.
+///
+/// The message-level columns still record the FIRST ack, because that is
+/// what "delivered" means in the log and on the dashboard.
 pub fn ack_messages(db: &Connection, agent_id: &str, ids: &[i64]) -> Result<()> {
     let now = now_ms();
+    let slot = slot_of(db, agent_id);
     for id in ids {
+        if let Some(slot) = &slot {
+            db.execute(
+                "INSERT INTO message_recipients
+                    (message_id, slot_id, acked_at_ms, acked_by_agent)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(message_id, slot_id) DO UPDATE SET
+                    acked_at_ms = ?3, acked_by_agent = ?4,
+                    inflight_agent = NULL, inflight_at_ms = NULL",
+                params![id, slot, now, agent_id],
+            )?;
+        }
         db.execute(
             "UPDATE messages SET acked_at_ms = ?, acked_by_agent = ?, inflight_agent = NULL,
                                  inflight_at_ms = NULL
@@ -344,6 +393,11 @@ pub fn ack_messages(db: &Connection, agent_id: &str, ids: &[i64]) -> Result<()> 
 /// offline needs.
 pub fn reclaim_stale_inflight(db: &Connection, older_than_ms: i64) -> Result<usize> {
     let cutoff = now_ms() - older_than_ms;
+    db.execute(
+        "UPDATE message_recipients SET inflight_agent = NULL, inflight_at_ms = NULL
+         WHERE acked_at_ms IS NULL AND inflight_at_ms IS NOT NULL AND inflight_at_ms <= ?",
+        [cutoff],
+    )?;
     Ok(db.execute(
         "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
          WHERE acked_at_ms IS NULL AND inflight_at_ms IS NOT NULL AND inflight_at_ms <= ?",
@@ -1645,12 +1699,62 @@ mod tests {
     }
 
     #[test]
+    fn one_teammate_reading_a_broadcast_does_not_take_it_from_the_others() {
+        // The bug this exists for: `messages` carries one `acked_at_ms`, so
+        // the first agent to answer consumed the message for the whole team
+        // and nobody could see that it had happened. On this fleet a
+        // capability bridge -- handed team chat it cannot answer -- ate an
+        // operator's question twice before anyone noticed.
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-eng"), "broadcast", &json!({"text": "standup"})).unwrap();
+        let mine = pending_for_slot(&db, "s1", "sl-rev").unwrap();
+        assert_eq!(mine.len(), 1);
+        mark_inflight(&db, "a-rev", "sl-rev", &[mine[0].id]).unwrap();
+        ack_messages(&db, "a-rev", &[mine[0].id]).unwrap();
+
+        assert!(pending_for_slot(&db, "s1", "sl-rev").unwrap().is_empty(),
+                "the one who read it does not get it again");
+        assert_eq!(pending_for_slot(&db, "s1", "sl-ext").unwrap().len(), 1,
+                   "everyone else still has it waiting");
+    }
+
+    #[test]
+    fn a_seat_that_takes_a_broadcast_in_flight_blocks_only_itself() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-eng"), "broadcast", &json!({"text": "standup"})).unwrap();
+        let mine = pending_for_slot(&db, "s1", "sl-rev").unwrap();
+        mark_inflight(&db, "a-rev", "sl-rev", &[mine[0].id]).unwrap();
+        assert!(pending_for_slot(&db, "s1", "sl-rev").unwrap().is_empty(), "no double delivery");
+        assert_eq!(pending_for_slot(&db, "s1", "sl-ext").unwrap().len(), 1,
+                   "and the others are not waiting on it");
+        // An agent that died holding it must not keep it from itself for ever.
+        assert!(reclaim_stale_inflight(&db, 0).unwrap() >= 1);
+        assert_eq!(pending_for_slot(&db, "s1", "sl-rev").unwrap().len(), 1, "it comes back");
+    }
+
+    #[test]
+    fn a_message_addressed_to_one_agent_is_still_acked_once() {
+        // The per-seat table must not change what a DIRECTED message means:
+        // it has one recipient, and the message's own ack is the whole story.
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message", &json!({"to": "Max", "text": "x"})).unwrap();
+        let m = pending_for_slot(&db, "s1", "sl-eng").unwrap();
+        assert_eq!(m.len(), 1);
+        ack_messages(&db, "a-eng", &[m[0].id]).unwrap();
+        assert!(pending_for_slot(&db, "s1", "sl-eng").unwrap().is_empty());
+        let acked: Option<i64> = db
+            .query_row("SELECT acked_at_ms FROM messages WHERE id = ?", [m[0].id], |r| r.get(0))
+            .unwrap();
+        assert!(acked.is_some(), "the log still shows it as delivered");
+    }
+
+    #[test]
     fn an_inflight_message_is_not_handed_out_twice_but_is_reclaimed_if_lost() {
         let db = fixture();
         dispatch(&ctx(&db, "sl-rev"), "send_message", &json!({"to": "Max", "text": "x"})).unwrap();
         let first = pending_for_slot(&db, "s1", "sl-eng").unwrap();
         assert_eq!(first.len(), 1);
-        mark_inflight(&db, "a-eng", &[first[0].id]).unwrap();
+        mark_inflight(&db, "a-eng", "sl-eng", &[first[0].id]).unwrap();
         assert!(pending_for_slot(&db, "s1", "sl-eng").unwrap().is_empty(), "no double delivery");
 
         // The agent died before acking: the message must come back.
@@ -1658,7 +1762,7 @@ mod tests {
         assert_eq!(pending_for_slot(&db, "s1", "sl-eng").unwrap().len(), 1, "must not be lost");
 
         // Once acked it is gone for good.
-        mark_inflight(&db, "a-eng", &[first[0].id]).unwrap();
+        mark_inflight(&db, "a-eng", "sl-eng", &[first[0].id]).unwrap();
         ack_messages(&db, "a-eng", &[first[0].id]).unwrap();
         assert_eq!(reclaim_stale_inflight(&db, 0).unwrap(), 0);
         assert!(pending_for_slot(&db, "s1", "sl-eng").unwrap().is_empty());

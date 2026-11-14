@@ -284,6 +284,34 @@ fn migrate(conn: &Connection) -> Result<()> {
             closed_at_ms  INTEGER
          )",
     )?;
+    // Per-seat delivery. An existing hub has messages that were acked under
+    // the old rule -- one ack for the whole team -- and re-offering those to
+    // everyone on upgrade would replay old conversation at a fleet. What was
+    // acked before this existed is acked for everyone, so it is written down
+    // that way, once.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS message_recipients (
+            message_id     INTEGER NOT NULL,
+            slot_id        TEXT NOT NULL,
+            inflight_agent TEXT,
+            inflight_at_ms INTEGER,
+            acked_at_ms    INTEGER,
+            acked_by_agent TEXT,
+            PRIMARY KEY (message_id, slot_id))",
+    )?;
+    if table_exists(conn, "messages")? && table_exists(conn, "slots")? {
+        let seeded = conn.execute(
+            "INSERT OR IGNORE INTO message_recipients (message_id, slot_id, acked_at_ms)
+             SELECT m.id, s.id, m.acked_at_ms
+               FROM messages m JOIN slots s ON s.session_id = m.session_id
+              WHERE m.to_slot IS NULL AND m.acked_at_ms IS NOT NULL",
+            [],
+        )?;
+        if seeded > 0 {
+            tracing::info!(rows = seeded, "migrated: broadcasts already read stay read");
+        }
+    }
+
     // `lost` was the wrong word and it was on the operator's screen. What the
     // hub knows is that it has no connection to the process -- not that the
     // process is gone, and certainly not that the conversation is. Renamed in

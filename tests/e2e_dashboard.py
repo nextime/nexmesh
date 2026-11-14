@@ -105,8 +105,18 @@ def main():
     refs = re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+)', html)
     external = [u for u in refs if u.startswith("http") or u.startswith("//")]
     check("no external resources are referenced", not external, str(external))
-    check("no script is loaded from anywhere",
-          not re.search(r'<script[^>]+src=', html), str(refs))
+    # Scripts are allowed from THIS HUB and nowhere else. The rule was "no
+    # script src at all" while there was nothing to load; the terminal
+    # emulator is a parser and belongs in its own file, served from here, so
+    # the check now says what it always meant -- the same rule the manifest
+    # and the icon have always lived under.
+    srcs = re.findall(r'<script[^>]+src\s*=\s*["\']([^"\']+)', html)
+    offsite_js = [u for u in srcs
+                  if "//" in u or ":" in u.split("/")[0] or u.startswith("data:")]
+    check("every script comes from this hub", not offsite_js, str(srcs))
+    for u in srcs:
+        s2, body = req("/" + u.lstrip("/"), raw=True)
+        check(f"and the hub serves it ({u})", s2 == 200 and len(body) > 100, f"{s2} {len(body)}")
     # Links are allowed now, but only to this hub's own routes: a manifest
     # and an icon are what make the page installable on a phone, and they
     # have to be referenced by URL. The rule being protected is that nothing

@@ -355,6 +355,9 @@ async fn initialize(
         }
         None => {
             let join = api::ParticipantJoin {
+                // The front door seats one client in one session: an MCP
+                // client is a conversation, and a conversation is one seat.
+                sessions: None,
                 session: params.session.clone(),
                 name: name.clone(),
                 role: params.role.clone(),

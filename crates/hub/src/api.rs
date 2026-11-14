@@ -1744,6 +1744,18 @@ pub(crate) fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::resul
 #[derive(Deserialize)]
 pub struct ParticipantJoin {
     pub session: Option<String>,
+    /// Several sessions at once, for a participant that serves more than one
+    /// team -- a capability bridge, typically, since OCR is OCR whoever is
+    /// asking. `["*"]` or `["all"]` means every active session this token may
+    /// join.
+    ///
+    /// A CLI cannot do this: one conversation is one seat, enforced when it
+    /// registers. An external participant has no conversation and no process
+    /// the hub can see, so nothing is ambiguous about it holding a seat in
+    /// each of several teams -- each seat has its own inbox, its own asks and
+    /// its own task state, which is exactly what a bridge wants.
+    #[serde(default)]
+    pub sessions: Option<Vec<String>>,
     pub name: String,
     pub role: Option<String>,
     pub role_description: Option<String>,
@@ -1760,10 +1772,81 @@ pub struct ParticipantJoin {
 pub async fn participant_join(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ParticipantJoin>,
+    Json(mut req): Json<ParticipantJoin>,
 ) -> ApiResult {
     let scoped = auth_participant(&st, &headers)?;
-    Ok(Json(join_participant(&st, req, scoped)?))
+    let Some(asked) = req.sessions.take().filter(|v| !v.is_empty()) else {
+        return Ok(Json(join_participant(&st, req, scoped)?));
+    };
+
+    // Which sessions. A scoped token gets its own and no more, whatever it
+    // asked for -- the same rule as a single join, applied once rather than
+    // per name so the refusal is not a surprise half way through.
+    let wanted: Vec<String> = if let Some(sc) = &scoped {
+        vec![sc.clone()]
+    } else if asked.iter().any(|s| s == "*" || s.eq_ignore_ascii_case("all")) {
+        let db = st.db.lock().unwrap();
+        db.prepare("SELECT id FROM sessions WHERE status = 'active' ORDER BY created_at_ms")
+            .and_then(|mut q| q.query_map([], |r| r.get::<_, String>(0)).and_then(|m| m.collect()))
+            .map_err(bad)?
+    } else {
+        asked
+    };
+    if wanted.is_empty() {
+        return Err(bad("no active session to join"));
+    }
+
+    // Seat it in each, and say which ones did not work rather than failing
+    // the lot: a bridge that serves four teams should not be kept out of all
+    // four because one session name was mistyped.
+    let mut seats: Vec<Value> = Vec::new();
+    let mut refused: Vec<Value> = Vec::new();
+    let mut tools: Option<Value> = None;
+    for sid in &wanted {
+        let one = ParticipantJoin {
+            session: Some(sid.clone()),
+            sessions: None,
+            name: req.name.clone(),
+            role: req.role.clone(),
+            role_description: req.role_description.clone(),
+            kind_hint: req.kind_hint.clone(),
+            workspace: req.workspace.clone(),
+            capabilities: req.capabilities.clone(),
+        };
+        match join_participant(&st, one, scoped.clone()) {
+            Ok(v) => {
+                if tools.is_none() {
+                    tools = v.get("tools").cloned();
+                }
+                seats.push(json!({
+                    "session_id": v.get("session_id").cloned().unwrap_or(Value::Null),
+                    "slot_id": v.get("slot_id").cloned().unwrap_or(Value::Null),
+                    "agent_id": v.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "session": v.get("session").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            Err((_, Json(e))) => refused.push(json!({
+                "session": sid,
+                "error": e.get("error").cloned().unwrap_or(Value::Null),
+            })),
+        }
+    }
+    if seats.is_empty() {
+        return Err(bad(format!(
+            "could not join any of those sessions: {}",
+            serde_json::to_string(&refused).unwrap_or_default()
+        )));
+    }
+    // The first seat's fields are repeated at the top level, so a client
+    // written against the single-session shape still works.
+    let first = seats[0].clone();
+    Ok(Json(json!({
+        "agent_id": first["agent_id"], "slot_id": first["slot_id"],
+        "session_id": first["session_id"],
+        "tools": tools.unwrap_or(Value::Null),
+        "seats": seats,
+        "refused": refused,
+    })))
 }
 
 /// Seat an external participant: a slot, an agent, and the tool set it may
@@ -2000,7 +2083,7 @@ pub async fn participant_messages(
         .ok_or_else(|| bad("unknown agent"))?;
     let pending = tools::pending_for_slot(&db, &session_id, &slot_id).map_err(bad)?;
     let ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
-    tools::mark_inflight(&db, &q.agent_id, &ids).map_err(bad)?;
+    tools::mark_inflight(&db, &q.agent_id, &slot_id, &ids).map_err(bad)?;
     Ok(Json(json!({ "messages": pending })))
 }
 

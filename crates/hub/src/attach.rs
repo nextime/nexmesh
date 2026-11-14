@@ -47,9 +47,24 @@ fn default_replay() -> usize {
 pub async fn attach_ws(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<AttachQuery>,
 ) -> Response {
-    ws.on_upgrade(move |sock| session(sock, st, q))
+    // A browser that authenticated with the subprotocol must be answered with
+    // the same one, or it closes the connection the instant it opens --
+    // which looked exactly like the hub refusing the attach.
+    let chosen = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(',')
+                .map(|p| p.trim().to_string())
+                .find(|p| p.starts_with(crate::auth::WS_TOKEN_PREFIX))
+        });
+    match chosen {
+        Some(p) => ws.protocols([p]).on_upgrade(move |sock| session(sock, st, q)),
+        None => ws.on_upgrade(move |sock| session(sock, st, q)),
+    }
 }
 
 async fn session(socket: WebSocket, st: AppState, q: AttachQuery) {

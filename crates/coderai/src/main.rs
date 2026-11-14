@@ -57,8 +57,18 @@ struct Args {
     #[arg(long, env = "NEXMESH_PARTICIPANT_TOKEN")]
     token: String,
     /// Session to join. Omitted means the only active one.
+    ///
+    /// Repeatable, and `--session all` joins every active session: a bridge
+    /// serves a capability, and OCR is OCR whoever is asking. An agent's
+    /// `ask_capability` only reaches providers in its OWN session, so a
+    /// bridge seated in one team is invisible to the rest -- which was the
+    /// whole reason this takes a list.
+    ///
+    /// Resolved once, at startup. A session created later needs a restart of
+    /// the bridge to be served; that is a second or two, and it keeps this
+    /// from quietly re-seating itself on a timer.
     #[arg(long, env = "NEXMESH_SESSION")]
-    session: Option<String>,
+    session: Vec<String>,
     /// What teammates will call it.
     #[arg(long, default_value = "CoderAI")]
     name: String,
@@ -320,6 +330,7 @@ fn render_answer(c: &Capability, v: &Value) -> String {
     out
 }
 
+#[derive(Clone)]
 struct Hub {
     http: reqwest::Client,
     base: String,
@@ -338,6 +349,31 @@ impl Hub {
             .await?
             .json()
             .await?;
+        // Anything handed back with the result is a message addressed to
+        // this bridge, taken in flight and waiting for an ack. A bridge
+        // cannot act on one -- it answers asks, not conversation -- but it
+        // must say it arrived: unacked, it is handed out again every couple
+        // of minutes for ever, and the fleet looks like it is ignoring
+        // somebody.
+        if let Some(ids) = v["messages"].as_array().filter(|a| !a.is_empty()) {
+            let ids: Vec<i64> = ids.iter().filter_map(|m| m["id"].as_i64()).collect();
+            for m in v["messages"].as_array().into_iter().flatten() {
+                tracing::info!(
+                    from = %m["from_name"].as_str().unwrap_or("someone"),
+                    body = %m["body"].as_str().unwrap_or(""),
+                    "a message for the bridge; acknowledging it"
+                );
+            }
+            if !ids.is_empty() {
+                let _ = self
+                    .http
+                    .post(format!("{}/v1/participant/ack", self.base))
+                    .bearer_auth(&self.token)
+                    .json(&json!({ "agent_id": self.agent_id, "message_ids": ids }))
+                    .send()
+                    .await;
+            }
+        }
         Ok(v)
     }
 }
@@ -433,8 +469,17 @@ async fn main() -> Result<()> {
         "kind_hint": format!("{} bridge {VERSION}", m.service.name),
         "capabilities": available.iter().map(|a| a.label.clone()).collect::<Vec<_>>(),
     });
-    if let Some(s) = &args.session {
-        join["session"] = json!(s);
+    // One session is sent the way it always was, so an older hub still
+    // understands this bridge. Several -- or `all` -- go as a list, which is
+    // the shape that hub answers with a seat per team.
+    match args.session.len() {
+        0 => {}
+        1 => join["session"] = json!(args.session[0]),
+        _ => join["sessions"] = json!(args.session),
+    }
+    if args.session.iter().any(|s| s == "all" || s == "*") {
+        join["sessions"] = json!(["*"]);
+        join.as_object_mut().map(|o| o.remove("session"));
     }
     let joined: Value = http
         .post(format!("{base}/v1/participant/join"))
@@ -444,13 +489,53 @@ async fn main() -> Result<()> {
         .await?
         .json()
         .await?;
-    let agent_id = joined["agent_id"]
-        .as_str()
-        .with_context(|| format!("the hub refused the join: {joined}"))?
-        .to_string();
-    tracing::info!(%agent_id, capabilities = available.len(), "joined the team");
+    // `seats` when the hub seated it in several teams, and the single-session
+    // fields otherwise -- which is also what an older hub answers with.
+    let seats: Vec<(String, String)> = match joined["seats"].as_array() {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v["agent_id"].as_str()?.to_string(),
+                    v["session"]
+                        .as_str()
+                        .or_else(|| v["session_id"].as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                ))
+            })
+            .collect(),
+        _ => vec![(
+            joined["agent_id"]
+                .as_str()
+                .with_context(|| format!("the hub refused the join: {joined}"))?
+                .to_string(),
+            joined["session_id"].as_str().unwrap_or("?").to_string(),
+        )],
+    };
+    for r in joined["refused"].as_array().into_iter().flatten() {
+        tracing::warn!(
+            session = %r["session"].as_str().unwrap_or("?"),
+            reason = %r["error"].as_str().unwrap_or("?"),
+            "could not join that session; carrying on with the others"
+        );
+    }
+    tracing::info!(
+        seats = seats.len(), capabilities = available.len(),
+        teams = %seats.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>().join(", "),
+        "joined"
+    );
 
-    let hub = Hub { http, base, token: args.token.clone(), agent_id };
+    let hubs: Vec<Hub> = seats
+        .iter()
+        .map(|(agent_id, _)| Hub {
+            http: http.clone(),
+            base: base.clone(),
+            token: args.token.clone(),
+            agent_id: agent_id.clone(),
+        })
+        .collect();
+
 
     // Say what is on offer, so teammates can read it rather than guess.
     let mut lines = format!("{} is available for:\n", args.name);
@@ -467,21 +552,34 @@ async fn main() -> Result<()> {
         ));
     }
     lines.push_str("Reach these with ask_capability.\n");
-    let _ = hub
-        .tool("store_memory", json!({ "key": format!("{}-capabilities", m.service.name),
-                                      "value": lines, "category": "context" }))
-        .await;
-    let _ = hub.tool("set_summary", json!({ "summary":
-        format!("{} capabilities ready: {}", available.len(),
-                available.iter().map(|a| a.label.clone()).collect::<Vec<_>>().join(", ")),
-        "status": "in_progress" })).await;
+    // Every team is told, not just the first: a seat whose summary is blank
+    // reads like something that has not started.
+    let summary = format!(
+        "{} capabilities ready: {}",
+        available.len(),
+        available.iter().map(|a| a.label.clone()).collect::<Vec<_>>().join(", ")
+    );
+    for h in &hubs {
+        let _ = h
+            .tool("store_memory", json!({ "key": format!("{}-capabilities", m.service.name),
+                                          "value": lines, "category": "context" }))
+            .await;
+        let _ = h
+            .tool("set_summary", json!({ "summary": summary, "status": "in_progress" }))
+            .await;
+    }
 
-    serve(&hub, &svc, &m, &available, args.max_inline_bytes).await
+    serve(&hubs, &svc, &m, &available, args.max_inline_bytes).await
 }
 
-/// Answer requests until stopped.
+/// Answer requests until stopped, for every seat this bridge holds.
+///
+/// A seat per team, polled in turn. The asks of one team are invisible to
+/// another -- `pending_asks` is answered for the seat that calls it -- so
+/// this is a loop over seats rather than anything cleverer, and the service
+/// behind it is shared the way it already was.
 async fn serve(
-    hub: &Hub,
+    hubs: &[Hub],
     svc: &Service,
     m: &Manifest,
     available: &[Available],
@@ -489,25 +587,35 @@ async fn serve(
 ) -> Result<()> {
     let mut idle = 0u32;
     loop {
-        let waiting = hub.tool("pending_asks", json!({})).await;
-        let text = waiting
-            .as_ref()
-            .ok()
-            .and_then(|v| v["text"].as_str())
-            .unwrap_or("")
-            .to_string();
+        let mut asks: Vec<(String, String, Value, Option<String>, &Hub)> = Vec::new();
+        for hub in hubs {
+            let waiting = hub.tool("pending_asks", json!({})).await;
+            let text = waiting
+                .as_ref()
+                .ok()
+                .and_then(|v| v["text"].as_str())
+                .unwrap_or("")
+                .to_string();
+            for (id, label, request, model) in parse_pending(&text) {
+                asks.push((id, label, request, model, hub));
+            }
+        }
 
-        let asks = parse_pending(&text);
         if asks.is_empty() {
             idle = (idle + 1).min(10);
             // Back off while nothing is happening, so an idle bridge is not a
-            // busy loop on somebody's hub.
-            tokio::time::sleep(std::time::Duration::from_millis(300 + 200 * idle as u64)).await;
+            // busy loop on somebody's hub. Divided by the number of seats, so
+            // four teams are not polled four times as often as one.
+            let n = hubs.len().max(1) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (300 + 200 * idle as u64) * n,
+            ))
+            .await;
             continue;
         }
         idle = 0;
 
-        for (id, label, request, model) in asks {
+        for (id, label, request, model, hub) in asks {
             let outcome = handle(svc, m, available, &label, &request, model.as_deref(), max_inline)
                 .await;
             let (result, failed) = match outcome {

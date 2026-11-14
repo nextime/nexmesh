@@ -49,6 +49,24 @@ if [ "${SKIP_UNIT:-0}" != "1" ]; then
     fi
 fi
 
+# The browser terminal's parser, in node. Not a python suite: it drives the
+# same term.js the dashboard serves, with a stubbed DOM, because a VT state
+# machine is exactly the kind of code where "it looked right" is not evidence.
+printf '%-14s ' "termjs"
+if ! command -v node >/dev/null 2>&1; then
+    echo "SKIP  node is not installed"
+else
+    tout=$(timeout 60 node tests/term_test.js 2>&1)
+    tverdict=$(printf '%s\n' "$tout" | grep -E "ALL .* PASSED|^FAILED" | head -1)
+    if [[ "$tverdict" == ALL* ]]; then
+        echo "$tverdict"
+    else
+        echo "FAILED -- last lines:"
+        printf '%s\n' "$tout" | grep -E "FAIL|Error" | tail -5 | sed 's/^/                 /'
+        failed+=(termjs)
+    fi
+fi
+
 for t in "${SUITES[@]}"; do
     printf '%-14s ' "$t"
     out=$(timeout "$TIMEOUT" python3 -u -I "tests/e2e_$t.py" 2>&1)

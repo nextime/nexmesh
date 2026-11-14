@@ -135,9 +135,41 @@ pub async fn launch_slot(
     // conversation id, which for claude and codex is exactly what --resume
     // takes. Without this, restarting someone's closed conversation under
     // the hub's control gives them a BLANK one wearing the same name.
-    let mut resume = row.resume.clone().or_else(|| {
-        row.cli_session.clone().filter(|c| !c.trim().is_empty())
-    });
+    //
+    // Unless the last attempt died on it. `claude --resume <id>` fails with
+    // "No conversation found with session ID" when that conversation is not
+    // in the project directory it is launched in -- a different cwd, another
+    // machine, a cleaned-up history -- and it exits at once. Retried, that is
+    // a flap that never resolves and whose only visible symptom is a seat
+    // restarting for ever. So a start that lasted no time at all spends the
+    // next attempt on a FRESH conversation: one wasted launch instead of
+    // three, and a seat that comes back rather than one that cannot.
+    let resume_just_failed = {
+        let db = st.db.lock().unwrap();
+        db.query_row(
+            "SELECT started_at_ms, exited_at_ms FROM agents
+              WHERE slot_id = ? AND provenance = 'managed'
+              ORDER BY started_at_ms DESC LIMIT 1",
+            [slot_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|(start, exit)| exit.map(|e| e - start < 10_000))
+        .unwrap_or(false)
+    };
+    let mut resume = if resume_just_failed {
+        tracing::info!(
+            %slot_id,
+            "the last start exited at once; trying a fresh conversation rather than resuming"
+        );
+        None
+    } else {
+        row.resume.clone().or_else(|| {
+            row.cli_session.clone().filter(|c| !c.trim().is_empty())
+        })
+    };
     let cli_for_identity = row.cli_id.clone().unwrap_or_default();
     let name_for_identity = row.display_name.clone().unwrap_or_default();
     if !cli_for_identity.is_empty() && !name_for_identity.is_empty() {

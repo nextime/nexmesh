@@ -550,11 +550,24 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
 
         HubToNode::AttachOpen { attach_id, agent_id, cols, rows, replay_bytes } => {
             let Some(io) = ctx.agent_io(&agent_id) else {
+                // "not running on this node" was true of what the node has
+                // and false of what the operator reads: the agent is very
+                // often running perfectly well, in a terminal this node
+                // never owned. An attach can only reach a terminal the node
+                // holds, and the two cases want different advice -- wait,
+                // versus adopt the pane it is sitting in.
+                let known = ctx.agent(&agent_id).is_some();
+                let reason = if known {
+                    format!(
+                        "this node has no terminal for {agent_id}: its CLI was started by hand,                          so nothing but its own shim reaches it. Adopt the tmux pane it is                          sitting in (`nexmesh adopt`) and it becomes attachable."
+                    )
+                } else {
+                    format!(
+                        "this node is not running {agent_id}. It may have restarted since that                          agent started, or the agent belongs to another machine."
+                    )
+                };
                 let _ = ctx
-                    .send_hub(&NodeToHub::AttachRejected {
-                        attach_id,
-                        reason: format!("agent {agent_id} is not running on this node"),
-                    })
+                    .send_hub(&NodeToHub::AttachRejected { attach_id, reason })
                     .await;
                 return;
             };

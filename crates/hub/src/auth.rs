@@ -27,9 +27,35 @@ use axum::{
 /// history and `ps` output, and this token is equivalent to shell access on
 /// every node in the fleet.
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get("authorization")?.to_str().ok()?;
-    let (scheme, value) = raw.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then(|| value.trim().to_string())
+    if let Some(raw) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some((scheme, value)) = raw.split_once(' ') {
+            if scheme.eq_ignore_ascii_case("bearer") {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    ws_token(headers)
+}
+
+/// The one header a browser may choose on a websocket.
+///
+/// `new WebSocket(url)` cannot set `Authorization` -- the API has no way to
+/// pass headers -- so an operator signed in with a TOKEN rather than a
+/// dashboard account could not open a terminal at all. The alternatives were
+/// the query string, which lands in every proxy log and browser history, or
+/// this: the subprotocol, which is a header, is chosen by the client, and is
+/// what Kubernetes and friends use for exactly this reason.
+///
+/// The handler must echo the protocol back or the browser fails the
+/// handshake; see `attach_ws`.
+pub const WS_TOKEN_PREFIX: &str = "nexmesh.token.";
+
+pub fn ws_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("sec-websocket-protocol")?.to_str().ok()?;
+    raw.split(',')
+        .map(|p| p.trim())
+        .find_map(|p| p.strip_prefix(WS_TOKEN_PREFIX))
+        .map(|t| t.to_string())
 }
 
 /// How far a scoped operator may reach, decided from the path it is asking for.

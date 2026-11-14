@@ -240,10 +240,86 @@
   .nicklist .nk .dot { flex: 0 0 auto; }
   .nicklist .nk small { color: var(--faint); }
   #chat .composer { grid-column: 1 / -1; background: var(--panel); }
+  /* On a phone the rail was taking a third of the width and leaving the
+     conversation in a gutter. It becomes a drawer: closed by default,
+     opened by the channel name in the header, and closed again by picking
+     a channel -- which is the only thing it is there for. */
+  #chat .railtoggle { display: none; }
   @media (max-width: 900px) {
-    #chat { grid-template-columns: 150px minmax(0, 1fr); }
+    #chat { grid-template-columns: minmax(0, 1fr); }
+    #chat .railtoggle { display: inline-block; }
     .nicklist { display: none; }
-    .chatline { grid-template-columns: 54px 10px minmax(0, 1fr); gap: 6px; }
+    .chatline { grid-template-columns: 50px 10px minmax(0, 1fr); gap: 6px; }
+    /* The drawer shares the grid cell the conversation is in, rather than
+       being positioned over the whole overlay: absolute inset:0 put it over
+       the header as well, hiding the very button that opens it. */
+    .chanrail {
+      grid-area: 2 / 1 / 3 / -1; justify-self: start; z-index: 3;
+      width: min(74vw, 250px); background: var(--panel);
+      border-right: 1px solid var(--line);
+      transform: translateX(-102%); transition: transform .18s ease-out;
+      box-shadow: 0 0 24px rgba(0, 0, 0, .45);
+    }
+    .chanrail.open { transform: none; }
+    /* Tapping anywhere else closes it, which is what every drawer does and
+       what a thumb reaches for first. */
+    #railScrim { grid-area: 2 / 1 / 3 / -1; z-index: 2; background: rgba(0,0,0,.45); }
+  }
+  @media (min-width: 901px) { #railScrim { display: none; } }
+
+  /* --------------------------------------------------------- terminal ----
+     An agent's own terminal, in the browser. The grid is rows of spans
+     rather than a canvas: a TUI rewrites two lines a frame, and replacing
+     two <div>s is cheaper than repainting a canvas -- and text stays
+     selectable, which is most of why you open a terminal to read something.
+  */
+  #term {
+    position: fixed; inset: 0; z-index: 70; background: var(--ntbg);
+    display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+  #term .thead {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  #term .thead .who { font-family: var(--mono); font-weight: 650; }
+  .nexterm {
+    position: relative; overflow: hidden; padding: 3px 4px;
+    background: var(--ntbg); color: var(--ntfg);
+    font-family: var(--mono); font-size: 13px; line-height: 1.2;
+  }
+  .ntgrid { white-space: pre; }
+  .ntrow { height: 1.2em; }
+  /* The probe measures one cell in the real font. Kept out of flow so it
+     cannot move anything while it is being measured. */
+  .ntprobe {
+    position: absolute; visibility: hidden; white-space: pre;
+    font: inherit; left: -9999px; top: 0;
+  }
+  /* Where a phone's keyboard comes from, and where a paste lands. Invisible
+     but focusable: a textarea with zero size is ignored by some browsers. */
+  .ntinput {
+    position: absolute; left: -9999px; top: 0; width: 1px; height: 1px;
+    opacity: 0; border: 0; padding: 0; resize: none;
+  }
+  /* The keys a phone has no way to send. Only shown on a touch screen. */
+  .tkeys { display: none; gap: 6px; padding: 7px 10px; background: var(--panel);
+           border-top: 1px solid var(--line); overflow-x: auto; }
+  .tkeys button { font-family: var(--mono); min-width: 3em; }
+  @media (pointer: coarse) { .tkeys { display: flex; } }
+  :root {
+    --ntbg: #07090c; --ntfg: #d8e0e8;
+    --a0: #1b2128; --a1: #f2777a; --a2: #99cc99; --a3: #ffcc66;
+    --a4: #6699cc; --a5: #cc99cc; --a6: #66cccc; --a7: #d3d0c8;
+    --a8: #55606b; --a9: #ff8d90; --a10: #b5e0b5; --a11: #ffe0a3;
+    --a12: #8fbce0; --a13: #e0b5e0; --a14: #8fe0e0; --a15: #ffffff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]):not([data-theme="lcars"]) {
+      /* A terminal stays dark in a light theme. Agent output is written for
+         a dark background -- its own colours assume one -- and inverting it
+         makes every TUI unreadable. */
+      --ntbg: #10151b; --ntfg: #dde4ea;
+    }
   }
 
   /* ------------------------------------------------------------ LCARS ----
@@ -344,6 +420,9 @@
   }
   :root[data-theme="lcars"] .chanrail .unread { background: var(--lc-pink); color: #000; }
   :root[data-theme="lcars"] .sizebar { background: var(--lc-pink); }
+  :root[data-theme="lcars"] #term .thead { background: #000; }
+  :root[data-theme="lcars"] .nexterm { --ntbg: #000; --ntfg: #ffffff; }
+  :root[data-theme="lcars"] #term { --ntbg: #000; }
 
   /* A class rule beats the UA stylesheet's [hidden], so anything styled
      display:* below would ignore its own hidden attribute without this. */
@@ -487,6 +566,15 @@
     <button id="forget" class="tiny" title="Remove the stored token from this browser">sign out</button>
   </header>
 
+  <!-- A new dashboard is on the hub. Said once, with a button, because an
+       installed PWA can stay open for days and never reload itself -- and
+       an operator looking at a dashboard from two deploys ago reasonably
+       concludes the fix was never deployed. -->
+  <div id="newBuild" class="err" hidden style="background:color-mix(in srgb, var(--ok) 14%, var(--panel));
+       border-color:color-mix(in srgb, var(--ok) 45%, transparent)">
+    A newer dashboard is available on this hub.
+    <button class="tiny" onclick="updateApp()">reload it</button>
+  </div>
   <div id="err" class="err" hidden></div>
   <!-- Separate from #err on purpose: the poll clears that one every few
        seconds, which wiped any message a button tried to show before it
@@ -536,6 +624,8 @@
   <div id="chat" hidden>
     <div class="chathead">
       <div class="brand">nex<span>mesh</span></div>
+      <button class="tiny railtoggle" onclick="toggleRail()"
+              title="Channels">\u2630</button>
       <span class="where" id="chatWhere">#all</span>
       <span class="tiny muted" id="chatHint"></span>
       <span class="spacer"></span>
@@ -543,15 +633,36 @@
       <button class="tiny" onclick="closeChat()" title="Back to the dashboard (Esc)">close</button>
     </div>
     <div class="chanrail" id="chanRail"></div>
+    <div id="railScrim" hidden onclick="toggleRail(false)"></div>
     <div class="chatfeed" id="chatFeed"
          onscroll="chatStick = (this.scrollHeight - this.scrollTop - this.clientHeight) < 50"></div>
     <div class="nicklist" id="nickList"></div>
     <div class="composer" id="chatComposer"></div>
   </div>
+
+  <!-- An agent's terminal. The hub already speaks this protocol to
+       `nexmesh attach`; all that was missing was something in a browser that
+       could draw it. Outside #view so a poll cannot tear it down mid-keystroke. -->
+  <div id="term" hidden>
+    <div class="thead">
+      <span class="who" id="tWho">—</span>
+      <span class="badge" id="tState">connecting</span>
+      <span class="tiny muted" id="tSize"></span>
+      <span class="spacer"></span>
+      <button class="tiny" onclick="termKeys()" title="Send a key a phone has no room for">keys</button>
+      <button class="tiny" onclick="closeTerm()" title="Detach (the agent keeps working)">detach</button>
+    </div>
+    <div id="termHost" class="nexterm"></div>
+    <div class="tkeys" id="tKeys"></div>
+  </div>
 </div>
 
+<script src="term.js"></script>
 <script>
 "use strict";
+// The build this page was served as. The hub substitutes it; opened from a
+// file it stays a placeholder and the check simply never fires.
+const PAGE_BUILD = "__BUILD__";
 const TABS = ["agents", "messages", "plan", "knowledge", "graph", "files", "fleet"];
 const KEY = "nexmesh.operator.token";
 let token = localStorage.getItem(KEY) || "";
@@ -1092,9 +1203,30 @@ window.addEventListener("hashchange", () => {
   if (TABS.includes(t)) { tab = t; render(); }
 });
 
+/// Fetch the new page, and the new service worker with it.
+///
+/// `location.reload()` alone is usually enough -- the page is served
+/// `no-store` -- but an installed app on Android holds a worker that was
+/// registered by the old one, and updating it first is what makes the next
+/// load actually new rather than the same thing again.
+async function updateApp() {
+  try {
+    if ("serviceWorker" in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.update().catch(() => {})));
+    }
+  } catch (e) { /* an update that cannot be asked for is not a reason to stay */ }
+  location.reload();
+}
+
 function render() {
   if (!snap) return;
   const d = snap.detail, now = snap.hub.now_ms;
+  // Is the hub serving a newer dashboard than this one?
+  const served = snap.hub && snap.hub.build;
+  if (served && PAGE_BUILD !== "__BUILD__" && served !== PAGE_BUILD) {
+    $("newBuild").hidden = false;
+  }
   $("hubInfo").textContent = "hub " + snap.hub.version +
     (snap.hub.authenticated ? " · authenticated" : " · no auth");
 
@@ -1218,7 +1350,7 @@ function viewAgents(d, now) {
     : "";
   return panel(`<table><thead><tr>` +
       th("Agent", "name") + (all ? th("Session", "session") : "") +
-      th("Role", "role") + th("Where", "host") + th("How", "cli", "hide") +
+      th("Role", "role") + "<th></th>" + th("Where", "host") + th("How", "cli", "hide") +
       th("State", "task_state") + th("Tokens", "tokens", "num hide") +
       th("Summary", "summary") +
     `</tr></thead><tbody>` +
@@ -1238,6 +1370,10 @@ function viewAgents(d, now) {
         <td class="muted"><span class="rename" title="click to change the role"
               onclick="editRole('${esc(a.slot_id)}', '${esc(a.role).replace(/'/g, "\\'")}')"
               id="rl-${esc(a.slot_id)}">${esc(a.role)}</span></td>
+        <td>${a.agent_id && a.status === "running" && a.kind !== "external"
+            ? `<button class="tiny" title="Open this agent's terminal here"
+                 onclick="openTerm('${esc(a.agent_id)}','${esc(a.name).replace(/'/g, "\\'")}')"
+                 >terminal</button>` : ""}</td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}
             ${a.pid || a.io_kind ? `<br><span class="tiny muted" title="the process behind this seat${
@@ -1314,6 +1450,136 @@ function paintComposer(d) {
   if (keep && $("sendText")) $("sendText").value = keep;
 }
 
+// -------------------------------------------------------------- terminal ----
+// Attaching to an agent from a browser. The hub has spoken this protocol to
+// `nexmesh attach` since the beginning -- binary frames are bytes, text
+// frames are control JSON -- so nothing new was needed on the wire: only
+// something in a page that could draw a terminal, which is term.js.
+//
+// The websocket carries the dashboard's own cookie, which is why this works
+// at all: /v1/attach/ws sits behind the operator middleware, and that accepts
+// a signed-in person as readily as a token.
+let termWs = null, term = null, termAgent = null, termRO = false;
+
+function termUrl(agent, cols, rows) {
+  const base = location.protocol === "https:" ? "wss://" : "ws://";
+  return `${base}${location.host}/v1/attach/ws?agent=${encodeURIComponent(agent)}` +
+         `&cols=${cols}&rows=${rows}&replay=65536`;
+}
+
+function openTerm(agent, name) {
+  if (!window.NexTerm) { note("the terminal did not load; reload the page"); return; }
+  closeTerm();
+  termAgent = agent;
+  $("term").hidden = false;
+  document.body.style.overflow = "hidden";
+  $("tWho").textContent = name || agent;
+  $("tState").textContent = "connecting";
+  $("tState").className = "badge";
+  $("termHost").innerHTML = "";
+  term = new NexTerm($("termHost"));
+  term.fit();
+  $("tSize").textContent = `${term.cols}\u00d7${term.rows}`;
+
+  // A websocket cannot carry an Authorization header, so a token signs in
+  // through the subprotocol instead -- a header, not a query string, which
+  // would otherwise put a fleet-wide credential in every proxy log. A
+  // dashboard ACCOUNT needs none of this: its cookie rides along.
+  const ws = token
+    ? new WebSocket(termUrl(agent, term.cols, term.rows), ["nexmesh.token." + token])
+    : new WebSocket(termUrl(agent, term.cols, term.rows));
+  ws.binaryType = "arraybuffer";
+  termWs = ws;
+  term.onInput((bytes) => {
+    if (ws.readyState === 1) ws.send(bytes);
+  });
+  term.onResize((cols, rows) => {
+    $("tSize").textContent = `${cols}\u00d7${rows}`;
+    if (ws.readyState === 1) ws.send(JSON.stringify({ t: "resize", cols, rows }));
+  });
+  term.onTitle((t) => { if (t) $("tWho").textContent = `${name || agent} — ${t}`; });
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      let v = {};
+      try { v = JSON.parse(ev.data); } catch (e) { return; }
+      if (v.t === "opened") {
+        // A headless agent is a protocol on a pipe, not a terminal: you can
+        // watch it, but there is nothing to take over.
+        termRO = !!v.read_only;
+        term.readOnly = termRO;
+        $("tState").textContent = termRO ? "watching" : "attached";
+        $("tState").className = "badge " + (termRO ? "info" : "ok");
+        term.focus();
+      } else if (v.t === "closed" || v.t === "error") {
+        $("tState").textContent = v.reason || v.message || "closed";
+        $("tState").className = "badge bad";
+      }
+      return;
+    }
+    term.write(new Uint8Array(ev.data));
+  };
+  ws.onclose = () => {
+    if (termWs === ws) {
+      $("tState").textContent = "detached";
+      $("tState").className = "badge";
+    }
+  };
+  ws.onerror = () => {
+    $("tState").textContent = "could not attach";
+    $("tState").className = "badge bad";
+  };
+  buildTermKeys();
+  window.addEventListener("resize", termFit);
+}
+
+function termFit() {
+  if (term) term.fit();
+}
+
+function closeTerm() {
+  window.removeEventListener("resize", termFit);
+  if (termWs) {
+    try {
+      // Say so, rather than just dropping the socket: the hub tells the node,
+      // which closes the viewer without touching the agent.
+      if (termWs.readyState === 1) termWs.send(JSON.stringify({ t: "close" }));
+      termWs.close();
+    } catch (e) {}
+  }
+  termWs = null;
+  term = null;
+  termAgent = null;
+  $("term").hidden = true;
+  document.body.style.overflow = "";
+}
+
+// The keys a touch keyboard has no room for. Shown only on a touch screen,
+// because a fleet is watched from a phone more often than from a desk.
+const TKEYS = [
+  ["esc", "\x1b"], ["tab", "\t"], ["^c", "\x03"], ["^d", "\x04"],
+  ["^z", "\x1a"], ["^r", "\x12"], ["\u2191", "\x1b[A"], ["\u2193", "\x1b[B"],
+  ["\u2190", "\x1b[D"], ["\u2192", "\x1b[C"], ["\u21b5", "\r"],
+];
+
+function buildTermKeys() {
+  $("tKeys").innerHTML = TKEYS.map(([label, seq], i) =>
+    `<button onclick="termSend(${i})">${esc(label)}</button>`).join("") +
+    `<button onclick="term && term.focus()">keyboard</button>`;
+}
+
+function termSend(i) {
+  if (term && !termRO) term.send(TKEYS[i][1]);
+  if (term) term.focus();
+}
+
+function termKeys() {
+  // On a desktop the bar is hidden by CSS; this makes it appear anyway for
+  // anyone who wants to send a control key without a modifier.
+  const el = $("tKeys");
+  el.style.display = el.style.display === "flex" ? "" : "flex";
+}
+
 // ---------------------------------------------------------------- themes ----
 // Two looks, and the machinery for both: a flight deck that stays out of the
 // way, and LCARS for when you would rather be on one. The choice is this
@@ -1363,6 +1629,7 @@ function openChat() {
   session = "*";
   $("chat").hidden = false;
   document.body.style.overflow = "hidden";
+  toggleRail(false);
   location.hash = "chat";
   tick();
 }
@@ -1381,7 +1648,25 @@ function chatPick(name) {
   chatChan = name;
   chatStick = true;
   loadChatHistory(name);
+  // Picking a channel is the only reason the drawer was open.
+  toggleRail(false);
   renderChat(snap && snap.detail);
+}
+
+/// The channel drawer, on a narrow screen. `want` forces a state; omitted it
+/// toggles. On a wide screen the rail is always there and this does nothing
+/// visible, because the class it sets only means anything under the media
+/// query.
+function toggleRail(want) {
+  const rail = $("chanRail");
+  if (!rail) return;
+  const open = want === undefined ? !rail.classList.contains("open") : !!want;
+  rail.classList.toggle("open", open);
+  // The same breakpoint the stylesheet uses, asked of the browser rather
+  // than recomputed from innerWidth: two definitions of "narrow" drift.
+  const narrow = window.matchMedia("(max-width: 900px)").matches;
+  const scrim = $("railScrim");
+  if (scrim) scrim.hidden = !open || !narrow;
 }
 
 // A nick's colour, by name, so the same agent is the same colour in every
@@ -1494,6 +1779,8 @@ function renderChat(d) {
     : `<div class="nk muted tiny">nobody</div>`);
 
   $("chatWhere").textContent = chatChan === "*" ? "#all" : "#" + chatChan;
+  $("chatWhere").onclick = () => toggleRail();
+  $("chatWhere").style.cursor = "pointer";
   $("chatHint").textContent = chatChan === "*"
     ? `${sessions.length} channel${sessions.length === 1 ? "" : "s"} \u00b7 recent fleet-wide`
     : `${msgs.length} line${msgs.length === 1 ? "" : "s"}`;
@@ -1545,6 +1832,9 @@ async function chatSend() {
 }
 
 // Esc leaves the room. Anything else typed in it belongs to the composer.
+//
+// The terminal is deliberately NOT closed by Esc: Esc is a key a TUI wants,
+// and a viewer that exits on it cannot drive anything. `detach` is a button.
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && chatOpen) { closeChat(); return; }
 });

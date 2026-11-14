@@ -518,6 +518,29 @@ CREATE TABLE IF NOT EXISTS messages (
   claimed_at_ms   INTEGER,
   claimed_by      TEXT
 );
+-- Who has had a given message, one row per SEAT.
+--
+-- `messages` carries one `acked_at_ms`, which is the right shape for a
+-- message addressed to somebody and the wrong one for a broadcast: the first
+-- teammate to ack consumed it for everyone, so "I told the team" reached
+-- exactly one of them, at random, and nobody could see that it had. This is
+-- what decides whether a seat still has a broadcast waiting; the columns on
+-- `messages` stay as they were, recording the FIRST delivery, because that
+-- is what the log and the dashboard mean by delivered.
+--
+-- Written lazily, when a message is handed to a seat: a seat that joins
+-- after a broadcast was sent is still a recipient, and materialising rows at
+-- send time would have decided otherwise.
+CREATE TABLE IF NOT EXISTS message_recipients (
+  message_id     INTEGER NOT NULL,
+  slot_id        TEXT NOT NULL,
+  inflight_agent TEXT,
+  inflight_at_ms INTEGER,
+  acked_at_ms    INTEGER,
+  acked_by_agent TEXT,
+  PRIMARY KEY (message_id, slot_id)
+);
+
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, to_slot) WHERE acked_at_ms IS NULL;
 
 -- --------------------------------------------------- file coordination ----

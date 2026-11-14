@@ -192,7 +192,7 @@ the supervisors when there is none, or when the one there has gone quiet.
 | `nexmesh-mcpd` | per agent, stdio | The MCP shim the CLI loads. Talks to its local node over a unix socket; holds no credentials. |
 | `nexmesh` | anywhere | Operator CLI — and, run bare from a terminal, the operator console: the whole fleet in one screen, braille code-graph maps and all. |
 | `nexmesh-orch` | wherever you work | The orchestrator, as an MCP server, so **any** MCP-capable CLI can run the fleet. |
-| `nexmesh-coderai` | beside a media/OCR service | A capability bridge: joins as a participant, offers OCR, transcription, speech, embeddings, images. The only component holding that service's token. |
+| `nexmesh-coderai` | beside a media/OCR service | A capability bridge: joins as a participant — one team, several, or `--session all` — and offers OCR, transcription, speech, embeddings, images. The only component holding that service's token. |
 
 ## Quick start
 
@@ -255,12 +255,12 @@ Every screenshot in this repository comes from it.
 |---|---|
 | **[The guide](docs/GUIDE.md)** | everything below, in detail |
 | [Sessions, seats and who joins what](docs/GUIDE.md#sessions-seats-and-who-joins-what) | how a conversation finds its team, moving between them, what a lock arbitrates, shared workspaces |
-| [Driving the fleet](docs/GUIDE.md#driving-the-fleet) | scoped and super orchestrators, the operator channel, watching, messaging, pausing, budgets |
+| [Driving the fleet](docs/GUIDE.md#driving-the-fleet) | scoped and super orchestrators, the operator channel, the terminal console, watching, messaging, pausing, budgets |
 | [Agents, and what counts as one](docs/GUIDE.md#agents-and-what-counts-as-one) | adding a CLI, writing a driver plugin, agents that are not CLIs, capability asks, the bridge |
 | [What the team knows](docs/GUIDE.md#what-the-team-knows) | the code graph read once per codebase, memory with a scope |
 | [Terminals, failure and recovery](docs/GUIDE.md#terminals-failure-and-recovery) | attach from anywhere, crash recovery, adopting a running tmux session |
-| [Running it for real](docs/GUIDE.md#running-it-for-real) | installing, the dashboard, mutual TLS, deployment |
-| [tests/README.md](tests/README.md) | the twenty-three end-to-end suites, and what each one guards |
+| [Running it for real](docs/GUIDE.md#running-it-for-real) | installing, the dashboard and its themes, the chat room, a terminal in the browser, mutual TLS, deployment |
+| [tests/README.md](tests/README.md) | the end-to-end suites, and what each one guards |
 | `man nexmesh` ([source](docs/man/nexmesh.1)) | every command and which argument is which, at the terminal |
 
 ## Status

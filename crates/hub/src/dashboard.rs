@@ -19,6 +19,28 @@ use serde_json::{json, Value};
 
 const PAGE: &str = include_str!("../static/dashboard.html");
 
+/// What build of the page this hub serves.
+///
+/// An installed PWA is the problem this solves: the page is `no-store` and
+/// the service worker caches nothing, but a phone keeps the app open for
+/// days and never reloads it, so an operator looks at a dashboard from two
+/// deploys ago and reasonably concludes the fix was not deployed. The page
+/// compares this with what the snapshot reports and offers to reload.
+///
+/// A hash of what is actually served, not the version number: the version
+/// does not change between deploys of the same release, and the thing that
+/// matters is whether THIS page differs from the one in front of you.
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(PAGE.as_bytes());
+        h.update(include_str!("../static/term.js").as_bytes());
+        hex::encode(h.finalize())[..10].to_string()
+    })
+}
+
 pub async fn page() -> Response {
     // no-store, deliberately. The page is one self-contained file that
     // changes whenever the hub is upgraded, and it carried no cache headers
@@ -30,7 +52,10 @@ pub async fn page() -> Response {
             (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
             (axum::http::header::PRAGMA, "no-cache"),
         ],
-        Html(PAGE),
+        // The page is told its own build so it can notice when the hub has
+        // a newer one. One small allocation per load; the page is served
+        // rarely and read for hours.
+        Html(PAGE.replacen("__BUILD__", build_id(), 1)),
     )
         .into_response()
 }
@@ -104,6 +129,26 @@ pub async fn app_icon_png(axum::extract::Path(size): axum::extract::Path<String>
 /// straight through. A dashboard is a live view of a fleet, and a cached one
 /// is worse than none -- it would show yesterday's agents as though they
 /// were running.
+/// The terminal emulator the dashboard uses to attach to an agent.
+///
+/// Its own file rather than inline in the page, for the same reason the
+/// service worker is: a VT parser is a parser and a page is a page. Served
+/// from the hub like everything else, so a fleet with no route to the
+/// internet still has a working terminal.
+pub async fn term_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            // Same reasoning as the page: it changes with the hub, and a
+            // browser caching it heuristically would run an old parser
+            // against a new one.
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+        ],
+        include_str!("../static/term.js"),
+    )
+        .into_response()
+}
+
 pub async fn service_worker() -> Response {
     (
         [
@@ -564,7 +609,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
 
     Json(json!({
         "hub": { "version": env!("CARGO_PKG_VERSION"), "authenticated": authed,
-                 "now_ms": now, "pair_listen": pair_listen, "pki_ready": pki_ready },
+                 "now_ms": now, "pair_listen": pair_listen, "pki_ready": pki_ready,
+                 // Which dashboard this hub would serve right now. A page
+                 // left open on a phone compares it with its own.
+                 "build": build_id() },
         "pairing": pairing,
         "nodes": nodes["nodes"],
         "sessions": sessions,

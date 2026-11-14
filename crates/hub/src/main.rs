@@ -711,6 +711,7 @@ async fn main() -> Result<()> {
         .route("/icon.svg", get(dashboard::app_icon))
         .route("/:icon_png", get(dashboard::app_icon_png))
         .route("/sw.js", get(dashboard::service_worker))
+        .route("/term.js", get(dashboard::term_js))
         .route("/healthz", get(api::health))
         // Signing in cannot itself require being signed in. These three are
         // the only unauthenticated write paths on the hub, and each is

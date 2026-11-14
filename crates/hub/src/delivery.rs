@@ -48,7 +48,7 @@ pub async fn push_tick(st: &AppState) {
                     let ids: Vec<i64> = m.iter().map(|x| x.id).collect();
                     // Mark in flight before sending: a tick that overlaps the
                     // previous one must not inject the same message twice.
-                    if tools::mark_inflight(&db, &agent_id, &ids).is_err() {
+                    if tools::mark_inflight(&db, &agent_id, &slot_id, &ids).is_err() {
                         continue;
                     }
                     m
@@ -132,9 +132,11 @@ pub async fn typed_tick(st: &AppState) {
             match tools::pending_for_slot(&db, &session_id, &slot_id) {
                 Ok(m) if !m.is_empty() => {
                     let ids: Vec<i64> = m.iter().map(|x| x.id).collect();
-                    // In flight against the TERMINAL, which is what will ack
-                    // it: the seat's own agent may not even be connected.
-                    if tools::mark_inflight(&db, &via, &ids).is_err() {
+                    // In flight against the TERMINAL, which is what will
+                    // ack it -- the seat's own agent may not even be
+                    // connected -- but recorded for the SEAT the message is
+                    // for, which is not the terminal's own.
+                    if tools::mark_inflight(&db, &via, &slot_id, &ids).is_err() {
                         continue;
                     }
                     m
@@ -182,11 +184,23 @@ pub async fn recovery_tick(st: &AppState) {
             // done is deliberately left alone unless feedback is waiting for
             // it -- restarting an agent with nothing to do would just burn
             // tokens and confuse the review loop.
+            // The MOST RECENT agent must have been a managed one. `EXISTS`
+            // was wrong and the fleet showed why: a seat that nexmesh had
+            // spawned once, and that a person later attached their own CLI
+            // to, was treated as the hub's to restart for ever. Closing that
+            // CLI then produced a `claude` nobody asked for, launched with a
+            // guess at how to resume a conversation only that person's
+            // terminal knew about -- which failed instantly and was retried.
+            //
+            // A seat whose last process was attached belongs to whoever
+            // started it. The hub does not know how they launched it and has
+            // no business inventing a replacement.
             "SELECT s.id, s.session_id, s.restarts, s.last_crash_ms, s.display_name
              FROM slots s
              WHERE s.status != 'flapping'
-               AND EXISTS (SELECT 1 FROM agents a WHERE a.slot_id = s.id
-                             AND a.provenance = 'managed')
+               AND (SELECT a.provenance FROM agents a WHERE a.slot_id = s.id
+                     ORDER BY a.started_at_ms DESC LIMIT 1) = 'managed'
+
                AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.slot_id = s.id
                                  AND a.exited_at_ms IS NULL)
                AND (

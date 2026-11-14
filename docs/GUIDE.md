@@ -31,6 +31,7 @@ of it, and how to watch a fleet without installing anything.
 - [Writing a driver plugin](#writing-a-driver-plugin)
 - [An agent does not have to be a CLI](#an-agent-does-not-have-to-be-a-cli)
 - [Reaching any CLI from any machine](#reaching-any-cli-from-any-machine)
+- [One bridge, several teams](#one-bridge-several-teams)
 - [Asking a teammate for something you cannot do](#asking-a-teammate-for-something-you-cannot-do)
 - [A bridge to senses the team does not have](#a-bridge-to-senses-the-team-does-not-have)
 
@@ -840,6 +841,32 @@ not witnessed, on a screen an operator reads to decide what to restart.
 `nexmesh status` prints the pid and the kind of I/O beside it, so "no longer
 connected" and "no longer there" can be told apart without guessing.
 
+### One bridge, several teams
+
+A capability bridge serves a capability, and OCR is OCR whoever is asking —
+but `ask_capability` resolves providers **within the asking agent's own
+session**, so a bridge seated in one team is invisible to every other. Hence
+`--session` is a list, and `--session all` means every active session:
+
+```bash
+nexmesh-coderai --session payments --session docs-site ...
+nexmesh-coderai --session all ...
+```
+
+A CLI cannot do this and should not be able to: one conversation is one seat,
+enforced when it registers, because the seat's inbox, task state and lock
+domain all belong to one team. An external participant has no conversation
+and no process the hub can see, so nothing is ambiguous about it holding a
+seat in each of several teams — each seat has its own asks, and the service
+behind them is shared the way it already was.
+
+A participant token scoped to one session still cannot cross: it is seated
+where its token reaches and told so. A session named wrongly is reported
+rather than silently dropped, and the bridge joins the rest — being kept out
+of four teams because one name was mistyped is not a useful failure. The list
+is resolved once, at startup; a session created later needs a restart, which
+is a second or two and keeps the bridge from re-seating itself on a timer.
+
 ### Asking a teammate for something you cannot do
 
 Messages are the right shape for "here is something you should know" and the
@@ -1254,7 +1281,7 @@ public address.
 Served by the hub itself, with no CDN and no external fonts: one page, inline.
 `agents`, `messages`, `plan`, `knowledge`, `graph`, `files` and `fleet`.
 
-#### The chat, as a room
+#### The chat, as a room, and a drawer on a phone
 
 The messages tab is a panel, which is the right shape for watching one team
 and the wrong one for reading a fleet. `chat` in the header opens the whole
@@ -1265,6 +1292,40 @@ channel carries its own unread count, each name its own colour (eight,
 assigned by name, so the same agent is the same colour in every channel and
 after every reload), and opening a channel fetches its log rather than showing
 only the fleet-wide window the poll carries.
+
+On a narrow screen the channel rail was taking a third of the width and
+leaving the conversation in a gutter, so there it becomes a drawer: closed by
+default, opened by the channel name or the ☰ beside it, and closed again by
+picking a channel — which is the only thing it is there for.
+
+#### A terminal, in the browser
+
+The `terminal` button on an agent's row opens its real terminal in the page —
+the same attach the CLI has always had, over the same websocket, drawn by a
+small VT emulator the hub serves (`term.js`). You can watch a TUI agent work
+and type at it from a phone.
+
+It is written here rather than vendored because the dashboard loads nothing
+from the internet by design, and xterm.js would be 280KB of somebody else's
+code in a repository that vendors none. What an agent CLI emits is a knowable
+subset: the pending-wrap rule, a scroll region with index and reverse index,
+insert and delete of lines and characters, the alternate screen, SGR with 256
+colours and truecolor, and answers to the cursor-position and
+device-attribute queries — because a program that asks and is never told
+waits for ever, which looks exactly like a hung agent. All of it is tested
+headlessly in `tests/term_test.js`, against the sequences rather than against
+a screenshot.
+
+Two details worth knowing:
+
+- **A websocket cannot carry an `Authorization` header.** A dashboard account
+  signs the terminal in with its cookie; an operator signed in with a *token*
+  sends it as the websocket subprotocol instead — a header, chosen by the
+  client, rather than a query string, which would put a fleet-wide credential
+  in every proxy log and browser history.
+- **A headless agent is read-only.** It is a protocol on a pipe, not a
+  terminal: the attach says so, and the page refuses to send keystrokes
+  rather than letting you type into nothing.
 
 #### Themes
 

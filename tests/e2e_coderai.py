@@ -231,6 +231,70 @@ def main():
           ("no teammate here offers" in str(j)) or ("could not do it" in j.get("text", ""))
           or ("has not answered" in j.get("text", "")), str(j)[:300])
 
+    print("\n=== one bridge, several teams ===")
+    # An agent's ask_capability only ever reaches a provider in its OWN
+    # session, so a bridge seated in one team is invisible to every other --
+    # which is the whole reason a bridge may now hold several seats. A CLI
+    # cannot: one conversation is one seat. A participant has no conversation,
+    # so nothing is ambiguous about it sitting in each of several teams.
+    sid2 = http("POST", "/v1/sessions", {"name": "second-team"})[1]["session_id"]
+    # Fleet-wide, because a token scoped to one session may not cross.
+    out = hub_cli("participant-token", "multi").stdout
+    ftok = [l.split()[1] for l in out.splitlines() if l.startswith("token:")][0]
+    procs.append(subprocess.Popen([f"{BIN}/nexmesh-coderai",
+        "--hub", HUB, "--token", ftok, "--session", sid, "--session", sid2,
+        "--name", "CoderAI-both", "--service", f"http://127.0.0.1:{SVC}",
+        "--manifest", f"{ROOT}/capabilities/coderai.toml"],
+        stdout=open(f"{T}/bridge2.log","w"), stderr=subprocess.STDOUT,
+        env=dict(os.environ, CODERAI_TOKEN=SERVICE_TOKEN, RUST_LOG="info", NO_COLOR="1")))
+    seats = until(lambda: q("SELECT session_id FROM slots WHERE display_name='CoderAI-both'")
+                  if len(q("SELECT 1 FROM slots WHERE display_name='CoderAI-both'")) == 2 else None,
+                  seconds=40)
+    check("it took a seat in each team", bool(seats) and len(seats) == 2,
+          open(f"{T}/bridge2.log").read()[-500:])
+    if seats:
+        check("one per session, not two in the same one",
+              {r["session_id"] for r in seats} == {sid, sid2}, str(seats))
+
+    # The point of all this: an agent in the SECOND team can reach it.
+    atok2 = ptoken(sid2, "asker2")
+    s, j = http("POST", "/v1/participant/join",
+        {"session": sid2, "name": "Asker2", "role": "engineer"}, token=atok2)
+    keep = dict(ASKER)
+    ASKER["id"] = j["agent_id"]; ASKER["token"] = atok2
+    j = tool("list_peers", {"capability": "ocr"})
+    check("a teammate in the second session can see the bridge",
+          "CoderAI-both" in j.get("text", ""), str(j)[:300])
+    pdf = base64.b64encode(b"SECOND TEAM 7 EUR").decode()
+    j = ask("ocr", {"image": f"data:application/pdf;base64,{pdf}"})
+    check("and its ask is answered there", j.get("ok") and "SECOND TEAM 7 EUR" in j.get("text", ""),
+          str(j)[:300])
+    ASKER.clear(); ASKER.update(keep)
+
+    print("\n=== a scoped token still cannot cross sessions ===")
+    s, j = http("POST", "/v1/participant/join",
+        {"sessions": [sid, sid2], "name": "Scoped", "role": "engineer"},
+        token=ptoken(sid2, "scoped-one"))
+    check("it is seated, but only where its token reaches",
+          s == 200 and len(j.get("seats") or []) == 1, str(j)[:300])
+    check("and that one is its own session",
+          (j.get("seats") or [{}])[0].get("session_id") == sid2, str(j)[:300])
+
+    print("\n=== `all` means every active session ===")
+    s, j = http("POST", "/v1/participant/join",
+        {"sessions": ["all"], "name": "Everywhere", "role": "watcher"}, token=ftok)
+    active = q("SELECT COUNT(*) n FROM sessions WHERE status='active'")[0]["n"]
+    check(f"seated in all {active} of them", s == 200 and len(j.get("seats") or []) == active,
+          str(j)[:400])
+
+    print("\n=== a mistyped session does not keep it out of the rest ===")
+    s, j = http("POST", "/v1/participant/join",
+        {"sessions": [sid, "no-such-session"], "name": "Partly", "role": "watcher"},
+        token=ftok)
+    check("the good one is joined", s == 200 and len(j.get("seats") or []) == 1, str(j)[:300])
+    check("and the bad one is reported rather than silently dropped",
+          any("no-such-session" in json.dumps(r) for r in (j.get("refused") or [])), str(j)[:400])
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1

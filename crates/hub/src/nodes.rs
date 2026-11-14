@@ -749,7 +749,7 @@ pub fn run_tool(
     } else {
         let pending = tools::pending_for_slot(&db, &session_id, &slot_id)?;
         let ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
-        tools::mark_inflight(&db, agent_id, &ids)?;
+        tools::mark_inflight(&db, agent_id, &slot_id, &ids)?;
         pending
     };
     let _ = db.execute(
