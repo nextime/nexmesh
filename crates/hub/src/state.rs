@@ -43,6 +43,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("sessions", "paused_at", "INTEGER"),
         ("slots", "paused_at", "INTEGER"),
         ("agents", "kind_hint", "TEXT"),
+        // Whether this agent has a terminal of its own (`pty`), runs on pipes
+        // (`pipes`), or is a process the node never started and has no I/O
+        // for at all (NULL). It decides whether a message can be TYPED at the
+        // agent, and it is the difference between a seat you can take over
+        // and one you can only read -- which used to be discoverable only by
+        // attaching and finding out.
+        ("agents", "io_kind", "TEXT"),
         ("slots", "model", "TEXT"),
         ("slots", "capabilities", "TEXT NOT NULL DEFAULT '[]'"),
         ("agents", "model", "TEXT"),
@@ -267,6 +274,25 @@ fn migrate(conn: &Connection) -> Result<()> {
             closed_at_ms  INTEGER
          )",
     )?;
+    // `lost` was the wrong word and it was on the operator's screen. What the
+    // hub knows is that it has no connection to the process -- not that the
+    // process is gone, and certainly not that the conversation is. Renamed in
+    // place so an upgraded hub does not go on showing a word it no longer
+    // writes, next to seats whose CLIs are still sitting there.
+    // Guarded on the COLUMN, not just the table: migrate() also runs against
+    // databases older than most of this schema, where `agents` may be little
+    // more than an id, and a statement naming a column that is not there
+    // fails the whole migration and the hub with it.
+    if table_exists(conn, "agents")? && has_column(conn, "agents", "status")? {
+        let renamed = conn.execute(
+            "UPDATE agents SET status = 'disconnected' WHERE status = 'lost'",
+            [],
+        )?;
+        if renamed > 0 {
+            tracing::info!(agents = renamed, "migrated: `lost` is now `disconnected`");
+        }
+    }
+
     for (table, column, decl) in wanted {
         // A database old enough to lack the table entirely gets it from the
         // schema's CREATE TABLE IF NOT EXISTS; there is nothing to alter.
@@ -825,9 +851,10 @@ impl AppState {
         );
     }
 
-    /// A node whose lease expired is offline and its agents are `lost`. Their
-    /// in-flight messages go back in the queue so a respawn elsewhere picks
-    /// them up. The hub records all this; it never signals a process.
+    /// A node whose lease expired is offline and its agents are
+    /// `disconnected`. Their in-flight messages go back in the queue so a
+    /// respawn elsewhere picks them up. The hub records all this; it never
+    /// signals a process.
     pub fn expire_leases(&self) {
         let now = now_ms();
         let db = self.db.lock().unwrap();
@@ -836,13 +863,13 @@ impl AppState {
             [now],
         );
         let _ = db.execute(
-            "UPDATE agents SET status = 'lost' WHERE exited_at_ms IS NULL AND node_id IN
+            "UPDATE agents SET status = 'disconnected' WHERE exited_at_ms IS NULL AND node_id IN
                 (SELECT id FROM nodes WHERE status = 'offline')",
             [],
         );
         // External agents keep their own lease.
         let _ = db.execute(
-            "UPDATE agents SET status = 'lost' WHERE exited_at_ms IS NULL
+            "UPDATE agents SET status = 'disconnected' WHERE exited_at_ms IS NULL
                AND provenance = 'external' AND lease_expires_ms IS NOT NULL AND lease_expires_ms < ?",
             [now],
         );
@@ -854,8 +881,14 @@ impl AppState {
         // be in the table, and an agent stayed `running` for as long as the
         // hub stayed up: the one state that makes the fleet lie rather than
         // merely look stale.
+        //
+        // `disconnected` and not `lost`, which is what this said for a year:
+        // the hub has lost its CONNECTION to the process, and nothing more
+        // than that. The CLI is very often still sitting there, perfectly
+        // alive, waiting to be typed at -- a word that declares it gone is
+        // the hub overstating what it knows.
         let _ = db.execute(
-            "UPDATE agents SET status = 'lost'
+            "UPDATE agents SET status = 'disconnected'
              WHERE exited_at_ms IS NULL AND status = 'running'
                AND provenance <> 'external' AND last_seen_ms < ?",
             [now - proto::NODE_LEASE_MS as i64],
@@ -863,7 +896,7 @@ impl AppState {
         let _ = db.execute(
             "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
              WHERE acked_at_ms IS NULL AND inflight_agent IN
-                (SELECT id FROM agents WHERE status IN ('lost', 'exited'))",
+                (SELECT id FROM agents WHERE status IN ('disconnected', 'exited'))",
             [],
         );
     }
@@ -880,7 +913,7 @@ impl AppState {
         let db = self.db.lock().unwrap();
         let _ = db.execute("UPDATE nodes SET status = 'offline' WHERE id = ?", [node_id]);
         let _ = db.execute(
-            "UPDATE agents SET status = 'lost' WHERE node_id = ? AND exited_at_ms IS NULL",
+            "UPDATE agents SET status = 'disconnected' WHERE node_id = ? AND exited_at_ms IS NULL",
             [node_id],
         );
         // An ATTACHED agent reaches the hub through this node's unix socket,
@@ -890,8 +923,8 @@ impl AppState {
         // node restart used to leave a seat occupied by nobody, and three
         // restarts left three of them, all called the same thing.
         //
-        // A MANAGED agent is left merely lost: its process may well still be
-        // running, and the node can adopt it again when it returns.
+        // A MANAGED agent is left merely disconnected: its process may well
+        // still be running, and the node can adopt it again when it returns.
         let _ = db.execute(
             "UPDATE agents SET exited_at_ms = ?
               WHERE node_id = ? AND exited_at_ms IS NULL AND provenance = 'attached'",
@@ -900,7 +933,7 @@ impl AppState {
         let _ = db.execute(
             "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
              WHERE acked_at_ms IS NULL AND inflight_agent IN
-                (SELECT id FROM agents WHERE node_id = ? AND status = 'lost')",
+                (SELECT id FROM agents WHERE node_id = ? AND status = 'disconnected')",
             [node_id],
         );
     }
@@ -1131,7 +1164,7 @@ pub fn reconcile_agents(db: &Connection, node_id: &str, live: &[String]) -> Vec<
 /// At startup nothing is connected, so nothing has been confirmed by anyone.
 pub fn demote_running(db: &Connection) -> usize {
     db.execute(
-        "UPDATE agents SET status = 'lost'
+        "UPDATE agents SET status = 'disconnected'
          WHERE exited_at_ms IS NULL AND status = 'running' AND provenance <> 'external'",
         [],
     )
@@ -1367,8 +1400,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(demote_running(&db), 2);
-        assert_eq!(status_of(&db, "ag-a").0, "lost");
-        assert_eq!(status_of(&db, "ag-b").0, "lost");
+        assert_eq!(status_of(&db, "ag-a").0, "disconnected");
+        assert_eq!(status_of(&db, "ag-b").0, "disconnected");
         assert_eq!(
             status_of(&db, "ag-x").0,
             "running",
@@ -1385,13 +1418,13 @@ mod tests {
         let stale = now_ms() - proto::NODE_LEASE_MS as i64 - 1;
         db.execute("UPDATE agents SET last_seen_ms = ? WHERE id = 'ag-a'", [stale]).unwrap();
         db.execute(
-            "UPDATE agents SET status = 'lost'
+            "UPDATE agents SET status = 'disconnected'
              WHERE exited_at_ms IS NULL AND status = 'running'
                AND provenance <> 'external' AND last_seen_ms < ?",
             [now_ms() - proto::NODE_LEASE_MS as i64],
         )
         .unwrap();
-        assert_eq!(status_of(&db, "ag-a").0, "lost");
+        assert_eq!(status_of(&db, "ag-a").0, "disconnected");
         assert_eq!(status_of(&db, "ag-b").0, "running");
     }
 

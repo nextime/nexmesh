@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""An interactive 'agent' that can be TYPED at, the way a real TUI is.
+
+Prints a prompt, echoes each line it reads, and records what it read to
+$FAKETYPED_LOG so a test can prove the CLI itself received a message rather
+than merely that the node wrote one.
+
+Typing `dialog` makes it put a permission prompt on the screen for a few
+seconds. Nothing must be typed at it while that is up: the text would be
+swallowed and the Enter after it would answer the question.
+"""
+import os, sys, time
+
+if "--version" in sys.argv:
+    print("faketyped 1.0.0"); sys.exit(0)
+
+LOG = os.environ.get("FAKETYPED_LOG", "/dev/null")
+HOLD = float(os.environ.get("FAKETYPED_DIALOG_SECONDS", "7"))
+
+def note(what):
+    with open(LOG, "a") as f:
+        f.write(f"{time.time():.3f} {what}\n")
+        f.flush()
+
+print(f"FAKETYPED READY tty={sys.stdin.isatty()}", flush=True)
+print("> ", end="", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    note(line)
+    if line in ("quit", "exit"):
+        print("\nbye", flush=True); break
+    if "dialog" in line:
+        # What a permission prompt looks like, escapes and box and all.
+        print("\n\x1b[36m╭─────────────────────────────╮\x1b[0m", flush=True)
+        print("\x1b[1m│ Do you want to make this edit?\x1b[0m", flush=True)
+        print("\x1b[32m│ \x1b[0m\x1b[7m❯ 1. Yes\x1b[0m", flush=True)
+        print("│   2. No", flush=True)
+        print("\x1b[36m╰─────────────────────────────╯\x1b[0m", flush=True)
+        sys.stdout.flush()
+        time.sleep(HOLD)
+        note("dialog answered by the operator")
+        print("\n\x1b[2mEdit applied.\x1b[0m", flush=True)
+        print("> ", end="", flush=True)
+        continue
+    print(f"\nread: {line}", flush=True)
+    print("> ", end="", flush=True)

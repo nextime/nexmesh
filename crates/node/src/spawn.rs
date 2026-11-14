@@ -309,6 +309,23 @@ pub fn push_capable(driver: &DriverSpec) -> bool {
     }
 }
 
+/// May the hub push a message to this agent rather than wait for its next
+/// tool call -- and if so, is it safe to?
+///
+/// Two routes, one answer. A structured driver takes the message on stdin as
+/// a frame. A pty takes it as keystrokes at the CLI's own prompt, which is
+/// the only route an interactive seat has.
+///
+/// The gate is the DRIVER in both cases, and that is the safety property
+/// worth stating plainly: an adopted tmux session also has a pty, but what is
+/// in that pane may be a shell prompt, where typing a teammate's message
+/// would EXECUTE it. Such a session is `mcp_only` and so excluded. A driver
+/// that takes structured input is proof the process on the other end is the
+/// CLI the node started.
+pub fn pushable(driver: &DriverSpec, mode: RunMode, typable: bool) -> bool {
+    push_capable(driver) && (matches!(mode, RunMode::Headless) || typable)
+}
+
 /// Everything both spawn paths do once the process exists: record the identity
 /// triple, register it, and tell the hub.
 async fn register_started(
@@ -334,6 +351,8 @@ async fn register_started(
             driver: driver.clone(),
         },
     );
+    // Read before the handle is given away: the map owns it after this.
+    let (typable, io_kind) = (io.typable(), io.io_kind_name().to_string());
     ctx.io.lock().unwrap().insert(spec.agent_id.clone(), io);
 
     ctx.send_hub(&proto::NodeToHub::AgentUp {
@@ -343,11 +362,16 @@ async fn register_started(
         provenance: Provenance::Managed,
         cwd: spec.cwd.clone(),
         resume_handle: None,
-        // A driver's fast path is a HEADLESS mechanism. An interactive slot
-        // has a pty instead, where an injected message would be typed into
-        // whatever the agent's TUI is showing; delivery there rides the MCP
-        // floor, which is correct if slower.
-        push_capable: push_capable(&driver) && matches!(spec.mode, RunMode::Headless),
+        // A driver's structured fast path is a HEADLESS mechanism. An
+        // interactive slot has a pty instead -- and a pty is a keyboard, so
+        // the message is typed at the CLI's own prompt exactly as a person
+        // would type it. That is worth having: delivery there used to wait
+        // for the agent to call a tool of its own accord, which for an
+        // interactive seat can be a very long time, or never.
+        //
+        // The gate is the DRIVER, not the terminal: see `pushable`.
+        push_capable: pushable(&driver, spec.mode, typable),
+        io_kind: Some(io_kind),
     })
     .await?;
     Ok(identity)
@@ -1033,15 +1057,28 @@ mod push_tests {
     }
 
     #[test]
-    fn an_interactive_slot_is_never_pushed_to_even_with_a_driver() {
-        // register_started combines push_capable with the run mode; this test
-        // pins the intent, since the consequence of getting it wrong is a
-        // teammate's message being typed into somebody's terminal.
+    fn an_interactive_seat_is_pushed_to_through_its_terminal() {
+        // An interactive seat used to be left to the MCP floor entirely, so a
+        // task sent to one waited until the agent happened to call a tool --
+        // minutes, or for a seat sitting at its prompt, never.
         use nexmesh_proto::RunMode;
         let driver = DriverSpec::StreamJson { replay_user_messages: true };
-        let decide = |mode: RunMode| push_capable(&driver) && matches!(mode, RunMode::Headless);
-        assert!(decide(RunMode::Headless));
-        assert!(!decide(RunMode::Interactive));
+        assert!(super::pushable(&driver, RunMode::Headless, false));
+        assert!(super::pushable(&driver, RunMode::Interactive, true));
+        // No terminal and not headless is nothing to write to.
+        assert!(!super::pushable(&driver, RunMode::Interactive, false));
+    }
+
+    #[test]
+    fn an_adopted_terminal_is_never_typed_at() {
+        // THE safety property of the pty route. An adopted tmux pane has a
+        // real pty, and what is sitting in it may be a shell prompt, where a
+        // teammate's message plus the Enter after it would be EXECUTED.
+        // Adoption is `mcp_only` precisely because nothing vouches for what
+        // is in the pane, so no amount of terminal makes it typeable.
+        use nexmesh_proto::RunMode;
+        assert!(!super::pushable(&DriverSpec::McpOnly, RunMode::Interactive, true));
+        assert!(!super::pushable(&DriverSpec::McpOnly, RunMode::Headless, true));
     }
 
     #[test]

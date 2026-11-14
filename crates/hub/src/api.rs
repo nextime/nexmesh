@@ -148,7 +148,7 @@ pub async fn remove_slot(
     let live: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM agents
-              WHERE slot_id = ? AND exited_at_ms IS NULL AND status <> 'lost'
+              WHERE slot_id = ? AND exited_at_ms IS NULL AND status <> 'disconnected'
                 AND COALESCE(last_seen_ms, 0) > ?",
             params![id, cutoff],
             |r| r.get(0),
@@ -272,6 +272,9 @@ pub async fn rename_session(
     if name.chars().count() > 64 {
         return Err(bad("a session name must be 64 characters or fewer"));
     }
+    // Renaming by the CURRENT name is the usual case: nobody reads a session
+    // id off the screen to type it back in.
+    let id = session_ref_to_id(&st.db.lock().unwrap(), &id);
     let db = st.db.lock().unwrap();
     let n = db
         .execute("UPDATE sessions SET name = ? WHERE id = ?", params![name, id])
@@ -784,12 +787,14 @@ pub struct AdoptRequest {
 /// rather than plumbing pipe-pane and send-keys.
 pub async fn adopt_slot(
     State(st): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(session_ref): Path<String>,
     Json(req): Json<AdoptRequest>,
 ) -> ApiResult {
     if req.tmux_target.trim().is_empty() {
         return Err(bad("tmux_target must not be empty"));
     }
+    // Named or identified, like every other session-scoped call.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     {
         let db = st.db.lock().unwrap();
@@ -1389,7 +1394,7 @@ pub async fn tidy_seats(
         let alive: bool = db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM agents WHERE slot_id = ?
-                                AND exited_at_ms IS NULL AND status <> 'lost')",
+                                AND exited_at_ms IS NULL AND status <> 'disconnected')",
                 [&row.0],
                 |r| r.get(0),
             )
@@ -1411,7 +1416,7 @@ pub async fn tidy_seats(
             .query_row(
                 "SELECT s.id FROM slots s
                    JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
-                                AND a.status <> 'lost'
+                                AND a.status <> 'disconnected'
                   WHERE s.session_id = ?1 AND COALESCE(s.cli_id,'') = ?2
                     AND a.node_id = ?3 AND a.cwd = ?4 LIMIT 1",
                 params![session_id, cli, node, cwd],
@@ -1442,7 +1447,8 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 s.participant_kind, COALESCE(s.cli_id, '-'), s.task_state,
                 s.summary, COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
                 COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external' ELSE '-' END),
-                COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0), s.paused
+                COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0), s.paused,
+                a.pid, a.io_kind, a.id, a.exited_at_ms
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
@@ -1462,6 +1468,14 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 "status": r.get::<_, String>(8)?, "host": r.get::<_, String>(9)?,
                 "input_tokens": r.get::<_, i64>(10)?, "output_tokens": r.get::<_, i64>(11)?,
                 "paused": r.get::<_, i64>(12)? == 1,
+                // The process behind the seat, and whether it has a terminal.
+                // A seat reading `idle` with nothing running behind it is how
+                // an attach fails for no visible reason: the task state
+                // describes the WORK, which outlives the process doing it.
+                "pid": r.get::<_, Option<i64>>(13)?,
+                "io_kind": r.get::<_, Option<String>>(14)?,
+                "agent_id": r.get::<_, Option<String>>(15)?,
+                "exited": r.get::<_, Option<i64>>(16)?.is_some(),
             }))
         })
         .and_then(|m| m.collect())
@@ -1547,8 +1561,14 @@ pub async fn agent_transcript(
 /// operator can say `nexmesh transcript Max` instead of hunting an agent id.
 pub async fn resolve_agent(
     State(st): State<AppState>,
-    Path((session_id, who)): Path<(String, String)>,
+    Path((session_ref, who)): Path<(String, String)>,
 ) -> ApiResult {
+    // A session may be named, not only identified -- and `nexmesh attach
+    // orchestrator Max` passes the name, because every other command takes
+    // one. Without this the lookup compared a name against session ids,
+    // matched nothing, and reported no agent for a seat that was listed on
+    // screen a second earlier.
+    let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let db = st.db.lock().unwrap();
     let found: Option<(String, String)> = db
         .query_row(
@@ -1564,8 +1584,51 @@ pub async fn resolve_agent(
         )
         .optional()
         .map_err(bad)?;
-    let (agent_id, name) = found.ok_or_else(|| bad(format!("no agent matching '{who}'")))?;
-    Ok(Json(json!({ "agent_id": agent_id, "name": name })))
+    // "No agent matching" is true of a seat nobody is sitting in, and
+    // unhelpful: the seat is in every listing, so the operator is left
+    // doubting the name they just read. Say which of the two it is.
+    let (agent_id, name) = match found {
+        Some(v) => v,
+        None => {
+            let seat: Option<(String, String)> = db
+                .query_row(
+                    "SELECT id, COALESCE(display_name, role, id) FROM slots
+                      WHERE session_id = ?1
+                        AND (id = ?2 OR LOWER(COALESCE(display_name,'')) = LOWER(?2)
+                             OR LOWER(COALESCE(role,'')) = LOWER(?2))
+                      ORDER BY created_at_ms DESC LIMIT 1",
+                    params![session_id, who],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(bad)?;
+            return Err(match seat {
+                Some((slot_id, seat_name)) => bad(format!(
+                    "seat {slot_id} ({seat_name}) has no process behind it: nothing has \
+                     connected to it yet, or what did has gone. Start the CLI there again, \
+                     or `nexmesh spawn` into the seat."
+                )),
+                None => bad(format!("no agent or seat matching '{who}' in this session")),
+            });
+        }
+    };
+    // Whether that agent is still there. The newest agent for a seat is the
+    // right answer for `transcript`, which reads what a finished agent said,
+    // and the wrong one for `attach`, which needs a process -- so the caller
+    // is told rather than left to find out from a failure further on.
+    let live: Option<(String, Option<i64>)> = db
+        .query_row(
+            "SELECT status, exited_at_ms FROM agents WHERE id = ?",
+            [&agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(bad)?;
+    let (status, exited) = live.unwrap_or_else(|| ("unknown".into(), None));
+    Ok(Json(json!({
+        "agent_id": agent_id, "name": name,
+        "status": status, "exited": exited.is_some(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1927,7 +1990,7 @@ pub(crate) fn touch_participant(st: &AppState, agent_id: &str) {
     let now = now_ms();
     let _ = db.execute(
         "UPDATE agents SET last_seen_ms = ?, lease_expires_ms = ?,
-            status = CASE WHEN status = 'lost' THEN 'running' ELSE status END
+            status = CASE WHEN status = 'disconnected' THEN 'running' ELSE status END
          WHERE id = ?",
         params![now, now + proto::NODE_LEASE_MS as i64, agent_id],
     );

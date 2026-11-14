@@ -613,6 +613,17 @@ async fn attach(
     bail_on_error(&r)?;
     let agent = r["agent_id"].as_str().context("no agent id returned")?.to_string();
     let name = r["name"].as_str().unwrap_or(who).to_string();
+    // There is a terminal to attach to only while there is a process. Saying
+    // so here beats failing inside the websocket upgrade, where the reason
+    // reads like a transport problem.
+    if r["exited"].as_bool() == Some(true) || r["status"].as_str() == Some("disconnected") {
+        anyhow::bail!(
+            "{name} has no process to attach to right now (its last agent is {}).\n\
+             Read what it said with:  nexmesh transcript {session} {who}\n\
+             Put something in the seat with:  nexmesh spawn {session} {who}",
+            r["status"].as_str().unwrap_or("gone")
+        );
+    }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
@@ -1014,9 +1025,21 @@ async fn main() -> Result<()> {
             // SEAT id, which is what the hub and half the API speak. Showing
             // one here and the other there is how a rename gets applied to
             // the wrong agent: it happened on this fleet.
+            // AGENT and STATE are two different questions and reading one
+            // for the other wastes an afternoon: STATE is the WORK (idle,
+            // working, released), which outlives the process doing it, while
+            // AGENT is whether there is a process there at all. A seat
+            // reading `idle` with nothing behind it cannot be attached to,
+            // messaged, or spawned into without taking the seat back first.
+            //
+            // PID and IO say which process and whether it has a terminal:
+            // `pty` can be attached to and typed at, `pipes` can be watched,
+            // and a blank means the node never started it -- it connected to
+            // the node itself, so only its own shim can reach it.
             println!(
-                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<15} {:>8} SUMMARY",
-                "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "TOKENS"
+                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} SUMMARY",
+                "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "AGENT", "PID", "IO",
+                "TOKENS"
             );
             for a in rows {
                 let tin = a["input_tokens"].as_i64().unwrap_or(0);
@@ -1027,7 +1050,7 @@ async fn main() -> Result<()> {
                     format!("{}/{}", human(tin), human(tout))
                 };
                 println!(
-                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<15} {:>8} {}",
+                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} {}",
                     a["name"].as_str().unwrap_or("?"),
                     a["slot_id"].as_str().unwrap_or("-"),
                     // Which program is in the seat. Worth a column of its
@@ -1043,11 +1066,16 @@ async fn main() -> Result<()> {
                     } else {
                         a["task_state"].as_str().unwrap_or("-").to_string()
                     },
+                    a["status"].as_str().unwrap_or("-"),
+                    a["pid"].as_i64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    a["io_kind"].as_str().unwrap_or("-"),
                     tokens,
                     a["summary"].as_str().unwrap_or(""),
                 );
             }
-            println!("\n  (TOKENS = input/output)");
+            println!(
+                "\n  (TOKENS = input/output; STATE is the work, AGENT the process behind it)"
+            );
         }
 
         Cmd::Certs => {

@@ -105,6 +105,25 @@ impl AgentIo {
         self.master.lock().unwrap().is_some()
     }
 
+    /// Can a message be TYPED at this agent?
+    ///
+    /// A pty with an input channel is a keyboard, and a CLI sitting at its
+    /// own prompt reads what is typed there exactly as it reads what a human
+    /// types. That is a delivery route for an interactive agent, which
+    /// otherwise has none until it calls a tool of its own accord.
+    pub fn typable(&self) -> bool {
+        self.kind == IoKind::Pty && self.input.is_some()
+    }
+
+    /// What the hub records for this agent's I/O. `None` for an agent the
+    /// node never started: there is no terminal and no pipe to speak of.
+    pub fn io_kind_name(&self) -> &'static str {
+        match self.kind {
+            IoKind::Pty => "pty",
+            IoKind::Pipes => "pipes",
+        }
+    }
+
     pub fn read_only(&self) -> bool {
         // An agent that runs its own server can have a terminal opened onto it
         // on demand, so it is not read-only even though it has no pty of its

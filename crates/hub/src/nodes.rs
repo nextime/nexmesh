@@ -210,13 +210,13 @@ async fn handle(
                 if a.alive {
                     db.execute(
                         "UPDATE agents SET last_seen_ms = ?, status =
-                            CASE WHEN status = 'lost' THEN 'running' ELSE status END
+                            CASE WHEN status = 'disconnected' THEN 'running' ELSE status END
                          WHERE id = ?",
                         params![now_ms(), a.agent_id],
                     )?;
                 } else {
                     db.execute(
-                        "UPDATE agents SET status = 'lost' WHERE id = ? AND exited_at_ms IS NULL",
+                        "UPDATE agents SET status = 'disconnected' WHERE id = ? AND exited_at_ms IS NULL",
                         [&a.agent_id],
                     )?;
                 }
@@ -224,19 +224,21 @@ async fn handle(
         }
 
         NodeToHub::AgentUp {
-            agent_id, slot_id, proc: id, provenance, cwd, resume_handle, push_capable,
+            agent_id, slot_id, proc: id, provenance, cwd, resume_handle, push_capable, io_kind,
         } => {
             let db = st.db.lock().unwrap();
             let now = now_ms();
             db.execute(
                 "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance,
-                                     status, cwd, started_at_ms, last_seen_ms, push_capable)
-                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9)
-                 ON CONFLICT(id) DO UPDATE SET status = 'running', last_seen_ms = ?8",
+                                     status, cwd, started_at_ms, last_seen_ms, push_capable,
+                                     io_kind)
+                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9,?10)
+                 ON CONFLICT(id) DO UPDATE SET status = 'running', last_seen_ms = ?8,
+                                               io_kind = COALESCE(?10, io_kind)",
                 params![
                     agent_id, slot_id, node_id, id.pid, id.start_ticks,
                     serde_json::to_value(provenance)?.as_str().unwrap_or("managed"),
-                    cwd, now, push_capable as i64
+                    cwd, now, push_capable as i64, io_kind
                 ],
             )?;
             db.execute("UPDATE slots SET status = 'connected' WHERE id = ?", [&slot_id])?;
@@ -905,7 +907,7 @@ fn join(
                 AND NOT EXISTS (
                     SELECT 1 FROM agents a
                      WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL
-                       AND a.status <> 'lost'
+                       AND a.status <> 'disconnected'
                        AND a.provenance = 'attached')
                 AND EXISTS (
                     SELECT 1 FROM agents a

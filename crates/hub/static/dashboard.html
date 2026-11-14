@@ -1012,7 +1012,11 @@ function viewAgents(d, now) {
               onclick="editRole('${esc(a.slot_id)}', '${esc(a.role).replace(/'/g, "\\'")}')"
               id="rl-${esc(a.slot_id)}">${esc(a.role)}</span></td>
         <td><span class="mono">${esc(a.host)}</span>
-            ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}</td>
+            ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}
+            ${a.pid ? `<br><span class="tiny muted" title="the process behind this seat${
+                a.io_kind === "pty" ? " — it has a terminal, so it can be attached to and typed at"
+              : a.io_kind === "pipes" ? " — pipes, so it can be watched but not typed at"
+              : ""}">pid ${a.pid}${a.io_kind ? " · " + esc(a.io_kind) : ""}</span>` : ""}</td>
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
             <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
         <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span>

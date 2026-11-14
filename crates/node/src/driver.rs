@@ -17,7 +17,7 @@
 //!   - `assistant` events carry `message.usage` per API call; the turn's
 //!     `result` carries the totals.
 
-use crate::ctx::{AgentIo, Injected, NodeCtx};
+use crate::ctx::{AgentIo, Injected, IoKind, NodeCtx};
 use nexmesh_proto::{self as proto, Envelope};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -46,20 +46,170 @@ pub fn render_injection(messages: &[Envelope]) -> String {
     body
 }
 
-/// Write a batch to the CLI's stdin and remember it until it is echoed back.
-pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<()> {
+/// How a batch reads when it has to be TYPED at a terminal.
+///
+/// A TUI submits on the first newline, so the rendering above would arrive as
+/// one message followed by several stray empty submits. The same wording goes
+/// onto a single line instead, with no newline in it until the Enter that
+/// sends it. Each body is collapsed the same way, because a teammate who
+/// writes a paragraph should not be able to submit on your behalf.
+pub fn render_injection_line(messages: &[Envelope]) -> String {
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut body = String::from("[PENDING MESSAGES] ");
+    for (i, m) in messages.iter().enumerate() {
+        if i > 0 {
+            body.push_str(" | ");
+        }
+        body.push_str(&format!(
+            "from {}: {}",
+            m.from_name.as_deref().unwrap_or("orchestrator"),
+            flat(&m.body)
+        ));
+    }
+    body.push_str(" | respond to these before continuing.");
+    body
+}
+
+/// Drop ANSI escapes so the tail of a screen can be matched as text.
+///
+/// A TUI's output is mostly cursor movement and colour; `❯ 1. Yes` arrives
+/// wrapped in both. Only CSI and the two-byte escapes are handled, which is
+/// everything a CLI emits in practice.
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI and OSC run until a final byte; everything between is
+            // parameters, not text.
+            Some('[') => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() || n == '~' {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\u{7}' || n == '\u{1b}' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Lines with something on them, decoration dropped.
+///
+/// A TUI frames everything, so `│   2. No` and `╰────────╯` are the same line
+/// of content and no line at all respectively. Judging a screen means judging
+/// what it SAYS.
+fn meaningful(text: &str) -> Vec<String> {
+    const FRAME: &[char] = &[
+        '│', '|', '╭', '╰', '╮', '╯', '┌', '└', '┐', '┘', '├', '┤', '─', '━', '═',
+        '-', '=', '*', '•', ' ', '\t',
+    ];
+    text.lines()
+        .map(|l| l.trim().trim_start_matches(FRAME).trim_end_matches(FRAME).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Does this line look like a CLI sitting at its own input prompt?
+///
+/// The strongest evidence there is that nothing is waiting for an answer:
+/// a prompt is drawn when the question is over. Short on purpose -- `>`,
+/// `❯`, `agent>` -- so that a sentence ending in a bracket is not mistaken
+/// for one.
+fn is_prompt(line: &str) -> bool {
+    let l = line.trim_end();
+    (l.ends_with('>') || l.ends_with('❯')) && l.chars().count() <= 12
+}
+
+/// Is this screen waiting for an ANSWER rather than for a message?
+///
+/// Typing at a permission prompt delivers nothing: the text is swallowed by a
+/// menu that does not take text, and the Enter after it answers the question
+/// -- usually by accepting it. An injected teammate message must never be the
+/// thing that approves a tool call nobody read. So when the bottom of the
+/// screen looks like a prompt awaiting a choice, nothing is typed; the batch
+/// goes back in the queue and the next tick looks again.
+///
+/// Only the BOTTOM is examined, and a prompt on the last line clears it
+/// outright. Scrollback is append-only -- a dialog that was answered minutes
+/// ago is still in it -- so a rule that searched the whole tail would block
+/// delivery for the rest of the agent's life the first time anyone was asked
+/// anything. A question is the last thing on a screen; an answered one is not.
+pub fn awaiting_answer(screen: &str) -> Option<String> {
+    let lines = meaningful(&strip_ansi(screen));
+    // A prompt means the CLI is done asking and is waiting to be typed at,
+    // which is the whole point of looking.
+    if lines.last().map(|l| is_prompt(l)).unwrap_or(false) {
+        return None;
+    }
+    for line in lines.iter().rev().take(4) {
+        let low = line.to_lowercase();
+        for pat in [
+            "(y/n)", "[y/n]", "(yes/no)", "do you want", "do you trust",
+            "press enter to", "esc to cancel", "overwrite?",
+        ] {
+            if low.contains(pat) {
+                return Some(pat.to_string());
+            }
+        }
+        // A menu option, with or without the cursor on it: `❯ 1. Yes`, `2. No`.
+        let opt = low.trim_start_matches(['❯', '>']).trim_start();
+        let mut c = opt.chars();
+        if let (Some(d), Some(sep)) = (c.next(), c.next()) {
+            if d.is_ascii_digit() && (sep == '.' || sep == ')') && !opt[2..].trim().is_empty() {
+                return Some("a numbered prompt".to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Write a batch to the CLI's stdin, or type it at the CLI's terminal.
+///
+/// Returns the ids that are delivered as far as anything will ever say so.
+/// For a structured driver that is empty: the CLI echoes the message back and
+/// THAT is the ack, matched later. A terminal has no echo worth parsing, so a
+/// successful write is the only evidence there will ever be and the caller
+/// acks on it -- which is also what a human pressing Enter amounts to.
+pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<Vec<i64>> {
     // Codex (JSON-RPC) and opencode (HTTP) take whole messages, not bytes on
     // stdin, and each acks itself once its call returns, so there is nothing
     // pending to record here.
     if let Some(push) = &io.push {
-        return push
-            .send(messages.to_vec())
+        push.send(messages.to_vec())
             .await
-            .map_err(|_| anyhow::anyhow!("this agent's driver has stopped"));
+            .map_err(|_| anyhow::anyhow!("this agent's driver has stopped"))?;
+        return Ok(vec![]);
     }
     let Some(tx) = &io.input else {
         anyhow::bail!("this agent has no input channel");
     };
+    // A terminal is not a stdin: a stream-json frame typed at a TUI shows up
+    // as a line of JSON in the chat box. Type what a person would type.
+    if io.kind == IoKind::Pty {
+        if let Some(why) = awaiting_answer(&String::from_utf8_lossy(&io.scrollback(4096))) {
+            anyhow::bail!("the terminal is waiting for an answer ({why})");
+        }
+        let line = format!("{}\r", render_injection_line(messages));
+        tx.send(line.into_bytes())
+            .await
+            .map_err(|_| anyhow::anyhow!("the agent's terminal is closed"))?;
+        return Ok(messages.iter().map(|m| m.id).collect());
+    }
     let text = render_injection(messages);
     let line = format!("{}\n", user_message(&text));
     // Record BEFORE writing: if the echo arrived first we would have nothing
@@ -71,7 +221,7 @@ pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<
     tx.send(line.into_bytes())
         .await
         .map_err(|_| anyhow::anyhow!("the agent's input channel is closed"))?;
-    Ok(())
+    Ok(vec![])
 }
 
 #[derive(Default)]
@@ -213,6 +363,86 @@ mod tests {
             body: body.into(),
             sent_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn a_typed_batch_is_one_line() {
+        // A TUI submits on the first newline. A message containing newlines
+        // would otherwise arrive as a fragment plus a handful of stray
+        // submits -- and an empty submit at a Claude prompt is not harmless.
+        let line = render_injection_line(&[
+            env(1, "orchestrator", "ship it\nthen tell me"),
+            env(2, "Max", "and\t rebase  first"),
+        ]);
+        assert!(!line.contains('\n'), "{line}");
+        assert!(!line.contains('\r'), "{line}");
+        assert!(line.starts_with("[PENDING MESSAGES] "));
+        assert!(line.contains("from orchestrator: ship it then tell me"));
+        assert!(line.contains("from Max: and rebase first"));
+        assert!(line.ends_with("respond to these before continuing."));
+    }
+
+    #[test]
+    fn escapes_do_not_hide_a_prompt() {
+        // The tail of a real screen is mostly colour and cursor movement.
+        let screen = "\u{1b}[2K\u{1b}[36m╭────╮\u{1b}[0m\n\u{1b}[1m│ \u{1b}[32m❯ 1. Yes\u{1b}[0m\n";
+        assert_eq!(awaiting_answer(screen).as_deref(), Some("a numbered prompt"));
+    }
+
+    #[test]
+    fn a_dialog_is_never_typed_over() {
+        // Each of these swallows the text and reads the Enter after it as the
+        // ANSWER -- which for a permission prompt means approving a tool call
+        // nobody looked at. Delivery waits; it does not answer.
+        for screen in [
+            "Do you want to make this edit to main.rs?\n  1. Yes\n  2. No\n",
+            "Overwrite config.toml? (y/n) ",
+            "  Do you trust the files in this folder?\n",
+            "press enter to continue",
+        ] {
+            assert!(awaiting_answer(screen).is_some(), "{screen}");
+        }
+    }
+
+    #[test]
+    fn an_idle_prompt_is_typed_at() {
+        // The other half: a guard that never lets anything through is just
+        // the old behaviour with extra steps.
+        for screen in [
+            "\u{1b}[2m> \u{1b}[0m\n  ? for shortcuts\n",
+            "",
+            "● Done. Anything else?\n\n> ",
+            // A question in the agent's own prose is not a dialog: it has no
+            // choice to answer and the agent is waiting for input anyway.
+            "Should I also update the tests?\n\n> ",
+            // An agent that ends its turn with a numbered list is not asking
+            // anything. The prompt under it says so.
+            "Done:\n  1. parser fixed\n  2. test added\n\n❯ ",
+        ] {
+            assert_eq!(awaiting_answer(screen), None, "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn an_answered_dialog_stops_blocking() {
+        // Scrollback is append-only: the dialog is still in it after it has
+        // been answered. A rule that searched the whole tail blocked every
+        // message for the rest of the agent's life, the first time anyone was
+        // asked anything -- which is strictly worse than not typing at all.
+        let up = "│ Do you want to make this edit?\n│ ❯ 1. Yes\n│   2. No\n╰────╯\n";
+        assert!(awaiting_answer(up).is_some());
+        let answered = up.to_string() + "\n\u{1b}[2mEdit applied.\u{1b}[0m\n> ";
+        assert_eq!(awaiting_answer(&answered), None, "{answered:?}");
+    }
+
+    #[test]
+    fn a_three_option_dialog_is_caught_by_its_later_options() {
+        // The real one puts the cursor on `1.` and two more options under it,
+        // so the cursor line is already out of sight at the bottom of the
+        // screen. Every option counts, not just the selected one.
+        let screen = "│ Do you want to proceed?\n│ ❯ 1. Yes\n│   2. Yes, for this session\n\
+                      │   3. No, and tell me what to do differently\n";
+        assert_eq!(awaiting_answer(screen).as_deref(), Some("a numbered prompt"));
     }
 
     #[test]

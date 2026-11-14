@@ -1,0 +1,18 @@
+# Test-only descriptor: an INTERACTIVE agent with a real driver, which is the
+# shape a hand-run `claude` has. Its messages are typed at its terminal, so
+# this is the descriptor the pty-delivery test needs -- `faketui` has no
+# driver and stands for an adopted pane, which must never be typed at.
+[cli]
+id = "faketyped"
+display_name = "Fake typed TUI"
+command = "faketyped"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.interactive]
+args = []
+attachable = true
+
+[driver]
+kind = "stream_json"
+replay_user_messages = true

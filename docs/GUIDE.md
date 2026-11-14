@@ -382,6 +382,32 @@ guess: `--replay-user-messages` makes the CLI echo the message back, and only
 that echo marks it delivered. If the agent dies before echoing, the message
 returns to the queue for whoever fills the slot next.
 
+**A terminal is also an input stream.** An interactive seat has no stdin to
+frame a message into — it has a pty, and a pty is a keyboard. So the message is
+*typed* at the CLI's own prompt, flattened onto one line because a TUI submits
+on the first newline. That is the only route an interactive seat has: without
+it a task sent to one waits for the agent to call a tool of its own accord,
+which for a CLI sitting at its prompt can be a very long time, or never. There
+is no echo to parse, so the write is the acknowledgement — which is all that
+pressing Enter is, too.
+
+Two rules keep that honest, and both are worth stating plainly because the
+failure modes are not subtle:
+
+- **Only a seat with a real driver is typed at.** An adopted tmux pane has a
+  pty as well, and whatever is sitting in it may be a shell prompt, where a
+  teammate's message plus the Enter after it would be *executed*. Adoption is
+  `mcp_only` and so is excluded: a driver that takes structured input is the
+  proof that the process on the other end is the CLI the node started.
+- **Nothing is typed over a dialog.** A permission prompt does not take text;
+  it swallows what is typed and reads the Enter as the answer, which on a real
+  CLI means approving a tool call nobody looked at. When the bottom of the
+  screen looks like a prompt awaiting a choice, the batch goes back in the
+  queue and the next tick looks again. Only the bottom is examined, and a
+  prompt on the last line clears it outright — scrollback is append-only, so a
+  rule that searched the whole tail would block delivery for the rest of the
+  agent's life the first time anyone was asked anything.
+
 Everything in that path was verified against claude 2.1.322 rather than
 assumed, and two things were not what you would guess:
 
@@ -740,10 +766,18 @@ happened to be in the table, so a seat could report a live teammate hours
 after its process had died.
 
 So: an agent the node does not list has gone, and its seat is free. An agent
-nothing has confirmed for a whole lease is `lost` rather than `running`,
-whether the hub noticed the node leave or was itself restarted. A `lost`
-managed agent may still be alive — its node can adopt it back — but it is no
-longer something the fleet claims to be driving.
+nothing has confirmed for a whole lease is `disconnected` rather than
+`running`, whether the hub noticed the node leave or was itself restarted. A
+`disconnected` managed agent may still be alive — its node can adopt it back —
+but it is no longer something the fleet claims to be driving.
+
+The word is deliberate, and it used to be `lost`. What the hub knows when a
+heartbeat stops is that it has lost its *connection* to a process, and nothing
+beyond that: the CLI is very often still sitting in its terminal, perfectly
+alive, with its whole conversation intact. `lost` announced a death the hub had
+not witnessed, on a screen an operator reads to decide what to restart.
+`nexmesh status` prints the pid and the kind of I/O beside it, so "no longer
+connected" and "no longer there" can be told apart without guessing.
 
 ### Asking a teammate for something you cannot do
 

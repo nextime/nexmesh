@@ -246,7 +246,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                                   ELSE '-' END),
                             COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0),
                             COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
-                            a.id, s.mode, s.paused
+                            a.id, s.mode, s.paused, a.pid, a.io_kind
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
@@ -272,6 +272,12 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "agent_id": r.get::<_, Option<String>>(17)?,
                             "mode": r.get::<_, String>(18)?,
                             "paused": r.get::<_, i64>(19)? == 1,
+                            // Which process, and whether it has a terminal.
+                            // `pty` can be attached to and typed at, `pipes`
+                            // can only be watched, and nothing at all means
+                            // the node never started it.
+                            "pid": r.get::<_, Option<i64>>(20)?,
+                            "io_kind": r.get::<_, Option<String>>(21)?,
                         }))
                     })
                     .and_then(|m| m.collect())

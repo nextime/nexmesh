@@ -142,7 +142,24 @@ Every machine, whether it is connected, and which agent CLIs it has.
 Every session, with how many seats each holds.
 .TP
 .BI status " SESSION"
-Every seat in one session: role, machine, state, tokens, summary.
+Every seat in one session: role, machine, work state, tokens, summary, and the
+process behind it \(em its status, pid and whether it has a terminal.
+.B STATE
+is the work and outlives the process doing it;
+.B AGENT
+is whether there is a process there at all. A seat reading
+.I idle
+with
+.I disconnected
+beside it cannot be attached to or spawned into until something takes the seat
+again. An
+.B IO
+of
+.I pty
+can be attached to and typed at,
+.I pipes
+can be watched, and a blank means the node never started that process \(em it
+connected on its own, so only its own shim reaches it.
 .TP
 .BI log " SESSION " [ \-\-follow ]
 What the agents have said to each other, with delivery state.

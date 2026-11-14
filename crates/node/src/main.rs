@@ -757,16 +757,31 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                     .await;
                 return;
             };
-            if let Err(e) = driver::inject(&io, &messages).await {
-                tracing::warn!(%agent_id, error = %e, "injection failed");
-                let _ = ctx
-                    .send_hub(&NodeToHub::InjectionsLost {
-                        agent_id,
-                        message_ids: messages.iter().map(|m| m.id).collect(),
-                    })
-                    .await;
-            } else {
-                tracing::info!(%agent_id, count = messages.len(), "injected mid-turn");
+            match driver::inject(&io, &messages).await {
+                Err(e) => {
+                    // Requeueing is the whole of the recovery here: a
+                    // terminal that was mid-dialog is typeable a moment
+                    // later, and until then the MCP floor is still there.
+                    tracing::debug!(%agent_id, reason = %e, "not injecting; requeueing");
+                    let _ = ctx
+                        .send_hub(&NodeToHub::InjectionsLost {
+                            agent_id,
+                            message_ids: messages.iter().map(|m| m.id).collect(),
+                        })
+                        .await;
+                }
+                // Typed at a terminal: the write is the only confirmation
+                // there is, so say so now rather than leave the batch in
+                // flight for the stale sweep to deliver all over again.
+                Ok(acked) if !acked.is_empty() => {
+                    tracing::info!(%agent_id, count = acked.len(), "typed at the agent's terminal");
+                    let _ = ctx
+                        .send_hub(&NodeToHub::MessageAcked { agent_id, message_ids: acked })
+                        .await;
+                }
+                Ok(_) => {
+                    tracing::info!(%agent_id, count = messages.len(), "injected mid-turn");
+                }
             }
         }
 

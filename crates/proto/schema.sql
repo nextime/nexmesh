@@ -464,9 +464,18 @@ CREATE TABLE IF NOT EXISTS agents (
   -- something if you know which model spent them.
   model             TEXT,
   -- Whether this agent's driver can take a message mid-turn. Decides whether
-  -- the hub pushes to it or waits for its next tool result.
+  -- the hub pushes to it or waits for its next tool result. True for a
+  -- structured driver on pipes, and for an interactive seat with a terminal
+  -- of its own, where the message is typed at the CLI's prompt.
   push_capable      INTEGER NOT NULL DEFAULT 0,
-  status            TEXT NOT NULL,             -- starting|running|idle|exited|lost
+  -- pty | pipes, or NULL for a process the node never started and so has no
+  -- I/O for. A pty is a keyboard: it is what makes a seat attachable, and
+  -- typeable.
+  io_kind           TEXT,
+  -- starting|running|idle|exited|disconnected. `disconnected` is deliberate
+  -- and replaced `lost`: the hub has lost its connection to the process, not
+  -- the process. The CLI is frequently still there.
+  status            TEXT NOT NULL,
   -- Liveness for agents with no process we can see: refreshed by the
   -- participant API, swept like a node lease.
   lease_expires_ms  INTEGER,

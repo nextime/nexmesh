@@ -4,7 +4,7 @@
 The node dials the hub and reconnects with backoff. The shim between a CLI
 and that node did not: a node restart -- an upgrade, a reboot -- left every
 attached CLI talking to a dead socket for the rest of its conversation. The
-seat read `lost` for ever and the only cure was restarting the CLI itself,
+seat read `disconnected` for ever and the only cure was restarting the CLI,
 which is the one thing a long conversation cannot afford.
 
 So: drive a shim through a tool call, kill the node under it, start a new

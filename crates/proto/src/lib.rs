@@ -258,6 +258,13 @@ pub enum NodeToHub {
         /// whether to push messages or let them ride on a tool result.
         #[serde(default)]
         push_capable: bool,
+        /// `pty` for an agent with a terminal of its own, `pipes` for one run
+        /// on pipes, absent for one the node never started and so has no I/O
+        /// for at all. Worth recording because it is the difference between
+        /// a seat you can attach to and type at and one you can only read --
+        /// which until now could be discovered only by trying.
+        #[serde(default)]
+        io_kind: Option<String>,
     },
     /// A handle that lets a respawned agent pick up where this one left off
     /// (Claude's session id, Codex's thread id). Learned after startup, so it
