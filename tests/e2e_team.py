@@ -293,6 +293,12 @@ def main():
     # And when the CLI seat reads it too, the team really has heard it.
     t = max_.tool("check_team_status")
     check("the CLI seat still gets its own copy", "who is awake in here?" in t, t[:300])
+    # And it is told who asked, and how to answer them. An agent told only to
+    # "respond" answered a sibling seat instead, and the operator's question
+    # read as ignored.
+    check("the operator is named as the operator, not as a teammate",
+          "from the OPERATOR" in t, t[:400])
+    check("and the way back to them is spelled out", "broadcast" in t, t[:400])
     m = team_msg()
     check("once every seat has seen it, it is delivered",
           m.get("seen") == m.get("audience") and m.get("delivered") is True, str(m)[:300])

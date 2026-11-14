@@ -173,6 +173,45 @@ pub struct Envelope {
     pub sent_at_ms: Ms,
 }
 
+/// Queued messages, as an agent reads them on a tool result.
+///
+/// One convention for every delivery path -- the shim, the hub's own MCP
+/// door, the driver plugins -- because an agent that sees two conventions
+/// learns neither.
+///
+/// The operator gets a line of their own. A message with no sending slot is
+/// from the person running the fleet, who is reading the session's chat, and
+/// an agent told only to "respond" has no way to know that a reply to a
+/// TEAMMATE does not reach them. One did exactly that: it was asked in the
+/// chat whether it was connected, answered a sibling seat, and the question
+/// read as ignored.
+pub fn render_pending(deliver: &[Envelope]) -> String {
+    if deliver.is_empty() {
+        return String::new();
+    }
+    let mut body = String::from("[PENDING MESSAGES]\n");
+    let mut from_operator = false;
+    for m in deliver {
+        let who = match (&m.from_slot, &m.from_name) {
+            (None, _) => {
+                from_operator = true;
+                "the OPERATOR".to_string()
+            }
+            (Some(_), Some(n)) => n.clone(),
+            (Some(_), None) => "a teammate".to_string(),
+        };
+        body.push_str(&format!("- from {}: {}\n", who, m.body));
+    }
+    body.push_str("[END PENDING MESSAGES]\n");
+    if from_operator {
+        body.push_str(
+            "The operator is a person, reading this session's chat. Answer them with              `broadcast` -- that is what they see. A message addressed to a teammate              does not reach them, and `notify_operator` reaches their inbox rather than              the chat they asked in.\n",
+        );
+    }
+    body.push_str("Respond to these before continuing.\n\n");
+    body
+}
+
 // ------------------------------------------------------- spawn request ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -100,20 +100,13 @@ fn origin_ok(headers: &HeaderMap, host: Option<&str>) -> bool {
 }
 
 /// Messages rendered the way every other delivery path renders them, so an
-/// agent sees one convention whichever door it came through.
+/// agent sees one convention whichever door it came through. The rendering
+/// itself lives in `proto`, which is what makes that true.
 fn with_pending(text: &str, deliver: &[Envelope]) -> String {
     if deliver.is_empty() {
         return text.to_string();
     }
-    let mut body = String::from("[PENDING MESSAGES]\n");
-    for m in deliver {
-        body.push_str(&format!(
-            "- from {}: {}\n",
-            m.from_name.as_deref().unwrap_or("orchestrator"),
-            m.body
-        ));
-    }
-    body.push_str("[END PENDING MESSAGES]\nRespond to these before continuing.\n\n");
+    let mut body = nexmesh_proto::render_pending(deliver);
     body.push_str(text);
     body
 }
@@ -548,10 +541,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_sender_is_the_orchestrator() {
-        let mut e = env(1, "x", "do this");
+    fn a_message_with_no_sending_slot_is_the_operator_asking() {
+        // A person, reading the session's chat. An agent told only to
+        // "respond" answered a sibling seat instead, and the question read
+        // as ignored -- so the route back is said here, not guessed there.
+        let mut e = env(1, "x", "are you connected?");
+        e.from_slot = None;
         e.from_name = None;
-        assert!(with_pending("ok", &[e]).contains("from orchestrator: do this"));
+        let out = with_pending("ok", &[e]);
+        assert!(out.contains("from the OPERATOR: are you connected?"), "{out}");
+        assert!(out.contains("broadcast"), "{out}");
+    }
+
+    #[test]
+    fn a_teammates_message_says_nothing_about_the_operator() {
+        let out = with_pending("ok", &[env(1, "Iris", "please review")]);
+        assert!(!out.contains("OPERATOR"), "{out}");
     }
 
     #[test]

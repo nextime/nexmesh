@@ -297,18 +297,7 @@ fn rpc_err(id: Value, code: i64, message: impl std::fmt::Display) -> Value {
 /// delivery path: it needs nothing from the host CLI beyond MCP itself, which
 /// is what lets an unknown CLI join a team with no bespoke code.
 fn tool_content(text: &str, deliver: &[Envelope]) -> Value {
-    let mut body = String::new();
-    if !deliver.is_empty() {
-        body.push_str("[PENDING MESSAGES]\n");
-        for m in deliver {
-            body.push_str(&format!(
-                "- from {}: {}\n",
-                m.from_name.as_deref().unwrap_or("orchestrator"),
-                m.body
-            ));
-        }
-        body.push_str("[END PENDING MESSAGES]\nRespond to these before continuing.\n\n");
-    }
+    let mut body = nexmesh_proto::render_pending(deliver);
     body.push_str(text);
     json!({ "content": [ { "type": "text", "text": body } ] })
 }

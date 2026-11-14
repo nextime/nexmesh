@@ -77,26 +77,42 @@ pub fn agent_word(slots: &str, agents: &str) -> String {
 /// and no rhythm cannot see anything, and counting it would mean a team
 /// message was never delivered to anybody.
 pub fn audience(m: &str) -> String {
+    format!("(SELECT COUNT(*) {})", audience_seats(m, ""))
+}
+
+/// How many of those seats have actually seen it. Per seat, because one
+/// teammate acking a broadcast must not count for the rest -- and counted
+/// over the SAME seats as the audience, or a message read by seats that have
+/// since been removed reads `4/3`, which is nobody's idea of an answer.
+pub fn seen(m: &str) -> String {
     format!(
-        "(SELECT COUNT(*) FROM slots s2
-           LEFT JOIN agents a2 ON a2.id = (
-               SELECT id FROM agents WHERE slot_id = s2.id
-               ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
-          WHERE s2.session_id = {m}.session_id
-            AND ({m}.from_slot IS NULL OR s2.id <> {m}.from_slot)
-            AND COALESCE(s2.task_state,'') <> 'released'
-            AND a2.id IS NOT NULL
-            AND (a2.exited_at_ms IS NULL OR ({cond})))",
-        cond = waiting("s2", "a2")
+        "(SELECT COUNT(*) {})",
+        audience_seats(
+            m,
+            &format!(
+                "AND EXISTS (SELECT 1 FROM message_recipients r
+                              WHERE r.message_id = {m}.id AND r.slot_id = s2.id
+                                AND r.acked_at_ms IS NOT NULL)"
+            )
+        )
     )
 }
 
-/// How many seats have actually seen it. Per seat, because one teammate
-/// acking a broadcast must not count for the rest.
-pub fn seen(m: &str) -> String {
+/// The seats a team message is for: the FROM and WHERE of both counts above,
+/// written once so they can never disagree.
+fn audience_seats(m: &str, extra: &str) -> String {
     format!(
-        "(SELECT COUNT(*) FROM message_recipients r
-           WHERE r.message_id = {m}.id AND r.acked_at_ms IS NOT NULL)"
+        "FROM slots s2
+          LEFT JOIN agents a2 ON a2.id = (
+              SELECT id FROM agents WHERE slot_id = s2.id
+              ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+         WHERE s2.session_id = {m}.session_id
+           AND ({m}.from_slot IS NULL OR s2.id <> {m}.from_slot)
+           AND COALESCE(s2.task_state,'') <> 'released'
+           AND a2.id IS NOT NULL
+           AND (a2.exited_at_ms IS NULL OR ({cond}))
+           {extra}",
+        cond = waiting("s2", "a2")
     )
 }
 
@@ -240,6 +256,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(word(&db), "running");
+    }
+
+    /// A session with a live CLI seat, a live external seat, a seat whose
+    /// process is long gone, and one team message from the operator.
+    fn room() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(nexmesh_proto::SCHEMA_SQL).unwrap();
+        crate::state::migrate(&db).unwrap();
+        db.execute(
+            "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,last_seen_ms,
+                                lease_expires_ms)
+             VALUES ('nd-1','machine-a','linux','x86_64','0.1.0','online',1,1,9999999999999)",
+            [],
+        )
+        .unwrap();
+        for (slot, name) in [("sl-cli", "Max"), ("sl-ext", "Bridge"), ("sl-dead", "Ghost")] {
+            db.execute(
+                "INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                 VALUES (?,'s1',?,'claude',1)",
+                params![slot, name],
+            )
+            .unwrap();
+        }
+        let now = now_ms();
+        db.execute(
+            "INSERT INTO agents (id,slot_id,node_id,provenance,status,started_at_ms,last_seen_ms)
+             VALUES ('ag-cli','sl-cli','nd-1','attached','running',?,?)",
+            params![now, now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO agents (id,slot_id,provenance,status,started_at_ms,last_seen_ms)
+             VALUES ('ag-ext','sl-ext','external','running',?,?)",
+            params![now, now],
+        )
+        .unwrap();
+        // Written off, never pinned, so nothing says it is coming back.
+        db.execute(
+            "INSERT INTO agents (id,slot_id,node_id,provenance,status,started_at_ms,last_seen_ms,
+                                 exited_at_ms)
+             VALUES ('ag-dead','sl-dead','nd-1','attached','exited',?,?,?)",
+            params![now - 9_000_000, now - 9_000_000, now - 8_000_000],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO messages (id,session_id,from_slot,to_slot,kind,body,sent_at_ms)
+             VALUES (1,'s1',NULL,NULL,'system','are you connected?',?)",
+            params![now],
+        )
+        .unwrap();
+        db
+    }
+
+    fn tally(db: &Connection) -> (i64, i64, bool) {
+        db.query_row(
+            &format!(
+                "SELECT {}, {}, {} FROM messages m WHERE m.id = 1",
+                seen("m"),
+                audience("m"),
+                delivered("m")
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_team_message_is_for_the_seats_that_could_read_it() {
+        let (seen_n, audience_n, delivered_f) = tally(&room());
+        assert_eq!((seen_n, audience_n), (0, 2), "the dead seat is nobody's audience");
+        assert!(!delivered_f);
+    }
+
+    #[test]
+    fn one_seat_acking_is_not_the_team_hearing_you() {
+        // The bridge takes everything, including team chat it cannot answer.
+        let db = room();
+        db.execute(
+            "INSERT INTO message_recipients (message_id,slot_id,acked_at_ms) VALUES (1,'sl-ext',?)",
+            params![now_ms()],
+        )
+        .unwrap();
+        let (seen_n, audience_n, delivered_f) = tally(&db);
+        assert_eq!((seen_n, audience_n), (1, 2));
+        assert!(!delivered_f, "the seat that could answer has not seen it");
+
+        db.execute(
+            "INSERT INTO message_recipients (message_id,slot_id,acked_at_ms) VALUES (1,'sl-cli',?)",
+            params![now_ms()],
+        )
+        .unwrap();
+        let (seen_n, audience_n, delivered_f) = tally(&db);
+        assert_eq!((seen_n, audience_n), (2, 2));
+        assert!(delivered_f, "now the team really has it");
+    }
+
+    #[test]
+    fn a_seat_that_has_since_gone_cannot_push_the_count_past_the_room() {
+        // `(team 4/3)` on the live fleet: acks counted over all time, the
+        // audience over seats that still exist.
+        let db = room();
+        for slot in ["sl-ext", "sl-cli", "sl-dead"] {
+            db.execute(
+                "INSERT INTO message_recipients (message_id,slot_id,acked_at_ms) VALUES (1,?,?)",
+                params![slot, now_ms()],
+            )
+            .unwrap();
+        }
+        db.execute("DELETE FROM slots WHERE id = 'sl-dead'", []).unwrap();
+        let (seen_n, audience_n, _) = tally(&db);
+        assert_eq!((seen_n, audience_n), (2, 2));
+    }
+
+    #[test]
+    fn a_message_to_one_seat_is_its_own_business() {
+        let db = room();
+        db.execute("UPDATE messages SET to_slot = 'sl-cli' WHERE id = 1", []).unwrap();
+        let (_, _, delivered_f) = tally(&db);
+        assert!(!delivered_f, "not acked yet");
+        db.execute("UPDATE messages SET acked_at_ms = ? WHERE id = 1", params![now_ms()])
+            .unwrap();
+        let (_, _, delivered_f) = tally(&db);
+        assert!(delivered_f);
+    }
+
+    #[test]
+    fn an_empty_room_has_not_received_anything() {
+        let db = room();
+        db.execute("UPDATE agents SET exited_at_ms = ?, status = 'exited'", params![now_ms()])
+            .unwrap();
+        let (_, audience_n, delivered_f) = tally(&db);
+        assert_eq!(audience_n, 0);
+        assert!(!delivered_f, "a team nobody is in has heard nothing");
     }
 
     #[test]
