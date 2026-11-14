@@ -1438,6 +1438,10 @@ function viewAgents(d, now) {
       const flap = a.slot_status === "flapping";
       const dead = !present(a.status);
       const between = a.status === "waiting";
+      // A pid belonging to a process that has ENDED is not a pid, it is a
+      // number somebody goes looking for on the wrong machine. A seat that
+      // merely lost touch keeps its pid: that process is often still there.
+      const gone = a.status === "waiting" || a.status === "exited";
       return `<tr>
         <td id="nm-${esc(a.slot_id)}">
             <span class="mono rename" title="click to rename"
@@ -1463,7 +1467,7 @@ function viewAgents(d, now) {
                 a.io_kind === "pty" ? " — it has a terminal, so it can be attached to and typed at"
               : a.io_kind === "tmux" ? " — its CLI sits in an adopted tmux pane, so the hub can type at it"
               : a.io_kind === "pipes" ? " — pipes, so it can be watched but not typed at"
-              : ""}">${a.pid ? "pid " + a.pid : "no process"}${
+              : ""}">${a.pid && !gone ? "pid " + a.pid : "no process"}${
                 a.io_kind ? " · " + esc(a.io_kind) : ""}</span>` : ""}</td>
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
             <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
