@@ -257,6 +257,9 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         if let Some(sock) = crate::tmux::socket() {
             args.splice(0..0, ["-L".to_string(), sock]);
         }
+        // And clear our own leftover view, or `new-session -s` collides with
+        // it and the adoption cannot come back after a node restart.
+        crate::tmux::clear_stale_view(&tmux_view(&spec.slot_id));
     }
     if spec.resume_handle.is_some() {
         for a in &mode.resume_args {

@@ -75,6 +75,50 @@ pub fn repaint(view: &str) {
     }
 }
 
+/// Clear our own leftover view of a previous adoption.
+///
+/// A tmux SESSION outlives its clients. When a node stops -- a deploy, a
+/// reboot -- its tmux client dies but the grouped session it created,
+/// `nexmesh-<slot>`, stays on the server with nobody attached. The next
+/// adoption then runs `new-session -s nexmesh-<slot>` against a name that
+/// already exists, tmux says "duplicate session", the spawn dies at once,
+/// and after four of those the hub writes the seat off as flapping. So an
+/// adopted terminal never came back on its own after a node restart, and the
+/// only cure was re-adopting it by hand -- which nobody knows to do.
+///
+/// Only ever OUR name: `nexmesh-<slot>` is created by this code and by
+/// nothing else, and only when nothing is attached to it, which is what
+/// makes it a corpse rather than somebody's window.
+pub fn clear_stale_view(view: &str) -> bool {
+    // `=name` is tmux's exact match; without it a prefix match could resolve
+    // to a different session entirely.
+    let exact = format!("={view}");
+    let exists = cmd()
+        .args(["has-session", "-t", &exact])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return false;
+    }
+    let attached = cmd()
+        .args(["list-clients", "-t", &exact, "-F", "#{client_tty}"])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+    if attached {
+        tracing::warn!(%view, "a view session of ours still has a client; leaving it alone");
+        return false;
+    }
+    let killed = cmd()
+        .args(["kill-session", "-t", &exact])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    tracing::info!(%view, killed, "cleared a leftover view session from a previous adoption");
+    killed
+}
+
 /// The pid of the process in the pane the given client view is looking at.
 ///
 /// `view` is the node's OWN grouped session (`nexmesh-<slot>`), not the

@@ -29,6 +29,11 @@ for f in os.listdir(f"{ROOT}/clis"):
 # runs, so this suite -- which creates, adopts and KILLS sessions -- used to
 # do all that on the same server as whatever the user was actually working in.
 # `-L` gives us our own, and the node is told to use it too.
+# A paired identity in ~/.nexmesh would send this suite's node at the REAL
+# hub. run-all.sh points it at nowhere; a suite run on its own has to do the
+# same for itself, or a test reaches a live fleet.
+os.environ.setdefault("NEXMESH_IDENTITY", "/nonexistent/nexmesh-identity")
+
 TMUX_SOCKET = f"nexmesh-e2e-{os.getpid()}"
 
 SRC = f"nexmesh-adopt-src-{os.getpid()}"
@@ -116,12 +121,13 @@ def main():
         time.sleep(0.2)
     # Deliberately start the node from inside a TMUX env var, the condition
     # that makes a nested client refuse.
-    procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
+    node = subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
         "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
                  NEXMESH_TMUX_SOCKET=TMUX_SOCKET,
-                 TMUX="/tmp/fake-tmux-socket,1234,0")))
+                 TMUX="/tmp/fake-tmux-socket,1234,0"))
+    procs.append(node)
     ok = False
     for _ in range(140):
         s, j = http("GET", "/v1/nodes")
@@ -137,6 +143,21 @@ def main():
     check("adopt accepted", s == 200 and j.get("slot_id"), str(j))
     check("the reply is honest about it not being a team member",
           "not a team member" in json.dumps(j).lower(), str(j))
+
+    # The adopt call returns once the node has been ASKED; the node answers a
+    # moment later with the client it started. Attaching in that gap gets a
+    # truthful "no process behind it", which is the hub being right and the
+    # test being hasty.
+    def seat_live(slot):
+        rows = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        row = next((a for a in rows if a.get("slot_id") == slot), {})
+        return row.get("status") == "running" and row.get("exited") is False
+    for _ in range(80):
+        if seat_live(j["slot_id"]):
+            break
+        time.sleep(0.25)
+    check("the node has the terminal and says so", seat_live(j["slot_id"]),
+          str(http("GET", f"/v1/sessions/{sid}/status")[1])[:300])
 
     print("\n=== 3. it is driveable from 'another machine' ===")
     t = Term([f"{BIN}/nexmesh", "--hub", HUB, "attach", sid, "Legacy"])
@@ -190,6 +211,42 @@ def main():
           "asked tmux to repaint an adopted pane" in nodelog, nodelog[-500:])
     t2.send("\x1d")
     t2.expect("detached")
+
+    print("\n=== 5c. the node restarts and the adoption comes back by itself ===")
+    # The deploy case, and it was broken: a tmux SESSION outlives its
+    # clients, so the view the node created (`nexmesh-<slot>`) was still on
+    # the server with nobody attached, and the next adoption collided with
+    # its own leftover -- "duplicate session", four times, and the hub wrote
+    # the seat off as flapping. An adopted terminal never survived a node
+    # restart, and nothing said why.
+    slot = j.get("slot_id")
+    procs.remove(node)
+    node.kill(); node.wait(timeout=5)
+    # The socket is the node's, and the replacement cannot bind it until the
+    # first one has really gone.
+    time.sleep(1.0)
+    leftover = tmux("list-sessions", "-F", "#{session_name}")
+    check("the node's own view session outlives it, as tmux sessions do",
+          any(l.startswith("nexmesh-sl-") for l in leftover.splitlines()), leftover)
+    procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
+        "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
+        stdout=open(f"{T}/node2.log","w"), stderr=subprocess.STDOUT,
+        env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
+                 NEXMESH_TMUX_SOCKET=TMUX_SOCKET,
+                 TMUX="/tmp/fake-tmux-socket,1234,0")))
+    back = None
+    for _ in range(160):          # recovery ticks, then the node spawns
+        rows = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        row = next((a for a in rows if a.get("slot_id") == slot), {})
+        back = row.get("status")
+        if back == "running" and row.get("exited") is False:
+            break
+        time.sleep(0.5)
+    check("the adopted terminal is adopted again, with nobody asking",
+          back == "running", f"status was {back}; {open(f'{T}/node2.log').read()[-400:]}")
+    check("and the leftover was cleared rather than collided with",
+          "cleared a leftover view session" in open(f"{T}/node2.log").read(),
+          open(f"{T}/node2.log").read()[-400:])
 
     print("\n=== 6. a bad target fails cleanly ===")
     s, j = http("POST", f"/v1/sessions/{sid}/adopt",
