@@ -1178,7 +1178,7 @@ Attach relays a pty **the node created**. That distinction decides what works:
 |---|---|
 | launched by nexmesh, `mode = "interactive"` | the real TUI: watch **and type**. Several viewers at once. |
 | launched by nexmesh, `mode = "headless"` | view-only — it is a protocol on a pipe, not a terminal |
-| joined by itself via `mcpd` (an *attached* agent) | nothing. It is a full team member for messages, tools and review, but its terminal belongs to whoever started it — unless you also `adopt` its tmux session |
+| joined by itself via `mcpd` (an *attached* agent) | nothing, unless its CLI sits in an adopted pane — then `nexmesh attach <session> <its own name>` opens that terminal, following the link the node proved, and you never type a tmux name |
 | adopted with `nexmesh adopt` | the real terminal: watch **and type**, alongside your own client |
 | headless on a CLI that has its own client (opencode) | a real TUI, started on demand for each viewer and closed when they leave |
 | an external participant (a hermes agent) | nothing — there is no terminal at all |

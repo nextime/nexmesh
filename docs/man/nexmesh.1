@@ -367,12 +367,15 @@ Publish, pull, or report on a shared workspace, on every machine at once.
 .SS Terminals
 .TP
 .BI attach " SESSION NAME|SEAT"
-Attach to an agent's terminal, wherever it runs. Only reaches an agent the
-hub holds a pty for: one it spawned in interactive mode, or one adopted from
-tmux. A CLI you started by hand in an ordinary terminal has none, so
-.B spawn
+Attach to an agent's terminal, wherever it runs, by the name you address it
+by. Reaches an agent the hub holds a pty for -- one it spawned in interactive
+mode, or an adopted tmux pane -- and a seat whose CLI is SITTING IN such a
+pane, which it opens through that terminal without being asked for its name.
+A CLI started by hand in an ordinary terminal has no terminal the hub can
+reach at all, so
+.B seat
 or
-.B adopt
+.B spawn
 it first.
 .RS
 .PP
