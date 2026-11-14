@@ -236,6 +236,31 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // rather than a directory. Added after the fact: an existing hub must
     // keep its slots.
     let _ = conn.execute("ALTER TABLE slots ADD COLUMN cli_session TEXT", []);
+
+    // Rows that say a process is running AND that it exited.
+    //
+    // A node restart wrote off the attached agents on it, the shims
+    // reconnected, the node vouched for them again and the hub set the
+    // status back to `running` -- without clearing the exit time, which
+    // nothing then ever cleared. Everything that asks "is there a process
+    // here?" reads that time, so `attach` refused CLIs that were sitting
+    // right there, and the seat read as empty to anything looking for one.
+    // The live hub had three of these before this ran.
+    //
+    // `last_seen_ms` is the evidence: it comes from a node confirming the
+    // process against /proc, so a sighting AFTER the recorded exit means the
+    // exit never happened.
+    let repaired = conn
+        .execute(
+            "UPDATE agents SET exited_at_ms = NULL
+              WHERE exited_at_ms IS NOT NULL AND status = 'running'
+                AND last_seen_ms > exited_at_ms",
+            [],
+        )
+        .unwrap_or(0);
+    if repaired > 0 {
+        tracing::info!(repaired, "cleared exit times from agents a node had vouched for since");
+    }
     // Guarded: migrate() also runs against databases predating most of this
     // schema, where `slots` may not have session_id yet. An index naming a
     // column that is not there fails the whole migration.
@@ -1350,6 +1375,31 @@ mod tests {
             .unwrap();
         }
         db
+    }
+
+    #[test]
+    fn a_row_that_says_running_and_exited_is_repaired_at_startup() {
+        // The live fleet's shape: a node restart wrote the seat off, the shim
+        // reconnected, the node vouched for the process again -- and the exit
+        // time stayed, so `attach` refused a CLI that was sitting there.
+        let db = fleet();
+        let now = now_ms();
+        db.execute(
+            "UPDATE agents SET exited_at_ms = ?, status = 'running', last_seen_ms = ?
+              WHERE id = 'ag-b'",
+            params![now - 10_000, now],
+        )
+        .unwrap();
+        // And one that really did end: nothing has seen it since.
+        db.execute(
+            "UPDATE agents SET exited_at_ms = ?, status = 'exited', last_seen_ms = ?
+              WHERE id = 'ag-a'",
+            params![now - 10_000, now - 20_000],
+        )
+        .unwrap();
+        migrate(&db).unwrap();
+        assert_eq!(status_of(&db, "ag-b").1, None, "a process a node vouches for is here");
+        assert!(status_of(&db, "ag-a").1.is_some(), "an ending nobody has contradicted stands");
     }
 
     fn status_of(db: &Connection, agent: &str) -> (String, Option<i64>) {

@@ -208,9 +208,21 @@ async fn handle(
                 // A node reports liveness it verified against /proc, so the hub
                 // never has to guess from a pid it cannot see.
                 if a.alive {
+                    // A process that is HERE has not exited. A node restart
+                    // writes its attached agents off -- rightly, nothing was
+                    // left to reach them through -- and then the shims
+                    // reconnect and the node vouches for them again. Without
+                    // clearing the exit time those rows read `running` with
+                    // an exit beside them, and everything that asks "is there
+                    // a process?" answered no: `attach` refused a CLI that was
+                    // sitting right there, the seat read as between turns, and
+                    // seat reclaim thought the chair was free.
                     db.execute(
-                        "UPDATE agents SET last_seen_ms = ?, status =
-                            CASE WHEN status = 'disconnected' THEN 'running' ELSE status END
+                        "UPDATE agents SET last_seen_ms = ?,
+                            exited_at_ms = CASE WHEN status = 'disconnected'
+                                                THEN NULL ELSE exited_at_ms END,
+                            status = CASE WHEN status = 'disconnected' THEN 'running'
+                                          ELSE status END
                          WHERE id = ?",
                         params![now_ms(), a.agent_id],
                     )?;
@@ -234,6 +246,8 @@ async fn handle(
                                      io_kind)
                  VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9,?10)
                  ON CONFLICT(id) DO UPDATE SET status = 'running', last_seen_ms = ?8,
+                                               -- Up again is not exited.
+                                               exited_at_ms = NULL,
                                                io_kind = COALESCE(?10, io_kind)",
                 params![
                     agent_id, slot_id, node_id, id.pid, id.start_ticks,
@@ -1132,7 +1146,14 @@ fn join(
     let agent_id = match returning {
         Some(existing) => {
             db.execute(
-                "UPDATE agents SET slot_id = ?, status = 'running', cwd = ?, last_seen_ms = ?
+                // Same pid, same start ticks: the same process, back in its
+                // seat. It has not exited, whatever was written off while it
+                // was out of touch -- and the exit time matters more than the
+                // word, because every "is there a process here?" reads it.
+                // `attach` refused a CLI that was sitting right there, for
+                // the whole life of a node restart.
+                "UPDATE agents SET slot_id = ?, status = 'running', cwd = ?, last_seen_ms = ?,
+                                   exited_at_ms = NULL
                   WHERE id = ?",
                 params![slot_id, cwd, now, existing],
             )?;

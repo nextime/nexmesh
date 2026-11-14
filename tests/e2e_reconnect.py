@@ -163,6 +163,20 @@ def main():
           back == "running", f"status was {back}")
     check("and it is still the same seat", len(seats(sid)) == 1, str(seats(sid))[:200])
 
+    # A process that is HERE has not exited. The restart wrote the seat off,
+    # the shim came back, the node vouched for the process -- and the exit
+    # time used to stay on the row for ever. Everything that asks "is there a
+    # process here?" reads that time: `attach` refused a CLI that was sitting
+    # right there, which is how this was found.
+    row = next((a for a in seats(sid) if a.get("slot_id") == seat_id), {})
+    check("the seat no longer claims its process has exited",
+          row.get("exited") is False, str(row)[:300])
+    check("and its own word for itself is `running`, not `waiting`",
+          row.get("agent_status") == "running", str(row)[:300])
+    s, rj = http("GET", f"/v1/sessions/{sid}/resolve/Survivor")
+    check("so an attach is offered rather than refused",
+          s == 200 and rj.get("exited") is False and rj.get("status") == "running", str(rj)[:300])
+
     print("\n=== 4. the conversation carries on ===")
     t = cli.tool("set_summary", {"summary": "after the restart"})
     check("a tool call works after the node restart",
