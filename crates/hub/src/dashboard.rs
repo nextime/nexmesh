@@ -293,7 +293,16 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
                             a.id, s.mode, s.paused, a.pid,
                             COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
-                                                     THEN 'tmux' END)
+                                                     THEN 'tmux' END),
+                            -- The agent an attach should open for this seat:
+                            -- its own process if that has a terminal, else
+                            -- the adopted terminal it sits in.
+                            COALESCE(
+                                CASE WHEN a.io_kind IS NULL THEN
+                                    (SELECT v.id FROM agents v
+                                      WHERE v.id = s.terminal_via
+                                        AND v.exited_at_ms IS NULL)
+                                END, a.id)
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
@@ -326,6 +335,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             // the node never started it.
                             "pid": r.get::<_, Option<i64>>(20)?,
                             "io_kind": r.get::<_, Option<String>>(21)?,
+                            "attach_agent_id": r.get::<_, Option<String>>(22)?,
                         }))
                     })
                     .and_then(|m| m.collect())

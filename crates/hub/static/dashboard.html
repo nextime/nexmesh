@@ -1475,9 +1475,13 @@ function viewAgents(d, now) {
         <td class="muted"><span class="rename" title="click to change the role"
               onclick="editRole('${esc(a.slot_id)}', '${esc(a.role).replace(/'/g, "\\'")}')"
               id="rl-${esc(a.slot_id)}">${esc(a.role)}</span></td>
-        <td>${a.agent_id && a.status === "running" && a.kind !== "external"
-            ? `<button class="tiny" title="Open this agent's terminal here"
-                 onclick="openTerm('${esc(a.agent_id)}','${esc(a.name).replace(/'/g, "\\'")}')"
+        <td>${(a.attach_agent_id || a.agent_id) && a.status === "running"
+              && a.kind !== "external"
+            ? `<button class="tiny" title="Open this agent's terminal here${
+                 a.attach_agent_id && a.attach_agent_id !== a.agent_id
+                   ? " \u2014 the adopted pane its CLI is sitting in" : ""}"
+                 onclick="openTerm('${esc(a.attach_agent_id || a.agent_id)}','${
+                   esc(a.name).replace(/'/g, "\\'")}')"
                  >terminal</button>` : ""}</td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}

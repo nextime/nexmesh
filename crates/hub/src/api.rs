@@ -1615,7 +1615,17 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                                                 THEN 'tmux' END),
                 a.id, a.exited_at_ms, s.terminal_via IS NOT NULL,
                 COALESCE(a.status, 'disconnected'),
-                s.cli_session, a.cwd, s.tmux_target
+                s.cli_session, a.cwd, s.tmux_target,
+                -- Which agent an attach should open: this seat's own
+                -- process when it has a terminal, and otherwise the adopted
+                -- terminal it is sitting in. The name you address is the
+                -- name you attach to; which pty that turns out to be is the
+                -- hub's business, not yours.
+                COALESCE(
+                    CASE WHEN a.io_kind IS NULL THEN
+                        (SELECT v.id FROM agents v
+                          WHERE v.id = s.terminal_via AND v.exited_at_ms IS NULL)
+                    END, a.id)
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
@@ -1659,6 +1669,7 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 "cli_session": r.get::<_, Option<String>>(19)?,
                 "cwd": r.get::<_, Option<String>>(20)?,
                 "tmux_target": r.get::<_, Option<String>>(21)?,
+                "attach_agent_id": r.get::<_, Option<String>>(22)?,
             }))
         })
         .and_then(|m| m.collect())
@@ -1820,13 +1831,58 @@ pub async fn resolve_agent(
         .map_err(bad)?;
     let (status, exited, host, io_kind) =
         live.unwrap_or_else(|| ("unknown".into(), None, None, None));
-    Ok(Json(json!({
-        "agent_id": agent_id, "name": name,
-        "status": status, "exited": exited.is_some(),
-        // Which machine, and what kind of terminal -- so a viewer can say
-        // whose screen you are looking at before it draws a byte of it.
-        "host": host, "io_kind": io_kind,
-    })))
+
+    // The terminal this seat is SITTING IN, when its own process has none.
+    //
+    // A CLI somebody started by hand has no pty the node owns -- the pty
+    // belongs to the adopted tmux pane around it, which is a seat of its
+    // own. So `nexmesh attach motus Motus-dev` used to be refused, and you
+    // had to know to ask for `term-Motus-dev` instead, or go and find the
+    // tmux session by hand. That is the plumbing showing through: the name
+    // you address an agent by should open the screen it is on.
+    //
+    // The link is the one `termlink` proved: the node checked, through
+    // /proc, that this seat's CLI is the process inside that pane. So an
+    // attach that follows it is looking at the right agent, not merely at a
+    // terminal that happens to be nearby.
+    let via: Option<(String, String, Option<String>)> = if io_kind.is_none() {
+        db.query_row(
+            // `vs` is the TERMINAL's own seat, not the one being resolved:
+            // the name wanted here is the terminal's, so a viewer can say
+            // which screen it put you on.
+            "SELECT v.id, COALESCE(vs.display_name, vs.role, vs.id), v.io_kind
+               FROM slots s
+               JOIN agents v ON v.id = s.terminal_via
+               JOIN slots vs ON vs.id = v.slot_id
+              WHERE s.id = (SELECT slot_id FROM agents WHERE id = ?1)
+                AND v.exited_at_ms IS NULL",
+            [&agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(bad)?
+    } else {
+        None
+    };
+
+    match via {
+        Some((via_id, via_name, via_io)) => Ok(Json(json!({
+            // The agent to attach to is the terminal's; the NAME stays the
+            // one that was asked for, because that is who you are looking at.
+            "agent_id": via_id, "name": name,
+            "status": status, "exited": exited.is_some(),
+            "host": host, "io_kind": via_io,
+            // Said plainly, so a viewer can tell you whose screen this is.
+            "via": via_name, "seat_agent_id": agent_id,
+        }))),
+        None => Ok(Json(json!({
+            "agent_id": agent_id, "name": name,
+            "status": status, "exited": exited.is_some(),
+            // Which machine, and what kind of terminal -- so a viewer can say
+            // whose screen you are looking at before it draws a byte of it.
+            "host": host, "io_kind": io_kind,
+        }))),
+    }
 }
 
 #[derive(Deserialize)]

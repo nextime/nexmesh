@@ -247,6 +247,28 @@ def main():
           bool(q("SELECT 1 FROM messages WHERE body LIKE '%rm -rf would run here%' "
                  "AND acked_at_ms IS NULL")))
 
+    print("\n=== 7b. the seat's own name opens the terminal it is sitting in ===")
+    # "I do not want to use tmux, I want to use nexmesh." A CLI started by
+    # hand has no pty of its own -- the pty belongs to the adopted pane
+    # around it, which is a seat of its own -- so attaching by the name you
+    # address the agent BY was refused, and you had to know the pane's seat
+    # name or go and find the tmux session. That is the plumbing showing
+    # through.
+    s, rj = http("GET", f"/v1/sessions/{sid}/resolve/Hand")
+    check("resolving the seat answers with the terminal it is in",
+          s == 200 and rj.get("via") == "HandTerm", str(rj)[:300])
+    check("and says which agent that is, not the seat's own shim",
+          rj.get("agent_id") != rj.get("seat_agent_id")
+          and bool(rj.get("seat_agent_id")), str(rj)[:300])
+    check("while keeping the name you asked for", rj.get("name") == "Hand", str(rj)[:200])
+    check("and reporting a terminal rather than nothing",
+          rj.get("io_kind") in ("pty", "tmux"), str(rj)[:200])
+    st = http("GET", f"/v1/sessions/{sid}/status")[1]["agents"]
+    row = [a for a in st if a["slot_id"] == slot][0]
+    check("status carries the same answer, for the console and the dashboard",
+          bool(row.get("attach_agent_id")) and row["attach_agent_id"] != row["agent_id"],
+          str(row)[:300])
+
     print("\n=== 8. and it shows up where you would look ===")
     st = http("GET", f"/v1/sessions/{sid}/status")[1]["agents"]
     row = [a for a in st if a["slot_id"] == slot][0]

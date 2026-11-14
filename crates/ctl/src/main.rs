@@ -814,11 +814,16 @@ async fn attach(
         _ => (120, 40),
     };
     let host = r["host"].as_str().unwrap_or("");
+    // A seat whose CLI sits in an adopted terminal is reached THROUGH that
+    // terminal: the hub says so rather than refusing, and the bar says so
+    // rather than pretending the pty is the agent's own.
+    let via = r["via"].as_str().map(|v| format!("  \u{00b7}  via {v}")).unwrap_or_default();
     let mut bar = StatusBar::new(
         format!(
-            " nexmesh \u{203a} {name}{}{}  \u{00b7}  Ctrl-] detach",
+            " nexmesh \u{203a} {name}{}{}{}  \u{00b7}  Ctrl-] detach",
             if host.is_empty() || host == "-" { String::new() } else { format!(" on {host}") },
-            format!("  \u{00b7}  {session}")
+            format!("  \u{00b7}  {session}"),
+            via
         ),
         cols,
         rows,
