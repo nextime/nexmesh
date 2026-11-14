@@ -233,6 +233,49 @@
   .chatline .ch { color: var(--accent); }
   .chatline.sys .txt { color: var(--dim); font-style: italic; }
   .chatline:target, .chatline.mine { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  /* A line you can act on: swipe it to reply, hold it to hear it. */
+  .chatline { touch-action: pan-y; position: relative; transition: transform .12s ease-out; }
+  .chatline.swiping { transition: none; }
+  .chatline.held { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .chatline .swipehint {
+    position: absolute; left: -26px; top: 2px; color: var(--accent); opacity: 0;
+  }
+  .chatline.swiping .swipehint { opacity: 1; }
+  #msgSheet {
+    position: fixed; z-index: 80; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; padding: 4px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.5); display: flex; flex-direction: column;
+    min-width: 170px;
+  }
+  #msgSheet button {
+    background: transparent; border: 0; text-align: left; padding: 9px 12px;
+    border-radius: 7px; color: var(--fg);
+  }
+  #msgSheet button:hover { background: var(--panel2); }
+  #msgSheet .head {
+    padding: 7px 12px 4px; color: var(--faint); font-size: 12px;
+    border-bottom: 1px solid var(--line); margin-bottom: 3px;
+    max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* What a capability bridge sends back. An OCR answer is text; an image
+     or a video is not, and a chat that shows you a URL instead of the
+     picture is making you do the last step by hand. */
+  .chatline .media { margin: 4px 0 2px; }
+  .chatline .media img, .chatline .media video {
+    display: block; max-width: min(460px, 72vw); max-height: 280px;
+    border-radius: 8px; border: 1px solid var(--line); background: #000;
+  }
+  .chatline .media audio { width: min(460px, 72vw); margin-top: 4px; }
+  .chatline .media .cap { font-size: 11px; color: var(--faint); }
+  .chatline a { color: var(--accent); }
+  #replyBar {
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+    border-top: 1px solid var(--line);
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+    font-size: 12.5px;
+  }
+  #replyBar .quoted { color: var(--dim); overflow: hidden; text-overflow: ellipsis;
+                      white-space: nowrap; flex: 1; }
   .nicklist { border-left: 1px solid var(--line); overflow-y: auto; padding: 6px 0;
               background: color-mix(in srgb, var(--panel) 60%, var(--bg)); }
   .nicklist .nk { display: flex; align-items: center; gap: 6px; padding: 3px 10px;
@@ -261,6 +304,32 @@
       box-shadow: 0 0 24px rgba(0, 0, 0, .45);
     }
     .chanrail.open { transform: none; }
+
+    /* The header has one job on a phone: say which channel you are in, and
+       open the list. The brand and the line about how many channels there
+       are were squeezing the one control that matters until it had no room
+       left -- which is how a drawer ends up with no handle. */
+    #chat .chathead { gap: 8px; padding: 7px 10px; }
+    #chat .chathead .brand, #chat .chathead #chatHint { display: none; }
+    #chat .railtoggle {
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 16px; line-height: 1; padding: 7px 11px; flex: 0 0 auto;
+    }
+    #chat .chathead .where {
+      font-size: 15px; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; min-width: 0;
+    }
+
+    /* One row, and the box gets whatever is left. The channel name is
+       already in the header, the buttons are thumbs-width, and the padding
+       clears the gesture bar an installed app sits under. */
+    #chat .composer {
+      flex-wrap: nowrap; gap: 6px;
+      padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+    }
+    #chat .composer > .mono { display: none; }
+    #chat .composer input { flex: 1 1 auto; min-width: 0; }
+    #chat .composer button { flex: 0 0 auto; padding: 7px 10px; }
     /* Tapping anywhere else closes it, which is what every drawer does and
        what a thumb reaches for first. */
     #railScrim { grid-area: 2 / 1 / 3 / -1; z-index: 2; background: rgba(0,0,0,.45); }
@@ -637,6 +706,11 @@
     <div class="chatfeed" id="chatFeed"
          onscroll="chatStick = (this.scrollHeight - this.scrollTop - this.clientHeight) < 50"></div>
     <div class="nicklist" id="nickList"></div>
+    <div id="replyBar" hidden style="grid-column: 1 / -1">
+      <span class="mono" id="replyWho"></span>
+      <span class="quoted" id="replyWhat"></span>
+      <button class="tiny" onclick="setReply(null)" title="Don't reply to it">\u00d7</button>
+    </div>
     <div class="composer" id="chatComposer"></div>
   </div>
 
@@ -1636,6 +1710,8 @@ function openChat() {
 
 function closeChat() {
   chatOpen = false;
+  setReply(null);
+  closeMsgSheet();
   if (chatPrevScope !== null) session = chatPrevScope;
   $("chat").hidden = true;
   document.body.style.overflow = "";
@@ -1754,16 +1830,20 @@ function renderChat(d) {
     const to = m.to && m.to !== "(team)" ? `<span class="to">\u2192 ${esc(m.to)}</span> ` : "";
     const ch = chatChan === "*" && m.session
       ? `<span class="ch">#${esc(m.session)}</span> ` : "";
-    return `<div class="chatline ${cls}">
+    return `<div class="chatline ${cls}" data-id="${m.id}"
+                 data-from="${esc(m.from)}" data-slot="${esc(m.from_slot || "")}"
+                 data-body="${esc(m.body)}">
+      <span class="swipehint">\u21a9</span>
       <span class="t">${hhmmss(m.at_ms)}</span>
       <span class="m" title="${esc(title)}">${mark}</span>
       <span class="txt">${ch}<span class="nick" style="color:${nickColor(m.from)}"
-        >&lt;${esc(m.from)}&gt;</span> ${to}${esc(m.body)}</span>
+        >&lt;${esc(m.from)}&gt;</span> ${to}${renderBody(m.body)}</span>
     </div>`;
   }).join("");
   const feed = $("chatFeed");
   feed.innerHTML = rows || `<div class="empty">Nothing said in here yet.</div>`;
   if (chatStick) feed.scrollTop = feed.scrollHeight;
+  wireChatGestures();
 
   // Who is in the room. A channel shows its seats; #all shows every seat
   // with the channel it belongs to, which is the closest thing a fleet has
@@ -1809,8 +1889,9 @@ function renderChat(d) {
              placeholder="say something to ${chatChan === "*" ? "every team" : "#" + esc(chatChan)}, as the operator"
              onkeydown="if(event.key==='Enter')chatSend()">
       ${(canHear() || fleetHas("transcribe")) ? `<button id="chatMic" class="mic"
-              onclick="dictate()" title="dictate (${fleetHas("transcribe")
-                ? "transcribed on the fleet" : "in this browser"})">\u{1F3A4}</button>` : ""}
+              onclick="chatVoice()" title="send a voice message (${fleetHas("transcribe")
+                ? "transcribed on the fleet" : "transcribed in this browser"})"
+              >\u{1F3A4}</button>` : ""}
       <button onclick="chatSend()">send</button>
       ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
               title="read new messages in this channel aloud (${fleetHas("tts")
@@ -1820,28 +1901,350 @@ function renderChat(d) {
   }
 }
 
+// ------------------------------------------------------ what came back ----
+// A capability bridge answers with whatever the work produced: OCR gives you
+// text, and `image_generate` gives you a picture. A chat that prints the URL
+// of a picture is making you do the last step by hand, so anything that is
+// plainly media is shown.
+//
+// Deliberately narrow about what counts: an http(s) URL ending in a known
+// extension, or a `data:` URI of a known type. Nothing else becomes an
+// element, because a message body is written by agents and the rule for
+// turning text into markup should be one you can hold in your head.
+const MEDIA_URL =
+  /https?:\/\/[^\s<>"']+\.(?:png|jpe?g|gif|webp|svg|mp4|webm|mov|m4v|ogg|oga|mp3|wav)(?:\?[^\s<>"']*)?/gi;
+const MEDIA_DATA = /data:(image|video|audio)\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]{32,}/gi;
+const PLAIN_URL = /https?:\/\/[^\s<>"']+/gi;
+
+function mediaKind(url) {
+  const u = url.split("?")[0].toLowerCase();
+  if (u.startsWith("data:image") || /\.(png|jpe?g|gif|webp|svg)$/.test(u)) return "image";
+  if (u.startsWith("data:video") || /\.(mp4|webm|mov|m4v)$/.test(u)) return "video";
+  if (u.startsWith("data:audio") || /\.(ogg|oga|mp3|wav)$/.test(u)) return "audio";
+  return null;
+}
+
+/// The body of a message: escaped text, links made clickable, and whatever
+/// media it refers to collected for showing underneath.
+function renderBody(body) {
+  const found = [];
+  // A base64 payload is thousands of characters of noise in a chat log. It
+  // becomes a short label, and the thing itself is shown.
+  let text = String(body || "").replace(MEDIA_DATA, (m) => {
+    found.push(m);
+    return `[${(mediaKind(m) || "data")}, ${Math.round(m.length * 0.75 / 1024)}KB]`;
+  });
+  for (const m of text.match(MEDIA_URL) || []) found.push(m);
+
+  let html = esc(text).replace(PLAIN_URL, (u) =>
+    `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`);
+
+  const seen = new Set();
+  const blocks = found.filter((u) => !seen.has(u) && seen.add(u)).map((u) => {
+    const kind = mediaKind(u);
+    if (kind === "image") {
+      return `<div class="media"><a href="${esc(u)}" target="_blank" rel="noopener noreferrer"
+                ><img src="${esc(u)}" loading="lazy" alt="shared image"></a></div>`;
+    }
+    if (kind === "video") {
+      return `<div class="media"><video src="${esc(u)}" controls preload="metadata"></video>
+              <div class="cap">video</div></div>`;
+    }
+    if (kind === "audio") {
+      return `<div class="media"><audio src="${esc(u)}" controls preload="metadata"></audio></div>`;
+    }
+    return "";
+  }).join("");
+  return html + blocks;
+}
+
+// ------------------------------------------------- one message at a time ----
+// A line is a thing you can act on, not just read: hold it to hear it, swipe
+// it to answer it. Both gestures are pointer events, so a mouse gets the
+// same affordances a thumb does -- and the right-click menu is the desktop's
+// own version of a long press.
+let chatReply = null;      // {id, from, slot, body}
+let press = null;          // the gesture in progress
+
+function setReply(r) {
+  chatReply = r;
+  const bar = $("replyBar");
+  if (!bar) return;
+  bar.hidden = !r;
+  if (r) {
+    $("replyWho").textContent = "\u21a9 " + r.from;
+    $("replyWhat").textContent = r.body;
+    const box = $("chatText");
+    if (box) box.focus();
+  }
+}
+
+function lineData(el) {
+  return {
+    id: Number(el.dataset.id || 0),
+    from: el.dataset.from || "",
+    slot: el.dataset.slot || "",
+    body: el.dataset.body || "",
+  };
+}
+
+/// What you can do with one message. Opened by a long press, or by the
+/// right-click menu on a desktop.
+function openMsgSheet(el, x, y) {
+  closeMsgSheet();
+  const d = lineData(el);
+  const sheet = document.createElement("div");
+  sheet.id = "msgSheet";
+  sheet.innerHTML =
+    `<div class="head">${esc(d.from)}: ${esc(d.body.slice(0, 60))}</div>` +
+    ((canSpeak() || fleetHas("tts"))
+      ? `<button onclick="listenTo(${d.id})">\u{1F50A} listen to this</button>` : "") +
+    `<button onclick="replyTo(${d.id})">\u21a9 reply to ${esc(d.from)}</button>` +
+    `<button onclick="copyMsg(${d.id})">copy</button>` +
+    `<button onclick="closeMsgSheet()">cancel</button>`;
+  document.body.appendChild(sheet);
+  // Keep it on screen: a sheet opened near the bottom of a phone would
+  // otherwise hang off it.
+  const r = sheet.getBoundingClientRect();
+  sheet.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + "px";
+  sheet.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+  setTimeout(() => document.addEventListener("pointerdown", sheetAway, { once: true }), 0);
+}
+
+function sheetAway(e) {
+  if (e.target.closest && e.target.closest("#msgSheet")) {
+    document.addEventListener("pointerdown", sheetAway, { once: true });
+    return;
+  }
+  closeMsgSheet();
+}
+
+function closeMsgSheet() {
+  const s = $("msgSheet");
+  if (s) s.remove();
+  document.querySelectorAll(".chatline.held").forEach((e) => e.classList.remove("held"));
+}
+
+function lineById(id) {
+  return document.querySelector(`#chatFeed .chatline[data-id="${id}"]`);
+}
+
+function listenTo(id) {
+  const el = lineById(id);
+  closeMsgSheet();
+  if (!el) return;
+  const d = lineData(el);
+  say(`${d.from} says: ${d.body}`);
+}
+
+function replyTo(id) {
+  const el = lineById(id);
+  closeMsgSheet();
+  if (el) setReply(lineData(el));
+}
+
+async function copyMsg(id) {
+  const el = lineById(id);
+  closeMsgSheet();
+  if (!el) return;
+  try {
+    await navigator.clipboard.writeText(lineData(el).body);
+    note("Copied.");
+  } catch (e) { note("This browser would not let me copy that."); }
+}
+
+/// Gestures on the room, by delegation: the feed is rebuilt on every poll,
+/// so handlers on each line would be attached and thrown away constantly.
+function wireChatGestures() {
+  const feed = $("chatFeed");
+  if (!feed || feed.dataset.wired === "1") return;
+  feed.dataset.wired = "1";
+
+  feed.addEventListener("pointerdown", (e) => {
+    const el = e.target.closest(".chatline");
+    if (!el) return;
+    press = { el, x: e.clientX, y: e.clientY, dx: 0, moved: false, long: false };
+    press.timer = setTimeout(() => {
+      if (!press || press.moved) return;
+      press.long = true;
+      press.el.classList.add("held");
+      // A long press that opens a menu should feel like one.
+      if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e2) {} }
+      openMsgSheet(press.el, press.x, press.y);
+    }, 480);
+  });
+
+  feed.addEventListener("pointermove", (e) => {
+    if (!press) return;
+    const dx = e.clientX - press.x, dy = e.clientY - press.y;
+    if (Math.abs(dy) > 24 || press.long) { endPress(true); return; }
+    if (Math.abs(dx) > 8) {
+      press.moved = true;
+      clearTimeout(press.timer);
+      // Rightwards only: leftwards is how a phone goes back, and fighting
+      // that gesture is a good way to be uninstalled.
+      press.dx = Math.max(0, Math.min(dx, 90));
+      press.el.classList.add("swiping");
+      press.el.style.transform = `translateX(${press.dx}px)`;
+    }
+  });
+
+  const finish = (e) => {
+    if (!press) return;
+    const far = press.dx > 55;
+    const el = press.el;
+    endPress(true);
+    if (far) {
+      setReply(lineData(el));
+      if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e2) {} }
+    }
+  };
+  feed.addEventListener("pointerup", finish);
+  feed.addEventListener("pointercancel", () => endPress(true));
+  feed.addEventListener("pointerleave", () => endPress(true));
+
+  // The desktop's long press.
+  feed.addEventListener("contextmenu", (e) => {
+    const el = e.target.closest(".chatline");
+    if (!el) return;
+    e.preventDefault();
+    openMsgSheet(el, e.clientX, e.clientY);
+  });
+}
+
+function endPress(reset) {
+  if (!press) return;
+  clearTimeout(press.timer);
+  if (reset && press.el) {
+    press.el.classList.remove("swiping");
+    press.el.style.transform = "";
+  }
+  press = null;
+}
+
+// ---------------------------------------------------- a spoken message ----
+// The microphone sends a VOICE MESSAGE: it records, the fleet (or the
+// browser) turns it into words, and those words go to the channel. It is not
+// a dictation aid for the box -- you press it, you speak, the team hears
+// about it.
+let voiceRec = null;
+
+async function chatVoice() {
+  const btn = $("chatMic");
+  if (voiceRec) { voiceRec.stop(); return; }
+
+  // The fleet's own ears first: they work on a desktop Firefox, which has
+  // no speech API at all, and they keep the audio on machines you own.
+  if (fleetHas("transcribe") && navigator.mediaDevices && window.MediaRecorder) {
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      note("No microphone: " + (e.message || e.name));
+      return;
+    }
+    const chunks = [];
+    voiceRec = new MediaRecorder(stream);
+    if (btn) { btn.classList.add("on"); btn.textContent = "\u23F9"; }
+    note("Recording — press the button again to send.");
+    voiceRec.ondataavailable = (e) => chunks.push(e.data);
+    voiceRec.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      voiceRec = null;
+      if (btn) { btn.classList.remove("on"); btn.textContent = "\u{1F3A4}"; }
+      const blob = new Blob(chunks, { type: chunks[0] ? chunks[0].type : "audio/webm" });
+      if (!blob.size) return;
+      note("Transcribing…");
+      try {
+        const b64 = await new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(String(fr.result).split(",")[1]);
+          fr.onerror = rej;
+          fr.readAsDataURL(blob);
+        });
+        const out = await askFleet("transcribe",
+          { audio: `data:${blob.type};base64,${b64}` }, 180000);
+        const text = spokenText(out);
+        if (!text) { note("Nothing was heard in that."); return; }
+        await sendChatText(text);
+      } catch (e) {
+        note("Could not transcribe that: " + (e.message || e));
+      }
+    };
+    voiceRec.start();
+    return;
+  }
+
+  // No fleet transcription: the browser's own, where it has some.
+  if (!SR) { note("No speech recognition here, and the fleet offers none."); return; }
+  const r = new SR();
+  r.lang = navigator.language || "en-GB";
+  r.interimResults = false;
+  r.continuous = false;
+  if (btn) btn.classList.add("on");
+  note("Listening…");
+  r.onresult = async (ev) => {
+    const text = [...ev.results].map((x) => x[0].transcript).join(" ").trim();
+    if (text) await sendChatText(text);
+  };
+  r.onerror = () => note("That did not come through.");
+  r.onend = () => { if (btn) btn.classList.remove("on"); };
+  r.start();
+}
+
+/// Pull the words out of whatever shape a transcription service answers in.
+function spokenText(out) {
+  if (!out) return "";
+  let j = null;
+  try { j = JSON.parse(out); } catch (e) { return String(out).trim(); }
+  const t = j.text || j.transcript || (j.data && (j.data.text || j.data.transcript))
+            || (Array.isArray(j.segments)
+                ? j.segments.map((s) => s.text).join(" ") : "");
+  return String(t || "").trim();
+}
+
 async function chatSend() {
   const box = $("chatText");
   const text = (box.value || "").trim();
   if (!text) return;
+  box.value = "";
+  if (!(await sendChatText(text))) box.value = text;
+}
+
+/// Send words to the channel on screen, however they were produced.
+///
+/// A reply goes TO the agent that said the thing, quoted, because that is
+/// what a reply is for here: the teammate who asked gets it in its own
+/// inbox rather than having to notice it going past.
+async function sendChatText(raw) {
+  let text = raw;
+  let to = null;
+  if (chatReply) {
+    const quoted = chatReply.body.length > 140
+      ? chatReply.body.slice(0, 140) + "\u2026" : chatReply.body;
+    text = `\u21a9 ${chatReply.from}: ${quoted}\n\n${raw}`;
+    to = chatReply.slot || chatReply.from;
+    setReply(null);
+  }
   // "#all" is one message to each team, not a message to a channel called
   // "all": every team has its own log, and a message belongs in one.
   const targets = chatChan === "*"
     ? chatSessions().map((x) => x.id)
     : [chanId(chatChan)].filter(Boolean);
-  if (!targets.length) { note("No session to send to."); return; }
-  box.value = "";
+  if (!targets.length) { note("No session to send to."); return false; }
   const failed = [];
   for (const t of targets) {
     try {
-      const r = await post(`/v1/sessions/${encodeURIComponent(t)}/messages`, { text });
+      const body = to ? { text, to } : { text };
+      const r = await post(`/v1/sessions/${encodeURIComponent(t)}/messages`, body);
       if (r && r.error) throw new Error(r.error);
     } catch (e) { failed.push(t); }
   }
-  if (failed.length === targets.length) { box.value = text; note("Could not send that."); }
-  else if (failed.length) note(`Sent, except to ${failed.length} session(s).`);
+  if (failed.length === targets.length) { note("Could not send that."); return false; }
+  if (failed.length) note(`Sent, except to ${failed.length} session(s).`);
   chatStick = true;
   tick();
+  return true;
 }
 
 // Esc leaves the room. Anything else typed in it belongs to the composer.

@@ -118,6 +118,36 @@ pub struct App {
     attach_to: Option<(String, String)>,
 }
 
+/// The first link in a message, if it has one.
+///
+/// A capability bridge answers with what the work produced, and a picture or
+/// a video comes back as a URL. A terminal cannot show it -- so the console
+/// shows the link, and `o` opens it in a browser, which is the honest
+/// division of labour between a terminal and a page.
+pub fn first_link(body: &str) -> Option<String> {
+    let at = body.find("http://").or_else(|| body.find("https://"))?;
+    let rest = &body[at..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>')
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',', ')', ']', '}']);
+    (url.len() > 8).then(|| url.to_string())
+}
+
+/// Hand a URL to whatever the desktop uses. Never waits for it: `xdg-open`
+/// on a machine with no browser blocks for ever, and a console that freezes
+/// because somebody pressed a key is worse than one that does nothing.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 impl App {
     fn detail(&self) -> Option<&Value> {
         self.snap.as_ref().and_then(|s| s.get("detail"))
@@ -486,6 +516,29 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
             app.fetch().await;
         }
         KeyCode::Char('i') if app.pane == Pane::Chat => app.editing = true,
+        KeyCode::Char('o') => {
+            // The newest link in what is on screen. A terminal cannot show a
+            // picture; it can hand you the one thing that can.
+            let link = app
+                .rows("messages")
+                .iter()
+                .filter(|m| {
+                    app.pane != Pane::Chat
+                        || app.chan == "*"
+                        || app.sessions().iter().any(|x| {
+                            x["id"].as_str() == Some(app.chan.as_str())
+                                && x["name"].as_str() == m["session"].as_str()
+                        })
+                })
+                .find_map(|m| m["body"].as_str().and_then(first_link));
+            match link {
+                Some(url) => match open_in_browser(&url) {
+                    Ok(()) => app.notice(format!("opened {url}")),
+                    Err(e) => app.notice(format!("could not open it: {e}")),
+                },
+                None => app.notice("nothing on screen has a link in it"),
+            }
+        }
         KeyCode::Enter => match app.pane {
             Pane::Chat => {
                 // The cursor is on the channel list; Enter joins that channel.

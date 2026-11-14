@@ -477,8 +477,14 @@ fn chat(f: &mut Frame, area: Rect, app: &App) {
                 ));
             }
             spans.push(Span::raw(" "));
+            // A message carrying a link says so, because the terminal
+            // cannot show what is behind it and `o` can.
+            let body = s(m, "body");
+            if crate::tui::first_link(&body).is_some() {
+                spans.push(Span::styled("\u{1F517} ", Style::default().fg(th.second())));
+            }
             spans.push(Span::styled(
-                clip(&s(m, "body"), w.saturating_sub(30)),
+                clip(&body, w.saturating_sub(30)),
                 Style::default().fg(th.fg()),
             ));
             Line::from(spans)
@@ -942,7 +948,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     let keys = match app.pane {
-        Pane::Chat => " 1-8 panes · [ ] channel · i type · Enter join+type · p panel · t theme · ? help · q quit",
+        Pane::Chat => " 1-8 panes · [ ] channel · i type · o open a link · p panel · t theme · ? help · q quit",
         Pane::Graph => " 1-8 panes · j/k subsystem · w workspace · p panel · t theme · ? help · q quit",
         Pane::Agents => " 1-8 panes · j/k move · a attach · s scope · p panel · t theme · ? help · q quit",
         _ => " 1-8 panes · j/k move · s scope · p panel · t theme · r refresh · ? help · q quit",
@@ -978,6 +984,7 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         row("g / G", "first / last"),
         row("a, Enter", "attach to the agent under the cursor"),
         row("i", "type in the chat; Esc stops"),
+        row("o", "open the newest link on screen in a browser"),
         row("[ / ]", "previous / next channel"),
         row("w", "next workspace, in the graph"),
         row("s", "change what the poll covers"),

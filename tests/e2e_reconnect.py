@@ -143,7 +143,27 @@ def main():
     check("a replacement node is online", any(
         n.get("connected") for n in http("GET", "/v1/nodes")[1].get("nodes", [])))
 
-    print("\n=== 3. the conversation carries on ===")
+    print("\n=== 3. the seat comes back on its own, with nobody calling a tool ===")
+    # The complaint this exists for: an operator sat typing at their CLI and
+    # watched the seat read `disconnected`, because reconnection only ever
+    # happened inside a tool call and a conversation can go a long time
+    # without making one. The shim now keeps its own link, so the seat is
+    # back a moment after the node is -- without the model doing anything.
+    def seat_status():
+        rows = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+        return next((a.get("status") for a in rows if a.get("slot_id") == seat_id), None)
+
+    back = None
+    for _ in range(80):                       # up to ~20s, and usually one
+        back = seat_status()
+        if back == "running":
+            break
+        time.sleep(0.25)
+    check("the seat is connected again without any tool call",
+          back == "running", f"status was {back}")
+    check("and it is still the same seat", len(seats(sid)) == 1, str(seats(sid))[:200])
+
+    print("\n=== 4. the conversation carries on ===")
     t = cli.tool("set_summary", {"summary": "after the restart"})
     check("a tool call works after the node restart",
           "updated" in t.lower(), t)

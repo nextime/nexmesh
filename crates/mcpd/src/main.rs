@@ -36,7 +36,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SUPPORTED_MCP: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const PREFERRED_MCP: &str = "2024-11-05";
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "nexmesh-mcpd", version, about = "nexmesh MCP shim")]
 struct Args {
     #[arg(long, env = "NEXMESH_SOCK", default_value = DEFAULT_SOCKET)]
@@ -59,6 +59,7 @@ struct Args {
 struct Node {
     lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     write: tokio::net::unix::OwnedWriteHalf,
+    #[allow(dead_code)] // the Link owns sequencing once the keeper takes over
     seq: u64,
 }
 
@@ -107,10 +108,6 @@ impl Node {
         }
     }
 
-    fn next_req(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
-    }
 }
 
 /// Say who we are and take (or retake) a seat.
@@ -141,34 +138,142 @@ async fn register(
     }
 }
 
-/// Reconnect to the node and take the seat again.
+/// The connection to the node, kept alive by somebody whose only job it is.
 ///
-/// The node dials the hub and reconnects with backoff; this shim did not,
-/// so a node restart -- an upgrade, a reboot -- left every CLI attached to
-/// it permanently disconnected. The conversation carried on, the seat read
-/// `lost` for ever, and nothing short of restarting the CLI itself brought
-/// it back. The conversation id is unchanged across this, so the same seat
-/// is reclaimed rather than a new one taken.
-async fn reconnect(args: &Args, pid: i32, cwd: &str) -> Result<(Node, String)> {
-    let mut wait = std::time::Duration::from_millis(250);
-    let mut last: Option<anyhow::Error> = None;
-    for attempt in 0..8 {
-        if attempt > 0 {
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(std::time::Duration::from_secs(5));
-        }
-        match Node::connect(&args.sock).await {
-            Ok(mut n) => match register(&mut n, args, pid, cwd).await {
-                Ok((agent_id, slot_id, _)) => {
-                    tracing::info!(%agent_id, %slot_id, attempt, "reconnected to the node");
-                    return Ok((n, slot_id));
-                }
-                Err(e) => last = Some(e),
-            },
-            Err(e) => last = Some(e),
+/// It used to be owned by the loop that reads the CLI's stdin, which meant it
+/// was only ever looked at when the model called a tool. A node restart
+/// therefore left the seat reading `disconnected` until the model happened to
+/// use one -- so an operator talking to their CLI watched it stay
+/// disconnected while they typed, which is indistinguishable from broken.
+///
+/// Now a reader task owns the socket. It notices the moment the node goes,
+/// redials, registers again with the same conversation id -- which is what
+/// takes the same seat back -- and forwards frames to whoever is waiting.
+struct Link {
+    args: Args,
+    pid: i32,
+    cwd: String,
+    /// Replaced on every reconnect; `None` while there is no node.
+    write: tokio::sync::Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
+    frames: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<NodeToMcpd>>,
+    slot: std::sync::Mutex<String>,
+    seq: std::sync::atomic::AtomicU64,
+    /// Woken when a reconnect finishes, so a tool call that arrived in the
+    /// gap waits for the link rather than failing into the model's lap.
+    back: tokio::sync::Notify,
+}
+
+impl Link {
+    fn next_req(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    fn slot_id(&self) -> String {
+        self.slot.lock().unwrap().clone()
+    }
+
+    async fn send(&self, frame: &McpdToNode) -> Result<()> {
+        let mut g = self.write.lock().await;
+        let w = g.as_mut().context("not connected to the node")?;
+        let mut s = serde_json::to_string(frame)?;
+        s.push('\n');
+        w.write_all(s.as_bytes()).await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    /// The next frame for `req_id`. Anything else is a late answer to a call
+    /// nobody is waiting for any more, and is dropped rather than returned
+    /// to the wrong caller.
+    async fn reply(&self, req_id: u64, wait: std::time::Duration) -> Result<NodeToMcpd> {
+        let mut rx = self.frames.lock().await;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(f)) => match &f {
+                    NodeToMcpd::ToolReply { req_id: got, .. } if *got == req_id => return Ok(f),
+                    NodeToMcpd::Error { req_id: Some(got), .. } if *got == req_id => return Ok(f),
+                    NodeToMcpd::Error { req_id: None, .. } => return Ok(f),
+                    other => {
+                        tracing::debug!(?other, "a late frame for nobody; dropped");
+                        continue;
+                    }
+                },
+                Ok(None) => anyhow::bail!("the link to the node closed"),
+                Err(_) => anyhow::bail!("the node did not answer in time"),
+            }
         }
     }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("could not reach the node")))
+}
+
+/// Dial and register, for ever, with a bounded backoff.
+///
+/// For ever on purpose: this runs in the background of a conversation that
+/// may last hours, and a node being restarted for a deploy should cost the
+/// seat a few seconds, not the rest of the session.
+async fn relink(link: &Link) -> (tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+                                 tokio::net::unix::OwnedWriteHalf,
+                                 String) {
+    let mut wait = std::time::Duration::from_millis(250);
+    loop {
+        match UnixStream::connect(&link.args.sock).await {
+            Ok(stream) => {
+                let (r, w) = stream.into_split();
+                let mut node = Node { lines: BufReader::new(r).lines(), write: w, seq: 0 };
+                match register(&mut node, &link.args, link.pid, &link.cwd).await {
+                    Ok((agent_id, slot_id, _tools)) => {
+                        tracing::info!(%agent_id, %slot_id, "registered with the node again");
+                        return (node.lines, node.write, slot_id);
+                    }
+                    // A node that refuses the registration will keep refusing
+                    // it until something changes, so this waits like any
+                    // other failure rather than spinning. Dropping `node`
+                    // closes the socket we just opened.
+                    Err(e) => tracing::warn!(error = %e, "the node refused the registration"),
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "the node is not there yet"),
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(5));
+    }
+}
+
+/// Forward what the node says, and put the link back when it goes.
+async fn keeper(
+    link: std::sync::Arc<Link>,
+    tx: tokio::sync::mpsc::Sender<NodeToMcpd>,
+    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+) {
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<NodeToMcpd>(&line) {
+                    Ok(f) => {
+                        if tx.send(f).await.is_err() {
+                            return; // the shim is shutting down
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "unparseable frame from the node"),
+                }
+            }
+            // EOF or a broken socket: the node has gone. This is the whole
+            // point of the task -- noticing now, rather than the next time
+            // the model happens to call a tool.
+            _ => {
+                tracing::warn!("the node went away; reconnecting");
+                *link.write.lock().await = None;
+                let (new_lines, w, slot) = relink(&link).await;
+                *link.write.lock().await = Some(w);
+                *link.slot.lock().unwrap() = slot;
+                lines = new_lines;
+                link.back.notify_waiters();
+            }
+        }
+    }
 }
 
 async fn write_stdout(v: &Value) -> Result<()> {
@@ -256,8 +361,28 @@ async fn main() -> Result<()> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let (agent_id, mut slot_id, tools) = register(&mut node, &args, pid, &cwd).await?;
+    let (agent_id, slot_id, tools) = register(&mut node, &args, pid, &cwd).await?;
     tracing::info!(%agent_id, %slot_id, tools = tools.len(), "registered with the node");
+
+    // From here the socket belongs to the keeper: it forwards what the node
+    // says and puts the link back on its own when the node restarts, so a
+    // seat does not sit there reading `disconnected` until the model next
+    // calls a tool.
+    let (tx, rx) = tokio::sync::mpsc::channel::<NodeToMcpd>(256);
+    let link = std::sync::Arc::new(Link {
+        args: args.clone(),
+        pid,
+        cwd: cwd.clone(),
+        write: tokio::sync::Mutex::new(Some(node.write)),
+        frames: tokio::sync::Mutex::new(rx),
+        slot: std::sync::Mutex::new(slot_id.clone()),
+        seq: std::sync::atomic::AtomicU64::new(1),
+        back: tokio::sync::Notify::new(),
+    });
+    {
+        let link = link.clone();
+        tokio::spawn(keeper(link, tx, node.lines));
+    }
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = stdin.next_line().await? {
@@ -291,10 +416,11 @@ async fn main() -> Result<()> {
                         "capabilities": { "tools": { "listChanged": false } },
                         "serverInfo": { "name": "nexmesh", "version": VERSION },
                         "instructions": format!(
-                            "You are part of a nexmesh team (slot {slot_id}). Teammates may run on \
+                            "You are part of a nexmesh team (slot {}). Teammates may run on \
                              other machines, under other CLIs, or not be CLIs at all. Call \
                              query_knowledge and check_team_status before planning. Teammate \
-                             messages arrive prefixed [PENDING MESSAGES] on any tool result."
+                             messages arrive prefixed [PENDING MESSAGES] on any tool result.",
+                            link.slot_id()
                         ),
                     }),
                 )
@@ -330,19 +456,22 @@ async fn main() -> Result<()> {
                 let mut trouble = String::new();
                 for attempt in 0..2 {
                     if attempt > 0 {
-                        match reconnect(&args, pid, &cwd).await {
-                            Ok((n, sl)) => {
-                                node = n;
-                                slot_id = sl;
-                            }
-                            Err(e) => {
-                                trouble = format!("node unreachable: {e}");
-                                break;
-                            }
+                        // The keeper is already putting the link back. Wait
+                        // for it rather than racing it with a second dial:
+                        // two registrations for one conversation is how a
+                        // seat ends up with a twin.
+                        let waited = tokio::time::timeout(
+                            std::time::Duration::from_secs(20),
+                            link.back.notified(),
+                        )
+                        .await;
+                        if waited.is_err() {
+                            trouble = "the node is not answering".into();
+                            break;
                         }
                     }
-                    let req_id = node.next_req();
-                    if let Err(e) = node
+                    let req_id = link.next_req();
+                    if let Err(e) = link
                         .send(&McpdToNode::Tool {
                             req_id,
                             tool: name.clone(),
@@ -353,7 +482,10 @@ async fn main() -> Result<()> {
                         trouble = format!("node unreachable: {e}");
                         continue;
                     }
-                    match node.recv().await {
+                    // Long, not unbounded: a capability ask can take minutes
+                    // and a lost answer should still end in an error rather
+                    // than a conversation that never comes back.
+                    match link.reply(req_id, std::time::Duration::from_secs(900)).await {
                         Ok(frame) => {
                             reply = Some(frame);
                             break;
@@ -385,7 +517,7 @@ async fn main() -> Result<()> {
                         // in this slot rather than lose them.
                         if !deliver.is_empty() {
                             let ids: Vec<i64> = deliver.iter().map(|m| m.id).collect();
-                            if let Err(e) = node.send(&McpdToNode::Ack { message_ids: ids }).await {
+                            if let Err(e) = link.send(&McpdToNode::Ack { message_ids: ids }).await {
                                 tracing::warn!(error = %e, "could not ack delivered messages");
                             }
                         }
@@ -402,7 +534,7 @@ async fn main() -> Result<()> {
         write_stdout(&response).await?;
     }
 
-    let _ = node.send(&McpdToNode::Bye).await;
+    let _ = link.send(&McpdToNode::Bye).await;
     Ok(())
 }
 

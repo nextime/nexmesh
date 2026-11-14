@@ -939,6 +939,64 @@ fn join(
         .optional()?,
     };
 
+    // A conversation that has ENDED, in a seat that is still somebody's.
+    //
+    // A CLI started by hand gives no name, and its conversation id is new
+    // every time one is started rather than resumed. So closing `claude` and
+    // opening another in the same folder left the old seat empty and minted
+    // `Claude-sissy-2` beside it: the team gains a stranger every morning,
+    // and the name everyone addresses belongs to the seat nobody is in.
+    //
+    // This is a judgement, and the surrounding code is right to be wary of
+    // guessing which empty seat was a restart. So it is narrowed until the
+    // guess is nearly forced:
+    //
+    //   - **no name was given.** A registration that names itself says which
+    //     seat it wants, and two named conversations deliberately get two
+    //     seats -- that is what `NEXMESH_NAME` is for.
+    //   - **the last agent EXITED.** An ending somebody reported, not a
+    //     connection the hub lost: `disconnected` is precisely the case
+    //     where the CLI is usually still sitting there, and taking its seat
+    //     would hand one terminal's conversation to another.
+    //   - **it was an attached agent.** A managed seat belongs to whoever
+    //     spawned it, and recovery may be about to bring it back.
+    //   - **same session, same CLI, same directory**, and nothing live in
+    //     the seat now.
+    //   - **not released.** Released means the work was accepted and the
+    //     seat is finished with, not waiting for its next occupant.
+    let mut reclaimed = false;
+    let existing = match (existing, name.as_deref().filter(|n| !n.trim().is_empty())) {
+        (Some(id), _) => Some(id),
+        (None, Some(_)) => None,
+        (None, None) => {
+            let found: Option<String> = db
+                .query_row(
+                    "SELECT s.id FROM slots s
+                      WHERE s.session_id = ?1 AND s.participant_kind = 'cli'
+                        AND COALESCE(s.cli_id,'') = COALESCE(?2,'')
+                        AND s.task_state <> 'released'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agents a
+                             WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL)
+                        AND EXISTS (
+                            SELECT 1 FROM agents a
+                             WHERE a.slot_id = s.id
+                               AND a.status = 'exited'
+                               AND a.provenance = 'attached'
+                               AND COALESCE(a.cwd,'') = COALESCE(?3,'')
+                               AND a.started_at_ms = (
+                                   SELECT MAX(b.started_at_ms) FROM agents b
+                                    WHERE b.slot_id = s.id))
+                      ORDER BY s.created_at_ms DESC LIMIT 1",
+                    params![session_id, cli_id, cwd],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            reclaimed = found.is_some();
+            found
+        }
+    };
+
     // A person starting a CLI by hand has no name to give, and a nameless
     // seat is useless to read: every view shows a blank where a teammate
     // should be, and two conversations on one machine are indistinguishable.
@@ -970,12 +1028,29 @@ fn join(
             // for an agent that already had a seat makes a SECOND one, which
             // looks exactly like the duplication the pin was meant to stop.
             if let Some(cs) = cli_session.as_deref().filter(|c| !c.is_empty()) {
-                db.execute(
-                    "UPDATE slots SET cli_session = ? WHERE id = ? AND cli_session IS NULL",
-                    params![cs, id],
-                )?;
+                if reclaimed {
+                    // Re-pin: this conversation is the seat's now, so a
+                    // resume of THIS one comes straight back to it rather
+                    // than going round the same reclaim again.
+                    db.execute(
+                        "UPDATE slots SET cli_session = ? WHERE id = ?",
+                        params![cs, id],
+                    )?;
+                } else {
+                    db.execute(
+                        "UPDATE slots SET cli_session = ? WHERE id = ? AND cli_session IS NULL",
+                        params![cs, id],
+                    )?;
+                }
             }
-            tracing::info!(slot_id = %id, "an attached agent returned to its seat");
+            if reclaimed {
+                tracing::info!(
+                    slot_id = %id,
+                    "a new conversation took the seat the last one finished in"
+                );
+            } else {
+                tracing::info!(slot_id = %id, "an attached agent returned to its seat");
+            }
             id
         }
         None => {

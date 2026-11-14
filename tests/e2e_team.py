@@ -436,6 +436,69 @@ def main():
     carried = [m for m in msgs if "for whoever works here" in (m.get("body") or "")]
     check("and what was waiting was carried over, not deleted", bool(carried), str(msgs)[:200])
 
+    print("\n=== a nameless CLI comes back to the seat the last one finished in ===")
+    # The morning-after case: you close `claude` and start another in the same
+    # folder. It has no name to give and a brand-new conversation id, so
+    # without this it took a fresh seat and left yesterday's -- the one every
+    # command and every queued message addresses -- standing empty.
+    quiet_dir = _os.path.join(WS_DIR, "quiet-corner")
+    _os.makedirs(quiet_dir, exist_ok=True)
+    q1 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_CLI_SESSION": "conv-quiet-1"}, cwd=quiet_dir)
+    def seat_of(r):
+        """The seat the hub just sat this shim in, from what it was told."""
+        import re as _re
+        text = json.dumps(r)
+        m = _re.search(r"slot (sl-[0-9a-f]+)", text)
+        return m.group(1) if m else None
+
+    r1 = q1.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "q", "version": "1"}})
+    first_seat = seat_of(r1)
+    check("the first conversation took a seat", bool(first_seat), str(r1)[:200])
+    rows = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    first_name = next((a["name"] for a in rows if a["slot_id"] == first_seat), None)
+
+    # It ENDS -- the shim closes, which is an exit somebody reported.
+    q1.close() if hasattr(q1, "close") else q1.p.terminate()
+    time.sleep(2.0)
+    q2 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_CLI_SESSION": "conv-quiet-2"}, cwd=quiet_dir)
+    r2 = q2.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "q", "version": "1"}})
+    check("the new conversation took the SAME seat, not a twin",
+          seat_of(r2) == first_seat, f"{seat_of(r2)} vs {first_seat}")
+    rows = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    mine = [a for a in rows if a["slot_id"] == first_seat]
+    check("and kept the name the team addresses",
+          len(mine) == 1 and mine[0]["name"] == first_name,
+          f"{[(a['name'], a['slot_id']) for a in mine]} wanted {first_name}")
+    check("and it is the only seat in that directory",
+          len([a for a in rows if a.get("cli") == "handmade"
+               and a["slot_id"] in (first_seat, seat_of(r2))]) == 1, str(mine)[:200])
+
+    # But a NAMED conversation still gets its own seat: a name says which
+    # seat it wants, and two named ones are deliberately two teammates.
+    q3 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_NAME": "Deliberate", "NEXMESH_CLI_SESSION": "conv-quiet-3"},
+              cwd=quiet_dir)
+    r3 = q3.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "q", "version": "1"}})
+    named = [a for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+             if a.get("name") == "Deliberate"]
+    check("a named conversation is still its own teammate",
+          len(named) == 1 and named[0]["slot_id"] != first_seat, str(named)[:200])
+    check("and it was told so", seat_of(r3) != first_seat, f"{seat_of(r3)} vs {first_seat}")
+
+    # And a conversation that is merely out of touch keeps its seat: taking
+    # it would hand one terminal's conversation to another.
+    q4 = Mcpd({"NEXMESH_CLI": "handmade", "NEXMESH_SESSION": sid,
+               "NEXMESH_CLI_SESSION": "conv-quiet-4"}, cwd=quiet_dir)
+    r4 = q4.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "q", "version": "1"}})
+    check("a second LIVE conversation in the same folder gets its own seat",
+          seat_of(r4) not in (None, first_seat), f"{seat_of(r4)} vs {first_seat}")
+
     print("\n=== an external participant comes back to its own seat ===")
     # A bridge or a hermes agent has no conversation id and no process the
     # hub can see, so its NAME is its identity. Restarting one used to mint a
