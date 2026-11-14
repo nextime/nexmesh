@@ -333,6 +333,14 @@ is given.
 nexmesh remove-agent sl-1a2b3c4d --force
 .EE
 .RE
+.TP
+.BI remove\-session " SESSION " [ \-\-force ]
+Remove a session and everything that belonged to it: its seats and their
+agent rows, its messages, workspaces, plan, knowledge, locks, capability
+requests and the tokens scoped to it. Refuses while anybody is still sitting
+in it unless
+.B \-\-force
+is given.
 .SS Driving
 .TP
 .BI send " SESSION TEXT " [ \-\-to " WHO" ]
@@ -379,6 +387,33 @@ driven from anywhere. Your own terminal stays attached.
 .I TARGET
 is a tmux session, window or pane \(em
 .IR mywork ", " mywork:1.0 ", " %3 .
+Adopting the same target twice returns the seat it had before rather than
+making a second one.
+.TP
+.BI seat " SESSION NAME|SEAT " [ \-\-tmux " NAME" ] [ \-\-cmd " CMD" ]
+Give one of your own conversations a keyboard: make the tmux session in the
+directory that conversation was running in, adopt it, and start the seat's
+own CLI inside it resuming the conversation that seat holds. A CLI started by
+hand in an ordinary terminal can only be reached when it next calls a tool;
+in an adopted pane the hub types at it in seconds.
+.RS
+.PP
+Run it on the machine the seat belongs to \(em tmux is local, and so is the
+node that adopts it. It refuses while that conversation is still running
+somewhere else, since two CLIs on one conversation loses half of it, and it
+types into the pane only when the pane is at a shell prompt.
+.I \-\-cmd
+says what to run instead of the default;
+.I \-\-cmd
+with an empty string makes the terminal and adopts it without starting
+anything.
+.I \-\-dry\-run
+prints the three steps instead of taking them.
+.PP
+.EX
+nexmesh seat payments Reviewer
+.EE
+.RE
 .SS Joining a fleet
 .TP
 .BI pair " CODE"

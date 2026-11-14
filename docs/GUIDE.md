@@ -465,6 +465,17 @@ exited and left a shell behind fails that check, and the message goes back in
 the queue rather than being executed by `sh`. An operator who switches window
 has moved the keyboard, and delivery waits.
 
+**Three steps, or one.** The three are: a tmux session in the right
+directory, `nexmesh adopt` so the node holds a view of that pane, and the CLI
+started inside it resuming the conversation that seat holds. `nexmesh seat
+<session> <name>` does all three, because the seat already knows which
+conversation is its own — that is what `cli_session` records — so the resume
+handle does not have to be hunted for in a list of twenty. It refuses while
+that conversation is still running somewhere else, since two CLIs on one
+conversation loses half of it, and it types into the pane only when the pane
+is at a shell prompt. Run it on the machine the seat belongs to: tmux is
+local, and so is the node that adopts it.
+
 The link is recorded on the **seat**, not on the agent, because that is what
 it is about: whoever is in this seat is reachable by keyboard for as long as
 that terminal is adopted. Nothing cleans it up and nothing needs to — every
@@ -1148,7 +1159,16 @@ so there is no encoding on the hot path.
 - Several people can attach to the same agent and all see the same session.
 - Detaching leaves the agent working. Ctrl-C belongs to the agent — that is the
   point of a takeover — so Ctrl-] is the detach key, as in telnet.
-- The terminal is restored on any exit path, including a panic.
+- The bottom row of the window is the viewer's, not the agent's: the agent is
+  told its screen is one row shorter and that row says whose terminal this is,
+  which session it belongs to, and that Ctrl-] brings you back. It is repainted
+  four times a second, because a full-screen agent redraws over everything, and
+  released on the way out. A window too short to spare a row does without.
+- The terminal is restored on any exit path, including a panic. The viewer
+  reads your keyboard through its own non-blocking handle on `/dev/tty`: a
+  blocking read on stdin cannot be cancelled, so a session the hub closed left
+  the viewer waiting for a keypress — and, run from inside the console, ate the
+  console's first keys after it came back.
 
 ### What attach can and cannot reach
 
