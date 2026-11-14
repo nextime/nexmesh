@@ -288,6 +288,15 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove a session and everything that belonged to it. Refuses while
+    /// anybody is still sitting in it.
+    RemoveSession {
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// Remove it even though agents are still live in it.
+        #[arg(long)]
+        force: bool,
+    },
     /// Live status of every agent in a session.
     Status { session: String },
     /// List the certificates the fleet CA has issued.
@@ -1326,6 +1335,21 @@ async fn main() -> Result<()> {
                 dry_run,
             })
             .await?;
+        }
+
+        Cmd::RemoveSession { session, force } => {
+            let url = format!(
+                "{base}/v1/sessions/{session}{}",
+                if force { "?force=1" } else { "" }
+            );
+            let r = authed(c.delete(&url)).send().await.with_context(|| format!("DELETE {url}"))?;
+            let v = body_or_error(r, "removing the session").await?;
+            bail_on_error(&v)?;
+            println!(
+                "removed session '{}' and its {} seat(s)",
+                v["name"].as_str().unwrap_or(&session),
+                v["seats"].as_i64().unwrap_or(0)
+            );
         }
 
         Cmd::Status { session } => {

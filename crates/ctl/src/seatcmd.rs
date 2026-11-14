@@ -235,8 +235,8 @@ pub async fn run(
         let pid = seat["pid"].as_i64().map(|p| format!(" (pid {p})")).unwrap_or_default();
         anyhow::bail!(
             "{name} is still running{pid}. Quit it first -- then this puts the same \
-             conversation back, in a terminal the fleet can type at.\n\
-             (Or pass --cmd '' to make the terminal now and start it yourself later.)"
+conversation back, in a terminal the fleet can type at.\n(Or pass --cmd '' to make \
+the terminal and adopt it now, and start the CLI in it yourself later.)"
         );
     }
     if seat["typed_via_terminal"].as_bool() == Some(true) {
@@ -250,8 +250,8 @@ pub async fn run(
     let descriptor = load_descriptor(o.clis_dir, &cli_id);
     if descriptor.is_none() && o.cmd.is_none() {
         println!(
-            "note: no descriptor for '{cli_id}' in {} -- starting a plain shell in the \
-             pane instead of the CLI. Pass --cmd to say what to run.",
+            "note: no descriptor for '{cli_id}' in {}, so there is nothing to resume \
+with. Pass --cmd to say what to run in the pane.",
             o.clis_dir
         );
     }
@@ -263,9 +263,9 @@ pub async fn run(
         .unwrap_or_default();
     if !here.is_empty() && here != p.node {
         anyhow::bail!(
-            "{name} runs on {}, and a terminal has to be made there: run this on {} \
-             (ssh {}, then `nexmesh seat {} {}`)",
-            p.node, p.node, p.node, o.session, o.who
+            "{name} runs on {}, and the terminal has to be made there: ssh {} and run \
+`nexmesh seat {} {}` on it",
+            p.node, p.node, o.session, o.who
         );
     }
 
@@ -318,10 +318,16 @@ pub async fn run(
     }
 
     println!(
-        "\nIt is yours and the fleet's at the same time:\n           tmux attach -t {}          # your own terminal\n           nexmesh attach {} {}   # from anywhere, Ctrl-] to leave\n\
+        "\nIt is yours and the fleet's at the same time:\n  \
+         tmux attach -t {}{}# your own terminal\n  \
+         nexmesh attach {} {}{}# from anywhere, Ctrl-] to leave\n\
          A message for {name} is now typed at it in seconds, rather than waiting \
          for its next tool call.",
-        p.tmux_name, o.session, o.who
+        p.tmux_name,
+        " ".repeat(30usize.saturating_sub(p.tmux_name.len())),
+        o.session,
+        o.who,
+        " ".repeat(28usize.saturating_sub(o.session.len() + o.who.len())),
     );
     if o.attach && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         println!("\nattaching your terminal to it now (Ctrl-B d to leave tmux)...");

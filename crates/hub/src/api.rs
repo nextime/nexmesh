@@ -170,6 +170,87 @@ pub async fn remove_slot(
     Ok(Json(serde_json::json!({ "removed": id, "agent_rows": agents })))
 }
 
+/// Remove a session and everything that belonged to it.
+///
+/// There was no way to do this at all, so a session made to try something --
+/// and every scratch session anybody has ever made -- stayed on the dashboard
+/// for ever, in the list you scan to see what the fleet is doing. A tool that
+/// can create a thing and not remove it teaches you not to create things.
+///
+/// Refuses while anybody is still sitting in it, like `remove-agent` does: a
+/// live agent is somebody's work, and deleting the session under it would
+/// leave a process talking to a team that does not exist.
+pub async fn remove_session(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> ApiResult {
+    let force = matches!(q.get("force").map(|s| s.as_str()), Some("1") | Some("true"));
+    let db = st.db.lock().unwrap();
+    let session_id = session_ref_to_id(&db, &session_ref);
+    let name: Option<String> = db
+        .query_row("SELECT name FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?;
+    let Some(name) = name else {
+        return Err(bad(format!("no session '{session_ref}'")));
+    };
+    // Live means a lease that has not run out, exactly as a seat removal
+    // reckons it: a row nobody has written off is not evidence of a process.
+    let cutoff = now_ms() - proto::NODE_LEASE_MS as i64;
+    let live: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM agents a JOIN slots s ON s.id = a.slot_id
+              WHERE s.session_id = ? AND a.exited_at_ms IS NULL
+                AND a.status <> 'disconnected' AND COALESCE(a.last_seen_ms, 0) > ?",
+            params![session_id, cutoff],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if live > 0 && !force {
+        return Err(bad(format!(
+            "'{name}' still has {live} live agent(s); release or stop them first,              or pass force=1"
+        )));
+    }
+    let slots: i64 = db
+        .query_row("SELECT COUNT(*) FROM slots WHERE session_id = ?", [&session_id], |r| r.get(0))
+        .unwrap_or(0);
+    db.execute(
+        "DELETE FROM agents WHERE slot_id IN (SELECT id FROM slots WHERE session_id = ?)",
+        [&session_id],
+    )
+    .map_err(bad)?;
+    db.execute(
+        "DELETE FROM message_recipients WHERE message_id IN
+            (SELECT id FROM messages WHERE session_id = ?)",
+        [&session_id],
+    )
+    .ok();
+    // Everything keyed on the session. Listed rather than cascaded, so adding
+    // a table makes you think about what removing a session means for it.
+    for table in [
+        "slots", "workspaces", "messages", "plan_items", "knowledge", "locks",
+        "capability_asks", "guardrails",
+    ] {
+        db.execute(&format!("DELETE FROM {table} WHERE session_id = ?"), [&session_id]).ok();
+    }
+    // Tokens scoped to this session can only ever have reached this session.
+    for table in ["operator_tokens", "participant_tokens"] {
+        db.execute(&format!("DELETE FROM {table} WHERE session_id = ?"), [&session_id]).ok();
+    }
+    db.execute("DELETE FROM sessions WHERE id = ?", [&session_id]).map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+        params![now_ms(), "operator", "session_removed",
+                serde_json::json!({ "session": session_id, "name": name, "slots": slots })
+                    .to_string()],
+    )
+    .ok();
+    Ok(Json(serde_json::json!({
+        "removed": session_id, "name": name, "seats": slots
+    })))
+}
+
 #[derive(Deserialize)]
 pub struct MoveSlot {
     /// Target session: its id or its name.

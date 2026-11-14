@@ -653,6 +653,7 @@ async fn main() -> Result<()> {
         .route("/v1/nodes", get(api::list_nodes))
         .route("/v1/sessions", get(api::list_sessions).post(api::create_session))
         .route("/v1/sessions/:id/name", post(api::rename_session))
+        .route("/v1/sessions/:id", axum::routing::delete(api::remove_session))
         .route("/v1/sessions/:id/slots", post(api::create_slot))
         .route("/v1/sessions/:id/adopt", post(api::adopt_slot))
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))

@@ -190,6 +190,35 @@ def main():
           r.returncode != 0 and "no agent matching" in (r.stdout + r.stderr),
           (r.stdout + r.stderr)[-200:])
 
+    print("\n=== a session can be removed, and not while somebody is in it ===")
+    # There was no way to remove a session at all, so every scratch session
+    # anybody ever made stayed on the dashboard for ever. A tool that can
+    # create a thing and not remove it teaches you not to create things.
+    s, j = http("POST", "/v1/sessions", {"name": "throwaway"})
+    tmp = j.get("session_id")
+    check("a session to throw away", bool(tmp), str(j))
+    r = subprocess.run([f"{BIN}/nexmesh", "--hub", HUB, "remove-session", "throwaway"],
+                       capture_output=True, text=True, cwd=ROOT)
+    check("`nexmesh remove-session` removes it by name", r.returncode == 0, r.stdout + r.stderr)
+    check("and it is gone from the hub",
+          not q("SELECT 1 FROM sessions WHERE id=?", (tmp,)), str(tmp))
+    r = subprocess.run([f"{BIN}/nexmesh", "--hub", HUB, "remove-session", "throwaway"],
+                       capture_output=True, text=True, cwd=ROOT)
+    check("removing it twice is a clean error",
+          r.returncode != 0 and "no session" in (r.stdout + r.stderr),
+          (r.stdout + r.stderr)[-200:])
+    # The live session from the rest of this suite: its seats are released
+    # but one of them still has a live agent, so it must refuse.
+    live = q("SELECT COUNT(*) AS n FROM agents a JOIN slots s ON s.id=a.slot_id "
+             "WHERE s.session_id=? AND a.exited_at_ms IS NULL", (sid,))[0]["n"]
+    if live:
+        r = subprocess.run([f"{BIN}/nexmesh", "--hub", HUB, "remove-session", sid],
+                           capture_output=True, text=True, cwd=ROOT)
+        check("a session with somebody in it is refused",
+              r.returncode != 0 and "live agent" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-200:])
+        check("and the session is still there", bool(q("SELECT 1 FROM sessions WHERE id=?", (sid,))))
+
     print()
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1
