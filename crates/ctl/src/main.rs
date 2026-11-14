@@ -11,12 +11,14 @@
 //! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
 mod install;
+mod seatcmd;
 mod tlstrust;
 mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "nexmesh", version, about = "nexmesh fleet control")]
@@ -256,6 +258,35 @@ Your own terminal stays attached; others can watch and type too.")]
         role: Option<String>,
         #[arg(long)]
         workspace: Option<String>,
+    },
+    /// Give one of your own conversations a keyboard: a tmux pane, adopted,
+    /// with that conversation resumed inside it.
+    ///
+    /// A CLI you started by hand can only be reached when it next calls a
+    /// tool. In an adopted pane the hub can type at it, so a message arrives
+    /// in seconds. Run this on the machine the seat belongs to.
+    Seat {
+        /// Session the seat is in: its name or id.
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// The seat, by the name you address it by.
+        #[arg(value_name = "NAME")]
+        who: String,
+        /// tmux session to use or create. Default: nexmesh-<name>.
+        #[arg(long = "tmux")]
+        tmux: Option<String>,
+        /// What to run in the pane. Default: the seat's own CLI, resuming the
+        /// conversation that seat holds. Pass '' for a plain shell.
+        #[arg(long)]
+        cmd: Option<String>,
+        #[arg(long, env = "NEXMESH_CLIS", default_value = "/etc/nexmesh/clis")]
+        clis: String,
+        /// Do not attach your own terminal afterwards.
+        #[arg(long)]
+        no_attach: bool,
+        /// Print the three steps instead of taking them.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Live status of every agent in a session.
     Status { session: String },
@@ -620,6 +651,123 @@ impl Drop for RawGuard {
 /// to the agent, which is the whole point of a takeover.
 const DETACH_BYTE: u8 = 0x1d;
 
+/// A keyboard this viewer can WALK AWAY FROM.
+///
+/// `tokio::io::stdin()` reads on a blocking thread that nothing can cancel.
+/// For a viewer the hub can close -- a refusal, an agent that exits, a node
+/// that goes -- that is not a detail: the read is still outstanding when the
+/// viewer is done, so the process hangs at exit until somebody presses a key,
+/// and inside the console it was worse. The console came back, drew itself,
+/// and the first keys went to the dead attach's reader instead of to it. The
+/// console looked broken, which is exactly what it was told it was.
+///
+/// So the viewer opens its OWN handle on the terminal, non-blocking, and
+/// polls it. Dropping it abandons nothing and swallows nothing.
+enum Keyboard {
+    Tty(tokio::io::unix::AsyncFd<std::fs::File>),
+    /// Not a terminal (a pipe, a test, a script). Nothing can be typed at it
+    /// anyway, so the old path is fine.
+    Piped(tokio::io::Stdin),
+}
+
+impl Keyboard {
+    fn open() -> Self {
+        use std::os::fd::AsRawFd;
+        if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            // O_NONBLOCK on OUR fd, never on fd 0: that flag is shared with
+            // whoever gave us stdin, and setting it there has broken the
+            // shell that started us ever since shells existed.
+            use nix::fcntl::{fcntl, FcntlArg, OFlag};
+            let fd = f.as_raw_fd();
+            if let Ok(bits) = fcntl(fd, FcntlArg::F_GETFL) {
+                let mut fl = OFlag::from_bits_truncate(bits);
+                fl.insert(OFlag::O_NONBLOCK);
+                if fcntl(fd, FcntlArg::F_SETFL(fl)).is_ok() {
+                    // Safe because the AsyncFd takes the File and owns it
+                    // for as long as it lives: the fd cannot be closed under
+                    // the registration, which is the thing being promised.
+                    let registered = unsafe { tokio::io::unix::AsyncFd::register(f) };
+                    if let Ok(afd) = registered {
+                        return Keyboard::Tty(afd);
+                    }
+                }
+            }
+        }
+        Keyboard::Piped(tokio::io::stdin())
+    }
+
+    /// Cancel-safe: on a tty this waits for readability and reads without
+    /// blocking, so dropping the future leaves no thread holding the terminal.
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Keyboard::Tty(afd) => loop {
+                let mut guard = afd.readable().await?;
+                match guard.try_io(|inner| {
+                    use std::io::Read;
+                    inner.get_ref().read(buf)
+                }) {
+                    Ok(res) => return res,
+                    Err(_would_block) => continue,
+                }
+            },
+            Keyboard::Piped(stdin) => {
+                use tokio::io::AsyncReadExt;
+                stdin.read(buf).await
+            }
+        }
+    }
+}
+
+/// One row at the bottom of the screen that is ours, not the agent's.
+///
+/// An attach is a full-screen takeover of somebody else's terminal, and the
+/// question it always raises is "how do I get out of this?". The remote is
+/// told the screen is one row shorter than it is, and that row says whose
+/// terminal this is and which key brings you back.
+struct StatusBar {
+    text: String,
+    cols: u16,
+    rows: u16,
+}
+
+impl StatusBar {
+    /// The bar is skipped on a screen too short to spare a row for it.
+    fn new(text: String, cols: u16, rows: u16) -> Option<Self> {
+        (rows >= 4).then_some(StatusBar { text, cols, rows })
+    }
+
+    /// Reserve the row: the agent's screen is everything above it.
+    fn agent_rows(&self) -> u16 {
+        self.rows.saturating_sub(1)
+    }
+
+    /// Save the cursor, paint the bar, put the cursor back. Reverse video
+    /// rather than colour, because this has to read the same on every
+    /// terminal anyone attaches from.
+    fn paint(&self) -> Vec<u8> {
+        let mut line = self.text.clone();
+        let w = self.cols as usize;
+        if line.chars().count() > w {
+            line = line.chars().take(w).collect();
+        } else {
+            let pad = w - line.chars().count();
+            line.push_str(&" ".repeat(pad));
+        }
+        format!("\x1b7\x1b[{};1H\x1b[7m{}\x1b[0m\x1b8", self.rows, line).into_bytes()
+    }
+
+    /// Keep the agent's output from scrolling over the bar. A full-screen app
+    /// positions absolutely and stays inside the size it was given; a stream
+    /// of plain output scrolls, and without this it would scroll our row away.
+    fn scroll_region(&self) -> Vec<u8> {
+        format!("\x1b[1;{}r", self.agent_rows()).into_bytes()
+    }
+
+    fn release(&self) -> Vec<u8> {
+        format!("\x1b[r\x1b[{};1H\x1b[2K", self.rows).into_bytes()
+    }
+}
+
 async fn attach(
     base: &str,
     c: &reqwest::Client,
@@ -628,9 +776,9 @@ async fn attach(
     replay: usize,
     ca_cert: Option<&str>,
     identity: Option<(&str, &str)>,
-) -> Result<()> {
+) -> Result<String> {
     use futures_util::{SinkExt, StreamExt};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     let r = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
@@ -649,9 +797,31 @@ async fn attach(
         );
     }
 
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    // A terminal with no size at all is not a terminal: run under `script`
+    // into a file, or any pty nobody sized, and `size()` answers 0x0 -- which
+    // we then asked the hub to make the agent's screen.
+    let (cols, rows) = match crossterm::terminal::size() {
+        Ok((c, r)) if c > 0 && r > 0 => (c, r),
+        _ => (120, 40),
+    };
+    let host = r["host"].as_str().unwrap_or("");
+    let mut bar = StatusBar::new(
+        format!(
+            " nexmesh \u{203a} {name}{}{}  \u{00b7}  Ctrl-] detach",
+            if host.is_empty() || host == "-" { String::new() } else { format!(" on {host}") },
+            format!("  \u{00b7}  {session}")
+        ),
+        cols,
+        rows,
+    );
+    // The agent's screen is what is left after the bar takes its row, so it
+    // is the size the hub is told. Without this the bar is painted over by
+    // anything that fills the screen.
+    let agent_rows = bar.as_ref().map(|b| b.agent_rows()).unwrap_or(rows);
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
-    let url = format!("{ws_base}/v1/attach/ws?agent={agent}&cols={cols}&rows={rows}&replay={replay}");
+    let url = format!(
+        "{ws_base}/v1/attach/ws?agent={agent}&cols={cols}&rows={agent_rows}&replay={replay}"
+    );
     // The attach upgrade needs the operator token too. It goes in a header,
     // never the query string: URLs land in proxy logs and shell history.
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -683,6 +853,15 @@ async fn attach(
 
     // Raw mode only after the connection is up, so a failure prints normally.
     let _guard = RawGuard::enter()?;
+
+    // The bar, and the room made for it, before a byte of the agent's output
+    // arrives.
+    if let Some(b) = &bar {
+        let mut out = tokio::io::stdout();
+        let _ = out.write_all(&b.scroll_region()).await;
+        let _ = out.write_all(&b.paint()).await;
+        let _ = out.flush().await;
+    }
 
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
 
@@ -743,12 +922,24 @@ async fn attach(
         }
     });
 
-    // Our keyboard -> hub.
-    let mut stdin = tokio::io::stdin();
+    // Our keyboard -> hub. Our own fd, non-blocking: see `Keyboard`.
+    let mut keys = Keyboard::open();
     let mut buf = vec![0u8; 4096];
+    // A full-screen agent redraws over anything, including our row, so the
+    // bar is repainted rather than merely written once. Four times a second
+    // is below noticing and far below costing anything.
+    let mut repaint = tokio::time::interval(Duration::from_millis(250));
+    repaint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let reason = loop {
         tokio::select! {
-            n = stdin.read(&mut buf) => {
+            _ = repaint.tick(), if bar.is_some() => {
+                if let Some(b) = &bar {
+                    let mut out = tokio::io::stdout();
+                    let _ = out.write_all(&b.paint()).await;
+                    let _ = out.flush().await;
+                }
+            }
+            n = keys.read(&mut buf) => {
                 let n = match n { Ok(0) | Err(_) => break "input ended".to_string(), Ok(n) => n };
                 if let Some(pos) = buf[..n].iter().position(|b| *b == DETACH_BYTE) {
                     // Send anything typed before the detach key, then leave.
@@ -762,7 +953,19 @@ async fn attach(
                 }
             }
             Some((c, r)) = resize_rx.recv() => {
-                let msg = json!({ "t": "resize", "cols": c, "rows": r }).to_string();
+                // The agent still gets one row less than the window, and the
+                // bar moves to the new bottom.
+                let mut agent_r = r;
+                if let Some(b) = &mut bar {
+                    b.cols = c;
+                    b.rows = r;
+                    agent_r = b.agent_rows();
+                    let mut out = tokio::io::stdout();
+                    let _ = out.write_all(&b.scroll_region()).await;
+                    let _ = out.write_all(&b.paint()).await;
+                    let _ = out.flush().await;
+                }
+                let msg = json!({ "t": "resize", "cols": c, "rows": agent_r }).to_string();
                 let _ = sink.send(WsMessage::Text(msg)).await;
             }
             Some(why) = quit_rx.recv() => break why,
@@ -772,19 +975,42 @@ async fn attach(
     let _ = sink.send(WsMessage::Text(json!({ "t": "close" }).to_string())).await;
     let _ = sink.close().await;
     reader.abort();
+    if let Some(b) = &bar {
+        let mut out = tokio::io::stdout();
+        let _ = out.write_all(&b.release()).await;
+        let _ = out.flush().await;
+    }
     drop(_guard);
     // "the agent exited. The agent is still running." was printed as one
     // line, and read as nonsense. The reassurance belongs only to a detach
     // the viewer chose: if the agent has gone, saying it is running is the
     // opposite of true.
-    let gone = reason.contains("exited") || reason.contains("closed the connection")
+    Ok(end_line(&reason))
+}
+
+/// What to say about an attach that has ended. Returned rather than printed,
+/// because the console shows it as a notice on its own screen -- printing it
+/// there left the reason under whatever the console drew next, so an attach
+/// that was REFUSED looked like an attach that did nothing.
+fn end_line(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    let gone = reason.contains("exited")
+        || reason.contains("closed the connection")
         || reason.contains("node disconnected");
-    if gone {
-        println!("{reason}.");
+    // A seat with no terminal is not a failure to explain away: it is the one
+    // case with a cure, so the cure goes on the SECOND line. The console
+    // shows the first line only, which is why the first line has to stand on
+    // its own.
+    let cure = if reason.contains("no terminal here") {
+        "\nGive it one:  nexmesh seat <session> <name>           (a tmux pane, adopted, with that conversation in it)"
     } else {
-        println!("{reason}. The agent is still running.");
+        ""
+    };
+    if gone {
+        format!("{reason}.{cure}")
+    } else {
+        format!("{reason}. The agent is still running.{cure}")
     }
-    Ok(())
 }
 
 #[tokio::main]
@@ -1089,6 +1315,19 @@ async fn main() -> Result<()> {
             }
         }
 
+        Cmd::Seat { session, who, tmux, cmd, clis, no_attach, dry_run } => {
+            seatcmd::run(&base, &c, seatcmd::Opts {
+                session: &session,
+                who: &who,
+                tmux: tmux.as_deref(),
+                clis_dir: &clis,
+                cmd: cmd.as_deref(),
+                attach: !no_attach,
+                dry_run,
+            })
+            .await?;
+        }
+
         Cmd::Status { session } => {
             let v = get(&c, format!("{base}/v1/sessions/{session}/status")).await?;
             bail_on_error(&v)?;
@@ -1295,7 +1534,10 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Attach { session, who, replay } => {
-            attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref(), identity).await?;
+            let reason =
+                attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref(), identity)
+                    .await?;
+            println!("{reason}");
         }
 
         Cmd::Pair { pair_hub, code, connect, insecure } => {

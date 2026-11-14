@@ -821,6 +821,62 @@ pub async fn adopt_slot(
     }
     // Named or identified, like every other session-scoped call.
     let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
+    // Adopting the same terminal twice is one terminal, not two.
+    //
+    // Every adopt minted a fresh seat, so re-running it after a reboot, a
+    // node restart or simply because you were not sure it had worked left a
+    // row of `term-...` twins, all pointing at one pane, all but one of them
+    // dead. The whole point of the seat machinery is that a thing you come
+    // back to keeps its place.
+    let existing: Option<String> = {
+        let db = st.db.lock().unwrap();
+        db.query_row(
+            "SELECT id FROM slots
+              WHERE session_id = ?1 AND cli_id = 'tmux' AND tmux_target = ?2
+                AND COALESCE(task_state,'') <> 'released'
+                AND COALESCE(placement,'') LIKE '%' || ?3 || '%'
+              ORDER BY created_at_ms DESC LIMIT 1",
+            params![session_id, req.tmux_target, req.node],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(bad)?
+    };
+    if let Some(slot_id) = existing {
+        {
+            let db = st.db.lock().unwrap();
+            if !req.name.trim().is_empty() {
+                let _ = db.execute(
+                    "UPDATE slots SET display_name = ? WHERE id = ?",
+                    params![req.name, slot_id],
+                );
+            }
+            if let Some(r) = &req.role {
+                let _ = db.execute("UPDATE slots SET role = ? WHERE id = ?", params![r, slot_id]);
+            }
+            // Live already? Then there is nothing to do but say so.
+            let live: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE slot_id = ?
+                                    AND exited_at_ms IS NULL)",
+                    [&slot_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if live {
+                return Ok(Json(json!({
+                    "slot_id": slot_id, "reused": true, "tmux_target": req.tmux_target,
+                    "note": "that terminal was already adopted; nothing to do"
+                })));
+            }
+        }
+        let (agent_id, node) = crate::launch::launch_slot(&st, &slot_id, None).await.map_err(bad)?;
+        return Ok(Json(json!({
+            "slot_id": slot_id, "agent_id": agent_id, "node": node, "reused": true,
+            "tmux_target": req.tmux_target,
+            "note": "the terminal is adopted again, in the seat it had before"
+        })));
+    }
     let slot_id = format!("sl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     {
         let db = st.db.lock().unwrap();
@@ -1477,7 +1533,8 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 a.pid, COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
                                                 THEN 'tmux' END),
                 a.id, a.exited_at_ms, s.terminal_via IS NOT NULL,
-                COALESCE(a.status, 'disconnected')
+                COALESCE(a.status, 'disconnected'),
+                s.cli_session, a.cwd, s.tmux_target
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
@@ -1514,6 +1571,13 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 // by the kinder one above: `waiting` is a seat, `exited` is
                 // a process, and the two are answers to different questions.
                 "agent_status": r.get::<_, String>(18)?,
+                // Which conversation is in this seat, where it was running,
+                // and the terminal it lives in if it has one. Enough to put
+                // the same conversation back in the same place -- which is
+                // what `nexmesh seat` does.
+                "cli_session": r.get::<_, Option<String>>(19)?,
+                "cwd": r.get::<_, Option<String>>(20)?,
+                "tmux_target": r.get::<_, Option<String>>(21)?,
             }))
         })
         .and_then(|m| m.collect())
@@ -1663,18 +1727,24 @@ pub async fn resolve_agent(
     // right answer for `transcript`, which reads what a finished agent said,
     // and the wrong one for `attach`, which needs a process -- so the caller
     // is told rather than left to find out from a failure further on.
-    let live: Option<(String, Option<i64>)> = db
+    let live: Option<(String, Option<i64>, Option<String>, Option<String>)> = db
         .query_row(
-            "SELECT status, exited_at_ms FROM agents WHERE id = ?",
+            "SELECT a.status, a.exited_at_ms, n.name, a.io_kind
+               FROM agents a LEFT JOIN nodes n ON n.id = a.node_id
+              WHERE a.id = ?",
             [&agent_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(bad)?;
-    let (status, exited) = live.unwrap_or_else(|| ("unknown".into(), None));
+    let (status, exited, host, io_kind) =
+        live.unwrap_or_else(|| ("unknown".into(), None, None, None));
     Ok(Json(json!({
         "agent_id": agent_id, "name": name,
         "status": status, "exited": exited.is_some(),
+        // Which machine, and what kind of terminal -- so a viewer can say
+        // whose screen you are looking at before it draws a byte of it.
+        "host": host, "io_kind": io_kind,
     })))
 }
 

@@ -26,3 +26,5 @@ futures-util = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
+# fcntl, for a non-blocking handle on our own terminal: see `Keyboard`.
+nix = { workspace = true }

@@ -178,6 +178,19 @@ def main():
     check("the recorded pid is the CLI, which is the shim's parent",
           row["terminal_cli_pid"] != shimpid, f"cli={row['terminal_cli_pid']} shim={shimpid}")
 
+    print("\n=== 3b. adopting the same terminal twice is one terminal ===")
+    # Every adopt used to mint a fresh seat, so re-running it after a reboot
+    # -- or because you were not sure the first one took -- left a row of
+    # `...Term` twins pointing at one pane, all but one of them dead.
+    before = len(q("SELECT id FROM slots WHERE session_id=? AND cli_id='tmux'", (sid,)))
+    s, j2 = http("POST", f"/v1/sessions/{sid}/adopt",
+        {"node": "machine-b", "tmux_target": "Hand", "name": "HandTerm"})
+    after = q("SELECT id FROM slots WHERE session_id=? AND cli_id='tmux'", (sid,))
+    check("the second adopt says it reused the seat", j2.get("reused") is True, str(j2))
+    check("and no twin seat appeared", len(after) == before, str(after))
+    check("it is the same seat as the first adopt", j2.get("slot_id") == j.get("slot_id"),
+          f"{j2.get('slot_id')} vs {j.get('slot_id')}")
+
     print("\n=== 4. now the queued message is typed at it ===")
     got = until(lambda: "before the adoption" in read(HANDLOG), seconds=40)
     check("the message that had nowhere to go arrived", bool(got), read(HANDLOG)[-400:])

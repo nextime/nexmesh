@@ -109,6 +109,13 @@ fn audience_seats(m: &str, extra: &str) -> String {
          WHERE s2.session_id = {m}.session_id
            AND ({m}.from_slot IS NULL OR s2.id <> {m}.from_slot)
            AND COALESCE(s2.task_state,'') <> 'released'
+           -- An adopted terminal is a window, not a mind. It holds no model
+           -- and can never ack, so counting it would mean every team message
+           -- in a session with one stayed undelivered for ever. Whatever is
+           -- SITTING in that terminal has a seat of its own, and that seat
+           -- is counted.
+           AND COALESCE(s2.cli_id,'') <> 'tmux'
+           AND s2.tmux_target IS NULL
            AND a2.id IS NOT NULL
            AND (a2.exited_at_ms IS NULL OR ({cond}))
            {extra}",
@@ -373,6 +380,26 @@ mod tests {
         db.execute("DELETE FROM slots WHERE id = 'sl-dead'", []).unwrap();
         let (seen_n, audience_n, _) = tally(&db);
         assert_eq!((seen_n, audience_n), (2, 2));
+    }
+
+    #[test]
+    fn an_adopted_terminal_is_not_part_of_the_audience() {
+        // It is a window onto a pane. The CLI inside it has its own seat.
+        let db = room();
+        db.execute(
+            "INSERT INTO slots (id,session_id,display_name,cli_id,tmux_target,created_at_ms)
+             VALUES ('sl-term','s1','term-Max','tmux','nexmesh-max',1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO agents (id,slot_id,node_id,provenance,status,started_at_ms,last_seen_ms)
+             VALUES ('ag-term','sl-term','nd-1','managed','running',?,?)",
+            params![now_ms(), now_ms()],
+        )
+        .unwrap();
+        let (_, audience_n, _) = tally(&db);
+        assert_eq!(audience_n, 2, "the terminal is not a teammate");
     }
 
     #[test]

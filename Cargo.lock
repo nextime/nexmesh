@@ -1427,6 +1427,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "nexmesh-proto",
+ "nix 0.29.0",
  "ratatui",
  "reqwest",
  "rustls",

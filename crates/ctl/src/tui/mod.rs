@@ -380,8 +380,17 @@ pub async fn run(
             if let Err(e) = term.clear() {
                 break Err(e.into());
             }
+            // The viewer hands back why it ended -- a detach, an agent that
+            // exited, a refusal -- and the console says it on its own screen.
+            // Printed by the viewer it landed under the next redraw, so a
+            // refused attach looked like a key that did nothing.
             match r {
-                Ok(()) => app.notice(format!("detached from {who}")),
+                // One line: the status row is one row. The viewer's second
+                // line is advice for a terminal you can scroll back in.
+                Ok(reason) => app.notice(format!(
+                    "{who}: {}",
+                    reason.lines().next().unwrap_or("detached")
+                )),
                 Err(e) => app.notice(trim_err(&e.to_string())),
             }
             app.fetch().await;

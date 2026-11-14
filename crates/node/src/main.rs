@@ -559,11 +559,13 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                 let known = ctx.agent(&agent_id).is_some();
                 let reason = if known {
                     format!(
-                        "this node has no terminal for {agent_id}: its CLI was started by hand,                          so nothing but its own shim reaches it. Adopt the tmux pane it is                          sitting in (`nexmesh adopt`) and it becomes attachable."
+                        "no terminal here for {agent_id}: its CLI was started by hand, \
+                         so only its own shim reaches it"
                     )
                 } else {
                     format!(
-                        "this node is not running {agent_id}. It may have restarted since that                          agent started, or the agent belongs to another machine."
+                        "this node is not running {agent_id}: it may have restarted since \
+                         that agent started, or the agent belongs to another machine"
                     )
                 };
                 let _ = ctx
