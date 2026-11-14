@@ -471,6 +471,12 @@ pub struct AppState {
     kicks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Where per-agent transcripts live, beside the database.
     pub transcripts: Arc<std::path::PathBuf>,
+    /// Open transcript files, with what has been written to each and what is
+    /// still on its way. See `Transcript`.
+    writers: Arc<Mutex<HashMap<String, Transcript>>>,
+    /// How large a transcript may grow before it is rotated. A field so a test
+    /// can prove rotation without writing eight megabytes.
+    transcript_max: u64,
     /// Where the fleet CA lives, for signing pairing requests.
     pki: Arc<std::path::PathBuf>,
     /// The pairing listener's address, so the dashboard can show the exact
@@ -488,6 +494,55 @@ pub struct AppState {
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 }
 
+/// How long a chunk may wait to be written, and how much may pile up first.
+/// Both are small enough that `nexmesh transcript` never looks stale and large
+/// enough that a chatty pane costs one write instead of thirty.
+const TRANSCRIPT_LINGER: std::time::Duration = std::time::Duration::from_millis(200);
+const TRANSCRIPT_BUF_BYTES: usize = 16 * 1024;
+/// Handles are cheap but not free, and the hub has seen fifteen hundred agents
+/// in two days. Idle ones are closed; the rest are capped.
+const TRANSCRIPT_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+const TRANSCRIPT_HANDLES: usize = 64;
+
+/// One agent's transcript, open.
+///
+/// The node streams an agent's output in whatever chunks the pty produced, and
+/// ten adopted panes produce a great many small ones. Appending each straight
+/// to disk cost a `stat`, a `mkdir`, an `open`, a `write` and a `close` -- five
+/// syscalls per chunk, and on a four-core Celeron serving ten live panes that
+/// was most of what the hub was doing. So the handle stays open, the size is
+/// counted here instead of being asked of the filesystem, and chunks are
+/// gathered for a fifth of a second before they land.
+///
+/// Nothing is lost by the wait: a read flushes first, and the flusher runs
+/// whether or not anybody is reading.
+struct Transcript {
+    file: std::fs::File,
+    /// Bytes already on disk.
+    size: u64,
+    /// Bytes not yet written.
+    buf: Vec<u8>,
+    /// When this file was last touched, for closing the ones nobody is using.
+    touched: std::time::Instant,
+}
+
+impl Transcript {
+    fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        match self.file.write_all(&self.buf) {
+            Ok(()) => self.size += self.buf.len() as u64,
+            // A transcript is a record, not the work: a write that fails must
+            // not take the agent down with it, and saying so once per flush is
+            // enough to find out why.
+            Err(e) => tracing::warn!(error = %e, "cannot write transcript"),
+        }
+        self.buf.clear();
+    }
+}
+
 impl AppState {
     pub fn open(path: &str) -> Result<Self> {
         let path = expand(path);
@@ -495,6 +550,24 @@ impl AppState {
             std::fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(&path).with_context(|| format!("opening {path}"))?;
+        // How the engine is asked to behave, which by default is "fsync on
+        // every commit". A hub writes a row for every heartbeat of every
+        // agent, so on a slow disk that was nine fsyncs a second for state
+        // that is rebuilt from the fleet within a heartbeat of a restart.
+        //
+        // NORMAL in WAL mode cannot corrupt the database -- that is the
+        // guarantee WAL gives; it can lose the last commits to a power cut,
+        // which for live fleet state is the right trade. The checkpoint is
+        // kept small so the WAL does not grow into something every read has
+        // to page through: this one was 64MB beside a 158MB database.
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA wal_autocheckpoint = 512;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -16000;",
+        );
         conn.execute_batch(proto::SCHEMA_SQL).context("applying schema")?;
         migrate(&conn).context("migrating schema")?;
         let transcripts = std::path::Path::new(&path)
@@ -505,6 +578,8 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             transcripts: Arc::new(transcripts),
+            writers: Arc::new(Mutex::new(HashMap::new())),
+            transcript_max: TRANSCRIPT_MAX_BYTES,
             pki: Arc::new(std::path::PathBuf::from(expand("~/.nexmesh/pki"))),
             pair_listen: Arc::new(None),
             nodes: Arc::new(Mutex::new(HashMap::new())),
@@ -528,6 +603,8 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             transcripts: Arc::new(std::env::temp_dir().join("nexmesh-test-transcripts")),
+            writers: Arc::new(Mutex::new(HashMap::new())),
+            transcript_max: TRANSCRIPT_MAX_BYTES,
             pki: Arc::new(std::env::temp_dir().join("nexmesh-test-pki")),
             pair_listen: Arc::new(None),
             nodes: Arc::new(Mutex::new(HashMap::new())),
@@ -727,30 +804,111 @@ impl AppState {
     /// Append an agent's output so the operator can read what it actually did.
     /// The node streams this; dropping it meant an agent's reasoning and errors
     /// were unrecoverable the moment it exited.
+    ///
+    /// The bytes are on their way, not necessarily on disk: see `Transcript`.
     pub fn append_transcript(&self, agent_id: &str, data: &[u8]) {
         let Some(id) = safe_id(agent_id) else {
             tracing::warn!(agent_id, "refusing transcript for an unsafe agent id");
             return;
         };
+        let mut open = self.writers.lock().unwrap();
+        if !open.contains_key(id) {
+            // The one place the directory is made: at startup, and again here
+            // only if something removed it underneath us.
+            let Some(t) = self.open_transcript(id) else { return };
+            if open.len() >= TRANSCRIPT_HANDLES {
+                // Close the one nobody has touched for longest. Its bytes are
+                // written first, or they would be the bytes we lost.
+                if let Some(cold) =
+                    open.iter().min_by_key(|(_, t)| t.touched).map(|(k, _)| k.clone())
+                {
+                    if let Some(mut t) = open.remove(&cold) {
+                        t.flush();
+                    }
+                }
+            }
+            open.insert(id.to_string(), t);
+        }
+        let Some(t) = open.get_mut(id) else { return };
+        t.touched = std::time::Instant::now();
+        t.buf.extend_from_slice(data);
+        // Rotation is decided from the counted size, so a chatty agent is not
+        // asking the filesystem how big its file is thirty times a second.
+        if t.size + t.buf.len() as u64 > self.transcript_max {
+            t.flush();
+            let path = self.transcripts.join(format!("{id}.log"));
+            let _ = std::fs::rename(&path, self.transcripts.join(format!("{id}.log.1")));
+            open.remove(id);
+            if let Some(fresh) = self.open_transcript(id) {
+                open.insert(id.to_string(), fresh);
+            }
+            return;
+        }
+        if t.buf.len() >= TRANSCRIPT_BUF_BYTES {
+            t.flush();
+        }
+    }
+
+    /// A transcript file, opened for appending, with its size read once.
+    fn open_transcript(&self, id: &str) -> Option<Transcript> {
         let path = self.transcripts.join(format!("{id}.log"));
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > TRANSCRIPT_MAX_BYTES {
-                let _ = std::fs::rename(&path, self.transcripts.join(format!("{id}.log.1")));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                let _ = std::fs::create_dir_all(self.transcripts.as_path());
+                match opts.open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(id, error = %e, "cannot open transcript");
+                        return None;
+                    }
+                }
+            }
+        };
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Some(Transcript { file, size, buf: Vec::new(), touched: std::time::Instant::now() })
+    }
+
+    /// Write out what is waiting, and close what nobody is using.
+    ///
+    /// Called on a timer. Returns how many files it wrote to, which is what a
+    /// log line would want to say if this ever needs one.
+    pub fn flush_transcripts(&self) -> usize {
+        let mut open = self.writers.lock().unwrap();
+        let mut wrote = 0;
+        for t in open.values_mut() {
+            if !t.buf.is_empty() && t.touched.elapsed() >= TRANSCRIPT_LINGER {
+                t.flush();
+                wrote += 1;
             }
         }
-        use std::io::Write;
-        let _ = std::fs::create_dir_all(self.transcripts.as_path());
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(mut f) => {
-                let _ = f.write_all(data);
+        let cold: Vec<String> = open
+            .iter()
+            .filter(|(_, t)| t.buf.is_empty() && t.touched.elapsed() > TRANSCRIPT_IDLE)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in cold {
+            if let Some(mut t) = open.remove(&k) {
+                t.flush();
             }
-            Err(e) => tracing::warn!(agent_id, error = %e, "cannot write transcript"),
+        }
+        wrote
+    }
+
+    /// Everything waiting for one agent, written now. A reader calls this, so
+    /// that waiting to write can never mean reading a stale tail.
+    fn flush_one(&self, id: &str) {
+        if let Some(t) = self.writers.lock().unwrap().get_mut(id) {
+            t.flush();
         }
     }
 
     /// The last `tail_bytes` of an agent's transcript.
     pub fn read_transcript(&self, agent_id: &str, tail_bytes: usize) -> Result<String> {
         let id = safe_id(agent_id).context("invalid agent id")?;
+        self.flush_one(&id);
         let path = self.transcripts.join(format!("{id}.log"));
         let data = std::fs::read(&path).unwrap_or_default();
         let start = data.len().saturating_sub(tail_bytes);
@@ -1563,6 +1721,69 @@ mod transcript_tests {
         let dir = std::env::temp_dir().join(format!("nexmesh-tr-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         AppState { transcripts: Arc::new(dir), ..st }
+    }
+
+    #[test]
+    fn many_small_chunks_cost_one_write_and_read_whole() {
+        // Ten adopted panes stream output in pty-sized pieces. Each used to be
+        // a stat, a mkdir, an open, a write and a close.
+        let st = fresh();
+        for i in 0..50 {
+            st.append_transcript("ag-chatty", format!("line {i}\n").as_bytes());
+        }
+        // Nothing has been asked to flush, so it is still in hand -- one open
+        // file, not fifty opens.
+        assert_eq!(st.writers.lock().unwrap().len(), 1);
+        // And a reader sees all of it anyway, because reading flushes.
+        let got = st.read_transcript("ag-chatty", 4096).unwrap();
+        assert_eq!(got.lines().count(), 50, "every line, in order: {got:?}");
+        assert!(got.starts_with("line 0\n") && got.ends_with("line 49\n"));
+    }
+
+    #[test]
+    fn the_flusher_writes_what_nobody_has_asked_for() {
+        let st = fresh();
+        st.append_transcript("ag-quiet", b"something\n");
+        // Too soon: it lingers, by design.
+        assert_eq!(st.flush_transcripts(), 0);
+        std::thread::sleep(TRANSCRIPT_LINGER + std::time::Duration::from_millis(20));
+        assert_eq!(st.flush_transcripts(), 1);
+        // On disk now, without anybody reading it.
+        let path = st.transcripts.join("ag-quiet.log");
+        assert_eq!(std::fs::read(path).unwrap(), b"something\n");
+    }
+
+    #[test]
+    fn a_transcript_that_grows_too_large_rotates_and_keeps_going() {
+        let st = AppState { transcript_max: 64, ..fresh() };
+        st.append_transcript("ag-big", &[b'a'; 50]);
+        st.append_transcript("ag-big", &[b'b'; 50]);
+        st.append_transcript("ag-big", b"after\n");
+        let now = st.read_transcript("ag-big", 4096).unwrap();
+        assert_eq!(now, "after\n", "the live file starts again");
+        let old = std::fs::read(st.transcripts.join("ag-big.log.1")).unwrap();
+        assert_eq!(old.len(), 100, "and the last one is kept beside it");
+    }
+
+    #[test]
+    fn handles_are_capped_and_the_coldest_is_written_before_it_closes() {
+        let st = fresh();
+        for i in 0..(TRANSCRIPT_HANDLES + 4) {
+            st.append_transcript(&format!("ag-{i}"), b"mine\n");
+        }
+        assert!(st.writers.lock().unwrap().len() <= TRANSCRIPT_HANDLES);
+        // The ones that were closed to make room kept their bytes.
+        for i in 0..4 {
+            let got = st.read_transcript(&format!("ag-{i}"), 100).unwrap();
+            assert_eq!(got, "mine\n", "agent {i} lost its transcript");
+        }
+    }
+
+    #[test]
+    fn an_unsafe_id_still_writes_nothing_and_opens_nothing() {
+        let st = fresh();
+        st.append_transcript("../../etc/nexmesh-pwned", b"nope");
+        assert!(st.writers.lock().unwrap().is_empty());
     }
 
     #[test]

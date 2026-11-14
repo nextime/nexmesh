@@ -134,6 +134,31 @@ fn audience_seats(m: &str, extra: &str) -> String {
     )
 }
 
+/// The seats that can read a team message in a session, as rows of
+/// `(session_id, slot_id)` -- the same test `audience_seats` applies, asked
+/// once for the whole fleet instead of once per message.
+///
+/// The counting form is correct and, on a dashboard that polls twice a second,
+/// ruinous: SQLite re-evaluates it for every message, and `delivered` asks for
+/// it twice more. Measured on the live hub, one dashboard poll spent 0.42s of
+/// a Celeron's second on exactly that. This returns the set, and the caller
+/// counts in memory.
+pub fn eligible_seats() -> String {
+    format!(
+        "SELECT s2.session_id, s2.id
+           FROM slots s2
+           LEFT JOIN agents a2 ON a2.id = (
+               SELECT id FROM agents WHERE slot_id = s2.id
+               ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+          WHERE COALESCE(s2.task_state,'') <> 'released'
+            AND NOT {term}
+            AND a2.id IS NOT NULL
+            AND (a2.exited_at_ms IS NULL OR ({cond}))",
+        term = is_terminal("s2"),
+        cond = waiting("s2", "a2")
+    )
+}
+
 /// Whether everyone it was for has seen it. A message addressed to one seat
 /// is its own business; a team message is not delivered until the team has
 /// it, and a team nobody is in has not received anything.

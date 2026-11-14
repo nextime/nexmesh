@@ -626,6 +626,42 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Transcripts land on disk here, a fifth of a second behind the pane that
+    // produced them, so ten chatty terminals cost ten writes a second instead
+    // of a write per chunk. A read flushes first, so nothing is ever read
+    // stale; this is what writes the bytes nobody has asked for yet.
+    //
+    // The WAL is kept short in the same place. SQLite checkpoints on its own
+    // when it can, and cannot while a reader holds an old snapshot -- which on
+    // a hub being polled once a second is most of the time, which is how a
+    // 64MB WAL grew beside a 158MB database and made every read page through
+    // it.
+    {
+        let st = st.clone();
+        tokio::spawn(async move {
+            let mut flush = tokio::time::interval(std::time::Duration::from_millis(200));
+            flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut since_checkpoint = 0u32;
+            loop {
+                flush.tick().await;
+                let st2 = st.clone();
+                // Disk work, off the async workers: a slow write must not
+                // stall an attach relay sharing the thread.
+                let _ = tokio::task::spawn_blocking(move || st2.flush_transcripts()).await;
+                since_checkpoint += 1;
+                if since_checkpoint >= 150 {
+                    since_checkpoint = 0;
+                    let st2 = st.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let db = st2.db.lock().unwrap();
+                        let _ = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+                    })
+                    .await;
+                }
+            }
+        });
+    }
+
     // Lease sweeper: the only thing that ages a node or an external agent out,
     // and the only thing that returns their in-flight messages to the queue.
     {

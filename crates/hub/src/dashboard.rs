@@ -172,6 +172,94 @@ pub struct StateQuery {
     pub session: Option<String>,
 }
 
+/// Who could read a team message, and who has -- for the whole fleet, once.
+///
+/// The dashboard asks this of every message it shows, for every session it
+/// shows, twice a second. Asked in SQL it is a correlated subquery over slots
+/// and agents, re-run per message and three times over per row once
+/// `delivered` is included: 0.42s of CPU per poll on the live hub, which with
+/// two pollers was most of a core. Asked once, it is two small queries and a
+/// pair of hash lookups.
+struct Delivery {
+    /// Seats that can read a team message, per session.
+    eligible: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Which seats have acked each message. Counted at the point of asking
+    /// over the seats that still count AND are not the sender -- otherwise a
+    /// message read by a seat since removed reads `4/3`, and a sender that
+    /// acked its own broadcast reads `2/1`.
+    acked: std::collections::HashMap<i64, Vec<String>>,
+}
+
+impl Delivery {
+    fn read(db: &rusqlite::Connection) -> Self {
+        let mut eligible: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            Default::default();
+        if let Ok(mut q) = db.prepare(&crate::seat::eligible_seats()) {
+            if let Ok(rows) =
+                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            {
+                for (session, slot) in rows.flatten() {
+                    eligible.entry(session).or_default().insert(slot);
+                }
+            }
+        }
+        // Every ack, with the seat that gave it, so the count can be taken
+        // over the seats that still count. There is one row per recipient per
+        // message, which is the smallest table involved.
+        let mut acked: std::collections::HashMap<i64, Vec<String>> = Default::default();
+        if let Ok(mut q) = db.prepare(
+            "SELECT r.message_id, r.slot_id, m.session_id
+               FROM message_recipients r JOIN messages m ON m.id = r.message_id
+              WHERE r.acked_at_ms IS NOT NULL",
+        ) {
+            if let Ok(rows) = q.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            }) {
+                for (id, slot, session) in rows.flatten() {
+                    if eligible.get(&session).is_some_and(|set| set.contains(&slot)) {
+                        acked.entry(id).or_default().push(slot);
+                    }
+                }
+            }
+        }
+        Self { eligible, acked }
+    }
+
+    /// How many seats a team message is for: everyone eligible except whoever
+    /// sent it. The operator is not a seat, so nothing is subtracted for it.
+    fn audience(&self, session: &str, from_slot: &str) -> i64 {
+        let Some(set) = self.eligible.get(session) else { return 0 };
+        let mut n = set.len() as i64;
+        if !from_slot.is_empty() && set.contains(from_slot) {
+            n -= 1;
+        }
+        n
+    }
+
+    /// How many of the seats it was for have seen it. Over the same seats the
+    /// audience is counted over, or the two numbers disagree: the sender is
+    /// not in the room it spoke to.
+    fn seen(&self, id: i64, from_slot: &str) -> i64 {
+        self.acked
+            .get(&id)
+            .map(|slots| slots.iter().filter(|s| s.as_str() != from_slot).count() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A message to one seat is its own business: delivered when acked. A team
+    /// message is not delivered until the team has it, and a team nobody is in
+    /// has not received anything.
+    fn delivered(&self, id: i64, session: &str, to_slot: &str, from_slot: &str, acked: bool)
+        -> bool
+    {
+        if !to_slot.is_empty() {
+            return acked;
+        }
+        let a = self.audience(session, from_slot);
+        a > 0 && self.seen(id, from_slot) >= a
+    }
+}
+
 /// Everything the page draws, in one request.
 ///
 /// Deliberately one round trip rather than a dozen: the page polls this, so a
@@ -287,6 +375,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
     // the one thing the dashboard could not answer without clicking through
     // each session in turn.
     const ALL: &str = "*";
+    // Who can read what, for the whole fleet, in two small queries. See
+    // `Delivery`: this used to be a correlated subquery evaluated four times
+    // per message shown.
+    let delivery = Delivery::read(&db);
     let detail = match &sid {
         None => Value::Null,
         Some(sid) => {
@@ -364,39 +456,43 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         });
 
             let messages: Vec<Value> = db
-                .prepare(&format!(
+                .prepare(
                     "SELECT m.id, m.sent_at_ms, m.kind, m.body,
                             COALESCE(sf.display_name, sf.role, 'operator'),
                             CASE WHEN m.to_slot IS NULL THEN '(team)'
                                  ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
-                            {delivered}, m.inflight_at_ms IS NOT NULL,
+                            m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL,
                             COALESCE(mx.name, ''),
                             m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, ''),
                             COALESCE(m.from_slot, ''), COALESCE(m.to_slot, ''),
-                            {seen}, {audience}
+                            m.session_id
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
                      LEFT JOIN sessions mx ON mx.id = m.session_id
                      WHERE (?1 = '*' OR m.session_id = ?1) ORDER BY m.id DESC LIMIT 120",
-                    delivered = crate::seat::delivered("m"),
-                    seen = crate::seat::seen("m"),
-                    audience = crate::seat::audience("m"),
-                ))
+                )
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
+                        let id: i64 = r.get(0)?;
+                        let acked: bool = r.get(6)?;
+                        let from_slot: String = r.get(11)?;
+                        let to_slot: String = r.get(12)?;
+                        let msg_session: String = r.get(13)?;
                         Ok(json!({
-                            "id": r.get::<_, i64>(0)?, "at_ms": r.get::<_, i64>(1)?,
+                            "id": id, "at_ms": r.get::<_, i64>(1)?,
                             "kind": r.get::<_, String>(2)?, "body": r.get::<_, String>(3)?,
                             "from": r.get::<_, String>(4)?, "to": r.get::<_, String>(5)?,
-                            "delivered": r.get::<_, bool>(6)?, "in_flight": r.get::<_, bool>(7)?,
+                            "delivered": delivery.delivered(
+                                id, &msg_session, &to_slot, &from_slot, acked),
+                            "in_flight": r.get::<_, bool>(7)?,
                             "session": r.get::<_, String>(8)?,
                             "claimed": r.get::<_, bool>(9)?,
                             "claimed_by": r.get::<_, String>(10)?,
-                            "from_slot": r.get::<_, String>(11)?,
-                            "to_slot": r.get::<_, String>(12)?,
-                            "seen": r.get::<_, i64>(13)?,
-                            "audience": r.get::<_, i64>(14)?,
+                            "from_slot": from_slot,
+                            "to_slot": to_slot,
+                            "seen": delivery.seen(id, &from_slot),
+                            "audience": delivery.audience(&msg_session, &from_slot),
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -653,4 +749,132 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         "sessions": sessions,
         "detail": detail,
     }))
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    /// Two seats that can read, one corpse that cannot, and one adopted
+    /// terminal that is a window rather than a teammate.
+    fn room() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(nexmesh_proto::SCHEMA_SQL).unwrap();
+        crate::state::migrate(&db).unwrap();
+        db.execute(
+            "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,last_seen_ms,
+                                lease_expires_ms)
+             VALUES ('nd-1','machine-a','linux','x86_64','0.1.0','online',1,1,9999999999999)",
+            [],
+        )
+        .unwrap();
+        let now = nexmesh_proto::now_ms();
+        for (slot, name) in [("sl-a", "Ann"), ("sl-b", "Bob")] {
+            db.execute(
+                "INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                 VALUES (?,'s1',?,'claude',1)",
+                params![slot, name],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO agents (id,slot_id,node_id,provenance,status,started_at_ms,
+                                     last_seen_ms)
+                 VALUES (?,?,'nd-1','attached','running',?,?)",
+                params![format!("ag-{slot}"), slot, now, now],
+            )
+            .unwrap();
+        }
+        // A window onto Ann's pane: a seat, with a process, and not a mind.
+        db.execute(
+            "INSERT INTO slots (id,session_id,display_name,cli_id,tmux_target,created_at_ms)
+             VALUES ('sl-term','s1','term-Ann','tmux','nexmesh-ann',1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO agents (id,slot_id,node_id,provenance,status,started_at_ms,last_seen_ms)
+             VALUES ('ag-term','sl-term','nd-1','managed','running',?,?)",
+            params![now, now],
+        )
+        .unwrap();
+        db
+    }
+
+    fn say(db: &Connection, id: i64, from: Option<&str>, to: Option<&str>) {
+        db.execute(
+            "INSERT INTO messages (id,session_id,from_slot,to_slot,kind,body,sent_at_ms)
+             VALUES (?,'s1',?,?,'text','hello',?)",
+            params![id, from, to, nexmesh_proto::now_ms()],
+        )
+        .unwrap();
+    }
+
+    fn ack(db: &Connection, id: i64, slot: &str) {
+        db.execute(
+            "INSERT INTO message_recipients (message_id,slot_id,acked_at_ms) VALUES (?,?,?)",
+            params![id, slot, nexmesh_proto::now_ms()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_broadcast_is_for_everyone_but_the_seat_that_sent_it() {
+        let db = room();
+        say(&db, 1, Some("sl-a"), None);
+        let d = Delivery::read(&db);
+        assert_eq!(d.audience("s1", "sl-a"), 1, "Bob, and not the terminal");
+        assert_eq!(d.audience("s1", ""), 2, "from the operator: both of them");
+    }
+
+    #[test]
+    fn the_sender_acking_its_own_broadcast_changes_nothing() {
+        // `2/1` on the live dashboard: the sender's own ack was counted
+        // against an audience it was not in.
+        let db = room();
+        say(&db, 1, Some("sl-a"), None);
+        ack(&db, 1, "sl-a");
+        let d = Delivery::read(&db);
+        assert_eq!(d.seen(1, "sl-a"), 0, "nobody it was for has seen it yet");
+        assert!(!d.delivered(1, "s1", "", "sl-a", false));
+        ack(&db, 1, "sl-b");
+        let d = Delivery::read(&db);
+        assert_eq!((d.seen(1, "sl-a"), d.audience("s1", "sl-a")), (1, 1));
+        assert!(d.delivered(1, "s1", "", "sl-a", false), "now the team has it");
+    }
+
+    #[test]
+    fn a_message_to_one_seat_is_delivered_when_that_seat_acks() {
+        let db = room();
+        say(&db, 1, Some("sl-a"), Some("sl-b"));
+        let d = Delivery::read(&db);
+        assert!(!d.delivered(1, "s1", "sl-b", "sl-a", false));
+        assert!(d.delivered(1, "s1", "sl-b", "sl-a", true));
+    }
+
+    #[test]
+    fn an_ack_from_a_seat_that_has_gone_cannot_push_the_count_past_the_room() {
+        let db = room();
+        say(&db, 1, None, None);
+        ack(&db, 1, "sl-a");
+        ack(&db, 1, "sl-b");
+        ack(&db, 1, "sl-gone");
+        let d = Delivery::read(&db);
+        assert_eq!((d.seen(1, ""), d.audience("s1", "")), (2, 2));
+    }
+
+    #[test]
+    fn a_team_nobody_is_in_has_not_received_anything() {
+        let db = room();
+        db.execute("UPDATE slots SET task_state = 'released'", []).unwrap();
+        say(&db, 1, None, None);
+        let d = Delivery::read(&db);
+        assert_eq!(d.audience("s1", ""), 0);
+        assert!(!d.delivered(1, "s1", "", "", false));
+    }
 }
