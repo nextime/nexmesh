@@ -248,6 +248,16 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     }
     vars.insert("slot", spec.slot_id.clone());
     let mut args = d.render_args(mode_name, &vars);
+    // An adopted terminal talks to whichever tmux server this node is pointed
+    // at: normally the user's own, and under test one of the suite's own, so a
+    // suite can create and kill sessions without touching the ones somebody is
+    // working in. `-L` must come before the subcommand, which is why it is
+    // spliced in here rather than written into the descriptor.
+    if spec.tmux_target.is_some() {
+        if let Some(sock) = crate::tmux::socket() {
+            args.splice(0..0, ["-L".to_string(), sock]);
+        }
+    }
     if spec.resume_handle.is_some() {
         for a in &mode.resume_args {
             let mut s = a.clone();

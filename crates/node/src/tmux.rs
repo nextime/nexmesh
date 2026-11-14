@@ -7,6 +7,35 @@
 
 use std::process::Command;
 
+/// The tmux server to talk to.
+///
+/// A tmux server is shared by everything one user runs, which meant the test
+/// suite and the live fleet shared one -- and a suite that creates, adopts
+/// and kills sessions on the same server as somebody's real work can break
+/// the thing it is testing. Setting `NEXMESH_TMUX_SOCKET` puts this node on a
+/// server of its own (`tmux -L <name>`), which is what the suites now do.
+/// Unset -- the normal case -- it is the user's own server, where their
+/// sessions are.
+pub fn socket() -> Option<String> {
+    std::env::var("NEXMESH_TMUX_SOCKET").ok().filter(|s| !s.trim().is_empty())
+}
+
+/// `tmux`, pointed at the right server, with $TMUX cleared.
+///
+/// $TMUX names the socket of the server we are INSIDE, and a node started
+/// from within tmux passes it down. Left in place, this asks the wrong server
+/// -- or a socket that does not exist -- and the answer is silence, which
+/// reads exactly like "no such pane". The spawned client clears it for the
+/// same reason (clis/tmux.toml).
+pub fn cmd() -> Command {
+    let mut c = Command::new("tmux");
+    c.env_remove("TMUX");
+    if let Some(sock) = socket() {
+        c.args(["-L", &sock]);
+    }
+    c
+}
+
 /// Make tmux paint the whole screen into our own client's pty.
 ///
 /// tmux is a differential renderer: it writes what CHANGED. A pane that has
@@ -24,8 +53,7 @@ use std::process::Command;
 pub fn repaint(view: &str) {
     // Our client is the one attached to the session the node created for
     // this view. tmux addresses clients by their tty, not by session.
-    let Some(out) = Command::new("tmux")
-        .env_remove("TMUX")
+    let Some(out) = cmd()
         .args(["list-clients", "-F", "#{client_tty} #{client_session}"])
         .output()
         .ok()
@@ -36,8 +64,7 @@ pub fn repaint(view: &str) {
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((tty, session)) = line.split_once(' ') {
             if session == view {
-                let done = Command::new("tmux")
-                    .env_remove("TMUX")
+                let done = cmd()
                     .args(["refresh-client", "-t", tty])
                     .output()
                     .map(|o| o.status.success())
@@ -54,13 +81,7 @@ pub fn repaint(view: &str) {
 /// operator's -- so this answers "where would a keystroke from this node
 /// land", which is the only question worth asking before typing.
 pub fn pane_pid(view: &str) -> Option<i32> {
-    let out = Command::new("tmux")
-        // $TMUX names the socket of the server we are INSIDE, and a node
-        // started from within tmux passes it down. Left in place, this asks
-        // the wrong server -- or a socket that does not exist -- and the
-        // answer is silence, which reads exactly like "no such pane". The
-        // spawned client clears it for the same reason (clis/tmux.toml).
-        .env_remove("TMUX")
+    let out = cmd()
         .args(["display-message", "-t", view, "-p", "#{pane_pid}"])
         .output()
         .ok()?;

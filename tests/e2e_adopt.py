@@ -25,13 +25,19 @@ DB = f"{T}/h.db"; SOCK = f"{T}/n.sock"; WS = f"{T}/ws"; os.makedirs(WS)
 CLIS = f"{T}/clis"; os.makedirs(CLIS)
 for f in os.listdir(f"{ROOT}/clis"):
     if f.endswith(".toml"): shutil.copy(f"{ROOT}/clis/{f}", CLIS)
+# A tmux server of our own. A tmux server is shared by everything one user
+# runs, so this suite -- which creates, adopts and KILLS sessions -- used to
+# do all that on the same server as whatever the user was actually working in.
+# `-L` gives us our own, and the node is told to use it too.
+TMUX_SOCKET = f"nexmesh-e2e-{os.getpid()}"
+
 SRC = f"nexmesh-adopt-src-{os.getpid()}"
 procs = []; fails = []
 
 def cleanup():
     print(f"  (logs: {T})")
-    subprocess.run(["tmux", "kill-session", "-t", SRC],
-                   capture_output=True)
+    # Our own server, so the whole thing goes rather than one session.
+    subprocess.run(["tmux", "-L", TMUX_SOCKET, "kill-server"], capture_output=True)
     for p in procs:
         try: p.send_signal(signal.SIGTERM)
         except Exception: pass
@@ -52,7 +58,7 @@ def http(m, p, b=None):
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b"{}")
 
 def tmux(*args, check_rc=False):
-    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    r = subprocess.run(["tmux", "-L", TMUX_SOCKET, *args], capture_output=True, text=True)
     if check_rc and r.returncode != 0:
         raise RuntimeError(f"tmux {args}: {r.stderr}")
     return r.stdout.strip()
@@ -114,6 +120,7 @@ def main():
         "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
+                 NEXMESH_TMUX_SOCKET=TMUX_SOCKET,
                  TMUX="/tmp/fake-tmux-socket,1234,0")))
     ok = False
     for _ in range(140):

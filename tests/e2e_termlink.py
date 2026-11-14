@@ -32,6 +32,14 @@ for f in os.listdir(f"{ROOT}/clis"):
 
 procs = []; fails = []
 
+# Our own tmux server: see the note in e2e_adopt.py. A suite that kills
+# sessions must not be able to kill somebody's work.
+TMUX_SOCKET = f"nexmesh-e2e-{os.getpid()}"
+
+def tmux(*args):
+    r = subprocess.run(["tmux", "-L", TMUX_SOCKET, *args], capture_output=True, text=True)
+    return r.stdout.strip()
+
 def kill_group(*names):
     """Kill these sessions AND the grouped ones nexmesh joined to them.
 
@@ -42,9 +50,7 @@ def kill_group(*names):
     suite pass or fail depending on what the run before it left behind.
     """
     want = set(names)
-    listing = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name} #{session_group}"],
-        capture_output=True, text=True).stdout
+    listing = tmux("list-sessions", "-F", "#{session_name} #{session_group}")
     for line in listing.splitlines():
         parts = line.split()
         if not parts:
@@ -52,12 +58,14 @@ def kill_group(*names):
         name = parts[0]
         group = parts[1] if len(parts) > 1 else ""
         if name in want or group in want or name.startswith("nexmesh-sl-"):
-            subprocess.run(["tmux", "kill-session", "-t", name],
-                           capture_output=True, text=True)
+            tmux("kill-session", "-t", name)
 
 def cleanup():
     print(f"  (logs: {T})")
     kill_group("Hand", "Hand2", SRC, SRC2)
+    # The server is ours alone, so it goes too -- no leftovers for the next
+    # run to collide with, and nothing of anybody else's on it to lose.
+    tmux("kill-server")
     for p in procs:
         try: p.send_signal(signal.SIGTERM)
         except Exception: pass
@@ -90,10 +98,6 @@ def until(fn, seconds=25.0, step=0.3):
         if v: return v
         time.sleep(step)
     return None
-
-def tmux(*args):
-    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
-    return r.stdout.strip()
 
 def read(path):
     try: return open(path).read()
@@ -137,7 +141,8 @@ def main():
         "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
         env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info,nexmesh_node=debug",
-                 NO_COLOR="1", TMUX="/tmp/fake-tmux-socket,1234,0")))
+                 NO_COLOR="1", NEXMESH_TMUX_SOCKET=TMUX_SOCKET,
+                 TMUX="/tmp/fake-tmux-socket,1234,0")))
     check("node online", bool(until(lambda: (http("GET","/v1/nodes")[1].get("nodes") or [{}])[0].get("connected"))))
 
     print("\n=== 1. a CLI you started by hand, in a pane nexmesh knows nothing about ===")
