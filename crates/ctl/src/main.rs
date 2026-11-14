@@ -298,7 +298,13 @@ Your own terminal stays attached; others can watch and type too.")]
         force: bool,
     },
     /// Live status of every agent in a session.
-    Status { session: String },
+    Status {
+        session: String,
+        /// Also list the adopted terminals other seats are sitting in. They
+        /// are plumbing, not teammates, so they are hidden by default.
+        #[arg(long)]
+        terminals: bool,
+    },
     /// List the certificates the fleet CA has issued.
     Certs,
     /// Revoke a machine or operator: its certificate stops working at the TLS
@@ -750,9 +756,11 @@ impl StatusBar {
         self.rows.saturating_sub(1)
     }
 
-    /// Save the cursor, paint the bar, put the cursor back. Reverse video
-    /// rather than colour, because this has to read the same on every
-    /// terminal anyone attaches from.
+    /// Save the cursor, paint the bar, put the cursor back.
+    ///
+    /// Black background, plain foreground: it is one row at the bottom of
+    /// somebody else's screen and should read as a frame around it, not as a
+    /// second thing competing for attention. (Reverse video did the latter.)
     fn paint(&self) -> Vec<u8> {
         let mut line = self.text.clone();
         let w = self.cols as usize;
@@ -762,7 +770,11 @@ impl StatusBar {
             let pad = w - line.chars().count();
             line.push_str(&" ".repeat(pad));
         }
-        format!("\x1b7\x1b[{};1H\x1b[7m{}\x1b[0m\x1b8", self.rows, line).into_bytes()
+        format!(
+            "\x1b7\x1b[{};1H\x1b[40m\x1b[37m{}\x1b[0m\x1b8",
+            self.rows, line
+        )
+        .into_bytes()
     }
 
     /// Keep the agent's output from scrolling over the bar. A full-screen app
@@ -1357,11 +1369,20 @@ async fn main() -> Result<()> {
             );
         }
 
-        Cmd::Status { session } => {
+        Cmd::Status { session, terminals } => {
             let v = get(&c, format!("{base}/v1/sessions/{session}/status")).await?;
             bail_on_error(&v)?;
             let empty = vec![];
-            let rows = v["agents"].as_array().unwrap_or(&empty);
+            let all = v["agents"].as_array().unwrap_or(&empty);
+            // An adopted terminal is the screen another seat is sitting in,
+            // not a teammate. Ten of them on a fleet of ten doubles this
+            // table with rows nobody can talk to, so they are shown only
+            // when asked for.
+            let rows: Vec<&Value> = all
+                .iter()
+                .filter(|a| terminals || a["cli"].as_str() != Some("tmux"))
+                .collect();
+            let hidden = all.len() - rows.len();
             if rows.is_empty() {
                 println!("no agents in this session");
                 return Ok(());
@@ -1387,7 +1408,7 @@ async fn main() -> Result<()> {
                 "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "AGENT", "PID", "IO",
                 "TOKENS"
             );
-            for a in rows {
+            for a in &rows {
                 let tin = a["input_tokens"].as_i64().unwrap_or(0);
                 let tout = a["output_tokens"].as_i64().unwrap_or(0);
                 let tokens = if tin + tout == 0 {
@@ -1431,6 +1452,13 @@ async fn main() -> Result<()> {
                 "\n  (TOKENS = input/output; STATE is the work, AGENT the process behind it;\n\
                  \x20  `waiting` = a CLI that takes this seat once per turn and is due back)"
             );
+            if hidden > 0 {
+                println!(
+                    "  ({hidden} adopted terminal{} not shown; they are the screens these \
+                     seats sit in -- `--terminals` lists them)",
+                    if hidden == 1 { "" } else { "s" }
+                );
+            }
         }
 
         Cmd::Certs => {

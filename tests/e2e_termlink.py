@@ -247,6 +247,31 @@ def main():
           bool(q("SELECT 1 FROM messages WHERE body LIKE '%rm -rf would run here%' "
                  "AND acked_at_ms IS NULL")))
 
+    print("\n=== 5c. a typed message is acked for the SEAT, not for the terminal ===")
+    # The loop this cost us: a message typed into an adopted pane is written
+    # by the TERMINAL's agent, on behalf of the seat whose CLI sits there.
+    # The ack was recorded against the terminal's own seat, so the
+    # recipient's copy stayed unacked, and every sweep typed the same message
+    # at it again -- hours-old notices, re-typed for ever, which the agent
+    # receiving them reported as a "stuck emitter".
+    http("POST", f"/v1/sessions/{sid}/messages", {"to": "Hand", "text": "acked for the right seat"})
+    got = until(lambda: "acked for the right seat" in read(HANDLOG), seconds=40)
+    check("it is typed at the seat", bool(got), read(HANDLOG)[-300:])
+    row = until(lambda: (q("SELECT r.acked_at_ms FROM message_recipients r "
+                          "JOIN messages m ON m.id = r.message_id "
+                          "WHERE m.body LIKE '%acked for the right seat%' AND r.slot_id = ?",
+                          (slot,)) or [{}])[0].get("acked_at_ms"), seconds=30)
+    check("the SEAT's copy is acked, not just the terminal's", bool(row),
+          str(q("SELECT r.slot_id, r.acked_at_ms, r.inflight_agent FROM message_recipients r "
+                "JOIN messages m ON m.id = r.message_id "
+                "WHERE m.body LIKE '%acked for the right seat%'")))
+    # And therefore it is not typed at it a second time.
+    before = read(HANDLOG).count("acked for the right seat")
+    time.sleep(25)
+    after = read(HANDLOG).count("acked for the right seat")
+    check(f"and it is never typed again ({before} -> {after})", before == after,
+          read(HANDLOG)[-400:])
+
     print("\n=== 7b. the seat's own name opens the terminal it is sitting in ===")
     # "I do not want to use tmux, I want to use nexmesh." A CLI started by
     # hand has no pty of its own -- the pty belongs to the adopted pane

@@ -309,7 +309,15 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         SELECT id FROM agents WHERE slot_id = s.id
                         ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
                      LEFT JOIN nodes n ON n.id = a.node_id
-                     WHERE (?1 = '*' OR s.session_id = ?1) ORDER BY 2",
+                     WHERE (?1 = '*' OR s.session_id = ?1)
+                       -- Adopted terminals are not teammates: they are the
+                       -- screens other seats are sitting in, and every seat
+                       -- they serve carries `attach_agent_id` so the terminal
+                       -- button still opens them. Listing them doubled the
+                       -- agent count on the dashboard with rows nobody can
+                       -- talk to.
+                       AND COALESCE(s.cli_id,'') <> 'tmux' AND s.tmux_target IS NULL
+                     ORDER BY 2",
                     word = crate::seat::agent_word("s", "a"),
                 ))
                 .and_then(|mut stmt| {

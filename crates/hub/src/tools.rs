@@ -77,8 +77,15 @@ impl<'a> Ctx<'a> {
     /// Every teammate in this session but me, with what they answer to.
     fn peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.db.prepare(
+            // An adopted terminal is a window onto a seat, not a teammate.
+            // It holds no model, answers nothing, and acks nothing -- and it
+            // was being listed as a peer, so an agent looking for somebody
+            // to hand work to found `term-Max` sitting there as if it could
+            // take it. Whatever is IN that terminal has a seat of its own,
+            // and that seat is listed.
             "SELECT id, LOWER(COALESCE(display_name, '')), LOWER(COALESCE(role, '')), capabilities
-             FROM slots WHERE session_id = ? AND id != ?",
+             FROM slots WHERE session_id = ? AND id != ?
+               AND COALESCE(cli_id,'') <> 'tmux' AND tmux_target IS NULL",
         )?;
         let rows = stmt
             .query_map(params![self.session_id, self.slot_id], |r| {
@@ -364,16 +371,39 @@ pub fn ack_messages(db: &Connection, agent_id: &str, ids: &[i64]) -> Result<()> 
     let now = now_ms();
     let slot = slot_of(db, agent_id);
     for id in ids {
-        if let Some(slot) = &slot {
-            db.execute(
-                "INSERT INTO message_recipients
-                    (message_id, slot_id, acked_at_ms, acked_by_agent)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(message_id, slot_id) DO UPDATE SET
-                    acked_at_ms = ?3, acked_by_agent = ?4,
-                    inflight_agent = NULL, inflight_at_ms = NULL",
-                params![id, slot, now, agent_id],
-            )?;
+        // The seat that was HANDED it, which is not always the seat of the
+        // agent reporting the ack.
+        //
+        // A message typed at an adopted terminal is written into the
+        // TERMINAL's pty, by the terminal's agent, on behalf of the seat
+        // whose CLI sits in that pane. `mark_inflight` recorded that seat
+        // correctly; the ack used to be recorded against the terminal's own
+        // seat instead -- so the recipient's copy stayed unacked for ever and
+        // the hub typed the same message at it on every sweep. Hours-old
+        // notices were still being typed at three agents when this was found,
+        // and one of them reported it as a "stuck emitter", which is exactly
+        // what it looked like from in there.
+        //
+        // So: ack the row this agent is holding, whoever it belongs to.
+        let held = db.execute(
+            "UPDATE message_recipients
+                SET acked_at_ms = ?1, acked_by_agent = ?2,
+                    inflight_agent = NULL, inflight_at_ms = NULL
+              WHERE message_id = ?3 AND inflight_agent = ?2 AND acked_at_ms IS NULL",
+            params![now, agent_id, id],
+        )?;
+        if held == 0 {
+            if let Some(slot) = &slot {
+                db.execute(
+                    "INSERT INTO message_recipients
+                        (message_id, slot_id, acked_at_ms, acked_by_agent)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(message_id, slot_id) DO UPDATE SET
+                        acked_at_ms = ?3, acked_by_agent = ?4,
+                        inflight_agent = NULL, inflight_at_ms = NULL",
+                    params![id, slot, now, agent_id],
+                )?;
+            }
         }
         db.execute(
             "UPDATE messages SET acked_at_ms = ?, acked_by_agent = ?, inflight_agent = NULL,

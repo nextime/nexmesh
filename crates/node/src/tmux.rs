@@ -61,6 +61,14 @@ pub fn repaint(view: &str) {
     else {
         return;
     };
+    // And tmux's own status line goes, for this client only.
+    //
+    // A viewer attaching to an adopted pane saw TWO rows at the bottom:
+    // tmux's status line and the viewer's own. The viewer's is the one that
+    // says whose screen this is and how to leave, so tmux's is noise -- and
+    // it is set on the session the NODE created, so it changes nothing about
+    // what the operator sees in their own `tmux attach`.
+    let _ = cmd().args(["set-option", "-t", view, "status", "off"]).output();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((tty, session)) = line.split_once(' ') {
             if session == view {

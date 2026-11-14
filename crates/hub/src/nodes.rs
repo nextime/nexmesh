@@ -346,10 +346,23 @@ async fn handle(
             tracing::info!(%agent_id, %model, "agent reported its model");
         }
 
-        NodeToHub::InjectionsLost { message_ids, .. } => {
+        NodeToHub::InjectionsLost { agent_id, message_ids } => {
             // Back in the queue, or they are never redelivered.
+            //
+            // Per recipient as well as per message: the row the agent was
+            // holding is the one that has to be freed. Clearing only the
+            // message-level columns left that row in flight for ever, and a
+            // row in flight is never handed over again -- so a terminal that
+            // was busy for one moment would have dropped that seat's copy
+            // silently, which is the opposite failure to the one that made
+            // this obvious.
             let db = st.db.lock().unwrap();
             for id in message_ids {
+                db.execute(
+                    "UPDATE message_recipients SET inflight_agent = NULL, inflight_at_ms = NULL
+                      WHERE message_id = ?1 AND inflight_agent = ?2 AND acked_at_ms IS NULL",
+                    params![id, agent_id],
+                )?;
                 db.execute(
                     "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
                      WHERE id = ? AND acked_at_ms IS NULL",
