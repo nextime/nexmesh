@@ -1401,7 +1401,10 @@ function layoutGraph(g) {
   const key = `${g.workspace_id}:${g.built_at_ms}:${(g.subsystems || []).length}`;
   if (layouts[key]) return layouts[key];
 
-  const W = 1500, H = 460;
+  // Wider than it is tall, and capped in CSS at a fraction of the window.
+  // A map that fills the screen leaves nothing to scroll past it, so every
+  // flick of the wheel landed on the map instead of the page.
+  const W = 1500, H = 360;
   const subs = (g.subsystems || []).slice(0, 24);
   const index = new Map(subs.map((sx, i) => [sx.id, i]));
   const rand = seeded(subs.length * 7919 + 13);
@@ -1560,7 +1563,8 @@ function graphSvg(g) {
         <button class="tiny" onclick="mapReset('${esc(ws)}')" title="fit the whole map">fit</button>
       </div>
       <svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet"
-        style="display:block;color:var(--dim);margin:6px 0;touch-action:none;cursor:grab"
+        style="display:block;color:var(--dim);margin:6px 0;touch-action:pan-y;
+               max-height:48vh;cursor:grab"
         role="img" aria-label="subsystem map">
         <defs><marker id="gArrow" viewBox="0 0 8 8" refX="7" refY="4"
           markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -1569,7 +1573,7 @@ function graphSvg(g) {
     <div class="tiny muted" style="margin-top:6px">
       Circle size is members; an arrow points from a subsystem to one it uses.
       Solid edges are read off the syntax tree, dashed ones were inferred by
-      matching a name. Drag to move, scroll or pinch to zoom, click a subsystem
+      matching a name. Drag to move, pinch or ctrl-scroll to zoom, click a subsystem
       for what is in it${
         selSub !== null ? ` &mdash; <a href="#graph" onclick="selectSub(null)">show all</a>` : ""}.
     </div>`;
@@ -1626,7 +1630,12 @@ function wireMaps() {
     svg.dataset.wired = "1";
     applyMap(ws);
 
+    // A plain wheel scrolls the PAGE. Taking it meant that passing over
+    // the map on the way down the page zoomed it instead, and you had to
+    // fight your way past it. Ctrl or Cmd held zooms -- which is also what
+    // a trackpad pinch sends, so pinching still works without asking.
     svg.addEventListener("wheel", (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
       mapZoom(ws, e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
     }, { passive: false });
