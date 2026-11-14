@@ -627,6 +627,99 @@ pub async fn create_slot(
     Ok(Json(json!({ "slot_id": slot_id })))
 }
 
+/// Everything in one subsystem, for someone who clicked it.
+///
+/// The map can only carry a handful of names per circle; this is what is
+/// actually in it, and what it depends on. Kept out of the dashboard
+/// snapshot on purpose -- it is wanted for one subsystem at a time, and
+/// putting it in the poll would mean sending all of them, every time, to
+/// nobody.
+pub async fn subsystem_detail(
+    State(st): State<AppState>,
+    Path((workspace_ref, community)): Path<(String, i64)>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let ws_id: String = db
+        .query_row(
+            "SELECT id FROM workspaces WHERE id = ?1 OR name = ?1 LIMIT 1",
+            [&workspace_ref],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no workspace '{workspace_ref}'")))?;
+
+    let members: Vec<Value> = db
+        .prepare(
+            "SELECT name, path, kind, line FROM code_graph_nodes
+              WHERE workspace_id = ? AND community = ?
+              ORDER BY CASE kind WHEN 'type' THEN 0 WHEN 'function' THEN 1 ELSE 2 END,
+                       name LIMIT 500",
+        )
+        .and_then(|mut q| {
+            q.query_map(params![ws_id, community], |r| {
+                Ok(json!({ "name": r.get::<_, String>(0)?, "path": r.get::<_, String>(1)?,
+                           "kind": r.get::<_, String>(2)?, "line": r.get::<_, i64>(3)? }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .map_err(bad)?;
+
+    let files: Vec<Value> = db
+        .prepare(
+            "SELECT path, COUNT(*) FROM code_graph_nodes
+              WHERE workspace_id = ? AND community = ? AND path <> ''
+              GROUP BY path ORDER BY 2 DESC, path LIMIT 100",
+        )
+        .and_then(|mut q| {
+            q.query_map(params![ws_id, community], |r| {
+                Ok(json!({ "path": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)? }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .map_err(bad)?;
+
+    // Which way a dependency runs is the whole point of looking: "what does
+    // this need" and "what needs this" are different questions with
+    // different consequences.
+    let neighbours: Vec<Value> = db
+        .prepare(
+            "SELECT CASE WHEN a.community = ?2 THEN b.community ELSE a.community END AS other,
+                    CASE WHEN a.community = ?2 THEN 'uses' ELSE 'used_by' END AS dir,
+                    SUM(CASE WHEN e.kind IN ('defines','imports') THEN 1 ELSE 0 END) AS certain,
+                    COUNT(*) AS n
+               FROM code_graph_edges e
+               JOIN code_graph_nodes a ON a.workspace_id = e.workspace_id AND a.id = e.from_id
+               JOIN code_graph_nodes b ON b.workspace_id = e.workspace_id AND b.id = e.to_id
+              WHERE e.workspace_id = ?1
+                AND a.community IS NOT NULL AND b.community IS NOT NULL
+                AND a.community <> b.community
+                AND (a.community = ?2 OR b.community = ?2)
+              GROUP BY other, dir ORDER BY n DESC LIMIT 40",
+        )
+        .and_then(|mut q| {
+            q.query_map(params![ws_id, community], |r| {
+                Ok(json!({ "id": r.get::<_, i64>(0)?, "dir": r.get::<_, String>(1)?,
+                           "certain": r.get::<_, i64>(2)? > 0, "n": r.get::<_, i64>(3)? }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .map_err(bad)?;
+
+    let total: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM code_graph_nodes WHERE workspace_id = ? AND community = ?",
+            params![ws_id, community],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "workspace_id": ws_id, "id": community, "n": total,
+        "members": members, "files": files, "neighbours": neighbours,
+    })))
+}
+
 /// Place a slot on a node and ask that node to start it.
 #[derive(Deserialize, Default)]
 pub struct SpawnRequest {

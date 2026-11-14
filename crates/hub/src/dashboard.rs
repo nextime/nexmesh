@@ -167,7 +167,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             vec![]
         });
 
-    let sessions: Vec<Value> = db
+    let mut sessions: Vec<Value> = db
         .prepare(
             "SELECT s.id, s.name, s.status, s.created_at_ms, s.last_active_ms,
                     (SELECT COUNT(*) FROM slots WHERE session_id = s.id)
@@ -187,6 +187,38 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
             vec![]
         });
+
+    // Teammates that are not machines. An external participant joins over
+    // HTTP with no node of its own, so it appears on no fleet row at all --
+    // and the fleet tab is the first place somebody looks to ask who is
+    // here. Carried with the session list because that is what the fleet
+    // tab already has in hand.
+    for sx in sessions.iter_mut() {
+        let Some(sid) = sx["id"].as_str().map(String::from) else { continue };
+        let outside: Vec<Value> = db
+            .prepare(
+                "SELECT s.id, s.display_name, s.role, s.status, s.participant_kind
+                   FROM slots s
+                  WHERE s.session_id = ? AND s.participant_kind <> 'cli'
+                  ORDER BY s.display_name",
+            )
+            .and_then(|mut q| {
+                q.query_map([&sid], |r| {
+                    Ok(json!({
+                        "slot_id": r.get::<_, String>(0)?,
+                        "name": r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        "role": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        "status": r.get::<_, String>(3)?,
+                        "kind": r.get::<_, String>(4)?,
+                    }))
+                })
+                .and_then(|m| m.collect())
+            })
+            .unwrap_or_default();
+        if !outside.is_empty() {
+            sx["external"] = json!(outside);
+        }
+    }
 
     // Default to the most recently active session so the page is useful with
     // no query string at all.

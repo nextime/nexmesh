@@ -123,6 +123,21 @@ def main():
     check("and it explains how to get in",
           "dashboard-setup-code" in html and "operator-token" in html,
           "both ways in should be named")
+    # The map is something you hold: it pans, it zooms, and a click opens
+    # what is in a subsystem. Each of those needs the markup to be there to
+    # hang off, and the poll must not tear it down mid-gesture.
+    check("the map can be moved and scaled",
+          "mapZoom(" in html and "pointerdown" in html and "wheel" in html,
+          "pan and zoom should be wired")
+    check("a drag is not read as a click",
+          "dragged" in html, "moving the map must not open a subsystem")
+    check("clicking a subsystem opens what is in it",
+          "openSub(" in html and 'id="subModal"' in html, "the detail sheet should exist")
+    check("the map survives a poll that changed nothing",
+          "graphSignature(" in html, "redrawing it would throw away the gesture")
+    check("the table under it folds away",
+          "details class=\"fold\"" in html or "details.fold" in html,
+          "the table should be collapsible")
     s2, _ = req("/dashboard", raw=True)
     check("/dashboard works too", s2 == 200, str(s2))
     s3, _ = req("/favicon.ico", raw=True)

@@ -166,6 +166,28 @@
   code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
   /* Not .bar: that is already a progress track used elsewhere on this page. */
   .sizebar { height: 8px; border-radius: 4px; background: var(--accent); opacity: .75; min-width: 4px; }
+  /* the map, and what it opens */
+  .mapbox { position: relative; }
+  .mapctl { position: absolute; right: 6px; top: 6px; display: flex; gap: 4px; z-index: 2; }
+  .mapctl button { min-width: 2.2em; }
+  #subModal { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.55);
+              display: flex; align-items: center; justify-content: center; padding: 16px; }
+  #subModal .sheet { background: var(--panel); border: 1px solid var(--line);
+                     border-radius: 10px; padding: 14px; width: min(980px, 100%);
+                     max-height: 86vh; overflow: auto; }
+  .subcols { display: grid; grid-template-columns: 1fr 1.4fr; gap: 16px; margin-top: 8px;
+             min-width: 0; }
+  /* A path is long and has no spaces in it, so without this the sheet
+     grows sideways and the member column falls off the edge of it. */
+  .subcols > div { min-width: 0; }
+  .subcols table { width: 100%; table-layout: fixed; }
+  .subcols td { overflow-wrap: anywhere; }
+  .subcols td:last-child { opacity: .75; }
+  @media (max-width: 760px) { .subcols { grid-template-columns: 1fr; } }
+  details.fold > summary { cursor: pointer; list-style: none; padding: 4px 2px;
+                           color: var(--dim); font-size: 12px; }
+  details.fold > summary::before { content: "\25B8 "; }
+  details.fold[open] > summary::before { content: "\25BE "; }
   @media (max-width: 620px) {
     .msg { grid-template-columns: 52px 14px minmax(0, 1fr); }
     th.hide, td.hide { display: none; }
@@ -298,6 +320,9 @@
          pages updating at all, for as long as the focus stayed there. A
          composer that is never rebuilt needs neither. -->
     <div id="composerHost" hidden></div>
+    <!-- What is in a subsystem, over the top of the map that sent you
+         here. Outside #view so a poll cannot close it under you. -->
+    <div id="subModal" hidden onclick="if (event.target === this) closeSub()"></div>
   </main>
 </div>
 
@@ -485,6 +510,14 @@ $("gateForm").addEventListener("submit", (e) => {
   submitted = true;
   start();
 });
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* an empty body is fine */ }
+  if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
+  return j;
+}
 
 async function post(url, body) {
   const r = await fetch(url, {
@@ -899,7 +932,15 @@ function render() {
   // input it belonged to had ceased to exist. Everything above -- the
   // tiles, the counts -- still refreshes.
   // Only an in-table rename holds the view still, and only until it ends.
-  if (!editingSeat) {
+  // The map is the other exception, and for a different reason: it is a
+  // thing you hold. Redrawing it every poll threw away the pan and zoom
+  // mid-gesture and detached the handlers that were listening for it. A
+  // graph only changes when somebody parses one, so redraw it only then.
+  const sig = tab === "graph" ? graphSignature(d) : null;
+  const sameMap = tab === "graph" && sig === drawnGraph && $("view").dataset.tab === "graph";
+  if (!editingSeat && !sameMap) {
+    $("view").dataset.tab = tab;
+    drawnGraph = sig;
     $("view").innerHTML = (!d && tab !== "fleet")
       ? `<div class="panel"><div class="empty">No sessions yet. Press
            <strong>new</strong> above, or pair a machine on the
@@ -907,6 +948,7 @@ function render() {
       : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
            knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
            fleet: viewFleet })[tab](d, now);
+    if (tab === "graph") wireMaps();
   }
 
   if (keep.name !== null && $("pairName")) {
@@ -1317,6 +1359,31 @@ function viewPlan(d) {
 // would never stop moving.
 const layouts = {};
 let selSub = null;
+// What is currently drawn, so a poll that changes nothing leaves it alone.
+let drawnGraph = null;
+// Pan and zoom, per workspace, kept across redraws so parsing a workspace
+// does not throw away where you were looking.
+const mapView = {};
+
+// A fold's state, remembered per workspace. Browser storage can throw or
+// come back empty -- a private window, cleared site data -- so every read
+// and write is guarded and the page is correct without it.
+function foldOpen(key, fallback) {
+  try {
+    const v = localStorage.getItem("fold:" + key);
+    return v === null ? fallback : v === "1";
+  } catch (e) { return fallback; }
+}
+
+function rememberFold(key, open) {
+  try { localStorage.setItem("fold:" + key, open ? "1" : "0"); } catch (e) {}
+}
+
+function graphSignature(d) {
+  return (d && d.graph ? d.graph : [])
+    .map((g) => `${g.workspace_id}:${g.built_at_ms}:${(g.subsystems || []).length}`)
+    .join("|") + `~${selSub}`;
+}
 
 // Deterministic: the same parse must produce the same picture every time,
 // or a reader cannot point at it and say "that one".
@@ -1471,7 +1538,8 @@ function graphSvg(g) {
     const lit = on(i);
     const hue = subHue(nd.id);
     const names = nd.members.slice(0, 5).map((m) => m.name).join(", ");
-    return `<g class="gnode" onclick="selectSub(${nd.id})" style="cursor:pointer"
+    return `<g class="gnode" onclick="openSub('${esc(g.workspace_id)}', ${nd.id})"
+        style="cursor:pointer"
         opacity="${lit ? 1 : 0.18}">
         <title>subsystem ${nd.id} — ${nd.n} members${
           nd.path ? "\n" + nd.path : ""}${names ? "\n" + names : ""}</title>
@@ -1484,19 +1552,149 @@ function graphSvg(g) {
       </g>`;
   }).join("");
 
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet"
-      style="display:block;color:var(--dim);margin:6px 0"
-      role="img" aria-label="subsystem map">
-      <defs><marker id="gArrow" viewBox="0 0 8 8" refX="7" refY="4"
-        markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-        <path d="M0 0 L8 4 L0 8 z" fill="currentColor" opacity=".6"/></marker></defs>
-      ${edges}${circles}</svg>
+  const ws = g.workspace_id;
+  return `<div class="mapbox" data-ws="${esc(ws)}">
+      <div class="mapctl">
+        <button class="tiny" onclick="mapZoom('${esc(ws)}', 1.3)" title="zoom in">+</button>
+        <button class="tiny" onclick="mapZoom('${esc(ws)}', 1/1.3)" title="zoom out">&minus;</button>
+        <button class="tiny" onclick="mapReset('${esc(ws)}')" title="fit the whole map">fit</button>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet"
+        style="display:block;color:var(--dim);margin:6px 0;touch-action:none;cursor:grab"
+        role="img" aria-label="subsystem map">
+        <defs><marker id="gArrow" viewBox="0 0 8 8" refX="7" refY="4"
+          markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0 0 L8 4 L0 8 z" fill="currentColor" opacity=".6"/></marker></defs>
+        <g class="mappan">${edges}${circles}</g></svg></div>
     <div class="tiny muted" style="margin-top:6px">
       Circle size is members; an arrow points from a subsystem to one it uses.
       Solid edges are read off the syntax tree, dashed ones were inferred by
-      matching a name. Click a subsystem to isolate it${
+      matching a name. Drag to move, scroll or pinch to zoom, click a subsystem
+      for what is in it${
         selSub !== null ? ` &mdash; <a href="#graph" onclick="selectSub(null)">show all</a>` : ""}.
     </div>`;
+}
+
+// ---- holding the map ---------------------------------------------------
+//
+// Pan and zoom live on a <g> transform rather than the viewBox, so the
+// pointer maths stays in one coordinate system and the arrowheads keep
+// their shape.
+function mapState(ws) {
+  return (mapView[ws] ||= { k: 1, x: 0, y: 0 });
+}
+
+function applyMap(ws) {
+  const box = document.querySelector(`.mapbox[data-ws="${CSS.escape(ws)}"]`);
+  if (!box) return;
+  const v = mapState(ws);
+  const g = box.querySelector(".mappan");
+  if (g) g.setAttribute("transform", `translate(${v.x} ${v.y}) scale(${v.k})`);
+}
+
+function mapZoom(ws, by, cx, cy) {
+  const box = document.querySelector(`.mapbox[data-ws="${CSS.escape(ws)}"]`);
+  if (!box) return;
+  const svg = box.querySelector("svg");
+  const v = mapState(ws);
+  const k = Math.min(12, Math.max(0.4, v.k * by));
+  // Zoom about a point: keep whatever is under it where it is. Without
+  // this, zooming walks the thing you are looking at off the screen.
+  const r = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  const scale = vb.width / r.width;
+  const px = cx === undefined ? vb.width / 2 : (cx - r.left) * scale;
+  const py = cy === undefined ? vb.height / 2 : (cy - r.top) * scale;
+  v.x = px - ((px - v.x) / v.k) * k;
+  v.y = py - ((py - v.y) / v.k) * k;
+  v.k = k;
+  applyMap(ws);
+}
+
+function mapReset(ws) {
+  mapView[ws] = { k: 1, x: 0, y: 0 };
+  applyMap(ws);
+}
+
+/// Attach the gestures after a redraw. The handlers belong to elements the
+/// redraw replaced, so they have to be put back with them.
+function wireMaps() {
+  document.querySelectorAll(".mapbox").forEach((box) => {
+    const ws = box.dataset.ws;
+    const svg = box.querySelector("svg");
+    if (!svg || svg.dataset.wired) return;
+    svg.dataset.wired = "1";
+    applyMap(ws);
+
+    svg.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      mapZoom(ws, e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
+    }, { passive: false });
+
+    // Pointer events rather than mouse events, so a finger on a phone and
+    // a mouse on a desk take the same path -- and two fingers can pinch.
+    const down = new Map();
+    let from = null;
+    // The pointer is NOT captured here, on purpose. Capturing retargets
+    // every later event -- including the click -- to the element that
+    // captured it, so grabbing the pointer on pointerdown meant a click on
+    // a subsystem was delivered to the svg and the circle's own handler
+    // never ran. Capture begins when a drag does, below.
+    svg.addEventListener("pointerdown", (e) => {
+      down.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const v = mapState(ws);
+      from = { x: v.x, y: v.y, k: v.k, moved: 0, held: false };
+      svg.dataset.dragged = "";
+    });
+    svg.addEventListener("pointermove", (e) => {
+      if (!down.has(e.pointerId)) return;
+      const start = down.get(e.pointerId);
+      const pts = [...down.values()];
+      const r = svg.getBoundingClientRect();
+      const scale = svg.viewBox.baseVal.width / r.width;
+      if (pts.length >= 2) {
+        down.set(e.pointerId, { ...start, x: e.clientX, y: e.clientY });
+        const now = [...down.values()];
+        const spread = Math.hypot(now[0].x - now[1].x, now[0].y - now[1].y);
+        if (from.spread) {
+          mapZoom(ws, spread / from.spread,
+                  (now[0].x + now[1].x) / 2, (now[0].y + now[1].y) / 2);
+        }
+        from.spread = spread;
+        return;
+      }
+      const dx = (e.clientX - start.x) * scale;
+      const dy = (e.clientY - start.y) * scale;
+      from.moved = Math.max(from.moved, Math.hypot(e.clientX - start.x, e.clientY - start.y));
+      // Past the threshold this is a drag, so take the pointer and keep it
+      // even if it leaves the picture.
+      if (from.moved > 4 && !from.held) {
+        from.held = true;
+        try { svg.setPointerCapture(e.pointerId); } catch (err) {}
+        svg.style.cursor = "grabbing";
+      }
+      if (!from.held) return;
+      const v = mapState(ws);
+      v.x = from.x + dx;
+      v.y = from.y + dy;
+      applyMap(ws);
+    });
+    const up = (e) => {
+      down.delete(e.pointerId);
+      svg.style.cursor = "grab";
+      try { svg.releasePointerCapture(e.pointerId); } catch (err) {}
+      // A drag is not a click. Without this, moving the map opened the
+      // subsystem you happened to start the drag on.
+      svg.dataset.dragged = from && from.moved > 4 ? "1" : "";
+      if (!down.size) from = null;
+    };
+    svg.addEventListener("pointerup", up);
+    svg.addEventListener("pointercancel", up);
+    svg.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      mapReset(ws);
+    });
+  });
 }
 
 // Parse a workspace on demand. It happens on the machine the files are on,
@@ -1515,7 +1713,77 @@ async function buildGraph(ws) {
 
 function selectSub(id) {
   selSub = (selSub === id) ? null : id;
+  closeSub();
+  drawnGraph = null;            // the highlight changed, so redraw once
   render();
+}
+
+// ---- what is actually in a subsystem -----------------------------------
+//
+// The map can carry five names per circle. This is the rest: every symbol
+// in it, the files it lives in, and which subsystems it depends on in each
+// direction -- fetched for the one you asked about rather than shipped for
+// all of them on every poll.
+async function openSub(ws, id) {
+  const svg = document.querySelector(`.mapbox[data-ws="${CSS.escape(ws)}"] svg`);
+  if (svg && svg.dataset.dragged === "1") return;   // that was a drag
+  const host = $("subModal");
+  host.hidden = false;
+  host.innerHTML = `<div class="sheet"><div class="row">
+      <strong>subsystem ${id}</strong>
+      <button class="tiny" onclick="closeSub()">close</button></div>
+    <div class="empty tiny">Reading it…</div></div>`;
+  let d;
+  try {
+    d = await getJSON(`/v1/workspaces/${encodeURIComponent(ws)}/subsystem/${id}`);
+    if (d && d.error) throw new Error(d.error);
+  } catch (e) {
+    host.innerHTML = `<div class="sheet"><div class="row">
+        <strong>subsystem ${id}</strong>
+        <button class="tiny" onclick="closeSub()">close</button></div>
+      <div class="empty tiny">${esc(e.message || "could not read it")}</div></div>`;
+    return;
+  }
+  const uses = (d.neighbours || []).filter((x) => x.dir === "uses");
+  const used = (d.neighbours || []).filter((x) => x.dir === "used_by");
+  const dep = (list, what) => list.length
+    ? `<div class="tiny" style="margin:2px 0">${what}: ` + list.map((x) =>
+        `<a href="#graph" onclick="openSub('${esc(ws)}', ${x.id});return false"
+            class="badge ${x.certain ? "info" : ""}"
+            title="${x.n} reference${x.n === 1 ? "" : "s"}${
+              x.certain ? "" : ", inferred by name"}">${x.id} · ${x.n}</a>`).join(" ") + `</div>`
+    : "";
+  const files = (d.files || []).map((f) =>
+    `<tr><td class="mono tiny">${esc(f.path)}</td><td class="num tiny muted">${f.n}</td></tr>`
+  ).join("");
+  const members = (d.members || []).map((m) =>
+    `<tr><td><span class="badge ${m.kind === "type" ? "info" : ""}">${esc(m.kind)}</span></td>
+       <td class="mono">${esc(m.name)}</td>
+       <td class="mono tiny muted">${esc(m.path)}${m.line ? ":" + m.line : ""}</td></tr>`
+  ).join("");
+  const capped = (d.members || []).length < d.n
+    ? `<div class="tiny muted">showing ${(d.members || []).length} of ${d.n}</div>` : "";
+  host.innerHTML = `<div class="sheet">
+      <div class="row">
+        <strong>subsystem ${d.id}</strong>
+        <span class="tiny muted">${d.n} member${d.n === 1 ? "" : "s"} ·
+          ${(d.files || []).length} file${(d.files || []).length === 1 ? "" : "s"}</span>
+        <button class="tiny" onclick="selectSub(${d.id})">${
+          selSub === d.id ? "show all" : "isolate on the map"}</button>
+        <button class="tiny" onclick="closeSub()">close</button>
+      </div>
+      ${dep(uses, "depends on")}${dep(used, "depended on by")}
+      <div class="subcols">
+        <div><h3 class="tiny muted">Files</h3>
+          <table><tbody>${files || `<tr><td class="tiny muted">none</td></tr>`}</tbody></table></div>
+        <div><h3 class="tiny muted">Members</h3>${capped}
+          <table><tbody>${members}</tbody></table></div>
+      </div></div>`;
+}
+
+function closeSub() {
+  const host = $("subModal");
+  if (host) { host.hidden = true; host.innerHTML = ""; }
 }
 
 // The code graph, as a person wants to read it: a map first, then subsystems
@@ -1559,7 +1827,8 @@ function viewGraph(d, now) {
     const rows = g.subsystems.map((sub) => {
       const width = Math.max(4, Math.round((sub.n / biggest) * 100));
       const files = [...new Set(sub.members.map((m) => m.path).filter(Boolean))];
-      return `<tr>
+      return `<tr onclick="openSub('${esc(g.workspace_id)}', ${sub.id})"
+          style="cursor:pointer" title="what is in it">
         <td class="num tiny muted">${sub.id}</td>
         <td style="width:28%">
           <div class="sizebar" style="width:${width}%" title="${sub.n} members"></div>
@@ -1572,9 +1841,19 @@ function viewGraph(d, now) {
               files.length > 3 ? ` +${files.length - 3}` : ""}</td>
       </tr>`;
     }).join("");
-    return panel(head + graphSvg(g) + `<table><thead><tr><th class="num">#</th><th>size</th>
+    // Folded away by default on a narrow screen, where the map plus a
+    // table of two dozen rows means the map is never on screen whole.
+    // The choice is remembered, because re-making it every visit is the
+    // sort of small tax that stops people opening a page at all.
+    const open = foldOpen(`subs:${g.workspace_id}`, window.innerWidth > 900);
+    return panel(head + graphSvg(g) +
+      `<details class="fold" ${open ? "open" : ""}
+          ontoggle="rememberFold('subs:${esc(g.workspace_id)}', this.open)">
+        <summary>${g.subsystems.length} subsystem${
+          g.subsystems.length === 1 ? "" : "s"} as a table</summary>
+        <table><thead><tr><th class="num">#</th><th>size</th>
         <th class="num">members</th><th>what is in it</th>
-        <th class="hide">files</th></tr></thead><tbody>${rows}</tbody></table>`);
+        <th class="hide">files</th></tr></thead><tbody>${rows}</tbody></table></details>`);
   }).join("");
 }
 
@@ -1638,6 +1917,24 @@ function viewFleet(d, now) {
         <td class="mono tiny">${(x.clis || []).map(esc).join(" · ") || "<span class=muted>none</span>"}</td>
       </tr>`).join("") + "</tbody></table>")
     : empty("No machines yet. Pair one below.");
+
+  // Not every teammate is a machine. An external participant joins over
+  // HTTP with no node of its own -- a service, a bot, something that is not
+  // a CLI at all -- so it has no row above and used to appear nowhere on
+  // this tab, which is the first place you look for "who is on the fleet".
+  const outside = (snap.sessions || []).flatMap((sx) =>
+    (sx.external || []).map((a) => ({ ...a, session: sx.name })));
+  if (outside.length) {
+    out += `<h3 class="tiny muted" style="margin:16px 2px 4px">Participants with no machine</h3>`;
+    out += panel(`<table><thead><tr><th>Agent</th><th>Session</th><th>State</th>
+        <th class="hide">Does</th></tr></thead><tbody>` +
+      outside.map((a) => `<tr>
+        <td>${esc(a.name)} <span class="muted tiny mono">${esc(a.slot_id)}</span></td>
+        <td><span class="badge info">${esc(a.session)}</span></td>
+        <td><span class="badge ${a.status === "running" ? "ok" : ""}">${esc(a.status)}</span></td>
+        <td class="hide tiny muted">${esc(a.role || "")}</td>
+      </tr>`).join("") + `</tbody></table>`);
+  }
 
   out += `<h3 class="tiny muted" style="margin:16px 2px 4px">Pairing</h3>`;
   if (!snap.hub.pair_listen) {

@@ -664,6 +664,7 @@ async fn main() -> Result<()> {
         .route("/v1/capabilities/ask", post(api::operator_ask))
         .route("/v1/capabilities/ask/:id", get(api::operator_ask_result))
         .route("/v1/workspaces/:id/graph", post(api::build_graph))
+        .route("/v1/workspaces/:id/subsystem/:community", get(api::subsystem_detail))
 
         // The operator channel. Not session-scoped on purpose: it is how a
         // scoped orchestrator reaches past its own session, which is the one

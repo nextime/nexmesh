@@ -263,6 +263,27 @@ def main():
               all(subs[i]["n"] >= subs[i+1]["n"] for i in range(len(subs)-1)),
               str([x["n"] for x in subs]))
 
+    print("\n=== clicking a subsystem asks for what is in it ===")
+    # The map can carry five names per circle. Everything else about a
+    # subsystem is fetched for the one that was clicked, rather than
+    # shipped for all of them on every poll of the page.
+    if g and (g[0].get("subsystems") or []):
+        c = g[0]["subsystems"][0]["id"]
+        s, j = http("GET", f"/v1/workspaces/local/subsystem/{c}")
+        check("a subsystem can be asked about on its own", s == 200, f"{s} {str(j)[:200]}")
+        check("it lists what is in it", len(j.get("members") or []) > 0, str(j)[:300])
+        check("a member says where it lives",
+              all("path" in m and "kind" in m for m in (j.get("members") or [])),
+              str(j.get("members"))[:300])
+        check("and which files it lives in", len(j.get("files") or []) > 0, str(j)[:300])
+        check("the count is the whole subsystem, not the page of it shown",
+              j.get("n", 0) >= len(j.get("members") or []), str(j)[:200])
+        dirs = {x.get("dir") for x in (j.get("neighbours") or [])}
+        check("dependencies say which way they run",
+              not dirs or dirs <= {"uses", "used_by"}, str(j.get("neighbours"))[:200])
+    s, j = http("GET", "/v1/workspaces/no-such-workspace/subsystem/0")
+    check("an unknown workspace is a clean error there too", s == 400, f"{s} {str(j)[:160]}")
+
     print("\n=== a person can build the map without an agent asking for it ===")
     # The graph used to appear only as a side effect of query_code_graph, so
     # a fresh fleet showed "nothing parsed yet" with no way to change it.
