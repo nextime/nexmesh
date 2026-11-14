@@ -1298,6 +1298,16 @@ leaving the conversation in a gutter, so there it becomes a drawer: closed by
 default, opened by the channel name or the ☰ beside it, and closed again by
 picking a channel — which is the only thing it is there for.
 
+The room has ears and a voice when something in the fleet offers them. A
+microphone button appears if any teammate advertises `transcribe` — a
+capability bridge, usually — and dictates into the composer; a speaker button
+appears if anything advertises `tts` and reads new messages **in the channel
+you are looking at** aloud. Where the fleet offers neither, the browser's own
+speech APIs stand in, and where neither exists the buttons simply are not
+there. This is the same machinery the messages tab has always used, which is
+the point: a capability is a capability, and the dashboard asks the fleet for
+one exactly as an agent would.
+
 #### A terminal, in the browser
 
 The `terminal` button on an agent's row opens its real terminal in the page —

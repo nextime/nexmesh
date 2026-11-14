@@ -1793,16 +1793,29 @@ function renderChat(d) {
 
   // Built once, not per poll: it holds a caret.
   const host = $("chatComposer");
-  const sig = chatChan + "~" + sessions.length;
+  const sig = [chatChan, sessions.length, speaking,
+               canHear() || fleetHas("transcribe"),
+               canSpeak() || fleetHas("tts")].join("~");
   if (host.dataset.sig !== sig) {
     host.dataset.sig = sig;
     const keep = $("chatText") ? $("chatText").value : "";
+    // The fleet's own ears and voice, where something offers them: a
+    // capability bridge with `transcribe` and `tts` makes a phone usable
+    // one-handed, which is where a fleet is actually read. The browser's
+    // own APIs stand in where the fleet has none.
     host.innerHTML = `
       <span class="tiny muted mono">${chatChan === "*" ? "every channel" : "#" + esc(chatChan)}</span>
       <input id="chatText" type="text" autocomplete="off"
              placeholder="say something to ${chatChan === "*" ? "every team" : "#" + esc(chatChan)}, as the operator"
              onkeydown="if(event.key==='Enter')chatSend()">
-      <button onclick="chatSend()">send</button>`;
+      ${(canHear() || fleetHas("transcribe")) ? `<button id="chatMic" class="mic"
+              onclick="dictate()" title="dictate (${fleetHas("transcribe")
+                ? "transcribed on the fleet" : "in this browser"})">\u{1F3A4}</button>` : ""}
+      <button onclick="chatSend()">send</button>
+      ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
+              title="read new messages in this channel aloud (${fleetHas("tts")
+                ? "spoken by the fleet" : "by this browser"})"
+              >${speaking ? "\u{1F50A}" : "\u{1F507}"}</button>` : ""}`;
     if (keep && $("chatText")) $("chatText").value = keep;
   }
 }
@@ -1877,6 +1890,23 @@ function viewMessages(d, now) {
        only claim_messages does, or the button above</p>`;
 }
 
+/// Where typed or spoken words go: the chat room when it is open, the
+/// messages tab otherwise. Dictation and the voice controls exist in both,
+/// and a transcript landing in the wrong box -- or in one nobody can see --
+/// is the obvious way to get this wrong.
+function msgBox() {
+  return (chatOpen ? $("chatText") : $("sendText")) || $("sendText") || $("chatText");
+}
+
+function micButton() {
+  return (chatOpen ? $("chatMic") : $("micBtn")) || $("micBtn") || $("chatMic");
+}
+
+/// Send what is in whichever composer is on screen.
+function sendHere() {
+  return chatOpen ? chatSend() : sendOperatorMessage();
+}
+
 // Speech, where the browser offers it. Chrome on Android has both; Firefox
 // has only the speaking half; nothing here is required for the dashboard to
 // work, so each control appears only if its API exists.
@@ -1916,7 +1946,7 @@ async function askFleet(capability, request, waitMs) {
 // one-handed is the thing people do not do.
 let recorder = null;
 async function dictateViaFleet() {
-  const btn = $("micBtn");
+  const btn = micButton();
   if (recorder) { recorder.stop(); return; }
   let stream;
   try {
@@ -1945,7 +1975,7 @@ async function dictateViaFleet() {
       const out = await askFleet("transcribe", { audio_base64: b64, language: navigator.language });
       const text = (() => { try { const j = JSON.parse(out); return j.text || out; }
                            catch (e) { return out; } })();
-      const box = $("sendText");
+      const box = msgBox();
       box.value = (box.value ? box.value + " " : "") + String(text).trim();
       note("");
       $("notice").hidden = true;
@@ -1966,13 +1996,13 @@ function dictate() {
     return;
   }
   if (!SR) { note("No speech recognition here, and the fleet offers none."); return; }
-  const btn = $("micBtn");
+  const btn = micButton();
   if (recog) { recog.stop(); return; }
   recog = new SR();
   recog.lang = navigator.language || "en-GB";
   recog.interimResults = true;
   recog.continuous = false;
-  const box = $("sendText");
+  const box = msgBox();
   const before = box.value;
   recog.onresult = (e) => {
     let said = "";
@@ -2008,8 +2038,14 @@ function lastMessageId() {
 
 // Called on every poll. Says only what arrived since the last time.
 function speakNew() {
-  if (!speaking || !canSpeak()) return;
+  // `canSpeak()` is the browser's own voice; the fleet's counts too, and on
+  // a desktop Firefox with a CoderAI in the fleet that is the only one there
+  // is.
+  if (!speaking || !(canSpeak() || fleetHas("tts"))) return;
   const msgs = ((snap && snap.detail && snap.detail.messages) || [])
+    // In the room, read the room: opening #payments and being read #all is
+    // not what the speaker was turned on for.
+    .filter((m) => !chatOpen || chatChan === "*" || m.session === chatChan)
     .filter((m) => (m.id || 0) > spokenUpTo)
     .sort((a, b) => a.id - b.id);
   if (!msgs.length) return;
@@ -2047,7 +2083,7 @@ async function say(text) {
 // The operator speaking into a team. In the combined view it has to say
 // which one; a message has to land somewhere.
 async function sendOperatorMessage() {
-  const box = $("sendText");
+  const box = msgBox();
   const text = (box.value || "").trim();
   if (!text) return;
   const sid = isAll() ? ($("sendTo") || {}).value : currentSession();
