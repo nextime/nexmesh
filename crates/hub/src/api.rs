@@ -735,6 +735,15 @@ pub struct SpawnRequest {
     /// CLI from now on.
     #[serde(default)]
     pub cli: Option<String>,
+    /// `headless` or `interactive`, when the caller has an opinion.
+    ///
+    /// Kept on the seat like `cli` is, and for the same reason: it really is
+    /// how that seat runs from now on, including when something respawns it
+    /// after a crash. Absent leaves the seat's own mode alone, which is what
+    /// a script and the orchestrator want -- a team declared headless must
+    /// not become interactive because something restarted it.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 pub async fn spawn_slot(
@@ -762,11 +771,28 @@ pub async fn spawn_slot(
         db.execute("UPDATE slots SET cli_id = ? WHERE id = ?", params![cli, slot_id])
             .map_err(bad)?;
     }
+    if let Some(mode) = req.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if mode != "headless" && mode != "interactive" {
+            return Err(bad(format!(
+                "mode must be 'headless' or 'interactive', not '{mode}'"
+            )));
+        }
+        let db = st.db.lock().unwrap();
+        db.execute("UPDATE slots SET mode = ? WHERE id = ?", params![mode, slot_id])
+            .map_err(bad)?;
+    }
     match crate::launch::launch_slot(&st, &slot_id, None).await {
-        Ok((agent_id, node)) => Ok(Json(json!({
-            "slot_id": slot_id, "agent_id": agent_id, "node": node,
-            "cli": req.cli,
-        }))),
+        Ok((agent_id, node)) => {
+            let mode: String = {
+                let db = st.db.lock().unwrap();
+                db.query_row("SELECT mode FROM slots WHERE id = ?", [&slot_id], |r| r.get(0))
+                    .unwrap_or_else(|_| "headless".into())
+            };
+            Ok(Json(json!({
+                "slot_id": slot_id, "agent_id": agent_id, "node": node,
+                "cli": req.cli, "mode": mode,
+            })))
+        }
         Err(e) => Err(bad(e)),
     }
 }
@@ -1448,7 +1474,9 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 s.summary, COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
                 COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external' ELSE '-' END),
                 COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0), s.paused,
-                a.pid, a.io_kind, a.id, a.exited_at_ms
+                a.pid, COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
+                                                THEN 'tmux' END),
+                a.id, a.exited_at_ms, s.terminal_via IS NOT NULL
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
@@ -1476,6 +1504,10 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 "io_kind": r.get::<_, Option<String>>(14)?,
                 "agent_id": r.get::<_, Option<String>>(15)?,
                 "exited": r.get::<_, Option<i64>>(16)?.is_some(),
+                // A seat with no process of its own that is nonetheless
+                // reachable: its CLI sits in a terminal a node has adopted,
+                // so a message can be typed at it. IO reads `tmux`.
+                "typed_via_terminal": r.get::<_, bool>(17)?,
             }))
         })
         .and_then(|m| m.collect())

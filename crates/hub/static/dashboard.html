@@ -21,13 +21,50 @@
     --fg: #e6edf3; --dim: #8b9cb0; --faint: #5d6b7d;
     --ok: #6ee7b7; --warn: #fcd34d; --bad: #fca5a5; --info: #93c5fd; --accent: #a78bfa;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    /* Nick colours. Eight, assigned by name, so the same agent is the same
+       colour in every channel and on every reload -- which is what makes a
+       busy log skimmable. */
+    --n1: #7dd3fc; --n2: #fca5a5; --n3: #86efac; --n4: #fcd34d;
+    --n5: #c4b5fd; --n6: #f9a8d4; --n7: #67e8f9; --n8: #fdba74;
+    --edge: color-mix(in srgb, var(--accent) 30%, transparent);
   }
   @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
+    :root:not([data-theme="dark"]):not([data-theme="lcars"]) {
       --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d4dae1;
       --fg: #1d242c; --dim: #5a6673; --faint: #8794a1;
       --ok: #047857; --warn: #92610a; --bad: #b91c1c; --info: #1d4ed8; --accent: #6d28d9;
     }
+  }
+  /* A flight deck, not a spaceship: the sci-fi is in the edges and the
+     labels, and never in the way of reading a number. One accent hairline
+     per panel, a faint grid behind everything, and small caps on the labels
+     that are already small. */
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      linear-gradient(transparent 95%, color-mix(in srgb, var(--accent) 7%, transparent) 95%)
+        0 0 / 100% 34px,
+      linear-gradient(90deg, transparent 95%, color-mix(in srgb, var(--accent) 5%, transparent) 95%)
+        0 0 / 34px 100%;
+    opacity: .5;
+  }
+  header { position: sticky; }
+  header::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+    background: linear-gradient(90deg, var(--accent), transparent 42%);
+    opacity: .7;
+  }
+  .panel { position: relative; }
+  /* The corner tick. Three pixels of deliberate machinery. */
+  .panel::before {
+    content: ""; position: absolute; left: -1px; top: -1px; width: 22px; height: 22px;
+    border-top: 2px solid var(--edge); border-left: 2px solid var(--edge);
+    border-top-left-radius: 10px; pointer-events: none;
+  }
+  .tile { position: relative; overflow: hidden; }
+  .tile::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--accent); opacity: .55;
   }
   * { box-sizing: border-box; }
   body {
@@ -150,6 +187,164 @@
     background: color-mix(in srgb, var(--bad) 14%, var(--panel));
     border: 1px solid color-mix(in srgb, var(--bad) 45%, transparent);
   }
+  /* ------------------------------------------------------------- chat ----
+     IRC, because IRC got this right: channels down the left, who is in the
+     room down the right, one line per utterance, and the whole screen for
+     it. A fleet is several conversations at once and the tab-sized feed
+     made you read them one session at a time. */
+  #chat {
+    position: fixed; inset: 0; z-index: 60; background: var(--bg);
+    display: grid; grid-template-columns: 215px minmax(0, 1fr) 205px;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+  #chat .chathead {
+    grid-column: 1 / -1; display: flex; align-items: center; gap: 12px;
+    padding: 9px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  #chat .chathead .where { font-family: var(--mono); font-weight: 650; }
+  .chanrail { border-right: 1px solid var(--line); overflow-y: auto; padding: 6px 0;
+              background: color-mix(in srgb, var(--panel) 60%, var(--bg)); }
+  .chanrail .chanbtn {
+    display: flex; width: 100%; align-items: center; justify-content: space-between;
+    gap: 6px; background: transparent; border: 0; border-left: 2px solid transparent;
+    border-radius: 0; color: var(--dim); padding: 5px 10px; text-align: left;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .chanrail .chanbtn:hover { color: var(--fg); background: var(--panel2); }
+  .chanrail .chanbtn[aria-current="true"] {
+    color: var(--fg); border-left-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .chanrail .unread {
+    font-size: 11px; padding: 0 6px; border-radius: 999px; color: var(--bg);
+    background: var(--warn); font-family: var(--mono); font-weight: 700;
+  }
+  .chanrail .rl { font-size: 10px; text-transform: uppercase; letter-spacing: .8px;
+                  color: var(--faint); padding: 8px 10px 3px; }
+  .chatfeed { overflow-y: auto; padding: 8px 12px 14px; font-family: var(--mono);
+              font-size: 13px; line-height: 1.55; }
+  .chatline { display: grid; grid-template-columns: 62px 10px minmax(0, 1fr); gap: 8px; }
+  .chatline .t { color: var(--faint); }
+  .chatline .m { color: var(--faint); text-align: center; }
+  .chatline.unclaimed .m { color: var(--warn); }
+  .chatline .nick { font-weight: 650; }
+  .chatline .to { color: var(--dim); }
+  .chatline .txt { white-space: pre-wrap; word-break: break-word; }
+  .chatline .ch { color: var(--accent); }
+  .chatline.sys .txt { color: var(--dim); font-style: italic; }
+  .chatline:target, .chatline.mine { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .nicklist { border-left: 1px solid var(--line); overflow-y: auto; padding: 6px 0;
+              background: color-mix(in srgb, var(--panel) 60%, var(--bg)); }
+  .nicklist .nk { display: flex; align-items: center; gap: 6px; padding: 3px 10px;
+                  font-family: var(--mono); font-size: 12.5px; }
+  .nicklist .nk .dot { flex: 0 0 auto; }
+  .nicklist .nk small { color: var(--faint); }
+  #chat .composer { grid-column: 1 / -1; background: var(--panel); }
+  @media (max-width: 900px) {
+    #chat { grid-template-columns: 150px minmax(0, 1fr); }
+    .nicklist { display: none; }
+    .chatline { grid-template-columns: 54px 10px minmax(0, 1fr); gap: 6px; }
+  }
+
+  /* ------------------------------------------------------------ LCARS ----
+     The nerd theme. Black, blocks, elbows, condensed capitals -- and the
+     trans flag for its palette, which is as close to canon LCARS pastels
+     as it is to the point. Shapes are CSS; nothing is loaded from anywhere.
+  */
+  :root[data-theme="lcars"] {
+    --lc-blue: #5bcefa; --lc-pink: #f5a9b8; --lc-dim-blue: #3c93b4;
+    --bg: #000000; --panel: #0b0b10; --panel2: #15151d; --line: #2a2a38;
+    --fg: #ffffff; --dim: #cfd8e3; --faint: #8e9aa8;
+    --ok: #5bcefa; --warn: #f5a9b8; --bad: #f5a9b8; --info: #ffffff;
+    --accent: #5bcefa; --edge: #f5a9b8;
+    --cond: "Avenir Next Condensed", "Roboto Condensed", "Liberation Sans Narrow",
+            "DejaVu Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+    --n1: #5bcefa; --n2: #f5a9b8; --n3: #ffffff; --n4: #9ad9f0;
+    --n5: #ffc9d4; --n6: #7fe3ff; --n7: #e6b3c0; --n8: #bfe9ff;
+  }
+  :root[data-theme="lcars"] body::before { display: none; }
+  :root[data-theme="lcars"] body { background: #000; }
+  :root[data-theme="lcars"] .brand,
+  :root[data-theme="lcars"] nav button,
+  :root[data-theme="lcars"] th,
+  :root[data-theme="lcars"] .tile .k,
+  :root[data-theme="lcars"] .badge,
+  :root[data-theme="lcars"] button {
+    font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.2px;
+  }
+  :root[data-theme="lcars"] .brand { font-size: 21px; font-weight: 700; color: var(--lc-pink); }
+  :root[data-theme="lcars"] .brand span { color: var(--lc-blue); }
+  /* The elbow: the one shape everyone recognises. */
+  :root[data-theme="lcars"] header {
+    background: #000; border-bottom: 0; padding-left: 0; gap: 10px;
+  }
+  :root[data-theme="lcars"] header::before {
+    content: ""; width: 86px; height: 34px; flex: 0 0 auto;
+    background: var(--lc-pink); border-radius: 0 0 0 34px;
+    border-top: 6px solid #000; border-left: 6px solid #000;
+  }
+  :root[data-theme="lcars"] header::after {
+    background: linear-gradient(90deg, var(--lc-blue) 60%, var(--lc-pink));
+    height: 3px; opacity: 1;
+  }
+  :root[data-theme="lcars"] button,
+  :root[data-theme="lcars"] nav button[aria-selected="true"] {
+    background: var(--lc-blue); color: #000; border: 0; border-radius: 999px;
+    padding: 4px 14px; font-weight: 700;
+  }
+  :root[data-theme="lcars"] button:hover { background: var(--lc-pink); color: #000; }
+  :root[data-theme="lcars"] nav button {
+    background: var(--panel2); color: var(--dim); border-radius: 999px; border: 0;
+  }
+  :root[data-theme="lcars"] nav button[aria-selected="true"] { color: #000; }
+  :root[data-theme="lcars"] nav .count { color: inherit; opacity: .7; }
+  :root[data-theme="lcars"] select, :root[data-theme="lcars"] input {
+    background: #000; border: 2px solid var(--lc-dim-blue); border-radius: 999px;
+    color: var(--fg); padding: 4px 12px;
+  }
+  /* A panel is a block with a coloured rail and one rounded outer corner. */
+  :root[data-theme="lcars"] .panel {
+    background: var(--panel); border: 0; border-radius: 22px 8px 8px 22px;
+    padding-left: 18px; overflow: hidden;
+  }
+  :root[data-theme="lcars"] .panel::before {
+    content: ""; left: 0; top: 0; bottom: 0; width: 12px; height: auto;
+    border: 0; border-radius: 0;
+    background: repeating-linear-gradient(
+      180deg, var(--lc-blue) 0 38px, #000 38px 42px,
+      var(--lc-pink) 42px 74px, #000 74px 78px);
+  }
+  :root[data-theme="lcars"] .tile {
+    background: var(--lc-blue); color: #000; border: 0; border-radius: 6px 20px 20px 6px;
+  }
+  :root[data-theme="lcars"] .tile .k { color: #000; opacity: .72; }
+  :root[data-theme="lcars"] .tile::before { background: #000; opacity: .25; }
+  :root[data-theme="lcars"] .tile.alert { background: var(--lc-pink); }
+  :root[data-theme="lcars"] .tile.alert .n,
+  :root[data-theme="lcars"] .tile.warn .n { color: #000; }
+  :root[data-theme="lcars"] .tile .n { font-family: var(--cond); font-size: 26px; }
+  :root[data-theme="lcars"] th { color: var(--lc-pink); font-size: 12px; }
+  :root[data-theme="lcars"] tr:hover td {
+    background: color-mix(in srgb, var(--lc-blue) 10%, transparent);
+  }
+  :root[data-theme="lcars"] .badge {
+    background: var(--lc-dim-blue); color: #000; border: 0; font-weight: 700;
+  }
+  :root[data-theme="lcars"] .badge.ok { background: var(--lc-blue); color: #000; }
+  :root[data-theme="lcars"] .badge.warn,
+  :root[data-theme="lcars"] .badge.bad { background: var(--lc-pink); color: #000; }
+  :root[data-theme="lcars"] .badge.info { background: #fff; color: #000; }
+  :root[data-theme="lcars"] .chanrail .chanbtn {
+    border-left: 0; border-radius: 0 999px 999px 0; margin: 1px 8px 1px 0;
+    background: var(--panel2); color: var(--dim); text-transform: none;
+    letter-spacing: 0; font-family: var(--mono); padding: 4px 12px;
+  }
+  :root[data-theme="lcars"] .chanrail .chanbtn[aria-current="true"] {
+    background: var(--lc-blue); color: #000; font-weight: 700;
+  }
+  :root[data-theme="lcars"] .chanrail .unread { background: var(--lc-pink); color: #000; }
+  :root[data-theme="lcars"] .sizebar { background: var(--lc-pink); }
+
   /* A class rule beats the UA stylesheet's [hidden], so anything styled
      display:* below would ignore its own hidden attribute without this. */
   [hidden] { display: none !important; }
@@ -277,7 +472,16 @@
     <button id="addBtn" class="tiny" title="Launch an agent on a machine">add agent</button>
     <button id="installBtn" class="tiny" hidden onclick="installApp()"
             title="Install this as an app on this device">install</button>
+    <button id="chatBtn" class="tiny" onclick="openChat()"
+            title="Full-screen chat: one channel per session">chat</button>
     <span class="spacer"></span>
+    <select id="themeSel" class="tiny" title="Theme"
+            onchange="applyTheme(this.value)">
+      <option value="auto">theme: auto</option>
+      <option value="dark">dark</option>
+      <option value="light">light</option>
+      <option value="lcars">LCARS</option>
+    </select>
     <span class="tiny muted" id="hubInfo"></span>
     <span class="dot" id="liveDot" title="polling"></span>
     <button id="forget" class="tiny" title="Remove the stored token from this browser">sign out</button>
@@ -324,6 +528,26 @@
          here. Outside #view so a poll cannot close it under you. -->
     <div id="subModal" hidden onclick="if (event.target === this) closeSub()"></div>
   </main>
+
+  <!-- The chat, as a room rather than a tab. Channels down the left, who is
+       in the room down the right, one line per utterance. Outside #view
+       because the poll replaces that wholesale, and a composer you are
+       typing into must survive a refresh. -->
+  <div id="chat" hidden>
+    <div class="chathead">
+      <div class="brand">nex<span>mesh</span></div>
+      <span class="where" id="chatWhere">#all</span>
+      <span class="tiny muted" id="chatHint"></span>
+      <span class="spacer"></span>
+      <span class="dot" id="chatDot" title="polling"></span>
+      <button class="tiny" onclick="closeChat()" title="Back to the dashboard (Esc)">close</button>
+    </div>
+    <div class="chanrail" id="chanRail"></div>
+    <div class="chatfeed" id="chatFeed"
+         onscroll="chatStick = (this.scrollHeight - this.scrollTop - this.clientHeight) < 50"></div>
+    <div class="nicklist" id="nickList"></div>
+    <div class="composer" id="chatComposer"></div>
+  </div>
 </div>
 
 <script>
@@ -490,7 +714,9 @@ async function showGate(msg, known) {
 
 function start() {
   $("gate").hidden = true; $("app").hidden = false;
-  tick();
+  // A link to the chat is a link to the chat: reopen the room rather than
+  // landing on the agents tab with a hash nobody can see the effect of.
+  if (location.hash === "#chat") openChat(); else tick();
   if (!timer) timer = setInterval(() => { if (!document.hidden) tick(); }, 1000);
 }
 
@@ -900,6 +1126,7 @@ function render() {
   ].join("");
 
   paintComposer(d);
+  renderChat(d);
   speakNew();
 
   const openCodes = (snap.pairing || []).filter((c) => c.state === "open").length;
@@ -1013,10 +1240,12 @@ function viewAgents(d, now) {
               id="rl-${esc(a.slot_id)}">${esc(a.role)}</span></td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}
-            ${a.pid ? `<br><span class="tiny muted" title="the process behind this seat${
+            ${a.pid || a.io_kind ? `<br><span class="tiny muted" title="the process behind this seat${
                 a.io_kind === "pty" ? " — it has a terminal, so it can be attached to and typed at"
+              : a.io_kind === "tmux" ? " — its CLI sits in an adopted tmux pane, so the hub can type at it"
               : a.io_kind === "pipes" ? " — pipes, so it can be watched but not typed at"
-              : ""}">pid ${a.pid}${a.io_kind ? " · " + esc(a.io_kind) : ""}</span>` : ""}</td>
+              : ""}">${a.pid ? "pid " + a.pid : "no process"}${
+                a.io_kind ? " · " + esc(a.io_kind) : ""}</span>` : ""}</td>
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
             <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
         <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span>
@@ -1085,6 +1314,241 @@ function paintComposer(d) {
   if (keep && $("sendText")) $("sendText").value = keep;
 }
 
+// ---------------------------------------------------------------- themes ----
+// Two looks, and the machinery for both: a flight deck that stays out of the
+// way, and LCARS for when you would rather be on one. The choice is this
+// browser's, not the fleet's -- an operator console is personal.
+const THEME_KEY = "nexmesh.theme";
+function applyTheme(t) {
+  if (!["auto", "dark", "light", "lcars"].includes(t)) t = "auto";
+  if (t === "auto") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = t;
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = t === "lcars" ? "#000000" : "#0b0f14";
+  const sel = $("themeSel");
+  if (sel) sel.value = t;
+}
+(function () {
+  let t = "auto";
+  try { t = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) {}
+  applyTheme(t);
+})();
+
+// ------------------------------------------------------------------ chat ----
+// IRC had this right: channels down one side, who is in the room down the
+// other, one line per utterance, and the whole screen for it. A fleet is
+// several conversations at once, and a panel-sized feed made you read them
+// one session at a time.
+let chatOpen = false;
+let chatChan = "*";          // a session NAME, or "*" for every channel
+let chatPrevScope = null;    // the dashboard's own scope, restored on close
+let chatStick = true;        // follow the tail unless the reader scrolled up
+let chatHist = {};           // channel -> older messages, fetched once
+const SEEN_KEY = "nexmesh.chat.seen";
+let chatSeen = {};
+try { chatSeen = JSON.parse(localStorage.getItem(SEEN_KEY) || "{}"); } catch (e) {}
+
+function saveSeen() {
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(chatSeen)); } catch (e) {}
+}
+
+function openChat() {
+  chatOpen = true;
+  chatStick = true;
+  // Every channel in one poll. The dashboard's own scope is put back on the
+  // way out, so opening the chat does not quietly change what you were
+  // looking at.
+  chatPrevScope = session;
+  session = "*";
+  $("chat").hidden = false;
+  document.body.style.overflow = "hidden";
+  location.hash = "chat";
+  tick();
+}
+
+function closeChat() {
+  chatOpen = false;
+  if (chatPrevScope !== null) session = chatPrevScope;
+  $("chat").hidden = true;
+  document.body.style.overflow = "";
+  saveSeen();
+  if (location.hash === "#chat") location.hash = tab;
+  tick();
+}
+
+function chatPick(name) {
+  chatChan = name;
+  chatStick = true;
+  loadChatHistory(name);
+  renderChat(snap && snap.detail);
+}
+
+// A nick's colour, by name, so the same agent is the same colour in every
+// channel and after every reload. That is what makes a busy log skimmable.
+function nickColor(name) {
+  let h = 0;
+  for (let i = 0; i < (name || "").length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return "var(--n" + (1 + (h % 8)) + ")";
+}
+
+function chatSessions() {
+  return (snap && snap.sessions) || [];
+}
+
+function chanId(name) {
+  const s = chatSessions().find((x) => x.name === name);
+  return s ? s.id : "";
+}
+
+// The live window the poll gives us, plus whatever history was fetched for
+// this channel, oldest first and never the same message twice.
+function chatMessages(d) {
+  const live = ((d && d.messages) || []).filter(
+    (m) => chatChan === "*" || m.session === chatChan);
+  const hist = chatHist[chatChan] || [];
+  const byId = new Map();
+  for (const m of hist) byId.set(m.id, m);
+  for (const m of live) byId.set(m.id, m);          // live wins: it is fresher
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+// The dashboard poll carries the last 120 messages across the whole fleet,
+// which in one channel is thin. A channel's own log goes deeper, so it is
+// fetched once when the channel is opened.
+async function loadChatHistory(name) {
+  if (name === "*" || chatHist[name]) return;
+  const id = chanId(name);
+  if (!id) return;
+  try {
+    const r = await fetch(`/v1/sessions/${encodeURIComponent(id)}/log?limit=400`,
+                          { headers: token ? { authorization: "Bearer " + token } : {},
+                            cache: "no-store", credentials: "same-origin" });
+    const j = await r.json();
+    // The log endpoint does not say whether a message was CLAIMED, and a
+    // marker that guesses is worse than no marker, so history carries none.
+    chatHist[name] = (j.messages || []).map((m) => ({ ...m, session: name, hist: true }));
+    renderChat(snap && snap.detail);
+  } catch (e) { /* the live window still shows */ }
+}
+
+function renderChat(d) {
+  if (!chatOpen) return;
+  const sessions = chatSessions();
+  const live = (d && d.messages) || [];
+  const unread = (name) => {
+    const seen = chatSeen[name] || 0;
+    return live.filter((m) => (name === "*" || m.session === name) && m.id > seen).length;
+  };
+
+  // The rail. #all first, because a fleet is usually read as one room.
+  const chan = (name, label, count) =>
+    `<button class="chanbtn" aria-current="${name === chatChan}"
+             onclick="chatPick('${esc(name).replace(/'/g, "\\'")}')">
+       <span>${esc(label)}</span>
+       ${count ? `<span class="unread">${count}</span>` : ""}</button>`;
+  $("chanRail").innerHTML =
+    `<div class="rl">channels</div>` +
+    chan("*", "#all", unread("*")) +
+    sessions.map((x) => chan(x.name, "#" + x.name, unread(x.name))).join("") +
+    `<div class="rl">you</div>
+     <div class="nk tiny muted" style="padding:3px 10px">operator</div>`;
+
+  // The room.
+  const msgs = chatMessages(d);
+  const rows = msgs.map((m) => {
+    const sys = m.kind && m.kind !== "text";
+    const cls = [sys ? "sys" : "", (!m.hist && !m.claimed) ? "unclaimed" : ""]
+                .filter(Boolean).join(" ");
+    const mark = (!m.hist && !m.claimed) ? "\u25cf" : "";
+    const title = m.hist ? "from this channel's log"
+      : (m.claimed ? `claimed by ${m.claimed_by || "someone"}`
+         : (m.delivered ? "delivered, but nobody has claimed it"
+            : (m.in_flight ? "handed over, not yet confirmed"
+               : "the recipient has not seen this yet")));
+    const to = m.to && m.to !== "(team)" ? `<span class="to">\u2192 ${esc(m.to)}</span> ` : "";
+    const ch = chatChan === "*" && m.session
+      ? `<span class="ch">#${esc(m.session)}</span> ` : "";
+    return `<div class="chatline ${cls}">
+      <span class="t">${hhmmss(m.at_ms)}</span>
+      <span class="m" title="${esc(title)}">${mark}</span>
+      <span class="txt">${ch}<span class="nick" style="color:${nickColor(m.from)}"
+        >&lt;${esc(m.from)}&gt;</span> ${to}${esc(m.body)}</span>
+    </div>`;
+  }).join("");
+  const feed = $("chatFeed");
+  feed.innerHTML = rows || `<div class="empty">Nothing said in here yet.</div>`;
+  if (chatStick) feed.scrollTop = feed.scrollHeight;
+
+  // Who is in the room. A channel shows its seats; #all shows every seat
+  // with the channel it belongs to, which is the closest thing a fleet has
+  // to a user list.
+  const agents = ((d && d.agents) || []).filter(
+    (a) => chatChan === "*" || a.session === chatChan || !a.session);
+  $("nickList").innerHTML = `<div class="rl">in the room</div>` + (agents.length
+    ? agents.map((a) => `<div class="nk" title="${esc(a.role || "")}">
+         <span class="dot ${a.status === "running" ? "live" : "stale"}"></span>
+         <span style="color:${nickColor(a.name)}">${esc(a.name)}</span>
+         ${chatChan === "*" && a.session ? `<small>#${esc(a.session)}</small>` : ""}
+       </div>`).join("")
+    : `<div class="nk muted tiny">nobody</div>`);
+
+  $("chatWhere").textContent = chatChan === "*" ? "#all" : "#" + chatChan;
+  $("chatHint").textContent = chatChan === "*"
+    ? `${sessions.length} channel${sessions.length === 1 ? "" : "s"} \u00b7 recent fleet-wide`
+    : `${msgs.length} line${msgs.length === 1 ? "" : "s"}`;
+  $("chatDot").className = $("liveDot").className;
+
+  // Mark what is on screen as seen, and remember it per channel so a reload
+  // does not show a hundred unread again.
+  const top = msgs.length ? msgs[msgs.length - 1].id : 0;
+  if (top > (chatSeen[chatChan] || 0)) { chatSeen[chatChan] = top; saveSeen(); }
+
+  // Built once, not per poll: it holds a caret.
+  const host = $("chatComposer");
+  const sig = chatChan + "~" + sessions.length;
+  if (host.dataset.sig !== sig) {
+    host.dataset.sig = sig;
+    const keep = $("chatText") ? $("chatText").value : "";
+    host.innerHTML = `
+      <span class="tiny muted mono">${chatChan === "*" ? "every channel" : "#" + esc(chatChan)}</span>
+      <input id="chatText" type="text" autocomplete="off"
+             placeholder="say something to ${chatChan === "*" ? "every team" : "#" + esc(chatChan)}, as the operator"
+             onkeydown="if(event.key==='Enter')chatSend()">
+      <button onclick="chatSend()">send</button>`;
+    if (keep && $("chatText")) $("chatText").value = keep;
+  }
+}
+
+async function chatSend() {
+  const box = $("chatText");
+  const text = (box.value || "").trim();
+  if (!text) return;
+  // "#all" is one message to each team, not a message to a channel called
+  // "all": every team has its own log, and a message belongs in one.
+  const targets = chatChan === "*"
+    ? chatSessions().map((x) => x.id)
+    : [chanId(chatChan)].filter(Boolean);
+  if (!targets.length) { note("No session to send to."); return; }
+  box.value = "";
+  const failed = [];
+  for (const t of targets) {
+    try {
+      const r = await post(`/v1/sessions/${encodeURIComponent(t)}/messages`, { text });
+      if (r && r.error) throw new Error(r.error);
+    } catch (e) { failed.push(t); }
+  }
+  if (failed.length === targets.length) { box.value = text; note("Could not send that."); }
+  else if (failed.length) note(`Sent, except to ${failed.length} session(s).`);
+  chatStick = true;
+  tick();
+}
+
+// Esc leaves the room. Anything else typed in it belongs to the composer.
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && chatOpen) { closeChat(); return; }
+});
+
 function viewMessages(d, now) {
   const all = isAll();
   if (!d.messages.length)
@@ -1116,6 +1580,8 @@ function viewMessages(d, now) {
   }).join("");
   return panel(`<div class="feed" onscroll="this.dataset.stick=
       (this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'">${rows}</div>`) +
+    `<div class="pair"><button onclick="openChat()">open as full-screen chat</button>
+       <span class="tiny muted">one channel per session, plus #all</span></div>` +
     `<p class="tiny muted" style="margin:8px 2px">
        <b>\u25cf</b> nobody has claimed it yet — reading no longer clears a message,
        only claim_messages does, or the button above</p>`;

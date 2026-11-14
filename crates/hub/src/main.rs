@@ -619,6 +619,7 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 delivery::push_tick(&st).await;
+                delivery::typed_tick(&st).await;
                 delivery::recovery_tick(&st).await;
             }
         });

@@ -372,6 +372,25 @@ async fn handle(
             }
         }
 
+        NodeToHub::TerminalLink { agent_id, slot_id, via_agent_id, cli } => {
+            let db = st.db.lock().unwrap();
+            // Recorded on the SEAT, not the agent, because that is what it
+            // is about: whoever is in this seat is reachable by keyboard for
+            // as long as that terminal is adopted. The shim that proved it
+            // may be gone by tomorrow; the CLI it was a child of is what the
+            // node will check against.
+            db.execute(
+                "UPDATE slots SET terminal_via = ?, terminal_cli_pid = ?,
+                                  terminal_cli_ticks = ?, terminal_at_ms = ?
+                  WHERE id = ?",
+                params![via_agent_id, cli.pid, cli.start_ticks as i64, now_ms(), slot_id],
+            )?;
+            tracing::info!(
+                node = %node_name, %agent_id, %slot_id, via = %via_agent_id, pid = cli.pid,
+                "seat is reachable through an adopted terminal"
+            );
+        }
+
         NodeToHub::MessageAcked { agent_id, message_ids } => {
             let db = st.db.lock().unwrap();
             tools::ack_messages(&db, &agent_id, &message_ids)?;

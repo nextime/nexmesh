@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""A CLI someone started BY HAND, with a nexmesh shim beside it.
+
+Stands for `claude` run in a terminal: it starts nexmesh-mcpd as its MCP
+server, registers through it (which is what takes a seat), and then sits
+reading its terminal for ever -- exactly the state in which an agent is
+unreachable by anything but its own next tool call.
+
+Everything it reads is appended to $HANDCLI_LOG, so a test can prove the CLI
+itself received a message rather than that something merely wrote one.
+"""
+import json, os, subprocess, sys, threading, time
+
+LOG = os.environ.get("HANDCLI_LOG", "/dev/null")
+MCPD = os.environ["HANDCLI_MCPD"]
+SOCK = os.environ["HANDCLI_SOCK"]
+SESSION = os.environ.get("HANDCLI_SESSION", "")
+NAME = os.environ.get("HANDCLI_NAME", "Hand")
+
+def note(what):
+    with open(LOG, "a") as f:
+        f.write(f"{time.time():.3f} {what}\n")
+
+args = [MCPD, "--sock", SOCK, "--cli", "claude", "--name", NAME]
+if SESSION:
+    args += ["--session", SESSION]
+shim = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=open(os.environ.get("HANDCLI_SHIMLOG", "/dev/null"), "a"),
+                        text=True, bufsize=1)
+n = 0
+def call(method, params=None):
+    global n
+    n += 1
+    m = {"jsonrpc": "2.0", "id": n, "method": method}
+    if params is not None:
+        m["params"] = params
+    shim.stdin.write(json.dumps(m) + "\n"); shim.stdin.flush()
+    return json.loads(shim.stdout.readline())
+
+call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "fakehandcli", "version": "1"}})
+tools = call("tools/list")["result"]["tools"]
+note(f"registered with {len(tools)} tools")
+print(f"HANDCLI READY tools={len(tools)} tty={sys.stdin.isatty()}", flush=True)
+print("> ", end="", flush=True)
+
+# Read the terminal for ever. Deliberately no tool calls from here on: the
+# floor is unavailable by construction, which is the whole point.
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    note(line)
+    if line in ("quit", "exit"):
+        break
+    print(f"\nread: {line}", flush=True)
+    print("> ", end="", flush=True)

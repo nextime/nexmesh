@@ -29,6 +29,9 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossterm = "0.28"
+# The operator console. Pinned to a line whose API the pty widget also
+# targets, so the terminals view can arrive without a version fight.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
 # hub
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

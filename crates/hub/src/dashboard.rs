@@ -246,7 +246,9 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                                   ELSE '-' END),
                             COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0),
                             COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
-                            a.id, s.mode, s.paused, a.pid, a.io_kind
+                            a.id, s.mode, s.paused, a.pid,
+                            COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
+                                                     THEN 'tmux' END)
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (

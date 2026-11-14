@@ -260,6 +260,12 @@ pub struct AgentRec {
     /// How this agent is driven, which decides whether the hub pushes messages
     /// to it or lets them ride on its next tool result.
     pub driver: nexmesh_proto::cli_descriptor::DriverSpec,
+    /// For an ADOPTED terminal: the name of the node's own tmux session,
+    /// grouped with the operator's. Keystrokes from this node land in
+    /// whatever pane this view is looking at, so it is also what a link
+    /// check must ask about -- never the operator's own view, which may be
+    /// looking somewhere else entirely.
+    pub tmux_view: Option<String>,
 }
 
 pub struct ToolOutcome {
@@ -396,6 +402,46 @@ impl NodeCtx {
 
     pub fn agent_io(&self, agent_id: &str) -> Option<Arc<AgentIo>> {
         self.io.lock().unwrap().get(agent_id).cloned()
+    }
+
+    /// Does the terminal `via` is holding still have exactly this CLI in it?
+    ///
+    /// The whole safety of typing at an adopted session rests on this being
+    /// asked again at the moment of writing, by the machine that shares a
+    /// kernel with the process. Three things must hold, and the error says
+    /// which one did not:
+    ///
+    ///   - `via` is still an adopted terminal of ours, with a view to ask
+    ///     about;
+    ///   - the CLI is still the same process, by pid AND start ticks -- a
+    ///     recycled pid is a different program;
+    ///   - it is still inside the pane that view is looking at, because a
+    ///     keystroke lands in that pane and nowhere else. An operator who
+    ///     switches window has moved the keyboard, and we wait.
+    pub fn terminal_still_holds(
+        &self,
+        via: &str,
+        cli: &proto::ProcIdentity,
+    ) -> std::result::Result<(), String> {
+        let view = self
+            .agents
+            .lock()
+            .unwrap()
+            .get(via)
+            .and_then(|r| r.tmux_view.clone())
+            .ok_or_else(|| format!("{via} is not an adopted terminal on this node"))?;
+        if !crate::proc::is_same_process(cli.pid, cli.start_ticks) {
+            return Err(format!("the CLI at pid {} has gone", cli.pid));
+        }
+        let pane = crate::tmux::pane_pid(&view)
+            .ok_or_else(|| format!("tmux no longer answers for {view}"))?;
+        if !crate::proc::is_descendant_of(cli.pid, pane) {
+            return Err(format!(
+                "the CLI at pid {} is not in the pane this view is looking at ({pane})",
+                cli.pid
+            ));
+        }
+        Ok(())
     }
 
     /// Find which agent an attach belongs to, so input and closes can be routed

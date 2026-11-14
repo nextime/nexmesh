@@ -19,6 +19,7 @@ of it, and how to watch a fleet without installing anything.
 
 - [Orchestrators, scoped and super](#orchestrators-scoped-and-super)
 - [Running the fleet from whatever CLI you use](#running-the-fleet-from-whatever-cli-you-use)
+- [The console](#the-console)
 - [Watching the team](#watching-the-team)
 - [Getting a message to a working agent](#getting-a-message-to-a-working-agent)
 - [Pausing and releasing](#pausing-and-releasing)
@@ -335,6 +336,37 @@ than editing a config format that may change underneath us; for opencode, whose
 `mcp add` is interactive and so unscriptable, it writes the documented config
 instead. Either way the token never appears in the output, including `--dry-run`.
 
+### The console
+
+`nexmesh`, with no command, from a terminal:
+
+```
+ nexmesh console   scope every session   hub 0.1.0  ● live
+  1·deck   2·agents   3·chat   4·plan   5·memory   6·graph   7·files   8·fleet
+```
+
+Everything the dashboard shows, on one screen, from the same snapshot — so a
+number here means what it means there. Panes for the deck (what you want to
+know before you know what you are looking for), agents, chat, plan, memory,
+the code graph, file locks and machines. A detail panel on the right carries
+whatever the cursor is on, in full. `a` attaches to the agent under the cursor
+— the real attach, the whole screen, and the console comes back when you
+detach.
+
+The graph pane draws the map in braille: subsystems placed on a ring, sized by
+how much is in them, with the heaviest dependencies between them and the
+cursor's own edges picked out. Only the big ones are labelled, because every
+label drawn is a label over something else.
+
+Two themes, remembered in `~/.nexmesh/console.toml` and switched with `t`:
+`deck` is quiet and modern, and `lcars` is black, blocky, capitalised, and
+painted in the trans flag — which is both the point and, as it happens, very
+close to canon LCARS pastels.
+
+From a script or a pipe there is no console: `nexmesh` prints help and exits
+non-zero. A program that clears your screen because it was called without
+arguments is a program that ends up wrapped in `</dev/null` for ever.
+
 ### Watching the team
 
 Two different things, deliberately separate:
@@ -407,6 +439,35 @@ failure modes are not subtle:
   prompt on the last line clears it outright — scrollback is append-only, so a
   rule that searched the whole tail would block delivery for the rest of the
   agent's life the first time anyone was asked anything.
+
+**A terminal you already had.** The route above belongs to seats nexmesh
+spawned, because those are the terminals a node owns. A CLI you started
+yourself has none — until you adopt the tmux pane it is sitting in, and then
+it does.
+
+Adoption gives the node a real pty onto an existing pane (`tmux new-session
+-t`, a second client, your own terminal untouched). What it cannot tell you is
+what is *in* the pane: a CLI, a shell, vim. So the pane alone earns nothing.
+What earns the keyboard is the pair of facts, neither sufficient alone:
+
+- a nexmesh shim registered over that node's socket, so an agent CLI
+  demonstrably exists, and we know its process;
+- that process is a descendant of the pane the node's own tmux view is looking
+  at, so we know *which* terminal it is sitting in.
+
+The CLI's identity is what gets recorded, not the shim's — the shim is the
+CLI's child, so the link outlives a shim that dies or loses its connection,
+which is exactly the case this exists for. And it is re-checked by the node,
+through `/proc`, before every single write: the same process by pid *and*
+start ticks, still inside the pane that view is looking at. A CLI that has
+exited and left a shell behind fails that check, and the message goes back in
+the queue rather than being executed by `sh`. An operator who switches window
+has moved the keyboard, and delivery waits.
+
+The link is recorded on the **seat**, not on the agent, because that is what
+it is about: whoever is in this seat is reachable by keyboard for as long as
+that terminal is adopted. Nothing cleans it up and nothing needs to — every
+use joins the adopted agent, so the link dies with the adoption it depends on.
 
 Everything in that path was verified against claude 2.1.322 rather than
 assumed, and two things were not what you would guess:
@@ -1192,6 +1253,27 @@ public address.
 
 Served by the hub itself, with no CDN and no external fonts: one page, inline.
 `agents`, `messages`, `plan`, `knowledge`, `graph`, `files` and `fleet`.
+
+#### The chat, as a room
+
+The messages tab is a panel, which is the right shape for watching one team
+and the wrong one for reading a fleet. `chat` in the header opens the whole
+screen instead, laid out the way IRC settled on decades ago and for the same
+reasons: channels down the left — one per session, plus `#all` — the room in
+the middle, who is in it down the right, and a composer at the bottom. Each
+channel carries its own unread count, each name its own colour (eight,
+assigned by name, so the same agent is the same colour in every channel and
+after every reload), and opening a channel fetches its log rather than showing
+only the fleet-wide window the poll carries.
+
+#### Themes
+
+A theme picker in the header, remembered per browser. `auto`, `dark` and
+`light` are the quiet one — modern, panelled, a little sci-fi at the edges and
+never at the expense of reading a number. `LCARS` is the other one: black,
+blocks, elbows, condensed capitals, and the trans flag for its palette, which
+is as close to canon pastels as it is to the point. Both are CSS tokens on
+`:root`, so nothing is loaded from anywhere to render either.
 
 #### Signing in
 

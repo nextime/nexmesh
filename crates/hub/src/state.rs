@@ -50,6 +50,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         // and one you can only read -- which used to be discoverable only by
         // attaching and finding out.
         ("agents", "io_kind", "TEXT"),
+        // A seat whose CLI is sitting in a terminal some node has adopted.
+        // `terminal_via` is the adopted agent whose pty the keystrokes go
+        // through, and the pid/ticks are the CLI that must still be in that
+        // pane for typing to be allowed. Nothing cleans these up and nothing
+        // needs to: every use joins the via agent, so a link dies with the
+        // adoption it depends on.
+        ("slots", "terminal_via", "TEXT"),
+        ("slots", "terminal_cli_pid", "INTEGER"),
+        ("slots", "terminal_cli_ticks", "INTEGER"),
+        ("slots", "terminal_at_ms", "INTEGER"),
         ("slots", "model", "TEXT"),
         ("slots", "capabilities", "TEXT NOT NULL DEFAULT '[]'"),
         ("agents", "model", "TEXT"),

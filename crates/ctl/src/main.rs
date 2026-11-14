@@ -12,6 +12,7 @@
 
 mod install;
 mod tlstrust;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -38,8 +39,9 @@ struct Args {
     /// taken from here.
     #[arg(long, global = true, env = "NEXMESH_IDENTITY", default_value = nexmesh_proto::identity::DEFAULT_DIR)]
     identity_dir: String,
+    /// Left out, and run from a terminal, this opens the operator console.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -219,6 +221,15 @@ from then on.")]
         /// claude, codex, opencode, qwen — whatever `nexmesh nodes` lists.
         #[arg(value_name = "CLI")]
         cli: Option<String>,
+        /// headless (driven, best delivery and token counts) or interactive
+        /// (a real terminal you can attach to and type at).
+        ///
+        /// Left out, a seat spawned FROM A TERMINAL becomes interactive --
+        /// someone typing this wants something to talk to -- while a spawn
+        /// from a script or the orchestrator leaves the seat's own mode
+        /// alone. Pass it explicitly and it is kept, like the CLI is.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
     },
     /// Adopt an already-running tmux session so you can watch and drive it
     /// from anywhere. Your own terminal stays attached.
@@ -782,7 +793,28 @@ async fn main() -> Result<()> {
     };
     let c = client(args.ca_cert.as_deref(), identity)?;
 
-    match args.cmd {
+    // No subcommand. A person at a terminal gets the console; a script gets
+    // help, as it always did. Judging that by the terminal rather than by a
+    // flag is the whole difference between a tool that feels alive when you
+    // sit down at it and one that clears your screen inside a pipeline.
+    let Some(cmd) = args.cmd else {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            let owned = match (&args.client_cert, &args.client_key) {
+                (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+                _ => None,
+            };
+            return tui::run(base, c, args.ca_cert.clone(), owned).await;
+        }
+        // `--help` writes to stdout and exits 0; a missing subcommand is a
+        // usage error, so this goes to stderr and exits non-zero.
+        use clap::CommandFactory;
+        Args::command().print_help()?;
+        eprintln!();
+        anyhow::bail!("no subcommand given, and this is not a terminal");
+    };
+
+    match cmd {
         Cmd::Health => println!("{:#}", get(&c, format!("{base}/healthz")).await?),
 
         Cmd::Nodes => {
@@ -972,7 +1004,7 @@ async fn main() -> Result<()> {
             println!("slot {} created", v["slot_id"].as_str().unwrap_or("?"));
         }
 
-        Cmd::Spawn { session, who, cli } => {
+        Cmd::Spawn { session, who, cli, mode } => {
             // Two shapes, because both are natural: name the seat directly
             // when you have its id, or say which team and who in it.
             let slot = match who.as_deref() {
@@ -984,13 +1016,36 @@ async fn main() -> Result<()> {
             if let Some(c) = cli.as_deref().filter(|x| !x.trim().is_empty()) {
                 body["cli"] = json!(c);
             }
+            // A person at a terminal who spawns a seat wants something they
+            // can talk to; headless is the right default for a program and
+            // the wrong one for a keyboard. A script keeps today's behaviour
+            // exactly -- nothing is sent, and the seat's own mode stands --
+            // because a team declared headless must not quietly become
+            // interactive just because something restarted it.
+            let chosen = match mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(m) => Some(m.to_string()),
+                None => std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    .then(|| "interactive".to_string()),
+            };
+            if let Some(m) = &chosen {
+                body["mode"] = json!(m);
+            }
             let v = post(&c, format!("{base}/v1/slots/{slot}/spawn"), body).await?;
             bail_on_error(&v)?;
             println!(
-                "spawning {} on {}",
+                "spawning {} on {} ({})",
                 v["agent_id"].as_str().unwrap_or("?"),
-                v["node"].as_str().unwrap_or("?")
+                v["node"].as_str().unwrap_or("?"),
+                v["mode"].as_str().unwrap_or("?")
             );
+            // Said once, where the decision was made. A default nobody can
+            // see is indistinguishable from a bug the first time it is not
+            // what you wanted.
+            if mode.is_none() && v["mode"].as_str() == Some("interactive") {
+                println!("  interactive because you are at a terminal; --mode headless for a driven agent");
+                println!("  watch it with:  nexmesh attach {session} {}",
+                         who.as_deref().unwrap_or(&slot));
+            }
         }
 
         Cmd::Adopt { session, node, tmux_target, name, role, workspace } => {

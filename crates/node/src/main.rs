@@ -31,7 +31,9 @@ mod plugin;
 mod proc;
 mod viewer;
 mod spawn;
+mod termlink;
 mod tlstrust;
+mod tmux;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -746,7 +748,24 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             }
         }
 
-        HubToNode::Inject { agent_id, messages } => {
+        HubToNode::Inject { agent_id, messages, expect_cli } => {
+            // A typed delivery into an adopted terminal is allowed only on
+            // the node's own evidence, re-gathered now. The hub's record was
+            // true when it was made; by the time a message arrives the CLI
+            // may have exited and left a shell in that pane, where typing
+            // this would EXECUTE it.
+            if let Some(cli) = &expect_cli {
+                if let Err(why) = ctx.terminal_still_holds(&agent_id, cli) {
+                    tracing::debug!(%agent_id, reason = %why, "not typing; requeueing");
+                    let _ = ctx
+                        .send_hub(&NodeToHub::InjectionsLost {
+                            agent_id,
+                            message_ids: messages.iter().map(|m| m.id).collect(),
+                        })
+                        .await;
+                    return;
+                }
+            }
             let Some(io) = ctx.agent_io(&agent_id) else {
                 tracing::warn!(%agent_id, "inject for an agent this node does not have");
                 let _ = ctx

@@ -21,6 +21,15 @@
 # Deliberately no send-keys driver: typing a teammate's message into a pane
 # that happens to be sitting at a shell prompt would EXECUTE it. Message
 # delivery belongs to the MCP path, which knows it is talking to an agent.
+#
+# That reasoning still stands, and it is the reason this stays `mcp_only`.
+# What has been added since is a way to EARN the keyboard rather than assume
+# it: if a nexmesh shim registers from inside one of these panes, an agent CLI
+# demonstrably is in there, and the node can check -- through /proc, every
+# time, before every write -- that the CLI is still that same process and
+# still inside the pane its own view is looking at. The pane is then typed at
+# through this pty, exactly as a human viewer would. Absent that proof,
+# nothing is ever typed here.
 [cli]
 id = "tmux"
 display_name = "Adopted tmux session"
@@ -31,7 +40,12 @@ version_args = ["-V"]
 env_unset = ["TMUX"]
 
 [modes.interactive]
-args = ["new-session", "-t", "{tmux_target}"]
+# `-s` names OUR grouped session `nexmesh-<slot>`. An auto-named session
+# cannot be addressed afterwards, and the node has to ask tmux where its own
+# view is pointing before it may type anything into it. It also makes the
+# adoption visible in `tmux ls`, where a second unexplained session is
+# alarming rather than reassuring.
+args = ["new-session", "-t", "{tmux_target}", "-s", "nexmesh-{slot}"]
 attachable = true
 
 [driver]

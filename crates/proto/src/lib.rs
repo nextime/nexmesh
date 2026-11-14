@@ -266,6 +266,21 @@ pub enum NodeToHub {
         #[serde(default)]
         io_kind: Option<String>,
     },
+    /// This seat is sitting in a terminal the node has adopted, so it can be
+    /// typed at even though nothing drives it.
+    ///
+    /// Reported once, when the CLI's shim registers -- that registration is
+    /// what proves an agent CLI is in there, and its ancestry is what proves
+    /// which pane. `cli` is the CLI's own identity triple, not the shim's:
+    /// the shim is the CLI's child, so the link outlives a shim that dies or
+    /// loses its connection, which is the case this exists for.
+    TerminalLink {
+        agent_id: String,
+        slot_id: String,
+        /// The adopted agent whose pty the keystrokes go through.
+        via_agent_id: String,
+        cli: ProcIdentity,
+    },
     /// A handle that lets a respawned agent pick up where this one left off
     /// (Claude's session id, Codex's thread id). Learned after startup, so it
     /// cannot ride along with `AgentUp`.
@@ -449,6 +464,18 @@ pub enum HubToNode {
     Inject {
         agent_id: String,
         messages: Vec<Envelope>,
+        /// Set when this is a TYPED delivery into an adopted terminal, where
+        /// `agent_id` is the terminal and this is the CLI that must be
+        /// sitting in it. The node re-checks both -- that the process is
+        /// still alive by its triple, and that it is still inside the pane
+        /// its own view is looking at -- and types nothing otherwise.
+        ///
+        /// Deliberately carried rather than trusted: the hub's record was
+        /// true when it was made, and a pane can hold a shell by the time
+        /// the message arrives. Only the node shares a kernel with the
+        /// process, so only the node can answer the question.
+        #[serde(default)]
+        expect_cli: Option<ProcIdentity>,
     },
     /// Universal-path delivery: the shim prepends these to the next tool result.
     Pending {

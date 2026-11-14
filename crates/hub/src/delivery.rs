@@ -1,5 +1,6 @@
-//! Two background duties: pushing messages to driven agents, and bringing
-//! crashed agents back.
+//! Three background duties: pushing messages to driven agents, typing them at
+//! the ones that can only be reached by keyboard, and bringing crashed agents
+//! back.
 
 use crate::{launch, state::AppState, tools};
 use nexmesh_proto::{now_ms, HubToNode};
@@ -57,7 +58,12 @@ pub async fn push_tick(st: &AppState) {
         };
         let count = batch.len();
         if let Err(e) = st
-            .send_to_node(&node_id, &HubToNode::Inject { agent_id: agent_id.clone(), messages: batch.clone() })
+            .send_to_node(&node_id, &HubToNode::Inject {
+                agent_id: agent_id.clone(),
+                messages: batch.clone(),
+                // A driven agent's own stdin: nothing to re-check.
+                expect_cli: None,
+            })
             .await
         {
             tracing::warn!(%agent_id, error = %e, "could not inject; requeueing");
@@ -71,6 +77,96 @@ pub async fn push_tick(st: &AppState) {
             }
         } else {
             tracing::debug!(%agent_id, count, "pushed to a driven agent");
+        }
+    }
+}
+
+/// Hand queued messages to seats whose CLI is sitting in an adopted terminal.
+///
+/// These are the seats nothing drives: a CLI someone started by hand, whose
+/// only route was its own next tool call. If its terminal happens to be a
+/// tmux pane a node has adopted, there is a keyboard, and a task can be typed
+/// at it in seconds rather than waiting for the agent to think of calling a
+/// tool -- which, sitting at a prompt, it may never do.
+///
+/// Three things make this safe, and only the last is here:
+///
+///   - the link was made when the CLI's shim registered, which is the proof
+///     that an agent CLI, not a shell, is in that pane (see `link_terminal`);
+///   - the node re-checks the CLI's identity and its pane before typing a
+///     single byte, because only the node shares a kernel with it;
+///   - and the message goes to the ADOPTED agent, whose pty it is. If that
+///     adoption has ended, the join below finds nothing and nothing is sent.
+pub async fn typed_tick(st: &AppState) {
+    // (via_agent_id, node_id, slot_id, session_id, cli pid, cli ticks)
+    let targets: Vec<(String, String, String, String, i32, i64)> = {
+        let db = st.db.lock().unwrap();
+        let Ok(mut stmt) = db.prepare(
+            // The via agent must still be alive and adopted; a paused seat
+            // is deliberately left alone, as everywhere else.
+            "SELECT v.id, v.node_id, s.id, s.session_id,
+                    s.terminal_cli_pid, s.terminal_cli_ticks
+             FROM slots s
+             JOIN agents v ON v.id = s.terminal_via
+             JOIN sessions se ON se.id = s.session_id
+             WHERE s.terminal_via IS NOT NULL AND s.terminal_cli_pid IS NOT NULL
+               AND v.exited_at_ms IS NULL AND v.node_id IS NOT NULL
+               AND s.task_state NOT IN ('released')
+               AND s.paused = 0 AND se.status = 'active'",
+        ) else {
+            return;
+        };
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .and_then(|m| m.collect())
+        .unwrap_or_default()
+    };
+
+    for (via, node_id, slot_id, session_id, pid, ticks) in targets {
+        if !st.node_is_connected(&node_id) {
+            continue;
+        }
+        let batch = {
+            let db = st.db.lock().unwrap();
+            match tools::pending_for_slot(&db, &session_id, &slot_id) {
+                Ok(m) if !m.is_empty() => {
+                    let ids: Vec<i64> = m.iter().map(|x| x.id).collect();
+                    // In flight against the TERMINAL, which is what will ack
+                    // it: the seat's own agent may not even be connected.
+                    if tools::mark_inflight(&db, &via, &ids).is_err() {
+                        continue;
+                    }
+                    m
+                }
+                _ => continue,
+            }
+        };
+        let count = batch.len();
+        let cli = nexmesh_proto::ProcIdentity {
+            node_id: node_id.clone(),
+            pid,
+            start_ticks: ticks as u64,
+        };
+        if let Err(e) = st
+            .send_to_node(&node_id, &HubToNode::Inject {
+                agent_id: via.clone(),
+                messages: batch.clone(),
+                expect_cli: Some(cli),
+            })
+            .await
+        {
+            tracing::warn!(slot = %slot_id, error = %e, "could not type that; requeueing");
+            let db = st.db.lock().unwrap();
+            for m in &batch {
+                let _ = db.execute(
+                    "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
+                     WHERE id = ? AND acked_at_ms IS NULL",
+                    [m.id],
+                );
+            }
+        } else {
+            tracing::debug!(slot = %slot_id, via = %via, count, "typing at an adopted terminal");
         }
     }
 }

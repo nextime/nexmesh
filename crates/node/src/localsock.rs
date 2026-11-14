@@ -263,11 +263,16 @@ async fn register(
                         start_ticks,
                     },
                     // Nobody spawned it, so nobody drives it: delivery rides
-                    // on its tool results, which is the universal floor.
+                    // on its tool results, which is the universal floor --
+                    // unless it turns out to be sitting in a terminal this
+                    // node has adopted, which is what `link_terminal` looks
+                    // for next.
                     driver: nexmesh_proto::cli_descriptor::DriverSpec::McpOnly,
+                    tmux_view: None,
                 },
             );
             tracing::info!(%agent_id, %slot_id, "attached agent joined the team");
+            crate::termlink::on_shim_registered(ctx, &agent_id, &slot_id, pid).await;
             Ok(NodeToMcpd::Registered { agent_id, slot_id, session_id, display_name, role, tools })
         }
         Err(reason) => anyhow::bail!("the hub refused the join: {reason}"),

@@ -6,6 +6,9 @@ nexmesh \- drive a team of agent CLIs across every machine you own
 .RI [ global-options ]
 .I command
 .RI [ arguments ]
+.br
+.B nexmesh
+.RI [ global-options ]
 .SH DESCRIPTION
 .B nexmesh
 is the operator's command line for a nexmesh fleet. It talks to the
@@ -129,6 +132,60 @@ A paired identity: anything not given explicitly is read from here. Defaults
 to
 .IR ~/.nexmesh .
 .RB [ NEXMESH_IDENTITY ]
+.SH THE CONSOLE
+Run from a terminal with no command,
+.B nexmesh
+opens the operator console: the whole fleet on one screen, reading the same
+snapshot the dashboard does. Panes for the deck, agents, chat, plan, memory,
+the code graph, file locks and machines; a detail panel on the right; and the
+code graph drawn in braille, subsystems and the dependencies between them.
+.PP
+Keys:
+.BR 1 \(en 8
+go to a pane,
+.B Tab
+cycles,
+.B j
+and
+.B k
+move,
+.B a
+or
+.B Enter
+attaches to the agent under the cursor,
+.B i
+types in the chat,
+.B [
+and
+.B ]
+change channel,
+.B w
+is the next workspace in the graph,
+.B s
+changes what the poll covers,
+.B p
+hides the detail panel,
+.B t
+switches theme,
+.B r
+refreshes,
+.B ?
+lists the keys and
+.B q
+quits.
+.PP
+Two themes, remembered in
+.IR ~/.nexmesh/console.toml :
+.B deck
+is quiet and modern,
+.B lcars
+is not.
+.PP
+From a script or a pipe there is no console: it prints help and exits
+non-zero, because a program that clears a screen because it was called
+without arguments is a program that gets wrapped in
+.I </dev/null
+for ever.
 .SH COMMANDS
 .SS Looking
 .TP
@@ -191,6 +248,14 @@ makes
 .B attach
 possible. Close the CLI in its own terminal first, or the seat ends up with
 two processes in it.
+.IP
+.IP
+.BI \-\-mode " headless|interactive"
+decides how it runs. Left out, a seat spawned FROM A TERMINAL becomes
+interactive \(em someone typing this wants something to talk to \(em while a
+spawn from a script or the orchestrator leaves the seat's own mode alone, so a
+team declared headless does not quietly change shape because something
+restarted it. Passed explicitly it is kept, like the CLI is.
 .IP
 Naming a
 .I CLI

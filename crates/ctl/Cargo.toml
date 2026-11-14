@@ -14,7 +14,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
-crossterm = { workspace = true }
+# event-stream: the console reads the keyboard inside the same async runtime
+# that polls the hub, rather than blocking one of them on the other.
+crossterm = { workspace = true, features = ["event-stream"] }
+ratatui = { workspace = true }
 tokio-tungstenite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

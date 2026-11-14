@@ -190,7 +190,7 @@ the supervisors when there is none, or when the one there has gone quiet.
 | `nexmesh-hub` | one host | All state. Decides what runs where. **Cannot signal a process.** |
 | `nexmesh-node` | every machine | Spawns local CLIs, drives them, reports health. The only component that may signal. |
 | `nexmesh-mcpd` | per agent, stdio | The MCP shim the CLI loads. Talks to its local node over a unix socket; holds no credentials. |
-| `nexmesh` | anywhere | Operator CLI. |
+| `nexmesh` | anywhere | Operator CLI — and, run bare from a terminal, the operator console: the whole fleet in one screen, braille code-graph maps and all. |
 | `nexmesh-orch` | wherever you work | The orchestrator, as an MCP server, so **any** MCP-capable CLI can run the fleet. |
 | `nexmesh-coderai` | beside a media/OCR service | A capability bridge: joins as a participant, offers OCR, transcription, speech, embeddings, images. The only component holding that service's token. |
 

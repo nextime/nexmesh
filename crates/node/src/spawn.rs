@@ -309,6 +309,15 @@ pub fn push_capable(driver: &DriverSpec) -> bool {
     }
 }
 
+/// The node's own tmux session name for an adopted seat.
+///
+/// Deterministic on purpose: `nexmesh-<slot>` can be addressed later, which
+/// an auto-named session cannot. It also makes the adoption visible in
+/// `tmux ls`, where an unexplained second session is alarming.
+pub fn tmux_view(slot_id: &str) -> String {
+    format!("nexmesh-{slot_id}")
+}
+
 /// May the hub push a message to this agent rather than wait for its next
 /// tool call -- and if so, is it safe to?
 ///
@@ -349,6 +358,10 @@ async fn register_started(
             cli_id: spec.cli_id.clone(),
             proc: identity.clone(),
             driver: driver.clone(),
+            // An adopted session is joined under a session name of our own
+            // (see clis/tmux.toml), so the node can ask tmux where ITS view
+            // is pointing rather than guess.
+            tmux_view: spec.tmux_target.as_ref().map(|_| tmux_view(&spec.slot_id)),
         },
     );
     // Read before the handle is given away: the map owns it after this.
@@ -374,6 +387,17 @@ async fn register_started(
         io_kind: Some(io_kind),
     })
     .await?;
+
+    // An adopted terminal may already hold a CLI that registered earlier --
+    // which is the usual order: you start the CLI, and adopt its pane
+    // afterwards. Off the spawn path so tmux can take its time answering.
+    if spec.tmux_target.is_some() {
+        let ctx2 = ctx.clone();
+        let agent = spec.agent_id.clone();
+        tokio::spawn(async move {
+            crate::termlink::on_terminal_adopted(&ctx2, &agent).await;
+        });
+    }
     Ok(identity)
 }
 
