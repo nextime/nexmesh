@@ -56,15 +56,31 @@ pub fn render_injection(messages: &[Envelope]) -> String {
 pub fn render_injection_line(messages: &[Envelope]) -> String {
     let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut body = String::from("[PENDING MESSAGES] ");
+    let mut from_operator = false;
     for (i, m) in messages.iter().enumerate() {
         if i > 0 {
             body.push_str(" | ");
         }
-        body.push_str(&format!(
-            "from {}: {}",
-            m.from_name.as_deref().unwrap_or("orchestrator"),
-            flat(&m.body)
-        ));
+        // A message with no sending slot is from the person running the
+        // fleet, and an agent told only to "respond" has no way to know that
+        // a reply to a TEAMMATE never reaches them. The MCP paths say this
+        // (see `proto::render_pending`); typing it at a terminal must say the
+        // same thing, or the one route that arrives in seconds is the one
+        // that gets answered to the wrong place.
+        let who = match (&m.from_slot, &m.from_name) {
+            (None, _) => {
+                from_operator = true;
+                "the OPERATOR".to_string()
+            }
+            (Some(_), Some(n)) => n.clone(),
+            (Some(_), None) => "a teammate".to_string(),
+        };
+        body.push_str(&format!("from {}: {}", who, flat(&m.body)));
+    }
+    if from_operator {
+        body.push_str(
+            " | the operator is a person reading this session's chat: answer with `broadcast`,              which is what they see",
+        );
     }
     body.push_str(" | respond to these before continuing.");
     body
@@ -185,6 +201,13 @@ pub fn awaiting_answer(screen: &str) -> Option<String> {
 /// THAT is the ack, matched later. A terminal has no echo worth parsing, so a
 /// successful write is the only evidence there will ever be and the caller
 /// acks on it -- which is also what a human pressing Enter amounts to.
+/// How long to wait before pressing Enter at a TUI.
+///
+/// Long enough that the keystroke is not part of the burst that carried the
+/// text -- paste detection keys on exactly that gap -- and short enough that
+/// delivery still feels immediate.
+const SUBMIT_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
 pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<Vec<i64>> {
     // Codex (JSON-RPC) and opencode (HTTP) take whole messages, not bytes on
     // stdin, and each acks itself once its call returns, so there is nothing
@@ -204,8 +227,20 @@ pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<
         if let Some(why) = awaiting_answer(&String::from_utf8_lossy(&io.scrollback(4096))) {
             anyhow::bail!("the terminal is waiting for an answer ({why})");
         }
-        let line = format!("{}\r", render_injection_line(messages));
-        tx.send(line.into_bytes())
+        tx.send(render_injection_line(messages).into_bytes())
+            .await
+            .map_err(|_| anyhow::anyhow!("the agent's terminal is closed"))?;
+        // The Enter is its own keystroke, a moment later -- never the tail of
+        // the same write.
+        //
+        // A TUI that sees a fast burst of bytes treats it as a PASTE, and a
+        // carriage return inside a paste is a newline in the box, not a
+        // submit. So the message was typed at the agent perfectly and then
+        // sat there unsent, waiting for a human to press Enter -- which is
+        // indistinguishable, from the outside, from an agent ignoring you.
+        // Verified against claude 2.x in an adopted tmux pane.
+        tokio::time::sleep(SUBMIT_PAUSE).await;
+        tx.send(vec![b'\r'])
             .await
             .map_err(|_| anyhow::anyhow!("the agent's terminal is closed"))?;
         return Ok(messages.iter().map(|m| m.id).collect());
@@ -380,6 +415,26 @@ mod tests {
         assert!(line.contains("from orchestrator: ship it then tell me"));
         assert!(line.contains("from Max: and rebase first"));
         assert!(line.ends_with("respond to these before continuing."));
+    }
+
+    #[test]
+    fn the_operator_is_named_as_the_operator_when_typed_at() {
+        // The same thing the MCP paths say. A message with no sending slot is
+        // the person running the fleet, and an agent that is not told so
+        // answers a teammate instead -- which is what happened in the chat.
+        let mut e = env(1, "orchestrator", "are you connected?");
+        e.from_slot = None;
+        e.from_name = None;
+        let line = render_injection_line(&[e]);
+        assert!(line.contains("from the OPERATOR: are you connected?"), "{line}");
+        assert!(line.contains("broadcast"), "{line}");
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+    }
+
+    #[test]
+    fn a_teammates_line_says_nothing_about_the_operator() {
+        let line = render_injection_line(&[env(1, "Max", "rebase first")]);
+        assert!(!line.contains("OPERATOR"), "{line}");
     }
 
     #[test]
