@@ -1251,7 +1251,7 @@ fn mint_seat_name(
 /// Two active sessions mounting the same directory on the same machine is a
 /// genuine ambiguity, and this refuses rather than picking one: joining the
 /// wrong team is worse than being asked which.
-fn session_for_cwd(
+pub(crate) fn session_for_cwd(
     db: &rusqlite::Connection,
     node_id: &str,
     cwd: &str,

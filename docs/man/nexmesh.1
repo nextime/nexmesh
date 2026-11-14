@@ -366,6 +366,37 @@ guard, so a session paused on budget can be given more and resumed.
 Publish, pull, or report on a shared workspace, on every machine at once.
 .SS Terminals
 .TP
+.BI run " CLI " [ \-\-session " S" ] [ \-\-name " N" ] [ \-\-node " NODE" ] [ \-\-cwd " DIR" ]
+Start an agent CLI here, in this directory, on a terminal the fleet owns \(em
+then put it on your screen. Type it where you would have typed the CLI's own
+name.
+.RS
+.PP
+It joins the session that owns this directory, mounting the directory into
+that session if it is new to it, and makes the session itself if nothing owns
+the directory. The seat is named after the CLI and the machine \(em
+.IR Claude\-sissy " \(em"
+so running it again takes that seat back, with the conversation it was on; a
+seat somebody is sitting in is never taken, and gets a numbered name beside
+it instead.
+.PP
+What this buys over starting the CLI yourself: the terminal belongs to the
+node, so the agent is attachable from any machine in the fleet from its first
+keystroke, the hub can type at it, and its output is recorded. It also
+outlives the window \(em close the terminal and it is still running, and
+.B attach
+brings it back.
+.I \-\-no\-attach
+starts it and says where it is.
+.I \-\-dry\-run
+prints what it would do.
+.PP
+.EX
+nexmesh run claude
+claude() { nexmesh run claude; }   # in your shell's rc
+.EE
+.RE
+.TP
 .BI attach " SESSION NAME|SEAT"
 Attach to an agent's terminal, wherever it runs, by the name you address it
 by. Reaches an agent the hub holds a pty for -- one it spawned in interactive

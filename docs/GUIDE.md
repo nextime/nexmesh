@@ -1188,6 +1188,42 @@ drivable from machine B. A `claude` you started yourself in a bare ssh session
 on machine-a is **not**: that pty belongs to your shell. Start it inside tmux and
 `nexmesh adopt` reaches it — see above.
 
+### Starting a CLI that is attachable from the first keystroke
+
+The limit above is not a design choice, it is a property of terminals: the pty
+behind a CLI you typed into a window belongs to that window, and nothing
+outside the process can read or write it. The only kernel facility that would
+is `TIOCSTI`, which exists switched off precisely to stop it.
+
+So make the terminal on the other side of the fence:
+
+```sh
+nexmesh run claude        # where you would have typed `claude`
+```
+
+It works out which session owns the directory you are standing in (mounting
+the directory into that session if it is new to it, creating the session if
+nothing owns it), takes the seat named for this CLI and this machine —
+`Claude-sissy` — asks the local node to start the CLI on a pty it owns, and
+relays that pty to your terminal with the usual one-line bar and `Ctrl-]` to
+leave. From the outside it is an ordinary interactive agent: attachable from
+any machine, drivable by the hub, recorded. It also outlives the window, so
+closing the terminal leaves it working and `nexmesh attach` brings it back.
+
+Behind a shell function the difference disappears:
+
+```sh
+claude() { nexmesh run claude; }
+```
+
+Running it again in the same directory takes the same seat back, which means
+the conversation that seat was on resumes. A seat somebody is already sitting
+in is never taken: that run gets `Claude-sissy-2` beside it.
+
+A CLI you start by hand still *joins* — it registers through `mcpd`, takes a
+seat, sends and receives, holds locks. What it cannot have is a screen anyone
+else can see.
+
 ### Crash recovery
 
 A managed agent that dies with work outstanding is respawned on a placed node —

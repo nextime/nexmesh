@@ -1898,6 +1898,71 @@ pub async fn resolve_agent(
 }
 
 #[derive(Deserialize)]
+pub struct SessionForPath {
+    /// Node name, as `nexmesh nodes` lists it.
+    pub node: String,
+    /// An absolute path on that node.
+    pub path: String,
+}
+
+/// Which session owns a directory on a machine.
+///
+/// The same question an arriving CLI asks of itself -- a workspace mount is
+/// how a conversation finds the team it belongs to -- asked from outside, so
+/// `nexmesh run` in a directory can join the team that owns it rather than
+/// making the operator name a session they already decided by cd'ing.
+///
+/// A directory two sessions both mount is not answered: a path says where
+/// files are, not who you work with, and guessing between two teams is worse
+/// than asking.
+pub async fn session_for_path(
+    State(st): State<AppState>,
+    Query(q): Query<SessionForPath>,
+) -> ApiResult {
+    if !q.path.starts_with('/') {
+        return Err(bad("path must be absolute: a relative path means nothing on a machine \
+                        you are not standing on"));
+    }
+    let db = st.db.lock().unwrap();
+    let node_id: Option<String> = db
+        .query_row("SELECT id FROM nodes WHERE name = ?", [&q.node], |r| r.get(0))
+        .optional()
+        .map_err(bad)?;
+    let node_id = node_id.ok_or_else(|| bad(format!("no node named '{}'", q.node)))?;
+    let session = crate::nodes::session_for_cwd(&db, &node_id, &q.path).map_err(bad)?;
+    let Some(session_id) = session else {
+        return Ok(Json(json!({ "session_id": Value::Null })));
+    };
+    let name: String = db
+        .query_row("SELECT name FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?
+        .unwrap_or_default();
+    // The mount that actually contains it, which is the workspace a seat
+    // working in this directory belongs to.
+    let ws: Option<(String, String)> = db
+        .prepare(
+            "SELECT w.id, w.name FROM workspace_mounts m
+               JOIN workspaces w ON w.id = m.workspace_id
+              WHERE m.node_id = ?1 AND w.session_id = ?2
+                AND (?3 = m.path OR ?3 LIKE m.path || '/%')
+              ORDER BY LENGTH(m.path) DESC LIMIT 1",
+        )
+        .and_then(|mut q2| {
+            q2.query_row(params![node_id, session_id, q.path.trim_end_matches('/')], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+        })
+        .optional()
+        .map_err(bad)?;
+    Ok(Json(json!({
+        "session_id": session_id, "session": name,
+        "workspace_id": ws.as_ref().map(|w| w.0.clone()),
+        "workspace": ws.map(|w| w.1),
+    })))
+}
+
+#[derive(Deserialize)]
 pub struct OperatorMessage {
     pub to: Option<String>,
     pub text: String,

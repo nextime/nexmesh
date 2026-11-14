@@ -11,6 +11,7 @@
 //! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
 mod install;
+mod runcmd;
 mod seatcmd;
 mod tlstrust;
 mod tui;
@@ -369,6 +370,53 @@ Your own terminal stays attached; others can watch and type too.")]
         /// Bytes from the end.
         #[arg(long, default_value_t = 65536)]
         tail: usize,
+    },
+    /// Start an agent CLI here, on a terminal the fleet owns -- so it is
+    /// attachable from anywhere, from the first keystroke.
+    ///
+    /// Type `nexmesh run claude` where you would have typed `claude`. It joins
+    /// the team that owns this directory, takes the seat it had last time, and
+    /// puts the CLI on your screen. Closing the window does not end it.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh run claude                 # here, in this directory
+  nexmesh run codex --name Reviewer  # a seat by that name
+  nexmesh run claude --dry-run       # say what it would do
+
+Behind a shell function the difference disappears:
+
+  claude() { nexmesh run claude; }
+
+A CLI you start by hand is a full teammate -- it registers, takes a seat,
+sends and receives -- but it cannot be attached to: the terminal behind it
+belongs to the window you typed in, and nothing outside that process can
+read or write it. This makes the terminal on the other side of the fence.")]
+    Run {
+        /// Which CLI: claude, codex, opencode, qwen -- whatever `nexmesh nodes`
+        /// lists for this machine.
+        #[arg(value_name = "CLI")]
+        cli: String,
+        /// Join this session instead of the one that owns this directory.
+        #[arg(long)]
+        session: Option<String>,
+        /// Name the seat. Default: the CLI and this machine, like Claude-sissy.
+        #[arg(long)]
+        name: Option<String>,
+        /// The machine to start it on. Default: this one.
+        #[arg(long)]
+        node: Option<String>,
+        /// What the seat is for, if the session's default is not it.
+        #[arg(long)]
+        role: Option<String>,
+        /// Work here instead of the current directory.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Start it and say where it is, without taking over this terminal.
+        #[arg(long)]
+        no_attach: bool,
+        /// Print what it would do and stop.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Attach to an agent's terminal, wherever it is running.
     ///
@@ -1641,6 +1689,26 @@ async fn main() -> Result<()> {
                 println!("--- {name} ({agent}) ---");
                 print!("{text}");
             }
+        }
+
+        Cmd::Run { cli, session, name, node, role, cwd, no_attach, dry_run } => {
+            runcmd::run(
+                &base,
+                &c,
+                runcmd::Opts {
+                    cli: &cli,
+                    session: session.as_deref(),
+                    name: name.as_deref(),
+                    node: node.as_deref(),
+                    role: role.as_deref(),
+                    cwd: cwd.as_deref(),
+                    dry_run,
+                    attach: !no_attach,
+                },
+                args.ca_cert.as_deref(),
+                identity,
+            )
+            .await?;
         }
 
         Cmd::Attach { session, who, replay } => {
