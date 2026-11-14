@@ -191,16 +191,28 @@ fn panes(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// A seat with somebody in it, or with somebody due back.
+///
+/// `waiting` is the hub's word for a seat whose CLI is one process per turn:
+/// a cron-driven loop takes the seat, says its piece and exits, and the next
+/// turn is along in a minute. Counting it as adrift put a perfectly healthy
+/// teammate in the "no process" tile once a minute, for ever.
+fn present(a: &serde_json::Value) -> bool {
+    matches!(s(a, "status").as_str(), "running" | "waiting")
+}
+
 /// The deck: what you want to know before you know what you are looking for.
 fn deck(f: &mut Frame, area: Rect, app: &App) {
     let th = app.theme;
     let agents = app.rows("agents");
     let msgs = app.rows("messages");
     let nodes = app.nodes();
+    // Strictly a process that is up now; `waiting` is neither running nor
+    // adrift, so it is counted in neither tile.
     let running = agents.iter().filter(|a| s(a, "status") == "running").count();
     let adrift = agents
         .iter()
-        .filter(|a| s(a, "status") != "running" && s(a, "kind") != "external")
+        .filter(|a| !present(a) && s(a, "kind") != "external")
         .count();
     let unclaimed = msgs.iter().filter(|m| !b(m, "claimed")).count();
     let undelivered = msgs.iter().filter(|m| !b(m, "delivered")).count();
@@ -272,7 +284,7 @@ fn deck(f: &mut Frame, area: Rect, app: &App) {
     );
 
     let mut right: Vec<Line> = Vec::new();
-    for a in agents.iter().filter(|a| s(a, "status") != "running") {
+    for a in agents.iter().filter(|a| !present(a)) {
         right.push(Line::from(vec![
             Span::styled(
                 format!("{:<16}", clip(&s(a, "name"), 16)),
@@ -850,8 +862,8 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
                 let name = s(&a, "name");
                 out.push(Line::from(vec![
                     Span::styled(
-                        if s(&a, "status") == "running" { " \u{25cf} " } else { " \u{25cb} " },
-                        Style::default().fg(if s(&a, "status") == "running" {
+                        if present(&a) { " \u{25cf} " } else { " \u{25cb} " },
+                        Style::default().fg(if present(&a) {
                             th.ok()
                         } else {
                             th.faint()

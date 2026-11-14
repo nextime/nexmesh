@@ -1468,22 +1468,24 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
     // A session may be named, not only identified.
     let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let db = st.db.lock().unwrap();
-    let Ok(mut stmt) = db.prepare(
+    let Ok(mut stmt) = db.prepare(&format!(
         "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
                 s.participant_kind, COALESCE(s.cli_id, '-'), s.task_state,
-                s.summary, COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
+                s.summary, COALESCE(a.provenance, '-'), {word},
                 COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external' ELSE '-' END),
                 COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0), s.paused,
                 a.pid, COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
                                                 THEN 'tmux' END),
-                a.id, a.exited_at_ms, s.terminal_via IS NOT NULL
+                a.id, a.exited_at_ms, s.terminal_via IS NOT NULL,
+                COALESCE(a.status, 'disconnected')
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
              ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
          LEFT JOIN nodes n ON n.id = a.node_id
          WHERE s.session_id = ? ORDER BY 2",
-    ) else {
+        word = crate::seat::AGENT_WORD_SQL,
+    )) else {
         return Json(json!({ "agents": [] }));
     };
     let rows: Vec<Value> = stmt
@@ -1508,6 +1510,10 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 // reachable: its CLI sits in a terminal a node has adopted,
                 // so a message can be typed at it. IO reads `tmux`.
                 "typed_via_terminal": r.get::<_, bool>(17)?,
+                // The row's own word, for anything that must not be fooled
+                // by the kinder one above: `waiting` is a seat, `exited` is
+                // a process, and the two are answers to different questions.
+                "agent_status": r.get::<_, String>(18)?,
             }))
         })
         .and_then(|m| m.collect())

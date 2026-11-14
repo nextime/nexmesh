@@ -907,7 +907,16 @@ fn join(
     // instead of showing a teammate who will never answer.
     if let Some(cs) = cli_session.as_deref().filter(|c| !c.is_empty()) {
         db.execute(
-            "UPDATE agents SET exited_at_ms = COALESCE(exited_at_ms, ?1)
+            // The word goes with the time. A row left saying `running` with
+            // an exit time beside it is a seat that reads as occupied by a
+            // process nobody will ever find: `nexmesh status` showed a pid
+            // that had been gone for minutes, because the row still claimed
+            // to be live. `disconnected` is left alone -- that one means the
+            // hub lost touch, which is a different thing it should keep
+            // saying.
+            "UPDATE agents SET exited_at_ms = COALESCE(exited_at_ms, ?1),
+                               status = CASE WHEN status = 'running' THEN 'exited'
+                                             ELSE status END
               WHERE exited_at_ms IS NULL
                 AND slot_id IN (SELECT id FROM slots WHERE cli_session = ?2)",
             params![now, cs],

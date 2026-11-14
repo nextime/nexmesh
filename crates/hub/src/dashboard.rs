@@ -281,12 +281,12 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         None => Value::Null,
         Some(sid) => {
             let agents: Vec<Value> = db
-                .prepare(
+                .prepare(&format!(
                     "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id),
                             COALESCE(s.role, '-'), s.participant_kind, COALESCE(s.cli_id, '-'),
                             s.task_state, s.summary, s.status, s.restarts,
                             COALESCE(sx.name, ''),
-                            COALESCE(a.provenance, '-'), COALESCE(a.status, 'disconnected'),
+                            COALESCE(a.provenance, '-'), {word},
                             COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external'
                                                   ELSE '-' END),
                             COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0),
@@ -301,7 +301,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
                      LEFT JOIN nodes n ON n.id = a.node_id
                      WHERE (?1 = '*' OR s.session_id = ?1) ORDER BY 2",
-                )
+                    word = crate::seat::AGENT_WORD_SQL,
+                ))
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
                         Ok(json!({

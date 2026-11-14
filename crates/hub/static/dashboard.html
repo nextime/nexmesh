@@ -1408,6 +1408,12 @@ const tile = (n, k, cls = "") =>
 const panel = (inner) => `<div class="panel">${inner}</div>`;
 const empty = (msg) => panel(`<div class="empty">${esc(msg)}</div>`);
 
+// A seat with somebody in it, or with somebody due back. `waiting` is what
+// the hub says about a seat whose CLI is one process per turn -- a cron-driven
+// loop takes the seat, says its piece and exits, and another is along in a
+// minute. Nothing is running in it this second, and it is nobody's derelict.
+const present = (s) => s === "running" || s === "waiting";
+
 function viewAgents(d, now) {
   const all = isAll();
   if (!d.agents.length)
@@ -1415,7 +1421,7 @@ function viewAgents(d, now) {
   // A seat outlives its process on purpose, so a conversation resumed under
   // a new id leaves its predecessor behind. Which of those are finished
   // with is a judgement, so it is offered rather than done.
-  const derelict = d.agents.filter((a) => a.status !== "running" && a.kind !== "external");
+  const derelict = d.agents.filter((a) => !present(a.status) && a.kind !== "external");
   const tidy = (derelict.length && !all)
     ? `<div class="pair"><button onclick="tidySeats()">retire ${derelict.length} empty
          seat${derelict.length === 1 ? "" : "s"}</button>
@@ -1430,7 +1436,8 @@ function viewAgents(d, now) {
     `</tr></thead><tbody>` +
     sorted(d.agents).map((a) => {
       const flap = a.slot_status === "flapping";
-      const dead = a.status !== "running";
+      const dead = !present(a.status);
+      const between = a.status === "waiting";
       return `<tr>
         <td id="nm-${esc(a.slot_id)}">
             <span class="mono rename" title="click to rename"
@@ -1450,6 +1457,8 @@ function viewAgents(d, now) {
                  >terminal</button>` : ""}</td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}
+            ${between ? ` <span class="badge info" title="between turns — this CLI takes its
+                 seat for each turn and exits when the turn ends; it is due back">waiting</span>` : ""}
             ${a.pid || a.io_kind ? `<br><span class="tiny muted" title="the process behind this seat${
                 a.io_kind === "pty" ? " — it has a terminal, so it can be attached to and typed at"
               : a.io_kind === "tmux" ? " — its CLI sits in an adopted tmux pane, so the hub can type at it"
@@ -1852,7 +1861,7 @@ function renderChat(d) {
     (a) => chatChan === "*" || a.session === chatChan || !a.session);
   $("nickList").innerHTML = `<div class="rl">in the room</div>` + (agents.length
     ? agents.map((a) => `<div class="nk" title="${esc(a.role || "")}">
-         <span class="dot ${a.status === "running" ? "live" : "stale"}"></span>
+         <span class="dot ${present(a.status) ? "live" : "stale"}"></span>
          <span style="color:${nickColor(a.name)}">${esc(a.name)}</span>
          ${chatChan === "*" && a.session ? `<small>#${esc(a.session)}</small>` : ""}
        </div>`).join("")

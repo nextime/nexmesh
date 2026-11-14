@@ -1132,14 +1132,23 @@ async fn main() -> Result<()> {
                         a["task_state"].as_str().unwrap_or("-").to_string()
                     },
                     a["status"].as_str().unwrap_or("-"),
-                    a["pid"].as_i64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    // The pid of a process that has ENDED is not a pid, it
+                    // is a number somebody will go looking for on the wrong
+                    // machine. A seat that merely lost touch keeps its pid,
+                    // because that process is very often still sitting there.
+                    if a["exited"].as_bool() == Some(true) {
+                        "-".to_string()
+                    } else {
+                        a["pid"].as_i64().map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                    },
                     a["io_kind"].as_str().unwrap_or("-"),
                     tokens,
                     a["summary"].as_str().unwrap_or(""),
                 );
             }
             println!(
-                "\n  (TOKENS = input/output; STATE is the work, AGENT the process behind it)"
+                "\n  (TOKENS = input/output; STATE is the work, AGENT the process behind it;\n\
+                 \x20  `waiting` = a CLI that takes this seat once per turn and is due back)"
             );
         }
 

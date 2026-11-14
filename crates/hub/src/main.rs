@@ -33,6 +33,7 @@ mod pairing;
 mod peer;
 mod pki;
 mod prompt;
+mod seat;
 mod state;
 mod sync;
 mod tools;

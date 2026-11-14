@@ -32,7 +32,7 @@ pub fn random_token(len: usize) -> String {
 /// exists, so a column added to the schema never reaches a database created by
 /// an older build. Adding columns here keeps an existing hub.db usable instead
 /// of failing at the first INSERT that mentions the new column.
-fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     let wanted: &[(&str, &str, &str)] = &[
         ("slots", "status", "TEXT NOT NULL DEFAULT 'disconnected'"),
         ("slots", "summary", "TEXT NOT NULL DEFAULT ''"),
