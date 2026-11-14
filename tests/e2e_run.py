@@ -121,6 +121,7 @@ def wait_for_seat(session, name, want_status=None, timeout=25):
 def main():
     os.makedirs(UNOWNED, exist_ok=True)
     os.makedirs(OWNED, exist_ok=True)
+    os.makedirs(f"{_T}/empty", exist_ok=True)
 
     print("\n=== 1. a fleet of one machine ===")
     out = subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, "enrol", NODE],
@@ -223,7 +224,16 @@ def main():
           sorted(x["name"] for x in j["sessions"]) == ["payments", "scratch"],
           str([x["name"] for x in j["sessions"]]))
 
-    print("\n=== 8. a machine that is not here is said so, before anything is made ===")
+    print("\n=== 8. a CLI the machine does not have leaves nothing behind ===")
+    before = {x["name"] for x in http("GET", "/v1/sessions")[1]["sessions"]}
+    rc, out = ctl("run", "nosuchcli", "--no-attach", cwd=f"{_T}/empty")
+    check("it refuses", rc != 0, out)
+    check("saying what this machine does have", "faketui" in out, out)
+    after = {x["name"] for x in http("GET", "/v1/sessions")[1]["sessions"]}
+    check("and made no session on the way to failing", before == after,
+          f"{before} -> {after}")
+
+    print("\n=== 9. a machine that is not here is said so, before anything is made ===")
     rc, out = ctl("run", "faketui", "--node", "machine-z", "--no-attach", cwd=UNOWNED)
     check("it refuses", rc != 0, out)
     check("naming the machine and what is known",

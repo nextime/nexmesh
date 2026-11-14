@@ -33,6 +33,50 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+/// Which CLI descriptor on this machine the operator meant.
+///
+/// A machine may have several configurations of one program -- `claude-nextime`
+/// and `claude-thinkdifferent` are two logins for claude, each its own
+/// descriptor -- and nobody types the suffix. So an exact id wins, a single
+/// configuration of that program wins, and several is the one case that has to
+/// be asked about rather than guessed: picking a login for somebody is picking
+/// whose account the work is billed to.
+pub fn resolve_cli(want: &str, available: &[String]) -> std::result::Result<String, String> {
+    resolve_cli_as(want, available, &std::env::var("USER").unwrap_or_default())
+}
+
+/// As above, told who is asking: a configuration named after the user running
+/// the command is that user's own login, and choosing it is not guessing.
+pub fn resolve_cli_as(
+    want: &str,
+    available: &[String],
+    user: &str,
+) -> std::result::Result<String, String> {
+    if available.iter().any(|c| c == want) {
+        return Ok(want.to_string());
+    }
+    let prefix = format!("{want}-");
+    let matches: Vec<&String> = available.iter().filter(|c| c.starts_with(&prefix)).collect();
+    if matches.len() > 1 && !user.is_empty() {
+        let mine = format!("{prefix}{user}");
+        if let Some(m) = matches.iter().find(|c| **c == &mine) {
+            return Ok((*m).clone());
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(format!(
+            "this machine has no '{want}'. It has: {}.",
+            if available.is_empty() { "nothing".into() } else { available.join(", ") }
+        )),
+        _ => Err(format!(
+            "'{want}' is installed here in {} configurations: {}. Name the one you want.",
+            matches.len(),
+            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 pub struct Opts<'a> {
     pub cli: &'a str,
     pub session: Option<&'a str>,
@@ -192,19 +236,25 @@ pub async fn run(
             if known.is_empty() { "none".into() } else { known.join(", ") }
         );
     }
-    let online = nodes["nodes"]
+    let row = nodes["nodes"]
         .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|n| n["name"].as_str() == Some(node.as_str()))
-                .and_then(|n| n["connected"].as_bool())
-        })
-        .unwrap_or(false);
-    if !online {
+        .and_then(|rows| rows.iter().find(|n| n["name"].as_str() == Some(node.as_str())).cloned())
+        .unwrap_or(Value::Null);
+    if row["connected"].as_bool() != Some(true) {
         anyhow::bail!(
             "node '{node}' is not connected to the hub right now, so nothing can be \
              started on it"
         );
+    }
+    // Which descriptor to start, settled HERE: a wrong answer three steps
+    // later would have left a session and a seat behind it.
+    let installed: Vec<String> = row["clis"]
+        .as_array()
+        .map(|cs| cs.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let cli = resolve_cli(o.cli, &installed).map_err(anyhow::Error::msg)?;
+    if cli != o.cli {
+        println!("cli        {cli}");
     }
 
     // Which team this directory belongs to.
@@ -234,7 +284,7 @@ pub async fn run(
     };
 
     let host_label = node.clone();
-    let want = o.name.map(String::from).unwrap_or_else(|| seat_name(o.cli, &host_label));
+    let want = o.name.map(String::from).unwrap_or_else(|| seat_name(&cli, &host_label));
 
     if o.dry_run {
         match &team {
@@ -248,7 +298,7 @@ pub async fn run(
             Team::Make(s) => println!("session:   create {s}, with {cwd} mounted on {node}"),
         }
         println!("seat:      {want} (reused if it is here and empty)");
-        println!("spawn:     {} on {node}, interactive, in {cwd}", o.cli);
+        println!("spawn:     {cli} on {node}, interactive, in {cwd}");
         println!("then:      attach this terminal to it");
         return Ok(());
     }
@@ -308,7 +358,7 @@ pub async fn run(
         }
         Seat::Make { name } => {
             let mut body = json!({
-                "cli_id": o.cli, "display_name": name, "mode": "interactive",
+                "cli_id": cli, "display_name": name, "mode": "interactive",
                 "placement": { "node": node },
                 // Which directory the CLI starts in, on that machine.
                 "workspace": workspace,
@@ -328,11 +378,11 @@ pub async fn run(
     let v = crate::post(
         c,
         format!("{base}/v1/slots/{slot}/spawn"),
-        json!({ "cli": o.cli, "mode": "interactive" }),
+        json!({ "cli": cli, "mode": "interactive" }),
     )
     .await?;
     crate::bail_on_error(&v)?;
-    println!("started    {} on {node} in {cwd}", o.cli);
+    println!("started    {cli} on {node} in {cwd}");
 
     if !o.attach {
         println!("\nAttach when you want it:  nexmesh attach {session} {name}");
@@ -365,6 +415,48 @@ fn urlencoding(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn one_configuration_of_a_program_is_the_one_meant() {
+        let have = vec!["claude-nextime".to_string(), "codex".to_string()];
+        assert_eq!(resolve_cli("claude", &have).unwrap(), "claude-nextime");
+        assert_eq!(resolve_cli("codex", &have).unwrap(), "codex");
+    }
+
+    #[test]
+    fn two_logins_for_one_program_is_asked_about_not_guessed() {
+        // Picking a login is picking whose account the work is billed to --
+        // unless one of them is named after whoever is asking.
+        let have = vec![
+            "claude-nextime".to_string(),
+            "claude-thinkdifferent".to_string(),
+        ];
+        let e = resolve_cli_as("claude", &have, "someoneelse").unwrap_err();
+        assert!(e.contains("claude-nextime") && e.contains("claude-thinkdifferent"), "{e}");
+        assert!(e.contains("2 configurations"), "{e}");
+        // Named exactly, there is nothing to ask.
+        assert_eq!(resolve_cli_as("claude-nextime", &have, "x").unwrap(), "claude-nextime");
+    }
+
+    #[test]
+    fn my_own_login_is_the_default_among_several() {
+        let have = vec![
+            "claude-nextime".to_string(),
+            "claude-thinkdifferent".to_string(),
+        ];
+        assert_eq!(resolve_cli_as("claude", &have, "nextime").unwrap(), "claude-nextime");
+        // And a user who has no configuration of their own is still asked.
+        assert!(resolve_cli_as("claude", &have, "").is_err());
+    }
+
+    #[test]
+    fn a_program_the_machine_does_not_have_says_what_it_has() {
+        let have = vec!["codex".to_string()];
+        let e = resolve_cli("qwen", &have).unwrap_err();
+        assert!(e.contains("no 'qwen'") && e.contains("codex"), "{e}");
+        let e = resolve_cli("qwen", &[]).unwrap_err();
+        assert!(e.contains("nothing"), "{e}");
+    }
 
     #[test]
     fn a_seat_is_named_after_the_program_and_the_machine() {
