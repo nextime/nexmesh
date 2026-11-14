@@ -61,6 +61,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // Delivered is not read. See schema.sql.
         ("messages", "claimed_at_ms", "INTEGER"),
         ("messages", "claimed_by", "TEXT"),
+        // WHICH limit cut a scan short. "partial" on its own sends you
+        // looking for the wrong fix -- a tree of data files that exhausts
+        // the walk and one of source files that exhausts the clock want
+        // opposite answers.
+        ("code_graph_meta", "truncated_reason", "TEXT"),
     ];
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.
@@ -201,6 +206,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             workspace_id TEXT PRIMARY KEY, built_at_ms INTEGER NOT NULL,
             files INTEGER NOT NULL, skipped TEXT NOT NULL DEFAULT '[]',
             truncated INTEGER NOT NULL DEFAULT 0,
+            truncated_reason TEXT,
             communities INTEGER NOT NULL DEFAULT 0)",
     )?;
 
@@ -447,9 +453,13 @@ impl AppState {
         (id, rx)
     }
 
-    pub fn complete_sync(&self, req_id: u64, value: serde_json::Value) {
-        if let Some(tx) = self.sync_waiters.lock().unwrap().remove(&req_id) {
-            let _ = tx.send(value);
+    /// Hand a node's answer to whoever asked. False when nobody is there to
+    /// take it any more -- the caller timed out, or went away -- which is
+    /// worth knowing for an answer that cost minutes to produce.
+    pub fn complete_sync(&self, req_id: u64, value: serde_json::Value) -> bool {
+        match self.sync_waiters.lock().unwrap().remove(&req_id) {
+            Some(tx) => tx.send(value).is_ok(),
+            None => false,
         }
     }
 

@@ -49,13 +49,18 @@ pub async fn build(st: &AppState, workspace_id: &str, node_id: &str, path: &str)
 pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<String> {
     let communities = assign_communities(graph);
     let db = st.db.lock().unwrap();
+    // One transaction for the lot. A large workspace is 200,000 symbols, and
+    // committing each of those separately is the difference between seconds
+    // and minutes -- minutes during which this lock is held and the rest of
+    // the hub waits.
+    let tx = db.unchecked_transaction()?;
     // Replace wholesale rather than merge: the graph is derived, so a stale
     // node left behind would be a symbol that no longer exists being offered
     // to an agent as though it did.
-    db.execute("DELETE FROM code_graph_nodes WHERE workspace_id = ?", [workspace_id])?;
-    db.execute("DELETE FROM code_graph_edges WHERE workspace_id = ?", [workspace_id])?;
+    tx.execute("DELETE FROM code_graph_nodes WHERE workspace_id = ?", [workspace_id])?;
+    tx.execute("DELETE FROM code_graph_edges WHERE workspace_id = ?", [workspace_id])?;
     for (i, n) in graph.nodes.iter().enumerate() {
-        db.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO code_graph_nodes
                 (workspace_id, id, kind, name, path, line, lang, community)
              VALUES (?,?,?,?,?,?,?,?)",
@@ -66,7 +71,7 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
         )?;
     }
     for e in &graph.edges {
-        db.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO code_graph_edges (workspace_id, from_id, to_id, kind)
              VALUES (?,?,?,?)",
             params![workspace_id, e.from, e.to, e.kind.as_str()],
@@ -78,19 +83,21 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
         c.dedup();
         c.len()
     };
-    db.execute(
+    tx.execute(
         "INSERT OR REPLACE INTO code_graph_meta
-            (workspace_id, built_at_ms, files, skipped, truncated, communities)
-         VALUES (?,?,?,?,?,?)",
+            (workspace_id, built_at_ms, files, skipped, truncated, truncated_reason, communities)
+         VALUES (?,?,?,?,?,?,?)",
         params![
             workspace_id,
             now_ms(),
             graph.files,
             serde_json::to_string(&graph.skipped).unwrap_or_else(|_| "[]".into()),
             graph.truncated as i64,
+            graph.truncated_reason,
             distinct as i64
         ],
     )?;
+    tx.commit()?;
     let mut out = format!(
         "Parsed {} file(s): {} symbols, {} relationships, {} subsystem(s).",
         graph.files,
@@ -99,7 +106,10 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
         distinct
     );
     if graph.truncated {
-        out.push_str(" The walk hit its file limit, so this graph is partial.");
+        out.push_str(&format!(
+            " This graph is partial: {}.",
+            graph.truncated_reason.as_deref().unwrap_or("a limit stopped the scan")
+        ));
     }
     if !graph.skipped.is_empty() {
         out.push_str(&format!(" {} file(s) skipped.", graph.skipped.len()));
@@ -161,15 +171,15 @@ fn kind_label(k: &str) -> &str {
 pub fn query(db: &Connection, workspace_id: &str, what: &str, target: &str, to: &str)
     -> Result<String>
 {
-    let meta: Option<(i64, i64, i64, i64)> = db
+    let meta: Option<(i64, i64, i64, Option<String>, i64)> = db
         .query_row(
-            "SELECT built_at_ms, files, truncated, communities FROM code_graph_meta
-              WHERE workspace_id = ?",
+            "SELECT built_at_ms, files, truncated, truncated_reason, communities
+               FROM code_graph_meta WHERE workspace_id = ?",
             [workspace_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((_built, files, truncated, communities)) = meta else {
+    let Some((_built, files, truncated, truncated_why, communities)) = meta else {
         anyhow::bail!(
             "this workspace has no code graph yet. Call query_code_graph with rebuild=true to \
              parse it."
@@ -234,7 +244,10 @@ pub fn query(db: &Connection, workspace_id: &str, what: &str, target: &str, to: 
         ),
     }
     if truncated != 0 {
-        out.push_str("\n(This graph is partial: the walk hit its file limit.)\n");
+        out.push_str(&format!(
+            "\n(This graph is partial: {}.)\n",
+            truncated_why.as_deref().unwrap_or("a limit stopped the scan")
+        ));
     }
     Ok(out)
 }

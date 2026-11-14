@@ -25,14 +25,34 @@ use std::path::{Path, PathBuf};
 
 /// How much of a workspace to read. A graph of a monorepo is not worth an
 /// unbounded walk, and a partial graph that says so beats a hung node.
+///
+/// Three limits, because they stop three different runaways. `max_files`
+/// bounds the parsing, which is the expensive part per file. `max_entries`
+/// bounds the walking, which a tree of 800,000 data files blows through
+/// without ever reaching the file limit, since almost nothing in it is
+/// source. `budget` bounds the wall clock, which is the only one of the
+/// three the caller actually feels: a scan that runs past the hub's patience
+/// has its result thrown away, and from the outside that is indistinguishable
+/// from a scan that never worked at all.
 pub struct Limits {
     pub max_files: usize,
     pub max_file_bytes: u64,
+    /// Directory entries the walk may look at before it gives up.
+    pub max_entries: usize,
+    /// How long the whole scan -- walk and parse together -- may take.
+    pub budget: std::time::Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_files: 4000, max_file_bytes: 1_500_000 }
+        Self {
+            max_files: 4000,
+            max_file_bytes: 1_500_000,
+            max_entries: 400_000,
+            // Comfortably inside the five minutes the hub waits, with room
+            // for handing a large graph over and storing it at the far end.
+            budget: std::time::Duration::from_secs(150),
+        }
     }
 }
 
@@ -161,8 +181,17 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
     // may name a file that has not been walked yet.
     let mut imports: Vec<(String, String)> = Vec::new();
 
-    let files = walk(root, limits, &mut graph);
+    let deadline = std::time::Instant::now() + limits.budget;
+    let files = walk(root, limits, deadline, &mut graph);
     for abs in files {
+        // The budget covers the parse too, and this is where it is usually
+        // spent: 4,000 source files can take several minutes, and a graph
+        // that arrives after the caller has stopped waiting is a graph
+        // nobody sees.
+        if std::time::Instant::now() >= deadline {
+            stop_short(&mut graph, "the parse ran out of time");
+            break;
+        }
         let rel = abs
             .strip_prefix(root)
             .unwrap_or(&abs)
@@ -470,23 +499,60 @@ fn import_target(text: String) -> Option<String> {
         .map(|w| w.to_string())
 }
 
+/// Note that a limit stopped the scan, and say which one.
+fn stop_short(graph: &mut CodeGraph, why: &str) {
+    graph.truncated = true;
+    if graph.truncated_reason.is_none() {
+        graph.truncated_reason = Some(why.to_string());
+    }
+}
+
 /// Collect candidate files, honouring the limits.
-fn walk(root: &Path, limits: &Limits, graph: &mut CodeGraph) -> Vec<PathBuf> {
+///
+/// Breadth-first, and that is the whole point of the ordering: when a limit
+/// cuts the walk short, what it keeps should be the code at the top of the
+/// tree -- the project's own -- rather than whichever deep branch a
+/// depth-first walk happened to descend into first. A partial graph of the
+/// thing you are working on is useful; a partial graph of someone's vendored
+/// fixtures is not.
+fn walk(
+    root: &Path,
+    limits: &Limits,
+    deadline: std::time::Instant,
+    graph: &mut CodeGraph,
+) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
+    let mut dirs: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+    dirs.push_back(root.to_path_buf());
+    let mut seen = 0usize;
+    'walk: while let Some(dir) = dirs.pop_front() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(meta) = entry.metadata() else { continue };
+        // Sorted, so a walk that stops early stops in the same place twice.
+        // `read_dir` hands them over in whatever order the filesystem likes,
+        // which would make a truncated graph differ from run to run.
+        let mut here: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        here.sort();
+        for path in here {
+            seen += 1;
+            if seen > limits.max_entries {
+                stop_short(graph, "the walk reached its limit of directory entries");
+                break 'walk;
+            }
+            // Checked periodically rather than per entry: on a cold tree the
+            // clock read is a real fraction of the work of looking at a file.
+            if seen % 2048 == 0 && std::time::Instant::now() >= deadline {
+                stop_short(graph, "the walk ran out of time");
+                break 'walk;
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
             if meta.is_dir() {
                 // Symlinked directories are not followed: a link to `/` would
                 // walk the machine, and a link back up would never terminate.
                 if meta.file_type().is_symlink() || SKIP_DIRS.contains(&name.as_str()) {
                     continue;
                 }
-                dirs.push(path);
+                dirs.push_back(path);
             } else if meta.is_file() {
                 if spec_for(&path).is_none() {
                     continue;
@@ -500,8 +566,8 @@ fn walk(root: &Path, limits: &Limits, graph: &mut CodeGraph) -> Vec<PathBuf> {
                     continue;
                 }
                 if out.len() >= limits.max_files {
-                    graph.truncated = true;
-                    return out;
+                    stop_short(graph, "the walk reached its limit of files to parse");
+                    break 'walk;
                 }
                 out.push(path);
             }
@@ -643,7 +709,7 @@ fn helper(s: &str) -> usize { s.len() }
     fn an_oversized_file_is_skipped_and_said_so() {
         let big = "fn f() {}\n".repeat(2000);
         let d = scratch(&[("big.rs", big.as_str()), ("small.rs", "fn s() {}")]);
-        let g = scan(d.path(), &Limits { max_files: 100, max_file_bytes: 100 });
+        let g = scan(d.path(), &Limits { max_files: 100, max_file_bytes: 100, ..Default::default() });
         assert_eq!(g.files, 1, "only the small one parsed");
         assert!(
             g.skipped.iter().any(|s| s.path.contains("big.rs") && s.reason.contains("limit")),
@@ -660,9 +726,67 @@ fn helper(s: &str) -> usize { s.len() }
         let refs: Vec<(&str, &str)> =
             files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         let d = scratch(&refs);
-        let g = scan(d.path(), &Limits { max_files: 3, max_file_bytes: 10_000 });
+        let g = scan(d.path(), &Limits { max_files: 3, max_file_bytes: 10_000, ..Default::default() });
         assert!(g.truncated, "a caller must be able to tell it is partial");
         assert!(g.files <= 3);
+        assert!(
+            g.truncated_reason.as_deref().unwrap_or("").contains("files"),
+            "which limit it hit decides what to do about it: {:?}",
+            g.truncated_reason
+        );
+    }
+
+    #[test]
+    fn the_walk_keeps_the_top_of_the_tree_when_it_must_choose() {
+        // Depth-first, this kept whichever deep branch it happened to
+        // descend into first -- so a tree with a large vendored corner
+        // produced a graph of the corner and none of the project. Shallow
+        // first is the only ordering that degrades sensibly.
+        let d = scratch(&[
+            ("mine.rs", "fn mine() {}"),
+            ("a/deep/deeper/deepest/theirs.rs", "fn theirs() {}"),
+            ("a/deep/deeper/other.rs", "fn other() {}"),
+        ]);
+        let g = scan(d.path(), &Limits { max_files: 1, max_file_bytes: 10_000,
+                                         ..Default::default() });
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"mine"), "the shallowest file should survive: {names:?}");
+    }
+
+    #[test]
+    fn a_tree_of_files_we_never_parse_cannot_walk_for_ever() {
+        // 800,000 data files reach neither the file limit nor the end of the
+        // walk in any useful time, because almost nothing in them is source.
+        // The entry limit is what stops that, and it has to say so.
+        let mut files: Vec<(String, String)> = (0..60)
+            .map(|i| (format!("data/d{i}.bin"), "not source".to_string()))
+            .collect();
+        files.push(("src/mine.rs".into(), "fn mine() {}".into()));
+        let refs: Vec<(&str, &str)> =
+            files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let d = scratch(&refs);
+        let g = scan(d.path(), &Limits { max_files: 4000, max_file_bytes: 10_000,
+                                         max_entries: 10, ..Default::default() });
+        assert!(g.truncated, "it stopped, and must say so");
+        assert!(
+            g.truncated_reason.as_deref().unwrap_or("").contains("entries"),
+            "the entry limit is a different diagnosis from the file limit: {:?}",
+            g.truncated_reason
+        );
+    }
+
+    #[test]
+    fn a_scan_with_no_time_left_gives_up_and_says_why() {
+        let d = scratch(&[("a.rs", "fn a() {}"), ("b.rs", "fn b() {}")]);
+        let g = scan(d.path(), &Limits { max_files: 4000, max_file_bytes: 10_000,
+                                         max_entries: 400_000,
+                                         budget: std::time::Duration::ZERO });
+        assert!(g.truncated, "no budget means no parsing, and that is not a silent outcome");
+        assert!(
+            g.truncated_reason.as_deref().unwrap_or("").contains("time"),
+            "{:?}",
+            g.truncated_reason
+        );
     }
 
     #[test]

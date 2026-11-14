@@ -299,10 +299,24 @@ async fn handle(
             tracing::debug!(%slot_id, "stored a resume handle");
         }
 
-        NodeToHub::CodeGraphResult { req_id, graph, .. } => {
+        NodeToHub::CodeGraphResult { req_id, workspace_id, graph } => {
             // Hand it to whoever asked, through the same waiter the workspace
             // sync round-trip uses.
-            st.complete_sync(req_id, serde_json::to_value(graph).unwrap_or_default());
+            let taken =
+                st.complete_sync(req_id, serde_json::to_value(&graph).unwrap_or_default());
+            if !taken {
+                // Nobody is waiting any more: the parse outlived the caller's
+                // patience. Store it anyway. The expensive work is done, and
+                // throwing it away leaves the workspace with no graph at all
+                // -- so the next ask starts from nothing and times out in the
+                // same place, for ever.
+                match crate::graph::store(st, &workspace_id, &graph) {
+                    Ok(summary) => tracing::info!(%workspace_id, %summary,
+                        "stored a code graph that arrived after its caller had gone"),
+                    Err(e) => tracing::warn!(%workspace_id, error = %e,
+                        "could not store a late code graph"),
+                }
+            }
         }
 
         NodeToHub::AgentModel { agent_id, model } => {

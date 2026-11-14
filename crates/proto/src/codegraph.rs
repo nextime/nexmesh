@@ -120,6 +120,10 @@ pub struct CodeGraph {
     /// True when a limit stopped the walk, so a caller knows the graph is
     /// partial.
     pub truncated: bool,
+    /// Which limit stopped it, in words fit to show a person: "partial" on
+    /// its own invites the wrong fix. `None` when nothing did.
+    #[serde(default)]
+    pub truncated_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,11 +220,23 @@ mod tests {
         // A hole nobody mentions is worse than a smaller graph that admits it.
         let g = CodeGraph {
             truncated: true,
+            truncated_reason: Some("the parse ran out of time".into()),
             skipped: vec![SkippedFile { path: "big.bin".into(), reason: "too large".into() }],
             ..Default::default()
         };
         assert!(g.truncated);
+        assert_eq!(g.truncated_reason.as_deref(), Some("the parse ran out of time"));
         assert_eq!(g.skipped[0].reason, "too large");
+    }
+
+    #[test]
+    fn an_older_node_sends_a_graph_this_hub_can_still_read() {
+        // The reason was added after the fact, and a fleet is not upgraded
+        // all at once: a node on yesterday's build sends a graph without it.
+        let json = r#"{"nodes":[],"edges":[],"files":2,"skipped":[],"truncated":true}"#;
+        let g: CodeGraph = serde_json::from_str(json).unwrap();
+        assert!(g.truncated);
+        assert_eq!(g.truncated_reason, None);
     }
 
     #[test]
@@ -231,6 +247,7 @@ mod tests {
             files: 1,
             skipped: vec![],
             truncated: false,
+            truncated_reason: None,
         };
         let back: CodeGraph = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
         assert_eq!(back, g);

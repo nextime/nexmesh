@@ -1547,7 +1547,8 @@ function viewGraph(d, now) {
           · ${g.communities} subsystem${g.communities === 1 ? "" : "s"}
           · parsed ${ago(g.built_at_ms, now)}</span>
         ${g.truncated
-          ? `<span class="badge warn" title="the walk hit its file limit">partial</span>` : ""}
+          ? `<span class="badge warn" title="${esc(g.truncated_reason
+              || "a limit stopped the scan")}">partial</span>` : ""}
       </div>
       <div class="muted tiny">${kinds}</div>`;
     if (!(g.subsystems || []).length)

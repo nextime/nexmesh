@@ -469,12 +469,13 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 .iter()
                 .filter_map(|(ws_id, ws_name)| {
                     let ws_id = ws_id.as_str();
-                    let (built, files, truncated, communities): (i64, i64, i64, i64) = db
+                    let (built, files, truncated, truncated_why, communities):
+                        (i64, i64, i64, Option<String>, i64) = db
                         .query_row(
-                            "SELECT built_at_ms, files, truncated, communities
+                            "SELECT built_at_ms, files, truncated, truncated_reason, communities
                                FROM code_graph_meta WHERE workspace_id = ?",
                             [ws_id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                         )
                         .optional()
                         .ok()
@@ -604,6 +605,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         "built_at_ms": built,
                         "files": files,
                         "truncated": truncated != 0,
+                        "truncated_reason": truncated_why,
                         "communities": communities,
                         "counts": counts,
                         "subsystems": subsystems,
