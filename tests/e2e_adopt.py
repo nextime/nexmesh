@@ -161,6 +161,29 @@ def main():
     pane = tmux("capture-pane", "-p", "-t", SRC)
     check("and still works", "you said: after detach" in pane, pane[-300:])
 
+    print("\n=== 5b. a viewer that arrives to a still pane still sees it ===")
+    # "It attaches but there is only a black terminal with nothing." tmux is a
+    # differential renderer: it writes what CHANGED, and it rewrites its
+    # status line every second. So on a pane nobody has touched, the recent
+    # scrollback is all status ticks and the screen itself has scrolled out of
+    # the replay -- the viewer gets an empty screen with a clock in the
+    # corner. With no replay AT ALL, the only thing that can paint the screen
+    # is the node asking tmux to repaint its client, which is the fix.
+    t2 = Term([f"{BIN}/nexmesh", "--hub", HUB, "attach", sid, "Legacy", "--replay", "0"])
+    check("attach succeeds with no scrollback replay",
+          t2.expect("attached to Legacy"), t2.buf[-300:])
+    check("and the screen arrives anyway",
+          t2.expect("FAKETUI READY", seconds=15), t2.buf[-600:])
+    # Where it came from, not merely that it came: a resize happens to repaint
+    # a tmux client too, so seeing the screen does not by itself prove the
+    # node asked for it. The node says when it asks, and a viewer that
+    # arrives to an unchanged pane has nothing else to go on.
+    nodelog = open(f"{T}/node.log").read()
+    check("because the node asked tmux to repaint its client",
+          "asked tmux to repaint an adopted pane" in nodelog, nodelog[-500:])
+    t2.send("\x1d")
+    t2.expect("detached")
+
     print("\n=== 6. a bad target fails cleanly ===")
     s, j = http("POST", f"/v1/sessions/{sid}/adopt",
         {"node": "machine-b", "tmux_target": "", "name": "Bad"})

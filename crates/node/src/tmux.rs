@@ -7,6 +7,47 @@
 
 use std::process::Command;
 
+/// Make tmux paint the whole screen into our own client's pty.
+///
+/// tmux is a differential renderer: it writes what CHANGED. A pane that has
+/// been sitting still since before a viewer arrived therefore sends nothing,
+/// and the viewer -- which starts from a replay of the last few kilobytes of
+/// that pty -- shows an empty screen with a status line ticking away at the
+/// bottom. Worse, tmux rewrites that status line every second, so on a pane
+/// nobody is using those ticks are the ONLY thing in the recent scrollback:
+/// the replay is full of them and the screen itself has scrolled out of it.
+///
+/// This is still only a question put to tmux, in the spirit of the rest of
+/// this module: `refresh-client` writes nothing into the pane and sends no
+/// keys. It asks tmux to repaint the client the NODE owns, which is the
+/// screen the viewer is waiting for.
+pub fn repaint(view: &str) {
+    // Our client is the one attached to the session the node created for
+    // this view. tmux addresses clients by their tty, not by session.
+    let Some(out) = Command::new("tmux")
+        .env_remove("TMUX")
+        .args(["list-clients", "-F", "#{client_tty} #{client_session}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((tty, session)) = line.split_once(' ') {
+            if session == view {
+                let done = Command::new("tmux")
+                    .env_remove("TMUX")
+                    .args(["refresh-client", "-t", tty])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                tracing::info!(%view, tty, done, "asked tmux to repaint an adopted pane");
+            }
+        }
+    }
+}
+
 /// The pid of the process in the pane the given client view is looking at.
 ///
 /// `view` is the node's OWN grouped session (`nexmesh-<slot>`), not the

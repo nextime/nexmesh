@@ -629,6 +629,15 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                     .send_hub(&NodeToHub::AttachData { attach_id, data: back })
                     .await;
             }
+            // And for an adopted tmux pane, ask tmux to paint the screen.
+            // The replay alone is not enough there: tmux writes only what
+            // changed, and it rewrites its status line every second, so on a
+            // pane that has been still the recent scrollback is all status
+            // ticks and the screen itself has scrolled out of it. That is the
+            // "it attaches but the terminal is black" this fixes.
+            if let Some(view) = ctx.agent(&agent_id).and_then(|r| r.tmux_view.clone()) {
+                crate::tmux::repaint(&view);
+            }
             tracing::info!(%agent_id, read_only = io.read_only(), "viewer attached");
         }
 
