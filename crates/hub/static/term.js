@@ -254,6 +254,18 @@ class NexTerm {
         }
         this.state = "ground";
         return this.csi(ch);
+      // Charset selection: `ESC ( B` and friends. The byte after the
+      // intermediate is the charset itself and is consumed here.
+      //
+      // Without this case the parser entered a state with no handler and
+      // every byte after it fell through the switch, so the FIRST charset
+      // selection in a stream swallowed the rest of it for ever. tmux emits
+      // `ESC ( B` constantly, which made every adopted tmux terminal render
+      // as a blank screen in the browser while the same agent was perfectly
+      // readable in a real terminal.
+      case "charset":
+        this.state = "ground";
+        return;
       case "osc":
         // Ends at BEL or at ST (ESC \). The title is the only one worth
         // keeping; the rest are swallowed rather than drawn as text.

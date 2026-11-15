@@ -204,6 +204,26 @@ console.log("\n=== what it answers, because a program that asks will wait ===");
         JSON.stringify(sent.join("")));
 }
 
+console.log("\n=== charset selection, which tmux emits constantly ===");
+{
+  const t = mk(20, 3);
+  // `ESC ( B` selects ASCII into G0. The parser must consume the byte after
+  // the intermediate and carry on. It used to enter a state with no handler,
+  // so every byte after the FIRST of these fell through the switch and was
+  // swallowed: an adopted tmux pane rendered as a blank screen in the
+  // browser while being perfectly readable in a real terminal.
+  t.write("\x1b(Bhello\x1b)0 world\x1b(B again");
+  const row = (y) => t.screen.lines[y].map((c) => c.c).join("").trimEnd();
+  check("text after a charset selection is still drawn",
+        row(0) === "hello world again", JSON.stringify(row(0)));
+  check("and the parser is back on the ground", t.state === "ground", t.state);
+  const t2 = mk(20, 3);
+  t2.write("\x1b(B\x1b[2;1Hsecond\x1b(B\x1b[31mred");
+  check("and so is a cursor move that follows one",
+        t2.screen.lines[1].map((c) => c.c).join("").trimEnd() === "secondred",
+        JSON.stringify(t2.screen.lines[1].map((c) => c.c).join("").trimEnd()));
+}
+
 console.log("\n=== keys ===");
 {
   const t = mk(10, 3);

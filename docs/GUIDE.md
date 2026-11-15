@@ -1786,6 +1786,15 @@ waits for ever, which looks exactly like a hung agent. All of it is tested
 headlessly in `tests/term_test.js`, against the sequences rather than against
 a screenshot.
 
+**One defect worth remembering.** The parser entered a `charset` state on
+`ESC ( B` and had no handler for that state, so every byte after the first
+charset selection in a stream fell through the switch and was swallowed. tmux
+emits `ESC ( B` constantly, so every adopted tmux terminal rendered as a blank
+screen in the browser and in the room, while the same agent was perfectly
+readable in a real terminal — which is exactly the shape of bug that sends you
+looking at the attach, the websocket and the hub before the emulator.
+`tests/term_test.js` now holds that case.
+
 **What it answers, and why that matters.** A current agent CLI opens by
 negotiating with the terminal: `CSI > 4 ; 0 m` and `CSI > 7 u` for the keyboard
 protocol, `CSI > c` for the firmware, `OSC 10 ; ?` and `OSC 11 ; ?` for the
