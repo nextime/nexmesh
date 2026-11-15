@@ -423,12 +423,40 @@ installed (`parecord`, `arecord`, `rec`, `ffmpeg`) and playing likewise
 (`paplay`, `aplay`, `play`, `ffplay`, `mpg123`); with neither, the key says so
 instead of doing nothing.
 
-The same two keys work inside an attached terminal, where they matter most on
-a phone or a tablet: `Ctrl-^` records and types the words into the agent's own
-prompt — never submitting them, because Enter stays yours — and `Ctrl-_` reads
-back the last of what the agent printed. In the browser terminal the same two
-are buttons, and holding (or right-clicking) a line of the terminal reads that
-line, or whatever is selected.
+Inside an **attached terminal** the same things are reached through a mode,
+because every other key on that keyboard belongs to the agent — a CLI in
+there uses `Ctrl-A`, `Ctrl-R`, `Ctrl-W`, and a viewer that quietly ate three
+control characters would break somebody's editor.
+
+`Ctrl-\` turns **command mode** on and off. While it is on the bottom row
+changes colour, nothing reaches the agent, and single letters do the work:
+
+| key | |
+|-----|---|
+| `d` | detach |
+| `v` | record a sentence; the fleet transcribes it into the prompt |
+| `r` | read the agent's last reply aloud — again walks further back, again while talking stops it |
+| `a` | read every new reply as it arrives |
+| `?` | list them |
+| `q`, Esc | leave command mode |
+
+`Ctrl-]` still detaches from either mode. A **reply** is everything the agent
+printed since you last pressed Enter: that boundary is what makes "read the
+last one" and "read the one before it" mean something on a stream of bytes.
+
+`Ctrl-[` is deliberately not the mode key — it *is* Escape, and taking it
+would break every arrow key and every full-screen program inside the attach.
+It is refused if configured. Both keys can be changed in
+`~/.nexmesh/console.toml`:
+
+```toml
+command_key = "ctrl-g"
+detach_key  = "ctrl-]"
+```
+
+In the browser terminal the same two are buttons, and holding (or
+right-clicking) a line of the terminal reads that line, or whatever is
+selected.
 
 Anything being read aloud can be stopped: `V` again in the console, `Ctrl-_`
 again in an attached terminal, and the loudspeaker button in the browser

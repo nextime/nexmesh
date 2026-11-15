@@ -1029,8 +1029,6 @@ impl Drop for RawGuard {
 
 /// Ctrl-] detaches, the way telnet does. Ctrl-C cannot: in raw mode it belongs
 /// to the agent, which is the whole point of a takeover.
-const DETACH_BYTE: u8 = 0x1d;
-
 /// The voice keys, from `~/.nexmesh/console.toml`.
 ///
 /// Defaults: Ctrl-^ dictates, Ctrl-_ reads a reply back, Ctrl-\ reads every
@@ -1131,6 +1129,11 @@ struct StatusBar {
     keys: Vec<(String, String)>,
     /// Passing state: `listening`, `aloud`, `reading 2 back`.
     marks: Vec<String>,
+    /// Command mode: the keys below are letters, and nothing reaches the
+    /// agent until it is left again.
+    command: bool,
+    /// What those letters are, for the row to say.
+    menu: Vec<(String, String)>,
     cols: u16,
     rows: u16,
 }
@@ -1148,6 +1151,8 @@ impl StatusBar {
             direct: false,
             keys: Vec::new(),
             marks: Vec::new(),
+            command: false,
+            menu: Vec::new(),
             cols,
             rows,
         })
@@ -1179,6 +1184,34 @@ impl StatusBar {
     fn line(&self) -> String {
         let w = self.cols as usize;
         let sep = "  \u{00b7}  ";
+        // In command mode the row IS the menu: what the letters do, and how
+        // to get out. Nothing else on it matters while it is up.
+        if self.command {
+            let id = if self.session.is_empty() {
+                self.who.clone()
+            } else {
+                format!("{}:{}", self.session, self.who)
+            };
+            let full: Vec<String> =
+                self.menu.iter().map(|(k, what)| format!("{k} {what}")).collect();
+            let short: Vec<String> = self.menu.iter().map(|(k, _)| k.clone()).collect();
+            let marks: String = if self.marks.is_empty() {
+                String::new()
+            } else {
+                format!("{sep}{}", self.marks.join(sep))
+            };
+            for body in [full.join(sep), short.join(" ")] {
+                let line = format!(" COMMAND{sep}{body}{marks}{sep}{id}");
+                if line.chars().count() <= w {
+                    return line;
+                }
+                let line = format!(" COMMAND{sep}{body}");
+                if line.chars().count() <= w {
+                    return line;
+                }
+            }
+            return format!(" COMMAND{sep}{}", short.join(" ")).chars().take(w).collect();
+        }
         let id = if self.session.is_empty() {
             self.who.clone()
         } else {
@@ -1266,11 +1299,12 @@ impl StatusBar {
             let pad = w - line.chars().count();
             line.push_str(&" ".repeat(pad));
         }
-        format!(
-            "\x1b7\x1b[{};1H\x1b[40m\x1b[37m{}\x1b[0m\x1b8",
-            self.rows, line
-        )
-        .into_bytes()
+        // Black and grey while the agent has the keyboard; bright and
+        // coloured while this row does. The difference has to be visible
+        // from the corner of an eye, because the whole point of a mode is
+        // knowing which one you are in without trying a key.
+        let colour = if self.command { "\x1b[45m\x1b[97m\x1b[1m" } else { "\x1b[40m\x1b[37m" };
+        format!("\x1b7\x1b[{};1H{}{}\x1b[0m\x1b8", self.rows, colour, line).into_bytes()
     }
 
     /// Keep the agent's output from scrolling over the bar. A full-screen app
@@ -1403,18 +1437,23 @@ async fn attach(
     };
     // Said out loud, because "why is this slow" should be answerable by
     // looking at the screen.
-    // The keys, least important first: that is the order they are given up
-    // in when the row is too narrow, and detach is never given up.
+    // Two keys, and what is behind one of them. Everything else on the
+    // keyboard belongs to the agent: a viewer that quietly eats Ctrl-R or
+    // Ctrl-W breaks somebody's editor, and finding out which three it took
+    // is not a thing anybody should have to do.
     if let Some(b) = &mut bar {
         let a = voice::detect();
-        if a.can_speak() {
-            b.keys.push((voice::key_name(vkeys.aloud), "aloud".into()));
-            b.keys.push((voice::key_name(vkeys.speak), "read".into()));
-        }
+        b.keys.push((voice::key_name(vkeys.command), "commands".into()));
+        b.keys.push((voice::key_name(vkeys.detach), "detach".into()));
+        b.menu.push(("d".into(), "detach".into()));
         if a.can_hear() {
-            b.keys.push((voice::key_name(vkeys.dictate), "say it".into()));
+            b.menu.push(("v".into(), "say it".into()));
         }
-        b.keys.push(("Ctrl-]".into(), "detach".into()));
+        if a.can_speak() {
+            b.menu.push(("r".into(), "read".into()));
+            b.menu.push(("a".into(), "aloud".into()));
+        }
+        b.menu.push((voice::key_name(vkeys.command), "back".into()));
         b.direct = wire.direct;
     }
 
@@ -1536,6 +1575,9 @@ async fn attach(
     let playing: voice::Playing = Default::default();
     // Reading every new reply out as it settles, rather than on request.
     let mut aloud = false;
+    // Command mode: one key in, one key out, and nothing reaches the agent
+    // while it is on.
+    let mut command = false;
     // Whether the last thing pressed was the read key, so pressing it again
     // means "the one before that" rather than "that one again".
     let mut spoke_once = false;
@@ -1604,145 +1646,171 @@ async fn attach(
             }
             n = keys.read(&mut buf) => {
                 let n = match n { Ok(0) | Err(_) => break "input ended".to_string(), Ok(n) => n };
-                if let Some(pos) = buf[..n].iter().position(|b| *b == DETACH_BYTE) {
-                    // Send anything typed before the detach key, then leave.
-                    if pos > 0 {
-                        let _ = wire.tx.send(wire::Out::Data(buf[..pos].to_vec())).await;
+                // Two keys are ours. Everything else on this keyboard
+                // belongs to the agent -- which is why the rest of what this
+                // viewer can do lives behind ONE of them rather than taking
+                // a control character each.
+                let mut forward: Vec<u8> = Vec::with_capacity(n);
+                let mut leaving: Option<String> = None;
+                for &byte in &buf[..n] {
+                    if byte == vkeys.detach {
+                        leaving = Some("detached".to_string());
+                        break;
                     }
-                    break "detached".to_string();
-                }
-                // Dictation: press once to start, again to send what was said
-                // to be transcribed. The key itself is never forwarded.
-                if let Some(pos) = buf[..n].iter().position(|b| *b == vkeys.dictate) {
-                    let mut rest = buf[..n].to_vec();
-                    rest.remove(pos);
-                    if !rest.is_empty() {
-                        let _ = wire.tx.send(wire::Out::Data(rest)).await;
-                    }
-                    rec = match rec.take() {
-                        Some((child, path)) => {
-                            match voice::stop(child, &path) {
-                                Ok(bytes) => {
-                                    let (b, cl, tx) = (base.to_string(), c.clone(), said_tx.clone());
-                                    let lang = std::env::var("LANG").ok().and_then(|l| {
-                                        l.split(['.', '_']).next()
-                                            .filter(|s| s.len() == 2).map(|s| s.to_string())
-                                    });
-                                    tokio::spawn(async move {
-                                        let _ = tx
-                                            .send(voice::transcribe(&b, &cl, &bytes, lang.as_deref()).await)
-                                            .await;
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = said_tx.send(Err(e)).await;
-                                }
-                            }
-                            if let Some(bar) = &mut bar {
-                                bar.set_mark("listening", false);
-                            }
-                            None
+                    if byte == vkeys.command {
+                        command = !command;
+                        if let Some(b) = &mut bar {
+                            b.command = command;
                         }
-                        None => match voice::start(&audio, &scratch) {
-                            Ok(r) => {
-                                if let Some(bar) = &mut bar {
-                                    bar.set_mark("listening", true);
-                                }
-                                Some(r)
-                            }
-                            Err(e) => {
-                                let _ = said_tx.send(Err(e)).await;
-                                None
-                            }
-                        },
-                    };
-                    continue;
-                }
-                // Read a reply back. Which reply is the question, and the
-                // answer is a cursor: the newest, then the one before it,
-                // and so on -- so "read that again" and "read the one before
-                // it" are the same key pressed twice. Anything the agent
-                // prints puts the cursor back at the newest.
-                if let Some(pos) = buf[..n].iter().position(|b| *b == vkeys.speak) {
-                    let mut rest = buf[..n].to_vec();
-                    rest.remove(pos);
-                    if !rest.is_empty() {
-                        let _ = wire.tx.send(wire::Out::Data(rest)).await;
-                    }
-                    // Talking already? The same key is a stop.
-                    if playing.lock().map(|p| p.is_some()).unwrap_or(false) {
-                        voice::hush(&playing);
                         continue;
                     }
-                    let (text, back) = {
-                        match heard.lock() {
-                            Ok(mut h) => {
-                                // The second press in a row walks back; the
-                                // first reads what is newest.
-                                if spoke_once {
-                                    h.older();
-                                }
-                                (h.selected().map(|s| s.to_string()), h.back())
-                            }
-                            Err(_) => (None, 0),
-                        }
-                    };
-                    spoke_once = true;
-                    match text {
-                        Some(text) if !text.trim().is_empty() => {
+                    if !command {
+                        forward.push(byte);
+                        continue;
+                    }
+                    // In command mode nothing reaches the agent: a letter
+                    // that means nothing here is a letter the operator meant
+                    // for a command, not for its prompt.
+                    match voice::command_for(byte) {
+                        Some(voice::Act::Leave) => {
+                            command = false;
                             if let Some(b) = &mut bar {
-                                if back == 0 {
-                                    b.set_mark("reading", false);
-                                } else {
-                                    b.say_mark("reading", format!("reading {back} back"));
-                                }
+                                b.command = false;
                             }
-                            let (bs, cl, tx, a, dir, pl) = (
-                                base.to_string(), c.clone(), said_tx.clone(),
-                                audio.clone(), scratch.clone(), playing.clone(),
-                            );
-                            tokio::spawn(async move {
-                                if let Err(e) = voice::speak(&bs, &cl, &a, &text, &dir, &pl).await {
-                                    let _ = tx.send(Err(e)).await;
-                                }
-                            });
                         }
-                        _ => {
+                        Some(voice::Act::Detach) => {
+                            leaving = Some("detached".to_string());
+                            break;
+                        }
+                        Some(voice::Act::Help) => {
                             let mut out = tokio::io::stdout();
                             let _ = out
-                                .write_all(b"\r\n[nexmesh] nothing further back to read\r\n")
+                                .write_all(
+                                    b"\r\n[nexmesh] d detach \xc2\xb7 v say it \xc2\xb7                                       r read a reply (again: further back) \xc2\xb7                                       a read new ones aloud \xc2\xb7 q leave command mode\r\n",
+                                )
                                 .await;
                             let _ = out.flush().await;
                         }
+                        Some(voice::Act::Dictate) => {
+                            rec = match rec.take() {
+                                Some((child, path)) => {
+                                    match voice::stop(child, &path) {
+                                        Ok(bytes) => {
+                                            let (b, cl, tx) =
+                                                (base.to_string(), c.clone(), said_tx.clone());
+                                            let lang = std::env::var("LANG").ok().and_then(|l| {
+                                                l.split(['.', '_']).next()
+                                                    .filter(|s| s.len() == 2)
+                                                    .map(|s| s.to_string())
+                                            });
+                                            tokio::spawn(async move {
+                                                let _ = tx
+                                                    .send(voice::transcribe(
+                                                        &b, &cl, &bytes, lang.as_deref(),
+                                                    )
+                                                    .await)
+                                                    .await;
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = said_tx.send(Err(e)).await;
+                                        }
+                                    }
+                                    if let Some(b) = &mut bar {
+                                        b.set_mark("listening", false);
+                                    }
+                                    None
+                                }
+                                None => match voice::start(&audio, &scratch) {
+                                    Ok(r) => {
+                                        if let Some(b) = &mut bar {
+                                            b.set_mark("listening", true);
+                                        }
+                                        Some(r)
+                                    }
+                                    Err(e) => {
+                                        let _ = said_tx.send(Err(e)).await;
+                                        None
+                                    }
+                                },
+                            };
+                        }
+                        Some(voice::Act::Read) => {
+                            // Talking already? The same key is a stop.
+                            if playing.lock().map(|p| p.is_some()).unwrap_or(false) {
+                                voice::hush(&playing);
+                                continue;
+                            }
+                            let (text, back) = match heard.lock() {
+                                Ok(mut h) => {
+                                    if spoke_once {
+                                        h.older();
+                                    }
+                                    (h.selected().map(|s| s.to_string()), h.back())
+                                }
+                                Err(_) => (None, 0),
+                            };
+                            spoke_once = true;
+                            match text {
+                                Some(text) if !text.trim().is_empty() => {
+                                    if let Some(b) = &mut bar {
+                                        if back == 0 {
+                                            b.set_mark("reading", false);
+                                        } else {
+                                            b.say_mark("reading", format!("reading {back} back"));
+                                        }
+                                    }
+                                    let (bs, cl, tx, a, dir, pl) = (
+                                        base.to_string(), c.clone(), said_tx.clone(),
+                                        audio.clone(), scratch.clone(), playing.clone(),
+                                    );
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            voice::speak(&bs, &cl, &a, &text, &dir, &pl).await
+                                        {
+                                            let _ = tx.send(Err(e)).await;
+                                        }
+                                    });
+                                }
+                                _ => {
+                                    let mut out = tokio::io::stdout();
+                                    let _ = out
+                                        .write_all(b"\r\n[nexmesh] nothing further back to read\r\n")
+                                        .await;
+                                    let _ = out.flush().await;
+                                }
+                            }
+                        }
+                        Some(voice::Act::Aloud) => {
+                            aloud = !aloud;
+                            if !aloud {
+                                voice::hush(&playing);
+                            }
+                            if let Some(b) = &mut bar {
+                                b.set_mark("aloud", aloud);
+                            }
+                        }
+                        None => {}
                     }
-                    continue;
                 }
-                // Read every new reply as it arrives, until told otherwise.
-                if let Some(pos) = buf[..n].iter().position(|b| *b == vkeys.aloud) {
-                    let mut rest = buf[..n].to_vec();
-                    rest.remove(pos);
-                    if !rest.is_empty() {
-                        let _ = wire.tx.send(wire::Out::Data(rest)).await;
+                if let Some(why) = leaving {
+                    if !forward.is_empty() {
+                        let _ = wire.tx.send(wire::Out::Data(forward)).await;
                     }
-                    aloud = !aloud;
-                    if !aloud {
-                        voice::hush(&playing);
-                    }
-                    if let Some(b) = &mut bar {
-                        b.set_mark("aloud", aloud);
-                    }
-                    continue;
+                    break why;
                 }
-                // Anything the operator submits closes off the agent's last
-                // answer: what comes next is the answer to THIS.
-                if buf[..n].iter().any(|b| *b == b'\r' || *b == b'\n') {
-                    if let Ok(mut h) = heard.lock() {
-                        h.submitted();
+                if !forward.is_empty() {
+                    // Anything the operator submits closes off the agent's
+                    // last answer: what comes next answers THIS.
+                    if forward.iter().any(|b| *b == b'\r' || *b == b'\n') {
+                        if let Ok(mut h) = heard.lock() {
+                            h.submitted();
+                        }
+                        spoke_once = false;
                     }
-                    spoke_once = false;
-                }
-                if wire.tx.send(wire::Out::Data(buf[..n].to_vec())).await.is_err() {
-                    break "connection lost".to_string();
+                    if wire.tx.send(wire::Out::Data(forward)).await.is_err() {
+                        break "connection lost".to_string();
+                    }
                 }
             }
             Some((c, r)) = resize_rx.recv() => {
@@ -2601,10 +2669,15 @@ mod bar_tests {
         )
         .unwrap();
         b.keys = vec![
-            ("Ctrl-\\".into(), "aloud".into()),
-            ("Ctrl-_".into(), "read".into()),
-            ("Ctrl-^".into(), "say it".into()),
+            ("Ctrl-\\".into(), "commands".into()),
             ("Ctrl-]".into(), "detach".into()),
+        ];
+        b.menu = vec![
+            ("d".into(), "detach".into()),
+            ("v".into(), "say it".into()),
+            ("r".into(), "read".into()),
+            ("a".into(), "aloud".into()),
+            ("Ctrl-\\".into(), "back".into()),
         ];
         b
     }
@@ -2617,7 +2690,7 @@ mod bar_tests {
         assert!(line.contains("nexmesh:Nexmesh-dev"), "{line}");
         assert!(line.contains("on machine-b"), "{line}");
         assert!(line.contains("via term-Nexmesh-dev"), "{line}");
-        assert!(line.contains("Ctrl-^ say it"), "{line}");
+        assert!(line.contains("Ctrl-\\ commands"), "{line}");
         assert!(line.chars().count() <= 160);
     }
 
@@ -2633,9 +2706,10 @@ mod bar_tests {
                 assert!(line.contains("Nexmesh-dev"), "{cols}: {line}");
             }
         }
-        assert!(!bar(100).line().contains("via "), "the adopted pane goes first");
-        assert!(bar(100).line().contains("Ctrl-] detach"), "{}", bar(100).line());
-        assert!(bar(100).line().contains("nexmesh:Nexmesh-dev"), "{}", bar(100).line());
+        assert!(!bar(80).line().contains("via "), "the adopted pane goes first");
+        assert!(!bar(60).line().contains("on machine-b"), "then the machine: {}", bar(60).line());
+        assert!(bar(80).line().contains("Ctrl-] detach"), "{}", bar(80).line());
+        assert!(bar(80).line().contains("nexmesh:Nexmesh-dev"), "{}", bar(80).line());
     }
 
     #[test]
@@ -2674,12 +2748,20 @@ mod bar_shapes {
             )
             .unwrap();
             b.keys = vec![
-                ("Ctrl-\\".into(), "aloud".into()),
-                ("Ctrl-_".into(), "read".into()),
-                ("Ctrl-^".into(), "say it".into()),
+                ("Ctrl-\\".into(), "commands".into()),
                 ("Ctrl-]".into(), "detach".into()),
             ];
+            b.menu = vec![
+                ("d".into(), "detach".into()),
+                ("v".into(), "say it".into()),
+                ("r".into(), "read".into()),
+                ("a".into(), "aloud".into()),
+            ];
             println!("{cols:>4} |{}|", b.line());
+            b.command = true;
+            println!("{cols:>4} *|{}|", b.line());
+            assert!(b.line().chars().count() <= cols as usize);
+            b.command = false;
             assert!(b.line().chars().count() <= cols as usize);
         }
     }

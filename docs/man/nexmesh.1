@@ -306,31 +306,42 @@ needs a player
 .BR mpg123 )
 and a teammate advertising
 .BR tts .
-With neither, the key says so rather than doing nothing. The same two work
-inside an attached terminal:
-.B Ctrl-^
-records and types the words into the agent's prompt \(em never submitting
-them, since Enter stays yours \(em and
-.B Ctrl-_
-reads the agent's last REPLY back \(em everything it printed since you last
-pressed Enter. Pressed again while it is talking it stops; pressed again
-after that it reads the reply before, and so on back through the
-conversation, which is how a reply is chosen without a mouse. Anything the
-agent prints puts the cursor back at the newest.
-.B Ctrl-\e
-turns on reading every new reply as it arrives: the agent printing nothing
-for a second and a bit is where one reply ends.
+With neither, the key says so rather than doing nothing.
 .PP
-All three are configurable, because
-.B Ctrl-^
-is Ctrl+Shift+6 on a US layout and awkward or impossible on others. In
+In an attached terminal the same two things are reached through a mode,
+because every other key on that keyboard belongs to the agent.
+.B Ctrl-\e\e
+turns COMMAND MODE on and off. While it is on the bottom row changes colour,
+nothing reaches the agent, and single letters do the work:
+.B d
+detaches,
+.B v
+records a sentence for the fleet to transcribe into the prompt,
+.B r
+reads the agent's last REPLY aloud \(em everything it printed since you last
+pressed Enter \(em and again walks further back through the conversation, or
+stops it if it is talking,
+.B a
+reads every new reply as it arrives,
+.B ?
+lists them, and
+.B q
+or Escape leaves.
+.PP
+Only those two keys are taken. Everything else belongs to the agent, which
+is the point: a CLI inside an attach uses Ctrl-A, Ctrl-R and Ctrl-W, and a
+viewer that quietly eats three control characters breaks somebody's editor.
+.PP
+.B Ctrl-[
+is deliberately NOT the mode key: it IS Escape, and binding it would break
+every arrow key and every full-screen program inside the attach. It is
+refused if configured. Both keys can be changed in
 .IR ~/.nexmesh/console.toml :
 .PP
 .RS
 .nf
-dictate_key = "ctrl-g"
-speak_key   = "ctrl-t"
-aloud_key   = "ctrl-\e\e"
+command_key = "ctrl-g"
+detach_key  = "ctrl-]"
 .fi
 .RE
 .PP

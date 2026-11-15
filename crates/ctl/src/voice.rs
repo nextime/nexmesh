@@ -31,28 +31,69 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// Which keys drive the voice inside an attached terminal.
+/// The two keys an attach keeps for itself.
 ///
-/// Control characters, because an attach forwards everything else to the
-/// agent -- and configurable, because `Ctrl-^` is Ctrl+Shift+6 on a US
-/// layout and awkward or impossible on several others. Read from
-/// `~/.nexmesh/console.toml`:
+/// Everything else goes to the agent, which is the point: a CLI inside an
+/// attach uses Ctrl-A, Ctrl-R, Ctrl-W and most of the rest, and a viewer
+/// that quietly eats three of them is a viewer that breaks somebody's
+/// editor. So there is a COMMAND MODE -- one key in, one key out -- and
+/// inside it plain letters do the work.
+///
+/// `Ctrl-[` would have been the obvious partner for `Ctrl-]`, and is the one
+/// key that absolutely cannot be used: it IS Escape. Taking it would break
+/// every arrow key and every TUI inside the attach. `Ctrl-\` is its
+/// neighbour, is almost never bound by a terminal program, and is what a
+/// shell would otherwise turn into SIGQUIT -- which an attach does not pass
+/// on anyway.
+///
+/// Both are configurable, from `~/.nexmesh/console.toml`:
 ///
 /// ```toml
-/// dictate_key = "ctrl-^"     # or f9, ctrl-g, ...
-/// speak_key   = "ctrl-_"     # read back, or stop
-/// aloud_key   = "ctrl-\\"    # read everything the agent prints
+/// command_key = "ctrl-\\"   # into and out of command mode
+/// detach_key  = "ctrl-]"    # always, in either mode
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keys {
-    pub dictate: u8,
-    pub speak: u8,
-    pub aloud: u8,
+    pub command: u8,
+    pub detach: u8,
 }
 
 impl Default for Keys {
     fn default() -> Self {
-        Keys { dictate: 0x1e, speak: 0x1f, aloud: 0x1c }
+        Keys { command: 0x1c, detach: 0x1d }
+    }
+}
+
+/// What a letter does once command mode is on. Letters, not control
+/// characters: nothing here is forwarded while the mode is on, so they cost
+/// the agent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    /// Record, then transcribe into the agent's prompt.
+    Dictate,
+    /// Read a reply back; again walks further back; again while talking stops.
+    Read,
+    /// Read every new reply as it arrives.
+    Aloud,
+    /// Leave, as `d` rather than reaching for the other key.
+    Detach,
+    /// Say what the letters are.
+    Help,
+    /// Leave command mode.
+    Leave,
+}
+
+/// A key pressed while command mode is on.
+pub fn command_for(b: u8) -> Option<Act> {
+    match b {
+        b'v' | b'V' => Some(Act::Dictate),
+        b'r' | b'R' => Some(Act::Read),
+        b'a' | b'A' => Some(Act::Aloud),
+        b'd' | b'D' => Some(Act::Detach),
+        b'?' | b'h' => Some(Act::Help),
+        // Escape leaves, which is what Escape means everywhere else.
+        0x1b | b'q' => Some(Act::Leave),
+        _ => None,
     }
 }
 
@@ -60,8 +101,8 @@ impl Default for Keys {
 pub fn key_byte(spec: &str) -> Option<u8> {
     let s = spec.trim().to_lowercase();
     // `^` alone is a key; `^]` is a key with a prefix. A letter on its own is
-    // NOT: `dictate_key = "x"` meaning Ctrl-X would be a surprise, and a
-    // plain letter cannot be a key here anyway, since an attach forwards
+    // NOT: `command_key = "x"` meaning Ctrl-X would be a surprise, and a
+    // plain letter cannot be one of these anyway, since an attach forwards
     // every printable byte to the agent.
     let (s, prefixed) = match s.strip_prefix("ctrl-") {
         Some(rest) => (rest.to_string(), true),
@@ -98,7 +139,7 @@ pub fn key_byte(spec: &str) -> Option<u8> {
 pub fn key_name(b: u8) -> String {
     match b {
         0x00 => "Ctrl-@".into(),
-        0x1b => "Ctrl-[".into(),
+        0x1b => "Esc".into(),
         0x1c => "Ctrl-\\".into(),
         0x1d => "Ctrl-]".into(),
         0x1e => "Ctrl-^".into(),
@@ -108,20 +149,28 @@ pub fn key_name(b: u8) -> String {
     }
 }
 
-/// Read the three keys from the console's own preferences file.
+/// Read the keys from the console's own preferences file.
+///
+/// Escape is refused outright: `command_key = "ctrl-["` is the one setting
+/// that would take Escape away from every program inside the attach, and
+/// somebody will try it because `Ctrl-[` looks like the partner of
+/// `Ctrl-]`.
 pub fn keys_from(toml_text: &str) -> Keys {
     let mut k = Keys::default();
     for line in toml_text.lines() {
         let line = line.trim();
         let Some((name, value)) = line.split_once('=') else { continue };
         let value = value.trim().trim_matches('"').trim_matches('\'');
-        let Some(b) = key_byte(value) else { continue };
+        let Some(b) = key_byte(value).filter(|b| *b != 0x1b) else { continue };
         match name.trim() {
-            "dictate_key" => k.dictate = b,
-            "speak_key" => k.speak = b,
-            "aloud_key" => k.aloud = b,
+            "command_key" => k.command = b,
+            "detach_key" => k.detach = b,
             _ => {}
         }
+    }
+    // Two keys that are the same key is one key and a puzzle.
+    if k.command == k.detach {
+        k.command = Keys::default().command;
     }
     k
 }
@@ -667,11 +716,41 @@ mod tests {
 
     #[test]
     fn the_keys_come_from_the_console_preferences() {
-        let k = keys_from("# nexmesh console\ntheme = \"deck\"\ndictate_key = \"ctrl-g\"\n");
-        assert_eq!(k.dictate, 7, "the one that was set");
-        assert_eq!(k.speak, Keys::default().speak, "and the others keep their defaults");
+        let k = keys_from("# nexmesh console\ntheme = \"deck\"\ncommand_key = \"ctrl-g\"\n");
+        assert_eq!(k.command, 7, "the one that was set");
+        assert_eq!(k.detach, Keys::default().detach, "and the other keeps its default");
         assert_eq!(key_name(7), "Ctrl-G");
-        assert_eq!(key_name(0x1e), "Ctrl-^");
+        assert_eq!(key_name(0x1c), "Ctrl-\\");
+    }
+
+    #[test]
+    fn escape_cannot_be_taken_however_it_is_asked_for() {
+        // `ctrl-[` IS Escape. Binding it would break every arrow key and
+        // every TUI inside the attach -- and it looks like the obvious
+        // partner for `ctrl-]`, so somebody will try.
+        let k = keys_from("command_key = \"ctrl-[\"\n");
+        assert_eq!(k.command, Keys::default().command, "{k:?}");
+        let k = keys_from("command_key = \"0x1b\"\n");
+        assert_eq!(k.command, Keys::default().command, "{k:?}");
+        // And two keys that are the same key is one key and a puzzle.
+        let k = keys_from("command_key = \"ctrl-]\"\n");
+        assert_eq!(k.command, Keys::default().command);
+        assert_ne!(k.command, k.detach);
+    }
+
+    #[test]
+    fn command_mode_letters_are_the_ones_the_row_advertises() {
+        assert_eq!(command_for(b'v'), Some(Act::Dictate));
+        assert_eq!(command_for(b'r'), Some(Act::Read));
+        assert_eq!(command_for(b'a'), Some(Act::Aloud));
+        assert_eq!(command_for(b'd'), Some(Act::Detach));
+        assert_eq!(command_for(b'?'), Some(Act::Help));
+        // Escape leaves, which is what Escape means everywhere else.
+        assert_eq!(command_for(0x1b), Some(Act::Leave));
+        assert_eq!(command_for(b'q'), Some(Act::Leave));
+        // Anything else does nothing AND is not forwarded: a letter pressed
+        // in command mode was meant for a command.
+        assert_eq!(command_for(b'z'), None);
     }
 
     #[test]

@@ -116,8 +116,11 @@ capability bridge does — then the microphone works everywhere the chat does:
 in the browser, in the installed app on a phone, and in the console (`v` to
 say it, `V` to have new messages read aloud). It works inside an attached
 terminal too, which is the only comfortable way to put a sentence into an
-agent's prompt one-handed: `Ctrl-^` types what you said, `Ctrl-_` reads back
-what the agent printed. Nothing is submitted for you — Enter stays yours.
+agent's prompt one-handed. There it lives behind a mode rather than taking
+keys the agent needs: `Ctrl-\` turns command mode on — the bottom row changes
+colour — and then `v` dictates, `r` reads the last reply aloud, `a` reads
+every new one, `d` detaches. Nothing is submitted for you: Enter stays
+yours.
 
 ### A dashboard that is also an app
 
