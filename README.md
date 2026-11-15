@@ -201,31 +201,46 @@ instead of something to scroll sideways.
 
 ![The fleet as a room, walked through](docs/images/xr-tour.gif)
 
-On a Quest the dashboard is a window you can leave floating over whatever
-else is running, which is the useful thing most of the time: BigscreenVR or
-Demeo in front of you, the fleet off to one side. It is the same PWA, so it
-installs and behaves the same way.
+In a headset the dashboard is a window you can leave floating over whatever
+else is running, which is the useful thing most of the time: a game or a
+workspace in front of you, the fleet off to one side. It is the same PWA, so
+it installs and behaves the same way.
 
-`/xr` is the other mode. The team stands in the room with you, one arc per
-session, each teammate a shape that says which CLI it is and a colour that
-says what it is doing: a green octahedron is Claude working, an amber sphere
-is opencode waiting for review, a ring is the capability bridge, which is not
-a CLI at all. Point at one to select it, or say its name.
+`/xr` is the other mode. The team stands in the room with you as figures,
+one arc per session, and every part of a figure says something: the badge
+turning over its head is which CLI it is, the body colour is what it is
+doing, the shoulder band is its role, and what it holds is that role as an
+object -- a reviewer carries a lens, an architect a rod, the capability
+bridge a ring, because it is not a CLI at all. An agent that is working
+moves; one that is idle breathes.
+
+![The team, standing in a room](docs/images/xr-team.png)
+
+**Click a teammate and their terminal opens**, at reading distance, in front
+of them, refreshing as they work. Two more things float in the room rather
+than hiding behind a key: the chat, and a menu of what the flat dashboard
+can do -- switch view, open a terminal, pause or start a seat, speak.
 
 | | |
 |---|---|
-| ![The team, standing in a room](docs/images/xr-team.png) | ![The code graph, from inside](docs/images/xr-graph.png) |
+| ![A teammate's terminal, open in the room](docs/images/xr-team-selected.png) | ![The chat, a terminal and the menu](docs/images/xr-panels.png) |
 
-The code graph becomes a thing with a far side: subsystems placed on a
-sphere, sized by what is in them, with the dependencies drawn between them.
-Solid edges are facts read off the tree and thin ones are guesses, the same
-distinction the flat graph makes. Pointing at a subsystem picks out its own
-edges.
+The code graph becomes a thing with a far side. Subsystems are placed on a
+sphere and carry three channels at once: **size** is how much is in them,
+**shape** is what they are mostly made of (functions, types, traits, files),
+and **colour** is where they live in the tree, so one crate is one colour.
+The dependencies are drawn between them, solid for facts read off the tree
+and thin for guesses, and pointing at a subsystem picks out its own edges.
+Grab one and it follows your hand.
+
+![The code graph, from inside](docs/images/xr-graph.png)
 
 Speech is the input that suits a headset, since there is no keyboard: the
 trigger on empty space starts listening, and what you say is either a command
 ("the code graph"), a name ("Iris"), or a sentence, which goes to whoever is
-selected or to the team.
+selected or to the team. Your own hands are drawn where the headset says they
+are, and grabbing empty space pulls the room past you, which is how you cross
+a map without walking into a wall.
 
 Written against WebGL2 and WebXR directly, with no 3D library, for the same
 reason the dashboard has no CDN: a hub on a network with no route to the

@@ -741,13 +741,22 @@ fn chat(f: &mut Frame, area: Rect, app: &App) {
         .rows("messages")
         .into_iter()
         .filter(|m| app.in_channel(m))
+        // Talking to one teammate shows what passed between the two of you
+        // and nothing else. The same log, read narrowly.
+        .filter(|m| match &app.with_them {
+            None => true,
+            Some(who) => s(m, "from") == *who || s(m, "to") == *who,
+        })
         .collect();
 
-    let name = chans
-        .iter()
-        .find(|(id, _)| *id == app.chan)
-        .map(|(_, l)| l.clone())
-        .unwrap_or_else(|| "#all".into());
+    let name = match &app.with_them {
+        Some(who) => format!("@{who}"),
+        None => chans
+            .iter()
+            .find(|(id, _)| *id == app.chan)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| "#all".into()),
+    };
     let feed = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
@@ -1216,9 +1225,19 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 Style::default().fg(th.faint()),
             )));
+            out.push(Line::from(Span::styled(
+                match &app.with_them {
+                    Some(w) => format!(" talking to {w} alone \u{2014} Enter: back to the room"),
+                    None => " \u{2191}\u{2193} a name \u{00b7} Enter talks to it \u{00b7} a attaches"
+                        .to_string(),
+                },
+                Style::default().fg(th.second()),
+            )));
             out.push(Line::from(""));
-            for a in here {
+            let picked = app.roster.min(here.len().saturating_sub(1));
+            for (ri, a) in here.into_iter().enumerate() {
                 let name = s(&a, "name");
+                let on = ri == picked;
                 out.push(Line::from(vec![
                     Span::styled(
                         if present(&a) { " \u{25cf} " } else { " \u{25cb} " },
@@ -1228,7 +1247,14 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
                             th.faint()
                         }),
                     ),
-                    Span::styled(clip(&name, 16), Style::default().fg(th.nick(&name))),
+                    Span::styled(
+                        clip(&name, 16),
+                        if on {
+                            Style::default().fg(th.nick(&name)).add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default().fg(th.nick(&name))
+                        },
+                    ),
                     Span::styled(
                         format!(" {}", clip(&s(&a, "session"), 14)),
                         Style::default().fg(th.dim()),
@@ -1319,7 +1345,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     let keys = match app.pane {
-        Pane::Chat => " j/k channel · i type · /help · v say it · P camera · o open a link · ? help",
+        Pane::Chat => " j/k channel · ↑↓ a name · Enter talks to it · a attach · i type · v say · ? help",
         Pane::Graph => " 1-8 panes · j/k subsystem · w workspace · p panel · t theme · ? help · q quit",
         Pane::Agents => " a attach · n new · S start · m move · e rename · x remove · P camera · , . sort · ? help",
         Pane::Memory => " j/k move · Enter opens it · PgDn scrolls · s scope · ? help · q quit",
@@ -1371,6 +1397,8 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         row("V", "read new messages aloud, if the fleet has a voice"),
         row("o", "open the newest link on screen in a browser"),
         row("[ / ]", "previous / next channel"),
+        row("Enter", "in chat: talk to the name under the cursor, alone"),
+        row("a", "in chat: attach to that one's terminal"),
         row("w", "next workspace, in the graph"),
         row("s", "change what the poll covers"),
         row("p", "show or hide the detail panel"),

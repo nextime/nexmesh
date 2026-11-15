@@ -224,17 +224,25 @@ def main():
 
         print("stills")
         shots = [
-            ("xr-team.png", "team", -0.55, 0.0, 1),
-            ("xr-team-selected.png", "team", 0.35, -0.04, 2),
-            ("xr-graph.png", "graph", 0.5, 0.05, 4),
+            # The room, nothing open: who is on the team and what they are.
+            ("xr-team.png", "team", -0.5, 0.0, 1, "a.panels = []; a.select(list[1], false);"),
+            # A teammate's screen, open in front of them.
+            ("xr-team-selected.png", "team", 0.12, -0.03, 2,
+             "a.panels = []; a.select(list[2]);"),
+            # Everything else, as things in the room.
+            ("xr-panels.png", "team", -0.25, -0.02, 2,
+             "a.select(list[2]); a.openMenu(); a.openChat();"),
+            # The map, from inside it.
+            ("xr-graph.png", "graph", 0.45, 0.04, 3,
+             "a.panels = []; a.select(list[3 % list.length], false);"),
         ]
-        for name, mode, yaw, pitch, pick in shots:
+        for name, mode, yaw, pitch, pick, act in shots:
             cdp.js(f"""(() => {{
               const a = window.nexmeshXR;
               a.setMode("{mode}");
               a.cam.yaw = {yaw}; a.cam.pitch = {pitch}; a.cam.dist = 0.2;
               const list = a.scene.active().filter((o) => !o.flat);
-              a.select(list[Math.min({pick}, list.length - 1)]);
+              {act}
               a.scene.hovered = null;
               return true;
             }})()""")

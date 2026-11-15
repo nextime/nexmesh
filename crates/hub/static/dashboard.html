@@ -250,6 +250,15 @@
   .chatline:target, .chatline.mine { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   /* The picture sits under the line that announced it, in the text column,
      so the timestamp gutter stays a gutter. */
+  /* The room list: a name you can click, and a terminal beside it. */
+  .nk .nkname { cursor: pointer; }
+  .nk .nkname:hover { text-decoration: underline; }
+  .nk .nkterm {
+    margin-left: auto; padding: 0 6px; border-radius: 6px; cursor: pointer;
+    border: 1px solid #2a3040; background: transparent; color: var(--dim);
+  }
+  .nk .nkterm:hover { color: var(--fg); border-color: var(--accent); }
+  .nk.picked { background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .chatline .attach { grid-column: 3; margin: 4px 0 2px; }
   .chatline .attach img.shot {
     max-width: min(320px, 100%); max-height: 200px; width: auto; height: auto;
@@ -2360,7 +2369,7 @@ function renderChat(d) {
      <div class="nk tiny muted" style="padding:3px 10px">operator</div>`;
 
   // The room.
-  const msgs = chatMessages(d);
+  const msgs = chatMessages(d).filter(withThem);
   const rows = msgs.map((m) => {
     const sys = m.kind && m.kind !== "text";
     const cls = [sys ? "sys" : "", (!m.hist && !m.claimed) ? "unclaimed" : ""]
@@ -2414,20 +2423,36 @@ function renderChat(d) {
   // to a user list.
   const agents = ((d && d.agents) || []).filter(
     (a) => chatChan === "*" || a.session === chatChan || !a.session);
+  // The room list is how you reach ONE teammate. Clicking a name opens a
+  // private channel with them -- the same log, filtered to what passed
+  // between you -- and the terminal button opens their screen. Both were
+  // reachable only from the agents tab before, which meant leaving the
+  // conversation to answer somebody in it.
   $("nickList").innerHTML = `<div class="rl">in the room</div>` + (agents.length
-    ? agents.map((a) => `<div class="nk" title="${esc(a.role || "")}">
+    ? agents.map((a) => `<div class="nk${chatWith === a.name ? " picked" : ""}"
+           title="${esc(a.role || "")} · click to talk to ${esc(a.name)} alone">
          <span class="dot ${present(a.status) ? "live" : "stale"}"></span>
-         <span style="color:${nickColor(a.name)}">${esc(a.name)}</span>
+         <span class="nkname" style="color:${nickColor(a.name)}"
+               onclick="talkTo(${JSON.stringify(a.name).replace(/"/g, "&quot;")})"
+               >${esc(a.name)}</span>
+         ${a.attach_agent_id ? `<button class="tiny nkterm" title="open ${esc(a.name)}'s terminal"
+             onclick="openTerm(${JSON.stringify(a.attach_agent_id).replace(/"/g, "&quot;")},
+                               ${JSON.stringify(a.name).replace(/"/g, "&quot;")})"
+             >⌨</button>` : ""}
          ${chatChan === "*" && a.session ? `<small>#${esc(a.session)}</small>` : ""}
        </div>`).join("")
     : `<div class="nk muted tiny">nobody</div>`);
 
-  $("chatWhere").textContent = chatChan === "*" ? "#all" : "#" + chatChan;
+  $("chatWhere").textContent = chatWith
+    ? "@" + chatWith
+    : (chatChan === "*" ? "#all" : "#" + chatChan);
   $("chatWhere").onclick = () => toggleRail();
   $("chatWhere").style.cursor = "pointer";
-  $("chatHint").textContent = chatChan === "*"
-    ? `${sessions.length} channel${sessions.length === 1 ? "" : "s"} \u00b7 recent fleet-wide`
-    : `${msgs.length} line${msgs.length === 1 ? "" : "s"}`;
+  $("chatHint").textContent = chatWith
+    ? `just you and ${chatWith} \u00b7 ${msgs.length} line${msgs.length === 1 ? "" : "s"}`
+    : (chatChan === "*"
+      ? `${sessions.length} channel${sessions.length === 1 ? "" : "s"} \u00b7 recent fleet-wide`
+      : `${msgs.length} line${msgs.length === 1 ? "" : "s"}`);
   $("chatDot").className = $("liveDot").className;
 
   // Mark what is on screen as seen, and remember it per channel so a reload
@@ -2539,6 +2564,37 @@ function renderBody(body) {
 // own version of a long press.
 let chatReply = null;      // {id, from, slot, body}
 let press = null;          // the gesture in progress
+
+// Talking to one teammate rather than to the room.
+//
+// Not a separate inbox: the same message log, shown filtered to what passed
+// between the two of you, with everything you type addressed to them. A
+// private channel that invented its own storage would be a second place to
+// look for a message.
+let chatWith = "";
+
+function talkTo(name) {
+  chatWith = (chatWith === name) ? "" : name;
+  // Their channel, if you were looking at #all: a message has to go to a
+  // session, and theirs is the one they are in.
+  if (chatWith) {
+    const a = ((snap && snap.detail && snap.detail.agents) || [])
+      .find((x) => x.name === chatWith);
+    if (a && a.session && chatChan === "*") chatChan = a.session;
+    note(`talking to ${chatWith} — click the name again to go back to the room`);
+  }
+  chatHtml = "";            // the room is a different room now
+  chatStick = true;
+  renderChat(snap && snap.detail);
+  const box = $("chatText");
+  if (box) box.focus();
+}
+
+/// Is this line part of the private conversation on screen?
+function withThem(m) {
+  if (!chatWith) return true;
+  return m.from === chatWith || m.to === chatWith;
+}
 
 function setReply(r) {
   chatReply = r;
@@ -2932,7 +2988,9 @@ async function chatSend() {
 /// inbox rather than having to notice it going past.
 async function sendChatText(raw) {
   let text = raw;
-  let to = null;
+  // A private channel addresses everything typed in it. A reply still wins,
+  // because replying to somebody else while in one is a deliberate act.
+  let to = chatWith || null;
   if (chatReply) {
     const quoted = chatReply.body.length > 140
       ? chatReply.body.slice(0, 140) + "\u2026" : chatReply.body;
@@ -2942,7 +3000,7 @@ async function sendChatText(raw) {
   }
   // "#all" is one message to each team, not a message to a channel called
   // "all": every team has its own log, and a message belongs in one.
-  const targets = chatChan === "*"
+  const targets = (chatChan === "*" && !chatWith)
     ? chatSessions().map((x) => x.id)
     : [chanId(chatChan)].filter(Boolean);
   if (!targets.length) { note("No session to send to."); return false; }

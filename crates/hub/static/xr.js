@@ -206,6 +206,126 @@ function meshData(name) {
   return new Float32Array(out);
 }
 
+// A teammate, built out of primitives: head, body, arms, legs, and the
+// things that say WHO it is.
+//
+// A room of floating shapes is a chart you are standing in. A room of
+// figures is a room: you read a crowd of people without being taught how,
+// you can tell who is facing you, and "the one on the left with the tall
+// hat" is a sentence that works. So the shapes carry meaning rather than
+// being the meaning:
+//
+//   the badge over the head   WHICH CLI -- the same shape the flat views use
+//   the body colour           WHAT IT IS DOING -- working, waiting, paused
+//   the shoulder band         ITS ROLE, by a hue derived from the word
+//   what it is holding        ITS ROLE again, as a thing: a reviewer holds
+//                             a lens, an architect a rod, a bridge a ring
+//
+// Every piece is one of six primitives with a matrix, which is why this
+// costs nothing: a figure is twelve draw calls of geometry already on the
+// card.
+function figureParts(a, t, busy) {
+  const swing = busy ? Math.sin(t * 2.2) * 0.35 : Math.sin(t * 0.7) * 0.06;
+  const breathe = Math.sin(t * (busy ? 2.0 : 0.9)) * (busy ? 0.015 : 0.008);
+  const body = colourFor(a);
+  const skin = [.78, .70, .62];
+  const dark = [body[0] * .55, body[1] * .55, body[2] * .62];
+  const band = roleColour(a.role || a.cli || "");
+  const P = [];
+  const put = (mesh, colour, m) => P.push({ mesh, colour, model: m });
+
+  // Legs, planted. A figure with no legs floats, and a floating figure
+  // reads as a ghost rather than a colleague.
+  for (const side of [-1, 1]) {
+    const lift = busy ? Math.sin(t * 2.2 + (side > 0 ? Math.PI : 0)) * 0.05 : 0;
+    put("box", dark, M4.mul(
+      M4.translate(side * 0.11, -0.52 + lift * 0.3, 0),
+      M4.scale(0.13, 0.46, 0.14)));
+    put("box", [.16, .17, .21], M4.mul(
+      M4.translate(side * 0.11, -0.74 + lift * 0.4, 0.03),
+      M4.scale(0.15, 0.08, 0.22)));
+  }
+  // Torso: a tapered stack, so it is not a filing cabinet.
+  put("box", body, M4.mul(M4.translate(0, -0.12 + breathe, 0), M4.scale(0.40, 0.44, 0.22)));
+  put("box", dark, M4.mul(M4.translate(0, -0.33, 0), M4.scale(0.34, 0.10, 0.21)));
+  // Shoulders, in the role's own colour: the band you read before the face.
+  put("box", band, M4.mul(M4.translate(0, 0.10 + breathe, 0), M4.scale(0.46, 0.09, 0.25)));
+  // Arms, swinging while there is work.
+  for (const side of [-1, 1]) {
+    const sw = swing * side;
+    put("box", body, M4.mul(
+      M4.mul(M4.translate(side * 0.26, -0.10 + breathe, sw * 0.18), M4.rotX(sw)),
+      M4.scale(0.10, 0.40, 0.11)));
+    put("sphere", skin, M4.mul(
+      M4.translate(side * 0.26, -0.30 + breathe, sw * 0.34), M4.scale(0.09, 0.09, 0.09)));
+  }
+  // Neck and head.
+  put("box", skin, M4.mul(M4.translate(0, 0.17 + breathe, 0), M4.scale(0.10, 0.07, 0.10)));
+  put("sphere", skin, M4.mul(M4.translate(0, 0.30 + breathe, 0), M4.scale(0.26, 0.29, 0.26)));
+  // A face you can tell the front from: two eyes, which is all it takes.
+  for (const side of [-1, 1]) {
+    put("sphere", [.08, .09, .12], M4.mul(
+      M4.translate(side * 0.07, 0.33 + breathe, 0.12), M4.scale(0.045, 0.05, 0.03)));
+  }
+  // The badge: which CLI this is, as the shape the flat views already use,
+  // turning slowly above the head.
+  put(shapeFor(a), band, M4.mul(
+    M4.mul(M4.translate(0, 0.60 + breathe * 2, 0), M4.rotY(t * (busy ? 1.1 : 0.4))),
+    M4.scale(0.17, 0.17, 0.17)));
+  // And the prop: the role, as a thing in the hand.
+  const prop = propFor(a);
+  if (prop) {
+    put(prop.mesh, prop.colour, M4.mul(
+      M4.mul(M4.translate(0.30, -0.26 + breathe, 0.16 + swing * 0.3), M4.rotX(prop.tilt || 0)),
+      M4.scale(prop.size[0], prop.size[1], prop.size[2])));
+  }
+  return P;
+}
+
+// A role's own colour. Free-form strings, so it is a hash rather than a
+// table: two agents with the same role always match, and nobody has to
+// register a role before using one.
+function roleColour(role) {
+  const r = role.toLowerCase();
+  if (/review|qa|test/.test(r)) return [.95, .72, .30];
+  if (/architect|design|lead/.test(r)) return [.68, .55, .95];
+  if (/engineer|dev|build/.test(r)) return [.35, .72, .92];
+  if (/doc|writer|archiv/.test(r)) return [.55, .85, .62];
+  if (/bridge|capab|ocr|voice/.test(r)) return [.95, .55, .70];
+  let h = 0;
+  for (let i = 0; i < r.length; i++) h = (h * 31 + r.charCodeAt(i)) >>> 0;
+  const hue = (h % 360) / 360;
+  // A cheap HSL->RGB at fixed saturation and lightness, which is all that
+  // is wanted: distinct, and never black or white.
+  const f = (n) => {
+    const k = (n + hue * 12) % 12;
+    return 0.62 - 0.26 * Math.max(-1, Math.min(Math.min(k - 3, 9 - k), 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+// What the role is, as an object held in the hand.
+function propFor(a) {
+  const r = (a.role || "").toLowerCase();
+  const band = roleColour(a.role || a.cli || "");
+  if (/review|qa|test/.test(r)) {
+    return { mesh: "ring", colour: [.95, .80, .45], size: [0.17, 0.5, 0.17], tilt: 1.57 };
+  }
+  if (/architect|design|lead/.test(r)) {
+    return { mesh: "box", colour: [.72, .62, .98], size: [0.035, 0.52, 0.035] };
+  }
+  if (/doc|writer|archiv/.test(r)) {
+    return { mesh: "box", colour: [.90, .90, .84], size: [0.22, 0.28, 0.02], tilt: 0.3 };
+  }
+  if (a.provenance === "external" || /bridge|capab/.test(r)) {
+    return { mesh: "ring", colour: [.95, .60, .75], size: [0.22, 0.4, 0.22], tilt: 1.57 };
+  }
+  if (/engineer|dev|build/.test(r)) {
+    return { mesh: "box", colour: [.60, .66, .74], size: [0.07, 0.30, 0.07], tilt: 0.25 };
+  }
+  return { mesh: "box", colour: band, size: [0.05, 0.22, 0.05] };
+}
+
 // Which shape stands for which CLI. A room of identical boxes tells you
 // nothing; this is the difference between "four agents" and "claude, codex,
 // opencode and the bridge".
@@ -523,9 +643,11 @@ class Scene {
         this.nodes.push({
           kind: "agent",
           data: a,
-          // Every other one a little higher, so two names side by side are
-          // never on the same line.
-          pos: [x, (i % 2 ? 0.16 : -0.04) - si * 0.05, z],
+          // On the floor, which is where a person stands. The arc itself
+          // staggers slightly so two names side by side never collide.
+          // The floor is at -1.42 and a figure is about 0.82 tall from its
+          // own origin down to the soles, so this is standing on it.
+          pos: [x, -0.87, z + (i % 2 ? 0.0 : -0.22)],
           size: 0.34,
           mesh: shapeFor(a),
           colour: colourFor(a),
@@ -569,18 +691,27 @@ class Scene {
       const y = 1 - (i / Math.max(n - 1, 1)) * 2;
       const r = Math.sqrt(Math.max(0, 1 - y * y));
       const th = golden * i;
-      const size = Math.min(.5, .14 + Math.log2((s.members || 1) + 1) * .06);
+      // Three things, three channels, so the map answers three questions
+      // at a glance rather than one:
+      //   SIZE   how much is in it
+      //   SHAPE  what KIND of thing it mostly is -- functions, types,
+      //          files -- which is the difference between a module of
+      //          behaviour and a module of definitions
+      //   COLOUR where it lives in the tree, so one crate is one colour
+      const members = Array.isArray(s.members) ? s.members : [];
+      const count = s.n || members.length || 1;
+      const size = Math.min(.46, .13 + Math.log2(count + 1) * .055);
       this.graph.push({
         kind: "subsystem",
         data: s,
         pos: [Math.cos(th) * r * 1.7, y * 1.05 + 0.25, Math.sin(th) * r * 1.7 - 2.1],
         size,
-        mesh: "sphere",
-        colour: [.42, .55, .85],
+        mesh: subsystemShape(members),
+        colour: pathColour(s.path || ""),
         spin: 0.05,
         bob: 0,
-        label: s.name || `subsystem ${i}`,
-        sub: `${s.members || 0} symbol(s)`,
+        label: subsystemLabel(s, i),
+        sub: `${count} symbol(s)` + (s.path ? `  ${s.path}` : ""),
       });
     });
     // What depends on what. A cloud of spheres is not a graph; the lines
@@ -649,25 +780,43 @@ class Scene {
         // distance, and in a headset "which one did I just point at" has to
         // be answerable without reading anything.
         const pulse = 1 + Math.sin(now * 0.004) * 0.05;
+        const foot = o.kind === "agent" ? o.pos[1] - o.size * 2.0 * 0.80
+                                        : o.pos[1] + bob - o.size - 0.06;
         const ring = M4.mul(
-          M4.translate(o.pos[0], o.pos[1] + bob - o.size - 0.06, o.pos[2]),
-          M4.scale(o.size * 2.5 * pulse, 0.12, o.size * 2.5 * pulse));
+          M4.translate(o.pos[0], foot, o.pos[2]),
+          M4.scale(o.size * 2.6 * pulse, 0.10, o.size * 2.6 * pulse));
         r.draw("ring", ring, o === this.selected ? [.55, .85, 1] : [.4, .5, .62],
                o === this.selected ? .45 : .15, proj, view);
       }
-      r.draw(o.mesh, model, o.colour, glow, proj, view);
+      if (o.kind === "agent") {
+        // A figure stands on the floor and faces you. Everything about it
+        // is in `figureParts`; here it is only placed and turned.
+        const face = Math.atan2(eye[0] - o.pos[0], eye[2] - o.pos[2]);
+        const stand = M4.mul(
+          M4.mul(M4.translate(o.pos[0], o.pos[1] + bob, o.pos[2]), M4.rotY(face)),
+          M4.scale(s * 2.0, s * 2.0, s * 2.0));
+        for (const part of figureParts(o.data, now * 0.001, o.data.task_state === "working")) {
+          const c = glow ? part.colour.map((v) => Math.min(1, v + glow * 0.35)) : part.colour;
+          r.draw(part.mesh, M4.mul(stand, part.model), c, glow * 0.5, proj, view);
+        }
+      } else {
+        r.draw(o.mesh, model, o.colour, glow, proj, view);
+      }
 
       // The name, always facing you. A label you have to walk round is not
       // a label.
       const lab = this.labelFor(o.label, { size: 46 });
       const h = (this.mode === "graph" ? 0.115 : 0.155), w = h * lab.aspect;
-      const lp = [o.pos[0], o.pos[1] + bob + o.size + 0.24, o.pos[2]];
+      const top = o.kind === "agent" ? o.size * 2.0 * 0.78 : o.size;
+      const lp = [o.pos[0], o.pos[1] + bob + top + 0.24, o.pos[2]];
       r.drawLabel(lab, M4.mul(billboard(lp, eye), M4.scale(w, h, 1)), proj, view, 1);
 
       if (o.sub && (o === this.selected || o === this.hovered)) {
         const sub = this.labelFor(o.sub, { size: 34, key: "sub:" + o.sub, fg: "#9fb0c8" });
         const sh = 0.095, sw = sh * sub.aspect;
-        const sp = [o.pos[0], o.pos[1] + bob - o.size - 0.16, o.pos[2]];
+        const sp = [o.pos[0], o.pos[1] + bob +
+                    (o.kind === "agent" ? o.size * 2.0 * 0.82 + 0.10 : -o.size - 0.16),
+                    o.pos[2]];
         r.drawLabel(sub, M4.mul(billboard(sp, eye), M4.scale(sw, sh, 1)), proj, view, .95);
       }
     }
@@ -699,11 +848,206 @@ Scene.prototype.renderLinks = function (proj, view) {
   }
 };
 
+// What a subsystem is mostly MADE of, as a shape.
+//
+// A map of identical spheres says only how big things are. Shape is free
+// and carries the one other thing worth knowing before you go in: a
+// subsystem of functions behaves, a subsystem of types defines, a subsystem
+// of files is a directory somebody grouped.
+function subsystemShape(members) {
+  const tally = {};
+  for (const m of members) {
+    const k = (m.kind || "").toLowerCase();
+    tally[k] = (tally[k] || 0) + 1;
+  }
+  const top = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
+  const kind = top ? top[0] : "";
+  if (/fn|func|method/.test(kind)) return "sphere";
+  if (/struct|class|type|enum|interface/.test(kind)) return "box";
+  if (/trait|protocol|impl/.test(kind)) return "octa";
+  if (/file|module|mod/.test(kind)) return "cyl";
+  if (/const|static|var/.test(kind)) return "tetra";
+  return "icosa";
+}
+
+// Where it lives in the tree, as a colour. One crate, one hue: the eye
+// groups by colour long before it reads a label, so a map coloured this
+// way has its crates already separated.
+function pathColour(path) {
+  const parts = String(path).split("/").filter(Boolean);
+  // The first segment that is not scaffolding. `crates/hub/src/api.rs` is
+  // hub, not crates.
+  const key = parts.find((p) => !["src", "crates", "lib", "pkg", "app"].includes(p)) ||
+              parts[0] || "";
+  if (!key) return [.42, .55, .85];
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 33 + key.charCodeAt(i)) >>> 0;
+  const hue = (h % 360) / 360;
+  const f = (n) => {
+    const k = (n + hue * 12) % 12;
+    return 0.60 - 0.28 * Math.max(-1, Math.min(Math.min(k - 3, 9 - k), 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+// The name a subsystem goes by: the file most of it lives in, which beats
+// the alphabetically first function in it.
+function subsystemLabel(s, i) {
+  if (s.name) return s.name;
+  if (s.path) {
+    const parts = String(s.path).split("/").filter(Boolean);
+    return parts.slice(-1)[0] || s.path;
+  }
+  const m = (Array.isArray(s.members) ? s.members : [])[0];
+  if (m && m.name) return m.name.length > 20 ? m.name.slice(0, 19) + "\u2026" : m.name;
+  return `subsystem ${s.id !== undefined ? s.id : i}`;
+}
+
 // A quad that faces the eye, turning only about Y so text never tilts.
 function billboard(pos, eye) {
   const d = V3.sub(eye, pos);
   const ang = Math.atan2(d[0], d[2]);
   return M4.mul(M4.translate(pos[0], pos[1], pos[2]), M4.rotY(ang));
+}
+
+// ----------------------------------------------------------------- panels --
+// A screen in the room: a terminal, the chat, a menu of the things the flat
+// dashboard can do.
+//
+// Everything a headset needs to SHOW is text, and text is a thing a 2D
+// canvas is already excellent at. So a panel is one textured quad whose
+// canvas is redrawn when its content changes, and a ray against its plane
+// gives the row under the pointer, which is how a line becomes a button.
+class Panel {
+  constructor(gl, opts) {
+    this.gl = gl;
+    this.kind = opts.kind || "text";
+    this.title = opts.title || "";
+    this.lines = opts.lines || [];
+    this.buttons = opts.buttons || [];
+    this.pos = opts.pos || [0, 0, -1.6];
+    this.yaw = opts.yaw || 0;
+    this.w = opts.w || 1.1;
+    this.h = opts.h || 0.72;
+    this.cols = opts.cols || 54;
+    this.rows = opts.rows || 18;
+    this.tex = null;
+    this.dirty = true;
+    this.row = -1;              // the row the pointer is on
+  }
+
+  set(lines) {
+    const next = lines.slice(-this.rows);
+    if (next.join("\n") !== this.lines.join("\n")) {
+      this.lines = next;
+      this.dirty = true;
+    }
+  }
+
+  // The canvas, and the texture made from it. Drawn at a size that keeps
+  // monospace text crisp at arm's length: a blurry terminal is not one.
+  redraw() {
+    const gl = this.gl;
+    const cell = 22;
+    const padX = 18, padTop = 46, padBottom = 14;
+    const c = document.createElement("canvas");
+    c.width = this.cols * (cell * 0.6) + padX * 2;
+    c.height = this.rows * cell + padTop + padBottom;
+    const x = c.getContext("2d");
+    x.fillStyle = "rgba(9,11,16,0.94)";
+    x.fillRect(0, 0, c.width, c.height);
+    x.strokeStyle = "rgba(90,130,200,0.55)";
+    x.lineWidth = 3;
+    x.strokeRect(1.5, 1.5, c.width - 3, c.height - 3);
+    // A title bar, so a panel says what it is without being read.
+    x.fillStyle = "rgba(40,70,120,0.75)";
+    x.fillRect(3, 3, c.width - 6, 34);
+    x.fillStyle = "#dceaff";
+    x.font = `600 23px ui-monospace, "DejaVu Sans Mono", monospace`;
+    x.textBaseline = "top";
+    x.fillText(this.title, padX, 8);
+    x.font = `400 ${cell - 4}px ui-monospace, "DejaVu Sans Mono", monospace`;
+    const rows = this.buttons.length ? this.buttons.map((b) => b.label) : this.lines;
+    rows.forEach((line, i) => {
+      const y = padTop + i * cell;
+      if (this.buttons.length) {
+        const on = i === this.row;
+        x.fillStyle = on ? "rgba(70,130,210,0.55)" : "rgba(255,255,255,0.04)";
+        x.fillRect(padX - 8, y - 2, c.width - padX * 2 + 16, cell - 2);
+        x.fillStyle = on ? "#ffffff" : "#cfe0f5";
+      } else {
+        x.fillStyle = "#b9c8dd";
+      }
+      x.fillText(String(line).slice(0, this.cols), padX, y);
+    });
+    if (this.tex) gl.deleteTexture(this.tex);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.tex = tex;
+    this.aspect = c.width / c.height;
+    this.dirty = false;
+  }
+
+  model() {
+    return M4.mul(
+      M4.mul(M4.translate(this.pos[0], this.pos[1], this.pos[2]), M4.rotY(this.yaw)),
+      M4.scale(this.w, this.h, 1));
+  }
+
+  // Where a ray crosses this panel, in its own 0..1 coordinates.
+  cross(origin, dir) {
+    const n = M4.dir(M4.rotY(this.yaw), [0, 0, 1]);
+    const denom = V3.dot(n, dir);
+    if (Math.abs(denom) < 1e-5) return null;
+    const t = V3.dot(V3.sub(this.pos, origin), n) / denom;
+    if (t < 0) return null;
+    const p = V3.add(origin, V3.mul(dir, t));
+    const local = V3.sub(p, this.pos);
+    const right = M4.dir(M4.rotY(this.yaw), [1, 0, 0]);
+    const u = V3.dot(local, right) / this.w + 0.5;
+    const v = 0.5 - local[1] / this.h;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+    return { t, u, v };
+  }
+}
+
+// ------------------------------------------------------------------ hands --
+// Your own hands, drawn where the headset says they are.
+//
+// A pair of hands is what makes a room a place you are IN rather than a
+// film you are watching: they tell you where you are reaching, they show
+// the moment a grab takes hold, and without them a ray appears out of
+// nothing. Controllers and hand-tracking both report a grip pose, so both
+// get the same pair.
+function handParts(pinch, grabbing) {
+  const P = [];
+  const skin = grabbing ? [.95, .72, .45] : [.78, .70, .62];
+  const put = (mesh, colour, m) => P.push({ mesh, colour, model: m });
+  // Palm.
+  put("box", skin, M4.mul(M4.translate(0, 0, 0.02), M4.scale(0.085, 0.030, 0.105)));
+  // Four fingers, curling as the hand closes.
+  for (let i = 0; i < 4; i++) {
+    const x = -0.030 + i * 0.020;
+    const curl = pinch * 0.9;
+    put("box", skin, M4.mul(
+      M4.mul(M4.translate(x, -0.004 - curl * 0.020, -0.050 - (1 - curl) * 0.020),
+             M4.rotX(-curl * 1.1)),
+      M4.scale(0.017, 0.017, 0.062)));
+  }
+  // Thumb, which is what a pinch looks like from the outside.
+  put("box", skin, M4.mul(
+    M4.mul(M4.translate(0.050, 0.004, 0.010), M4.rotY(-0.6 + pinch * 0.5)),
+    M4.scale(0.020, 0.018, 0.055)));
+  // A cuff, so the hand ends somewhere.
+  put("cyl", grabbing ? [.35, .65, .95] : [.22, .26, .34], M4.mul(
+    M4.mul(M4.translate(0, 0, 0.085), M4.rotX(1.5708)), M4.scale(0.17, 0.09, 0.17)));
+  return P;
 }
 
 // -------------------------------------------------------------------- app --
@@ -733,6 +1077,10 @@ async function api(path, body) {
 // Deliberately not real hostnames -- machine-a, machine-b, like every other
 // example in this repository.
 function demoSnapshot() {
+  const sub = (name, path, n, kind) => ({
+    name, path, n,
+    members: Array.from({ length: Math.min(n, 6) }, (_, i) => ({ name: `${name}_${i}`, kind })),
+  });
   const mk = (name, cli, role, state, host, session) =>
     ({ name, cli, role, task_state: state, status: "running", host, session,
        provenance: "managed", paused: false });
@@ -749,11 +1097,16 @@ function demoSnapshot() {
         provenance: "external", paused: false },
     ],
     graph: [{ subsystems: [
-      { name: "auth", members: 34 }, { name: "wire", members: 51 },
-      { name: "storage", members: 28 }, { name: "render", members: 19 },
-      { name: "cli", members: 42 }, { name: "node", members: 37 },
-      { name: "hub", members: 66 }, { name: "memory", members: 15 },
-      { name: "graph", members: 23 }, { name: "voice", members: 12 },
+      sub("auth", "crates/hub/src/auth.rs", 34, "fn"),
+      sub("wire", "crates/proto/src/lib.rs", 51, "struct"),
+      sub("storage", "crates/hub/src/state.rs", 28, "fn"),
+      sub("render", "crates/ctl/src/tui/draw.rs", 19, "fn"),
+      sub("cli", "crates/ctl/src/main.rs", 42, "fn"),
+      sub("node", "crates/node/src/spawn.rs", 37, "fn"),
+      sub("hub", "crates/hub/src/api.rs", 66, "fn"),
+      sub("memory", "crates/hub/src/memory.rs", 15, "struct"),
+      sub("graph", "crates/hub/src/graph.rs", 23, "trait"),
+      sub("voice", "crates/ctl/src/voice.rs", 12, "mod"),
     ], links: [
       { a: "hub", b: "wire", n: 41, certain: true },
       { a: "hub", b: "storage", n: 33, certain: true },
@@ -771,6 +1124,48 @@ function demoSnapshot() {
   } };
 }
 
+// What a terminal looks like when there is no fleet to read one from.
+function demoTranscript(a) {
+  const who = a.name || "agent";
+  return [
+    `$ ${a.cli || "claude"} --resume`,
+    `[nexmesh] seat ${who} \u00b7 ${a.role || "engineer"} \u00b7 ${a.session || "payments"}`,
+    "",
+    "> add the refresh-token rotation to the login flow",
+    "",
+    `  reading src/auth.rs \u2026 142 lines`,
+    "  reading src/store.rs \u2026 88 lines",
+    "  acquire_file src/auth.rs \u2014 held by nobody, taken",
+    "",
+    "  editing src/auth.rs",
+    "    + pub fn rotate(refresh: &str) -> Result<Pair> {",
+    "    +     let claims = verify(refresh)?;",
+    "    +     if store::is_revoked(&claims.jti)? {",
+    "    +         bail!(\"that refresh token has been used\");",
+    "    +     }",
+    "",
+    "  cargo test -p auth \u2026 14 passed",
+    "  publish_work \u2014 pushed to main, the team has been told",
+    "",
+    `[PENDING MESSAGES] from Iris: looks right, one question about the jti index`,
+    "> ",
+  ];
+}
+
+function demoChat() {
+  return [
+    "operator \u2192 (team): the login flow is the priority today",
+    "Ada \u2192 (team): taking the token rotation, Max has the session store",
+    "Max \u2192 Ada: the store needs a revoked-jti index first",
+    "Ada \u2192 Max: agreed, yours",
+    "Iris \u2192 (team): reviewing what Ada pushed",
+    "Iris \u2192 Ada: looks right, one question about the jti index",
+    "CoderAI \u2192 (team): transcribed 1 clip, 12s",
+    "Rune \u2192 (team): docs updated for the new endpoint",
+    "operator \u2192 Iris: approve it if the index is there",
+  ];
+}
+
 class App {
   constructor() {
     this.canvas = document.getElementById("gl");
@@ -782,12 +1177,149 @@ class App {
     // Where you are standing when there is no headset. Orbiting, because a
     // screenshot of a room wants to move through it.
     this.cam = { yaw: 0, pitch: -0.06, dist: 0, pos: [0, 0, 0] };
+    // Where the ROOM is, relative to you. Grabbing empty space and pulling
+    // moves this, which is how you cross a map without walking into a wall
+    // -- the world comes to you. Your hands are drawn outside it, because
+    // your hands are not part of the scene.
+    this.world = { off: [0, 0, 0], yaw: 0 };
+    this.grab = new Map();          // input source -> what it took hold of
+    this.panels = [];               // open screens: terminals, chat, the menu
+    this.panelHit = null;
     this.pointers = [];
     this.status = "";
     this.sayings = [];
     this.resize();
     window.addEventListener("resize", () => this.resize());
     this.wireDesktop();
+  }
+
+  // Open a screen, or bring the one that is already open to the front.
+  panel(kind, title, opts) {
+    let p = this.panels.find((x) => x.kind === kind);
+    if (!p) {
+      p = new Panel(this.r.gl, Object.assign({ kind, title }, opts || {}));
+      this.panels.push(p);
+    } else {
+      p.title = title;
+      if (opts && opts.buttons) { p.buttons = opts.buttons; p.dirty = true; }
+      if (opts && opts.pos) p.pos = opts.pos;
+      if (opts && opts.yaw !== undefined) p.yaw = opts.yaw;
+    }
+    return p;
+  }
+
+  closePanel(kind) {
+    this.panels = this.panels.filter((p) => p.kind !== kind);
+  }
+
+  // An agent's own screen, in the room, in front of them.
+  //
+  // The transcript rather than a live attach: a headset has no keyboard, so
+  // what it needs is to SEE what the agent is doing, and what it needs to
+  // send is a sentence, which the voice already does. The hub types that
+  // into the agent's real terminal, so this is an attach in every sense
+  // that matters without pretending to be a vt100.
+  openTerminal(o) {
+    const a = o.data;
+    const ahead = 0.85;
+    const yaw = Math.atan2(o.pos[0], o.pos[2] + 10);
+    const p = this.panel("terminal", `${a.name} \u00b7 ${a.cli || ""} \u00b7 ${a.host || ""}`, {
+      // In front of them and a little to the side, at the height of a
+      // screen on a desk rather than a billboard over the room.
+      // Pulled toward you rather than left back with them: a screen you
+      // are reading belongs at reading distance, and the figure it came
+      // from is still behind it.
+      pos: [o.pos[0] * 0.4, -0.12, o.pos[2] + ahead + 0.5],
+      yaw: -yaw,
+      w: 1.95, h: 1.15, cols: 62, rows: 19,
+    });
+    p.agent = a;
+    p.set(["connecting to " + a.name + "\u2026"]);
+    this.refreshTerminal();
+  }
+
+  async refreshTerminal() {
+    const p = this.panels.find((x) => x.kind === "terminal");
+    if (!p || !p.agent) return;
+    if (DEMO || !p.agent.agent_id) {
+      p.set(demoTranscript(p.agent));
+      return;
+    }
+    try {
+      const v = await api(
+        `/v1/agents/${encodeURIComponent(p.agent.agent_id)}/transcript?tail=4000`);
+      const text = (v.transcript || "")
+        .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+        .replace(/\r/g, "");
+      p.set(text.split("\n").filter((l) => l.trim() !== ""));
+    } catch (e) {
+      p.set([`could not read ${p.agent.name}'s screen: ${e.message || e}`]);
+    }
+  }
+
+  // The chat, as a thing in the room rather than a key to press.
+  openChat() {
+    const p = this.panel("chat", "the team", {
+      pos: [-1.65, -0.12, -1.25], yaw: 0.65, w: 1.2, h: 0.76, cols: 54, rows: 15,
+    });
+    this.refreshChat();
+  }
+
+  async refreshChat() {
+    const p = this.panels.find((x) => x.kind === "chat");
+    if (!p) return;
+    if (DEMO) { p.set(demoChat()); return; }
+    const session = (this.scene.sessions && this.scene.sessions[0]) || "";
+    if (!session) { p.set(["no session"]); return; }
+    try {
+      const v = await api(`/v1/sessions/${encodeURIComponent(session)}/log?limit=400`);
+      const ms = (v.messages || []).slice(-16);
+      p.set(ms.map((m) => `${m.from} \u2192 ${m.to}: ${m.body.replace(/\n/g, " ")}`));
+    } catch (e) {
+      p.set(["could not read the log"]);
+    }
+  }
+
+  // Everything else the flat views can do, as a list you point at.
+  openMenu() {
+    const sel = this.scene.selected;
+    const who = sel && sel.data ? sel.data.name : null;
+    const buttons = [
+      { label: "\u25b6  the team", act: () => this.setMode("team") },
+      { label: "\u25c6  the code graph", act: () => this.setMode("graph") },
+      { label: "\u2328  open " + (who || "a terminal"),
+        act: () => (sel ? this.openTerminal(sel) : this.say("point at somebody first")) },
+      { label: "\u2709  the chat", act: () => this.openChat() },
+      { label: "\u1f3a4  say something", act: () => this.listen() },
+      { label: "\u23f8  pause " + (who || "\u2014"),
+        act: () => this.agentAction("pause") },
+      { label: "\u25b6  start " + (who || "\u2014"),
+        act: () => this.agentAction("spawn") },
+      { label: "\u2715  close the screens", act: () => { this.panels = []; } },
+    ];
+    this.panel("menu", "what this can do", {
+      pos: [1.62, -0.12, -1.25], yaw: -0.65, w: 0.95, h: 0.70, cols: 32, rows: 8, buttons,
+    });
+  }
+
+  async agentAction(what) {
+    const sel = this.scene.selected;
+    if (!sel || !sel.data || !sel.data.slot_id) { this.say("point at somebody first"); return; }
+    if (DEMO) { this.say(`${what} ${sel.data.name} (demo)`); return; }
+    try {
+      await api(`/v1/slots/${encodeURIComponent(sel.data.slot_id)}/${what}`, {});
+      this.say(`${what}: ${sel.data.name}`);
+    } catch (e) {
+      this.say(`could not ${what} that: ${e.message || e}`);
+    }
+  }
+
+  // The scene's own transform, and its inverse for turning a hand's ray
+  // into something the scene can be asked about.
+  worldMatrix() {
+    return M4.mul(
+      M4.translate(this.world.off[0], this.world.off[1], this.world.off[2]),
+      M4.rotY(this.world.yaw));
   }
 
   resize() {
@@ -836,7 +1368,7 @@ class App {
       try { c.releasePointerCapture(e.pointerId); } catch (err) {}
       // A click that did not drag is a selection.
       if (Math.abs(e.clientX - lx) < 4 && Math.abs(e.clientY - ly) < 4) {
-        if (this.scene.hovered) this.select(this.scene.hovered);
+        this.press(this.lastRay);
       }
     });
     c.addEventListener("pointermove", (e) => {
@@ -859,7 +1391,15 @@ class App {
     window.addEventListener("keydown", (e) => {
       if (e.key === "g") this.setMode(this.scene.mode === "graph" ? "team" : "graph");
       if (e.key === "v") this.listen();
+      if (e.key === "c") this.openChat();
+      if (e.key === "m") this.openMenu();
+      if (e.key === "Escape") this.panels = [];
     });
+    // A terminal is only a terminal if it keeps up.
+    setInterval(() => {
+      this.refreshTerminal().catch(() => {});
+      this.refreshChat().catch(() => {});
+    }, 1500);
   }
 
   setMode(mode) {
@@ -870,29 +1410,44 @@ class App {
     if (b) b.textContent = mode === "graph" ? "the team" : "the code graph";
   }
 
-  select(o) {
+  select(o, andOpen) {
     this.scene.selected = o;
     if (!o) return;
     if (o.kind === "agent") {
       const a = o.data;
       this.say(`${a.name}: ${a.role || a.cli}, ${a.task_state || a.status}` +
                (a.host && a.host !== "-" ? `, on ${a.host}` : ""));
+      // Clicking a teammate opens their screen. That is what clicking a
+      // person in this room means; the alternative is selecting them and
+      // then hunting for a verb.
+      if (andOpen !== false) this.openTerminal(o);
     } else {
       this.say(`${o.label}: ${o.sub}`);
     }
+  }
+
+  // A press, wherever the ray happens to be: a button on a screen, a
+  // teammate, a subsystem, or nothing, which starts listening.
+  press(p) {
+    if (p && p.panelHit && p.panelHit.row >= 0) {
+      const b = p.panelHit.panel.buttons[p.panelHit.row];
+      if (b && b.act) { b.act(); return; }
+    }
+    if (p && p.hit) { this.select(p.hit.object); return; }
+    this.listen();
   }
 
   // ------------------------------------------------------------- the eye --
   desktopView() {
     // Standing in the room rather than looking down on it: eye height, a
     // step back from the arc, and the floor taking the bottom third.
-    const d = 2.2 + this.cam.dist;
+    const d = 2.4 + this.cam.dist;
     const eye = [
       Math.sin(this.cam.yaw) * d,
-      0.30 - this.cam.pitch * 1.6,
-      Math.cos(this.cam.yaw) * d - 0.2,
+      -0.18 - this.cam.pitch * 1.6,
+      Math.cos(this.cam.yaw) * d - 0.1,
     ];
-    const at = [0, 0.16, -2.0];
+    const at = [0, -0.52, -2.1];
     return { eye, view: M4.lookAt(eye, at, [0, 1, 0]) };
   }
 
@@ -906,14 +1461,25 @@ class App {
       gl.clearColor(0.035, 0.04, 0.06, 1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       this.updatePointers(xrFrame);
+      this.applyGrab();
+      this.applyStick();
+      const world = this.worldMatrix();
+      const inv = M4.invert(world);
       for (const view of pose.views) {
         const vp = layer.getViewport(view);
         this.r.begin(vp, false);
-        const eye = [
+        const head = [
           view.transform.position.x, view.transform.position.y, view.transform.position.z];
-        this.scene.render(view.projectionMatrix, view.transform.inverse.matrix, eye, now);
+        // The scene is drawn THROUGH the world transform, so pulling the
+        // room moves everything in it at once. Hands and rays are not: they
+        // are yours, and they stay where your arms are.
+        const sceneView = M4.mul(view.transform.inverse.matrix, world);
+        const eyeInScene = M4.apply(inv, head);
+        this.scene.render(view.projectionMatrix, sceneView, eyeInScene, now);
+        this.renderPanels(view.projectionMatrix, sceneView);
         this.renderPointers(view.projectionMatrix, view.transform.inverse.matrix);
-        this.renderPanel(view.projectionMatrix, view.transform.inverse.matrix, eye);
+        this.renderHands(view.projectionMatrix, view.transform.inverse.matrix);
+        this.renderPanel(view.projectionMatrix, view.transform.inverse.matrix, head, true);
       }
       return;
     }
@@ -928,11 +1494,14 @@ class App {
       const tanF = Math.tan(Math.PI / 6);
       const aspect = this.canvas.width / Math.max(this.canvas.height, 1);
       const dir = V3.norm(M4.dir(inv, [this.mouse[0] * tanF * aspect, this.mouse[1] * tanF, -1]));
-      const hit = this.scene.hit(eye, dir);
+      const onPanel = this.hitPanels(eye, dir);
+      const hit = onPanel ? null : this.scene.hit(eye, dir);
+      this.lastRay = { hit, panelHit: onPanel };
       this.scene.hovered = hit ? hit.object : null;
-      this.canvas.style.cursor = hit ? "pointer" : "grab";
+      this.canvas.style.cursor = (hit || onPanel) ? "pointer" : "grab";
     }
     this.scene.render(proj, view, eye, now);
+    this.renderPanels(proj, view);
     this.renderPanel(proj, view, eye);
   }
 
@@ -948,11 +1517,135 @@ class App {
       const m = pose.transform.matrix;
       const origin = [m[12], m[13], m[14]];
       const dir = V3.norm(M4.dir(m, [0, 0, -1]));
-      const hit = this.scene.hit(origin, dir);
-      this.pointers.push({ origin, dir, hit, src });
+      // The ray is in the room's coordinates; the scene is somewhere else
+      // by now, so the question is asked in the scene's own space.
+      const inv = M4.invert(this.worldMatrix());
+      const sOrigin = M4.apply(inv, origin);
+      const sDir = V3.norm(M4.dir(inv, dir));
+      const onPanel = this.hitPanels(sOrigin, sDir);
+      const hit = onPanel ? null : this.scene.hit(sOrigin, sDir);
+      const grip = xrFrame.getPose(src.gripSpace || src.targetRaySpace, this.refSpace);
+      const gamepad = src.gamepad;
+      const squeeze = gamepad && gamepad.buttons[1] ? gamepad.buttons[1].value : 0;
+      const trigger = gamepad && gamepad.buttons[0] ? gamepad.buttons[0].value : 0;
+      this.pointers.push({
+        origin, dir, hit, src, panelHit: onPanel,
+        grip: grip ? grip.transform.matrix : null,
+        pinch: Math.max(squeeze, trigger),
+        handed: src.handedness,
+      });
       if (hit) this.scene.hovered = hit.object;
     }
     if (!this.pointers.some((p) => p.hit)) this.scene.hovered = null;
+  }
+
+  // Taking hold. Squeezing on empty space grabs the ROOM and pulls it past
+  // you, which is the locomotion every hand-tracked thing settles on: no
+  // teleport arc to aim, no stick to make you ill, and the scale of a map
+  // becomes something your arms already know how to handle. Squeezing on a
+  // subsystem takes that one instead, so a map can be rearranged into the
+  // shape in your head rather than the one Fibonacci gave it.
+  applyGrab() {
+    for (const p of this.pointers) {
+      const held = this.grab.get(p.src);
+      const squeezing = p.pinch > 0.6;
+      if (squeezing && !held) {
+        const inv = M4.invert(this.worldMatrix());
+        this.grab.set(p.src, {
+          at: M4.apply(inv, p.origin),
+          node: this.scene.mode === "graph" && p.hit ? p.hit.object : null,
+          nodeAt: p.hit ? p.hit.object.pos.slice() : null,
+        });
+      } else if (!squeezing && held) {
+        this.grab.delete(p.src);
+      } else if (squeezing && held) {
+        const inv = M4.invert(this.worldMatrix());
+        const now = M4.apply(inv, p.origin);
+        const d = V3.sub(now, held.at);
+        if (held.node) {
+          // Dragging one subsystem: it follows the hand exactly.
+          held.node.pos = V3.add(held.nodeAt, d);
+        } else {
+          // Dragging the room: the world moves the OTHER way, because what
+          // moved is you.
+          const w = this.worldMatrix();
+          const moved = M4.dir(w, d);
+          this.world.off = V3.add(this.world.off, moved);
+          held.at = M4.apply(M4.invert(this.worldMatrix()), p.origin);
+        }
+      }
+    }
+  }
+
+  // A thumbstick, for people who prefer one: push to slide, left and right
+  // to turn in steps rather than smoothly, which is the comfortable way.
+  applyStick() {
+    const now = performance.now();
+    for (const p of this.pointers) {
+      const g = p.src.gamepad;
+      if (!g || !g.axes || g.axes.length < 4) continue;
+      const x = g.axes[2] || 0, y = g.axes[3] || 0;
+      if (p.handed === "left" || !this.turnReady) {
+        if (Math.abs(y) > 0.2 || Math.abs(x) > 0.2) {
+          // Slide along the floor, in the direction you are facing.
+          const yaw = this.world.yaw;
+          const step = 0.04;
+          const dx = (Math.cos(yaw) * x - Math.sin(yaw) * -y) * step;
+          const dz = (Math.sin(yaw) * x + Math.cos(yaw) * -y) * step;
+          this.world.off = V3.add(this.world.off, [-dx, 0, -dz]);
+        }
+      }
+      if (p.handed === "right" && Math.abs(x) > 0.7) {
+        if (!this.turnAt || now - this.turnAt > 350) {
+          this.world.yaw -= Math.sign(x) * (Math.PI / 6);
+          this.turnAt = now;
+        }
+      }
+    }
+  }
+
+  // The screens. Drawn after the scene so they sit in front of it, and
+  // with the same texture shader the labels use.
+  renderPanels(proj, view) {
+    for (const p of this.panels) {
+      if (p.dirty || !p.tex) p.redraw();
+      this.r.drawLabel({ tex: p.tex, aspect: p.aspect }, p.model(), proj, view, 0.97);
+    }
+  }
+
+  // Which screen, and which row of it, a ray is on. Panels are tested
+  // before the room: a teammate standing behind a terminal must not be
+  // selectable through it.
+  hitPanels(origin, dir) {
+    let best = null;
+    for (const p of this.panels) {
+      const c = p.cross(origin, dir);
+      if (c && (!best || c.t < best.c.t)) best = { p, c };
+    }
+    for (const p of this.panels) p.row = -1;
+    if (!best) return null;
+    if (best.p.buttons.length) {
+      // The title bar is 34 of the canvas's height; the rows start under it.
+      const top = 46 / (best.p.rows * 22 + 60);
+      const rowH = (1 - top - 0.02) / best.p.rows;
+      const row = Math.floor((best.c.v - top) / rowH);
+      if (row >= 0 && row < best.p.buttons.length) {
+        if (best.p.row !== row) { best.p.row = row; best.p.dirty = true; }
+        return { panel: best.p, row, t: best.c.t };
+      }
+    }
+    return { panel: best.p, row: -1, t: best.c.t };
+  }
+
+  renderHands(proj, view) {
+    for (const p of this.pointers) {
+      if (!p.grip) continue;
+      const held = this.grab.has(p.src);
+      for (const part of handParts(p.pinch, held)) {
+        this.r.draw(part.mesh, M4.mul(p.grip, part.model), part.colour,
+                    held ? .3 : 0, proj, view);
+      }
+    }
   }
 
   renderPointers(proj, view) {
@@ -972,13 +1665,15 @@ class App {
 
   // One panel, in front of you, saying what is selected and what the keys
   // are. In a headset there is nowhere else to put it.
-  renderPanel(proj, view, eye) {
+  renderPanel(proj, view, eye, inHeadset) {
     const text = (this.status || "nexmesh") + "\n" +
       (this.scene.mode === "graph" ? "pointing: a subsystem" : "pointing: a teammate") +
       "   ·   trigger selects   ·   squeeze: team / graph";
     const lab = this.scene.labelFor(text, { key: "panel:" + text, size: 34, fg: "#cfe0f5" });
-    const h = 0.18, w = h * lab.aspect;
-    const ahead = [0, -0.82, -1.5];
+    const h = inHeadset ? 0.13 : 0.18, w = h * lab.aspect;
+    // Low and close in a headset, so it sits under what you are looking at
+    // rather than across it.
+    const ahead = inHeadset ? [eye[0], eye[1] - 0.55, eye[2] - 1.1] : [0, -0.95, -1.5];
     this.r.drawLabel(lab, M4.mul(billboard(ahead, eye), M4.scale(w, h, 1)), proj, view, .92);
   }
 }
@@ -1109,9 +1804,8 @@ App.prototype.enterXR = async function () {
   // The trigger selects what a controller is pointing at; the grip swaps
   // between the team and the map, because that is the other thing you do.
   session.addEventListener("select", () => {
-    const p = this.pointers.find((x) => x.hit);
-    if (p) this.select(p.hit.object);
-    else this.listen();
+    const p = this.pointers.find((x) => x.hit || x.panelHit);
+    this.press(p);
   });
   session.addEventListener("squeeze", () => {
     this.setMode(this.scene.mode === "graph" ? "team" : "graph");
@@ -1132,27 +1826,43 @@ App.prototype.loop = function (t) {
   requestAnimationFrame((tt) => this.loop(tt));
 };
 
-// A camera that walks itself, for recording what this looks like. Turned on
-// with ?tour=1, which is what the README's animation is made from.
+// A camera that walks itself, for recording what this looks like.
+//
+// Scripted rather than random, because the animation in the README has a
+// job: show that you can open somebody's screen, walk into the code map,
+// and reach the things the flat dashboard does. Each leg is one of those.
 App.prototype.tour = function () {
   const legs = [
-    { mode: "team", from: -0.75, to: 0.75, ms: 7000, select: 2 },
-    { mode: "graph", from: 0.6, to: -0.6, ms: 6000, select: 3 },
+    // The room, and who is in it.
+    { mode: "team", from: -0.62, to: 0.30, ms: 5200, at: 0.15,
+      act: (a) => { a.panels = []; a.select(a.scene.nodes.filter((o) => !o.flat)[1], false); } },
+    // Open a teammate's terminal and watch it.
+    { mode: "team", from: 0.18, to: -0.10, ms: 5200, at: 0.05,
+      act: (a) => {
+        const who = a.scene.nodes.filter((o) => !o.flat)[2];
+        if (who) a.select(who);
+      } },
+    // Everything else this can do, as a list you point at.
+    { mode: "team", from: -0.10, to: -0.42, ms: 4200, at: 0.05,
+      act: (a) => { a.openMenu(); a.openChat(); } },
+    // Into the map.
+    { mode: "graph", from: 0.55, to: -0.55, ms: 6000, at: 0.1,
+      act: (a) => {
+        a.panels = [];
+        const list = a.scene.active().filter((o) => !o.flat);
+        if (list.length) a.select(list[3 % list.length], false);
+      } },
   ];
-  let i = 0, start = performance.now();
+  let i = 0, start = performance.now(), fired = false;
   const step = (now) => {
     const leg = legs[i % legs.length];
     const k = Math.min(1, (now - start) / leg.ms);
-    // Ease, so the motion reads as a camera rather than a slider.
     const e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
     if (this.scene.mode !== leg.mode) this.setMode(leg.mode);
     this.cam.yaw = leg.from + (leg.to - leg.from) * e;
-    this.cam.pitch = -0.05 + Math.sin(k * Math.PI) * 0.08;
-    if (k > .45 && this.scene.selected === null) {
-      const list = this.scene.active();
-      this.select(list[Math.min(leg.select, list.length - 1)]);
-    }
-    if (k >= 1) { i++; start = now; this.scene.selected = null; }
+    this.cam.pitch = -0.04 + Math.sin(k * Math.PI) * 0.06;
+    if (!fired && k > (leg.at || 0.1)) { fired = true; leg.act(this); }
+    if (k >= 1) { i++; start = now; fired = false; }
     requestAnimationFrame(step);
   };
   requestAnimationFrame(step);

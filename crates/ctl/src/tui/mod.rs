@@ -196,6 +196,13 @@ pub struct App {
     sel: [usize; 8],
     ws: usize,
     chan: String,
+    /// Talking to ONE teammate rather than the room: the same log, filtered
+    /// to what passed between you, and everything typed addressed to them.
+    /// Not a second inbox -- a private channel with its own storage would
+    /// be a second place to look for a message.
+    with_them: Option<String>,
+    /// Which name in the room list the cursor is on, for picking one.
+    roster: usize,
     input: Composer,
     editing: bool,
     /// How many lines back the chat feed is scrolled from the newest.
@@ -615,7 +622,16 @@ impl App {
         let mut said: Option<String> = None;
         for t in &targets {
             let url = format!("{}/v1/sessions/{}/messages", self.base, urlish(t));
-            match crate::post(&self.client, url, serde_json::json!({ "text": text })).await {
+            // In a private channel every line is addressed to that teammate.
+            // A command is not: `/rename` is housekeeping, and sending it to
+            // one agent would be asking that agent to rename itself.
+            let mut body = serde_json::json!({ "text": text });
+            if !command {
+                if let Some(who) = &self.with_them {
+                    body["to"] = serde_json::json!(who);
+                }
+            }
+            match crate::post(&self.client, url, body).await {
                 Ok(v) => match v.get("error").and_then(|e| e.as_str()) {
                     // The hub refuses a mistyped command with what it should
                     // have been; saying "could not send that" instead threw
@@ -677,6 +693,36 @@ impl App {
     }
 
     /// The session name behind the current channel, or `None` for `#all`.
+    /// Who is in the room on screen, in the order the panel lists them.
+    pub fn room(&self) -> Vec<serde_json::Value> {
+        let room = self.channel_session();
+        self.rows("agents")
+            .into_iter()
+            .filter(|a| {
+                room.as_deref()
+                    .is_none_or(|r| a["session"].as_str().unwrap_or_default() == r)
+            })
+            .collect()
+    }
+
+    /// The name under the room cursor.
+    fn room_pick(&self) -> Option<String> {
+        let here = self.room();
+        here.get(self.roster.min(here.len().saturating_sub(1)))
+            .and_then(|a| a["name"].as_str().map(|x| x.to_string()))
+    }
+
+    /// The agent id behind that name, for attaching to its terminal: the
+    /// seat's own process when it has one, else the pane it sits in.
+    fn room_pick_agent(&self) -> Option<(String, String)> {
+        let here = self.room();
+        let a = here.get(self.roster.min(here.len().saturating_sub(1)))?;
+        let id = a["attach_agent_id"]
+            .as_str()
+            .or_else(|| a["agent_id"].as_str())?;
+        Some((id.to_string(), a["name"].as_str().unwrap_or("agent").to_string()))
+    }
+
     pub fn channel_session(&self) -> Option<String> {
         if self.chan == "*" {
             return None;
@@ -806,6 +852,8 @@ pub async fn run(
         sel: [0; 8],
         ws: 0,
         chan: "*".into(),
+        with_them: None,
+        roster: 0,
         input: Composer::default(),
         editing: false,
         scroll: 0,
@@ -1137,8 +1185,40 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
         }
         // In the chat the cursor IS the channel: moving it and then having
         // to press Enter to actually go there was a step nobody wants.
-        KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Chat => app.step_channel(1),
-        KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Chat => app.step_channel(-1),
+        // In the chat, j/k are the CHANNELS and the arrows are the ROOM: two
+        // lists on one screen, and the one you are picking a teammate from
+        // is the one under the arrows.
+        KeyCode::Char('j') if app.pane == Pane::Chat => app.step_channel(1),
+        KeyCode::Char('k') if app.pane == Pane::Chat => app.step_channel(-1),
+        KeyCode::Down if app.pane == Pane::Chat => {
+            let n = app.room().len();
+            if n > 0 {
+                app.roster = (app.roster + 1).min(n - 1);
+            }
+        }
+        KeyCode::Up if app.pane == Pane::Chat => {
+            app.roster = app.roster.saturating_sub(1);
+        }
+        // Enter on a name is a private channel with that teammate; Enter
+        // again is back to the room.
+        KeyCode::Enter if app.pane == Pane::Chat && !app.editing => {
+            if app.with_them.is_some() {
+                app.with_them = None;
+                app.notice("back to the room");
+            } else if let Some(who) = app.room_pick() {
+                app.notice(format!("talking to {who} alone -- Enter goes back"));
+                app.with_them = Some(who);
+            }
+            app.scroll = 0;
+        }
+        // And the keyboard of whoever is picked, which is the other thing
+        // you want from a name in a chat.
+        KeyCode::Char('a') if app.pane == Pane::Chat => {
+            match app.room_pick_agent() {
+                Some((agent, name)) => app.attach_to = Some((agent, name)),
+                None => app.notice("nobody there has a terminal"),
+            }
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             let n = app.len();
             if n > 0 {
@@ -1538,6 +1618,8 @@ mod tests {
             sel: [0; 8],
             ws: 0,
             chan: "*".into(),
+            with_them: None,
+            roster: 0,
             input: Composer::default(),
             editing: false,
             scroll: 0,
