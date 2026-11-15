@@ -134,6 +134,24 @@ def main():
     check("the hub stops holding it in flight once typed", bool(acked),
           str(q("SELECT inflight_at_ms,acked_at_ms FROM messages")))
 
+    print("\n=== a long message is pasted the way a terminal pastes ===")
+    # A burst of bytes is a PASTE as far as a TUI is concerned, and one that
+    # has asked for bracketed paste expects to be told where the paste ends.
+    # Without the markers codex buffers it as "[Pasted Content 1024 chars]"
+    # and reads the Enter after it as part of the paste: the message is
+    # delivered, sits in the composer, and waits for a human to press Enter.
+    long_body = "the context a teammate actually sends, at length. " * 24
+    http("POST", f"/v1/sessions/{sid}/messages", {"to": "Tess", "text": long_body})
+    arrived = until(lambda: "at length." in typed().split("bracketed paste")[-1], seconds=30)
+    check("a long message reaches the CLI", bool(arrived), typed()[-200:])
+    check("and it arrived as a bracketed paste, because the CLI asked for one",
+          "bracketed paste of" in typed(), typed()[-300:])
+    check("the whole message survived the wrapping, not just the first 1024 bytes",
+          typed().count("at length.") >= 24, str(typed().count("at length.")))
+    check("still one line, so still one submit",
+          len([l for l in typed().splitlines() if "at length." in l and "bracketed" not in l]) == 1,
+          typed()[-300:])
+
     print("\n=== typed once, not once per tick ===")
     before = len([l for l in typed().splitlines() if "ping at the terminal" in l])
     time.sleep(8)

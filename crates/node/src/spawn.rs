@@ -960,6 +960,9 @@ pub(crate) async fn emit_output(
     seq: u64,
 ) {
     io.push_output(data);
+    // What the CLI has asked of its terminal, which changes how a message
+    // must be typed at it.
+    io.note_modes(data);
     let _ = ctx
         .send_hub(&proto::NodeToHub::Output {
             agent_id: agent_id.to_string(),

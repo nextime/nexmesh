@@ -27,11 +27,20 @@ def note(what):
         f.flush()
 
 print(f"FAKETYPED READY tty={sys.stdin.isatty()}", flush=True)
+# Ask for bracketed paste, as every real TUI does. The node watches for
+# this and wraps what it types, which is the difference between a long
+# message being submitted and sitting in the composer for ever.
+sys.stdout.write("\x1b[?2004h")
 print("> ", end="", flush=True)
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
+    # A bracketed paste arrives with its markers, which a terminal program
+    # strips. Note that it WAS bracketed, so a test can tell.
+    if "\x1b[200~" in line:
+        note(f"bracketed paste of {len(line) - 14} chars")
+        line = line.replace("\x1b[200~", "").replace("\x1b[201~", "").strip()
     note(line)
     if line in ("quit", "exit"):
         print("\nbye", flush=True); break

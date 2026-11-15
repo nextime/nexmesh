@@ -227,7 +227,21 @@ pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<
         if let Some(why) = awaiting_answer(&String::from_utf8_lossy(&io.scrollback(4096))) {
             anyhow::bail!("the terminal is waiting for an answer ({why})");
         }
-        tx.send(render_injection_line(messages).into_bytes())
+        // A burst of bytes IS a paste as far as a TUI is concerned, and a
+        // TUI that has asked for bracketed paste expects to be told where
+        // one ends. Without the markers codex buffers the text as
+        // "[Pasted Content 1024 chars]" and reads the Enter 300ms later as
+        // part of it: the message is delivered, sits in the composer, and
+        // waits for a human to press Enter. With them, the Enter is an
+        // Enter. Verified against codex 0.169 at 1151 bytes, which is an
+        // ordinary length for a teammate's message.
+        let line = render_injection_line(messages);
+        let typed = if io.bracketed() {
+            format!("\x1b[200~{line}\x1b[201~")
+        } else {
+            line
+        };
+        tx.send(typed.into_bytes())
             .await
             .map_err(|_| anyhow::anyhow!("the agent's terminal is closed"))?;
         // The Enter is its own keystroke, a moment later -- never the tail of
@@ -442,6 +456,35 @@ mod tests {
         // The tail of a real screen is mostly colour and cursor movement.
         let screen = "\u{1b}[2K\u{1b}[36m╭────╮\u{1b}[0m\n\u{1b}[1m│ \u{1b}[32m❯ 1. Yes\u{1b}[0m\n";
         assert_eq!(awaiting_answer(screen).as_deref(), Some("a numbered prompt"));
+    }
+
+    #[tokio::test]
+    async fn a_typed_message_is_bracketed_when_the_cli_asked_for_it() {
+        // Codex buffers an unbracketed burst as "[Pasted Content 1024
+        // chars]" and reads the Enter after it as part of the paste, so the
+        // message is delivered, sits in the composer, and waits for a human.
+        // The markers are what a real terminal sends, and make the Enter an
+        // Enter.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pty, Some(tx), None);
+        io.note_modes(b"\x1b[?2004h");
+        let body = "x".repeat(1200);
+        inject(&io, &[env(1, "Ada", &body)]).await.unwrap();
+        let first = String::from_utf8(rx.recv().await.unwrap()).unwrap();
+        assert!(first.starts_with("\x1b[200~"), "no paste start: {:?}", &first[..20]);
+        assert!(first.ends_with("\x1b[201~"), "no paste end");
+        assert!(first.contains(&body), "the message itself must survive the wrapping");
+        assert_eq!(rx.recv().await.unwrap(), vec![b'\r'], "the Enter is its own keystroke");
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_did_not_ask_is_typed_at_plainly() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pty, Some(tx), None);
+        inject(&io, &[env(1, "Ada", "hello")]).await.unwrap();
+        let first = String::from_utf8(rx.recv().await.unwrap()).unwrap();
+        assert!(!first.contains("\x1b[200~"), "markers a CLI never asked for are noise");
+        assert!(first.contains("hello"));
     }
 
     #[test]

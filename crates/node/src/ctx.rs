@@ -47,6 +47,16 @@ pub struct AgentIo {
     server: Mutex<Option<(String, Option<(String, Vec<String>)>)>>,
     ring: Mutex<VecDeque<u8>>,
     attaches: Mutex<HashSet<String>>,
+    /// Whether the CLI has turned BRACKETED PASTE on, and the tail of its
+    /// output, because the sequence that says so can be split across two
+    /// reads. It matters because a burst of bytes typed at a TUI is treated
+    /// as a paste by the TUI's own heuristics, and the Enter after it then
+    /// lands inside the paste instead of submitting it -- so a long message
+    /// sat in the composer, delivered and unsent. Wrapping the text in the
+    /// paste markers is what a real terminal does, and makes the Enter an
+    /// Enter again.
+    bracketed: std::sync::atomic::AtomicBool,
+    mode_tail: Mutex<Vec<u8>>,
     /// Injections written to the CLI but not yet echoed back, oldest first.
     pending: Mutex<VecDeque<Injected>>,
 }
@@ -79,6 +89,8 @@ impl AgentIo {
             server: Mutex::new(None),
             ring: Mutex::new(VecDeque::new()),
             attaches: Mutex::new(HashSet::new()),
+            bracketed: std::sync::atomic::AtomicBool::new(false),
+            mode_tail: Mutex::new(Vec::new()),
             pending: Mutex::new(VecDeque::new()),
         })
     }
@@ -96,8 +108,44 @@ impl AgentIo {
             server: Mutex::new(self.server.lock().unwrap().clone()),
             ring: Mutex::new(self.ring.lock().unwrap().clone()),
             attaches: Mutex::new(self.attaches.lock().unwrap().clone()),
+            bracketed: std::sync::atomic::AtomicBool::new(
+                self.bracketed.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            mode_tail: Mutex::new(Vec::new()),
             pending: Mutex::new(Default::default()),
         })
+    }
+
+    /// Has the CLI asked for bracketed paste?
+    pub fn bracketed(&self) -> bool {
+        self.bracketed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Watch the CLI's own output for the bracketed-paste mode switch.
+    ///
+    /// A few bytes of the previous chunk are kept, because `\x1b[?2004h` is
+    /// seven bytes and a read can end in the middle of it -- which would
+    /// otherwise mean the mode was missed exactly once, at startup, which is
+    /// when every CLI sets it.
+    pub fn note_modes(&self, data: &[u8]) {
+        const ON: &[u8] = b"\x1b[?2004h";
+        const OFF: &[u8] = b"\x1b[?2004l";
+        let mut tail = self.mode_tail.lock().unwrap();
+        let mut buf = Vec::with_capacity(tail.len() + data.len());
+        buf.extend_from_slice(&tail);
+        buf.extend_from_slice(data);
+        let on = buf.windows(ON.len()).rposition(|w| w == ON);
+        let off = buf.windows(OFF.len()).rposition(|w| w == OFF);
+        match (on, off) {
+            (Some(a), Some(b)) => self
+                .bracketed
+                .store(a > b, std::sync::atomic::Ordering::Relaxed),
+            (Some(_), None) => self.bracketed.store(true, std::sync::atomic::Ordering::Relaxed),
+            (None, Some(_)) => self.bracketed.store(false, std::sync::atomic::Ordering::Relaxed),
+            (None, None) => {}
+        }
+        let keep = buf.len().saturating_sub(ON.len() - 1);
+        *tail = buf[keep..].to_vec();
     }
 
     /// Does this agent have a pty of its own?
@@ -550,5 +598,46 @@ impl NodeCtx {
             .values()
             .find(|io| io.attach_ids().iter().any(|a| a == attach_id))
             .cloned()
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    fn io() -> Arc<AgentIo> {
+        AgentIo::new(IoKind::Pty, None, None)
+    }
+
+    #[test]
+    fn bracketed_paste_is_noticed_and_can_be_turned_off_again() {
+        let io = io();
+        assert!(!io.bracketed(), "nothing has asked for it yet");
+        io.note_modes(b"\x1b[?1049h\x1b[?2004h\x1b[2J");
+        assert!(io.bracketed());
+        io.note_modes(b"bye\x1b[?2004l");
+        assert!(!io.bracketed(), "a CLI that gives it back is taken at its word");
+    }
+
+    #[test]
+    fn a_mode_switch_split_across_two_reads_is_still_seen() {
+        // Seven bytes, and a pty read can end anywhere. Missing it would
+        // mean missing it exactly at startup, which is when every CLI sets
+        // it -- and then a long message would be pasted unbracketed for the
+        // rest of that agent's life.
+        let io = io();
+        io.note_modes(b"welcome\x1b[?20");
+        assert!(!io.bracketed(), "half a sequence is not a sequence");
+        io.note_modes(b"04h> ");
+        assert!(io.bracketed(), "the other half completes it");
+    }
+
+    #[test]
+    fn the_last_switch_in_a_chunk_wins() {
+        let io = io();
+        io.note_modes(b"\x1b[?2004h\x1b[?2004l\x1b[?2004h");
+        assert!(io.bracketed());
+        io.note_modes(b"\x1b[?2004h\x1b[?2004l");
+        assert!(!io.bracketed());
     }
 }
