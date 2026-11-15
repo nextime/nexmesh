@@ -1833,16 +1833,25 @@ the dashboard sends, rate limited during the drag and flushed on release. The
 corner under the hand moves and the opposite corner stays where it is. A screen
 sized by hand keeps that size when it is reused for another agent.
 
-**The menu** is mounted on the left wrist, created when the session starts and
-not removed by *close the screens*. It carries everything the flat views do:
-the team, the code map, the chat, a teammate's screen, the keyboard, speech,
-and one line per team with the active one ticked — the equivalent of the
-dashboard's session dropdown. Selecting a team rebuilds the room with that team
-alone; *every team* restores all of them.
+**The menu** is a screen in the room like any other: movable, resizable and
+closable. It carries the team, the code map, the chat, a teammate's screen, the
+keyboard, speech, and the dashboard's own tabs. `A` on either controller brings
+it back after it has been closed (and hides the other screens when it is
+already up); `m` does the same on a flat screen, as does saying "menu".
 
-**The dashboard's tabs** are on the same menu and open as a screen in the room:
-the machines, the plan, what the team knows, and files with their locks and
-ownership zones. One panel, switched, as a tab is.
+**The teams are picked in the room.** A `#channel` sign stands where each team
+stands. Pointing at one and pressing shows that team on its own — its sign
+lights, the others dim but stay where they are — and pressing it again shows
+them all. Every team keeps its own sector whether or not it is being shown, so
+the signs do not move about under you, and the menu holds no list of teams: a
+room with the channels in it does not need one.
+
+**Whoever is driving the fleet stands with you.** An orchestrator holds an
+operator token rather than a seat, so it belongs to no session and appears on
+no agent row; the hub reports them separately and the room places them beside
+you, present whichever team you are looking at. Selecting a team therefore
+shows that team's agents and the orchestrators, and nothing else. An
+orchestrator has no process on the fleet, so it has no terminal to open.
 
 **Terminals are attached, not transcribed.** Opening a teammate's screen opens
 the same websocket the dashboard and `nexmesh attach` use, and the screen is
@@ -1852,6 +1861,16 @@ and drawn as a panel texture, with the agent's own cursor. A full-screen agent
 interface therefore appears as the agent draws it. Where no attach is possible
 — an external participant, an exited agent, the demo fleet — the panel falls
 back to reading the transcript.
+
+**When the hub refuses an attach, the panel says why.** The common case is a
+seat whose CLI was started by hand in a tmux session whose *view* has since
+exited: the process is alive and reachable through its own shim, but there is
+no pty for anyone to attach to. The hub's own sentence is wrapped onto the
+panel, and under it: **start its terminal**, which spawns the adopted view's
+slot again and reopens the screen when it comes up, or read the transcript
+instead, or close the screen. The snapshot carries `terminal_slot` and
+`terminal_live` for exactly this, so a client can tell the difference between
+"no terminal" and "its terminal has exited" and act on the second.
 
 **Typing.** The keyboard in the room is a grid panel: point with one hand,
 press with the trigger. Its keys clear the frame, so a key press is never a

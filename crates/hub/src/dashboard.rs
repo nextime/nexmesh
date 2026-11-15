@@ -372,6 +372,30 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             vec![]
         });
 
+    // Who is DRIVING the fleet. An orchestrator holds an operator token
+    // rather than a seat, so it appears on no agent row and in no session's
+    // member list -- and the immersive view keeps it in the room whichever
+    // team is being looked at, because the thing giving the orders belongs
+    // in the picture as much as the thing taking them.
+    let orchestrators: Vec<Value> = db
+        .prepare(
+            "SELECT label, session_id, last_used_ms FROM operator_tokens
+              WHERE revoked_at_ms IS NULL
+              ORDER BY COALESCE(last_used_ms, 0) DESC, label",
+        )
+        .and_then(|mut q| {
+            q.query_map([], |r| {
+                Ok(json!({
+                    "name": r.get::<_, String>(0)?,
+                    // None is a super orchestrator: the whole fleet.
+                    "session": r.get::<_, Option<String>>(1)?,
+                    "last_used_ms": r.get::<_, Option<i64>>(2)?,
+                }))
+            })
+            .and_then(|m| m.collect())
+        })
+        .unwrap_or_default();
+
     // Teammates that are not machines. An external participant joins over
     // HTTP with no node of its own, so it appears on no fleet row at all --
     // and the fleet tab is the first place somebody looks to ask who is
@@ -447,7 +471,16 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                       WHERE v.id = s.terminal_via
                                         AND v.exited_at_ms IS NULL)
                                 END, a.id),
-                            s.voice
+                            s.voice,
+                            -- The adopted terminal's SLOT, alive or not, and
+                            -- whether its process is still there. Without
+                            -- these a client can only report that an attach
+                            -- was refused; with them it can offer to start
+                            -- the view again, which is the actual remedy
+                            -- when a tmux view has exited under a seat.
+                            (SELECT v.slot_id FROM agents v WHERE v.id = s.terminal_via),
+                            (SELECT CASE WHEN v.exited_at_ms IS NULL THEN 1 ELSE 0 END
+                               FROM agents v WHERE v.id = s.terminal_via)
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
@@ -499,6 +532,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             // Which voice reads this one out, when the fleet
                             // is being listened to rather than read.
                             "voice": r.get::<_, Option<String>>(24)?,
+                            "terminal_slot": r.get::<_, Option<String>>(25)?,
+                            "terminal_live": r.get::<_, Option<i64>>(26)? == Some(1),
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -818,6 +853,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         "pairing": pairing,
         "nodes": nodes["nodes"],
         "sessions": sessions,
+        "orchestrators": orchestrators,
         "detail": detail,
     }))
 }

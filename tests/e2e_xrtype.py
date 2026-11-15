@@ -152,11 +152,21 @@ def main():
     seats = 0
     for _ in range(80):
         seats = cdp.js(f"({APP} && {APP}.scene) ? {APP}.scene.nodes.filter"
-                       "((n) => n.kind === 'agent').length : 0") or 0
+                       "((n) => n.kind === 'agent' && !n.orch).length : 0") or 0
         if seats:
             break
         time.sleep(0.5)
     check("the room drew the fleet's one seat", seats == 1, f"saw {seats}")
+
+    # And whoever is driving the fleet, which the hub reports from its own
+    # operator tokens rather than from any seat.
+    drivers = json.loads(cdp.js(
+        "JSON.stringify(%s.scene.nodes.filter((n) => n.orch)"
+        ".map((n) => [n.data.name, n.data.role]))" % APP))
+    check("the orchestrator is in the room, from the hub's own token list",
+          any(d[0] == "me" for d in drivers), str(drivers))
+    check("and it is marked as driving the whole fleet, not a team",
+          any("whole fleet" in (d[1] or "") for d in drivers), str(drivers))
 
     # Open that teammate's screen, the way clicking them does.
     cdp.js("""(() => {
@@ -338,6 +348,64 @@ def main():
     check("the wheel over a screen no longer resizes it",
           abs(mouse["wNow"] - mouse["dragged"]["w"]) < 1e-9, str(mouse))
     check("the wheel still moves the camera", mouse["camMoved"] is True, str(mouse))
+
+    # A refused attach. The hub refuses a seat whose CLI was started by hand
+    # in a tmux session whose view has exited -- the process is alive but
+    # there is no pty to attach to -- and the room has to say so and offer
+    # the remedy rather than sitting on "attaching" for ever.
+    refused = json.loads(cdp.js("""(() => {
+      const a = %s;
+      const who = a.scene.nodes.find((n) => n.kind === 'agent' && !n.orch);
+      a.openTerminal(who);
+      const p = a.panels.find((q) => q.kind === 'terminal');
+      p.agent = Object.assign({}, p.agent,
+                              { terminal_slot: 'sl-view1', terminal_live: false });
+      const why = 'no terminal here for ag-x: its CLI was started by hand, '
+                + 'so only its own shim reaches it';
+      a.attachRefused(p, why);
+      const rows = p.buttons.map((b) => b.label);
+      const live = Object.assign({}, p.agent, { terminal_live: true });
+      a.attachRefused(Object.assign(p, { agent: live }), why);
+      const rowsLive = p.buttons.map((b) => b.label);
+      return JSON.stringify({ rows, rowsLive, said: a.status,
+                              wrapped: rows.filter((l) => l.trim().length > 0
+                                                       && l.length <= p.cols).length });
+    })()""" % APP))
+    body = " ".join(refused["rows"])
+    check("a refused attach says so on the panel",
+          "no live terminal" in body, str(refused["rows"])[:160])
+    check("it quotes the hub's own reason",
+          "started by hand" in body and "only its own shim" in body, body[:200])
+    check("the reason is wrapped to the panel, not cut off",
+          refused["wrapped"] >= 3, str(refused["rows"]))
+    check("it offers to start the terminal",
+          any("start its terminal" in l for l in refused["rows"]), str(refused["rows"]))
+    check("and offers the transcript and a way out",
+          any("transcript" in l for l in refused["rows"])
+          and any("close" in l for l in refused["rows"]), str(refused["rows"]))
+    check("a seat whose view IS alive is not offered a restart",
+          not any("start its terminal" in l for l in refused["rowsLive"]),
+          str(refused["rowsLive"]))
+
+    # Put the live screen back: a refusal closes the attach, and the checks
+    # below are about a screen that has one.
+    cdp.js("""(() => {
+      const a = %s;
+      const who = a.scene.nodes.find((n) => n.kind === 'agent' && !n.orch);
+      const p = a.panels.find((q) => q.kind === 'terminal');
+      if (p) { p.buttons = []; }
+      a.openTerminal(who);
+      return 1;
+    })()""" % APP)
+    for _ in range(40):
+        st = cdp.js("""(() => {
+          const p = %s.panels.find((q) => q.kind === 'terminal');
+          return p && p.live ? p.live.state : "none";
+        })()""" % APP)
+        if st == "attached":
+            break
+        time.sleep(0.3)
+    check("the screen attaches again after a refusal was shown", st == "attached", str(st))
 
     # The tabs: the dashboard's own views, as screens in the room.
     views = json.loads(cdp.js("""(() => {

@@ -235,14 +235,19 @@ drawn by the same VT emulator the dashboard uses. **There is a keyboard in the
 room**, so a path, a flag or a Ctrl-C can be typed at an agent without taking
 the headset off; a flat screen types into the focused terminal directly.
 
-The chat is another screen, and the menu — the team, the code map, the chat, a
-terminal, the keyboard, speech, one line per team, and the dashboard's own tabs
-for the machines, the plan, what the team knows and what is locked — is mounted
-on your left wrist in a headset, so it is reachable from anywhere in the scene.
-A ray lands on a button exactly as it lands on a person. Every screen has a
-close button that detaches it and a handle at each corner: dragging one is a
-window resize rather than a zoom, so the text stays the size it was and the
-terminal gains columns and rows, which the agent's process is told about.
+The chat is another screen, and so is the menu — the team, the code map, the
+chat, a terminal, the keyboard, speech, and the dashboard's own tabs for the
+machines, the plan, what the team knows and what is locked. Screens are moved,
+resized by their corners and closed by the button in the title bar; closing a
+terminal detaches it, and a corner drag is a window resize rather than a zoom,
+so the text stays the size it was while the terminal gains columns and rows,
+which the agent's process is told about.
+
+**Which team you are looking at is a thing in the room**: a `#channel` sign
+stands where each team stands, and pressing one shows that team on its own.
+Whoever is driving the fleet stands beside you whichever team that is, because
+an orchestrator holds an operator token rather than a seat and belongs to no
+session.
 
 | | |
 |---|---|

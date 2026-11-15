@@ -169,6 +169,19 @@ function hashStr(str) {
   return h >>> 0;
 }
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/// Break a sentence into lines that fit a panel, on word boundaries.
+function wrapWords(text, width) {
+  const out = [];
+  let line = "";
+  for (const word of String(text).split(/\s+/).filter(Boolean)) {
+    if (!line.length) line = word;
+    else if (line.length + 1 + word.length <= width) line += " " + word;
+    else { out.push(line); line = word; }
+  }
+  if (line.length) out.push(line);
+  return out.length ? out : [""];
+}
 const smooth = (k) => k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
 
 // -------------------------------------------------------------- geometry --
@@ -1092,6 +1105,7 @@ function roleColour(role) {
   if (/architect|design|lead/.test(r)) return [.48, .36, .86];
   if (/engineer|dev|build/.test(r)) return [.16, .50, .82];
   if (/doc|writer/.test(r)) return [.20, .66, .46];
+  if (/orchestr/.test(r)) return [.95, .74, .30];
   if (/archiv|memory|librar/.test(r)) return [.70, .30, .52];
   if (/bridge|capab|ocr|voice/.test(r)) return [.88, .36, .56];
   const h = hashStr(r);
@@ -1612,16 +1626,18 @@ class Scene {
     // crowd and a room you can read.
     const one = this.only && every.includes(this.only) ? this.only : null;
     const agents = one ? all.filter((a) => (a.session || "") === one) : all;
-    const sessions = one ? [one] : every;
     const keep = this.selected && this.selected.data ? this.selected.data.name : null;
     this.nodes = [];
     this.signs = [];
     // One sector per session, side by side: two teams standing apart is
     // what two teams look like, and you are at the centre of the arc.
     const R = 2.7;
-    const sector = Math.min(1.7, 2.4 / Math.max(sessions.length, 1));
-    const first = -((sessions.length - 1) / 2) * sector;
-    sessions.forEach((sname, si) => {
+    // The sectors are laid out over EVERY team, shown or not, so each
+    // team keeps its own place and its channel sign stays where it was
+    // while you are looking at one of them.
+    const sector = Math.min(1.7, 2.4 / Math.max(every.length, 1));
+    const first = -((every.length - 1) / 2) * sector;
+    every.forEach((sname, si) => {
       const mine = agents.filter((a) => (a.session || "") === sname);
       const middle = first + si * sector;
       const spread = Math.min(sector * 0.80, 0.36 * Math.max(mine.length - 1, 1));
@@ -1642,14 +1658,50 @@ class Scene {
         this.nodes.push(node);
         if (keep && a.name === keep) this.selected = node;
       });
-      if (mine.length) {
-        this.signs.push({
-          text: "#" + (sname || "session"),
-          sub: `${mine.length} seat${mine.length === 1 ? "" : "s"}`,
-          // Out past the arc and low, where a sign on a floor would be.
-          pos: [Math.sin(middle) * (R + 2.35), 0.30, -Math.cos(middle) * (R + 2.35)],
-        });
-      }
+      // The channel sign. It is the session picker: pointing at one shows
+      // that team on its own, pointing at it again shows them all. Every
+      // team has one whether it is being shown or not, or choosing a team
+      // would hide the way back to the others.
+      const seats = all.filter((a) => (a.session || "") === sname).length;
+      const sx = Math.sin(middle) * (R + 2.35), sz = -Math.cos(middle) * (R + 2.35);
+      this.signs.push({
+        kind: "session", data: { session: sname, seats },
+        label: "#" + (sname || "session"),
+        text: "#" + (sname || "session"),
+        sub: one === sname ? `${seats} seat${seats === 1 ? "" : "s"} · shown on its own`
+                           : `${seats} seat${seats === 1 ? "" : "s"}`,
+        only: one === sname,
+        dimmed: !!one && one !== sname,
+        pos: [sx, 0.62, sz],
+        bounds: [{ c: [sx, 0.62, sz], r: 0.62 }],
+      });
+    });
+    // Whoever is DRIVING the fleet stands with you rather than in a team's
+    // sector, and is here whichever team you are looking at: an orchestrator
+    // holds an operator token, not a seat, so it belongs to no session and
+    // choosing one must not make it disappear.
+    const drivers = (snap && snap.orchestrators) || [];
+    const nowMs = Date.now();
+    drivers.slice(0, 6).forEach((d, i) => {
+      const side = i % 2 ? 1 : -1;
+      const x = side * (0.95 + Math.floor(i / 2) * 0.55), z = 0.30;
+      const busy = d.last_used_ms && nowMs - d.last_used_ms < 5 * 60 * 1000;
+      const data = {
+        name: d.name || "orchestrator",
+        cli: "orch",
+        role: d.session ? `orchestrator · #${d.session}` : "orchestrator · the whole fleet",
+        task_state: busy ? "working" : "idle",
+        status: "running",
+        host: "-",
+        session: d.session || "",
+        provenance: "operator",
+      };
+      this.nodes.push({
+        kind: "agent", data, orch: true,
+        pos: [x, 0, z],
+        yaw: Math.atan2(-x, -2.7 - z),
+        bounds: [{ c: [x, 0.55, z], r: 0.50 }, { c: [x, 1.35, z], r: 0.45 }],
+      });
     });
     if (keep && !(this.selected && this.nodes.includes(this.selected))) this.selected = null;
     this.sessions = every;
@@ -1700,9 +1752,15 @@ class Scene {
 
   active() { return this.mode === "graph" ? this.graph : this.nodes; }
 
+  /// What a ray can land on. In the team view that is the teammates AND
+  /// the channel signs, because the signs are controls.
+  pickable() {
+    return this.mode === "graph" ? this.graph : this.nodes.concat(this.signs);
+  }
+
   hit(origin, dir) {
     let best = null, bestT = Infinity;
-    for (const o of this.active()) {
+    for (const o of this.pickable()) {
       for (const b of o.bounds || []) {
         const m = V3.sub(b.c, origin);
         const tca = V3.dot(m, dir);
@@ -1785,9 +1843,23 @@ class Scene {
       L.labels.push({ tex: p.tex, model: xf(billboard(lp, eye), S(wid, hgt, 1)), alpha: 0.96 });
     }
     for (const s of this.signs) {
-      const p = this.plate(s.text, s.sub, [.35, .60, .95]);
-      const hgt = 0.24, wid = hgt * p.aspect;
-      L.labels.push({ tex: p.tex, model: xf(billboard(s.pos, eye), S(wid, hgt, 1)), alpha: 0.75 });
+      // The channel being shown on its own is lit; the others are dimmed
+      // but still there, because they are how you get back to them.
+      const on = this.hovered === s || this.selected === s;
+      const col = s.only ? [.55, .85, 1.0] : on ? [.70, .80, 1.0] : [.35, .60, .95];
+      const p = this.plate(s.text, s.sub, col);
+      const hgt = s.only || on ? 0.30 : 0.26, wid = hgt * p.aspect;
+      L.labels.push({ tex: p.tex, model: xf(billboard(s.pos, eye), S(wid, hgt, 1)),
+                      alpha: s.dimmed && !on ? 0.42 : 0.95 });
+      // A post under it, so it reads as something standing in the room
+      // rather than text floating in the air.
+      L.opaque.push({ mesh: "cyl",
+                      model: xf(T(s.pos[0], s.pos[1] / 2 - 0.08, s.pos[2]),
+                                S(0.035, s.pos[1] - 0.16, 0.035)),
+                      mat: mat(s.only ? [.35, .70, 1.0] : [.16, .20, .28], .35, .4,
+                               s.only ? 1.4 : 0.15) });
+      L.glows.push({ at: s.pos, size: 0.9,
+                     c: col.map((v) => v * (s.only ? 0.08 : on ? 0.05 : 0.015)) });
     }
   }
 
@@ -1918,12 +1990,6 @@ class Panel {
     this.tex = null;
     this.dirty = true;
     this.row = -1;
-    // A panel either stands in the room -- and so moves with the room when
-    // you pull it past you -- or rides on your wrist and comes with you.
-    // The menu is the second kind: a menu you have to go and find is a
-    // menu nobody finds. `roomSpace` is set while it is actually mounted.
-    this.wrist = !!opts.wrist;
-    this.roomSpace = false;
     // A grid panel is a keyboard: rows of keys rather than one action per
     // row, so a ray has to resolve a column as well as a row.
     this.grid = opts.grid || null;
@@ -1960,7 +2026,7 @@ class Panel {
   /// Everything else is body, and the body moves the panel.
   zoneAt(u, v) {
     const px = u * this.cw, py = v * this.ch;
-    if (!this.wrist && px > this.cw - 46 && py < 46) return "close";
+    if (px > this.cw - 46 && py < 46) return "close";
     const band = 34, along = 80;
     const edge = px < band || px > this.cw - band || py < band || py > this.ch - band;
     const inL = px < along, inR = px > this.cw - along;
@@ -2029,7 +2095,7 @@ class Panel {
       x.lineTo(cx1, cy1 + sy * hl);
       x.stroke();
     }
-    if (!this.wrist) {
+    {
       const on = this.zone === "close";
       x.fillStyle = on ? "rgba(255,120,120,0.85)" : "rgba(255,255,255,0.10)";
       x.fillRect(c.width - 44, 6, 38, 34);
@@ -2207,7 +2273,11 @@ function demoSnapshot() {
     name, path, n,
     members: Array.from({ length: Math.min(n, 6) }, (_, i) => ({ name: `${name}_${i}`, kind })),
   });
-  return { detail: {
+  return {
+    orchestrators: [
+      { name: "nextime", session: null, last_used_ms: Date.now() - 20000 },
+    ],
+    detail: {
     agents: [
       mk("Ada", "claude", "architect", "working", "machine-a", "payments"),
       mk("Max", "claude", "engineer", "working", "machine-a", "payments"),
@@ -2346,8 +2416,15 @@ class LiveTerm {
           this.t.readOnly = this.readOnly;
           this.state = this.readOnly ? "watching" : "attached";
           this.app.say(`${this.name}: ${this.state}`);
-        } else if (v.t === "closed" || v.t === "error") {
-          this.state = v.reason || v.message || "closed";
+        } else if (v.t === "error") {
+          // The hub says WHY, and that sentence is the only thing that
+          // explains a screen which otherwise just sits there saying
+          // "attaching". It goes on the panel, with what to do about it.
+          this.state = v.message || "refused";
+          this.refused = true;
+          this.app.attachRefused(this.panel, this.state);
+        } else if (v.t === "closed") {
+          this.state = v.reason || "closed";
         }
         this.needs = true;
         return;
@@ -2355,7 +2432,11 @@ class LiveTerm {
       this.t.write(new Uint8Array(ev.data));
       this.needs = true;
     };
-    ws.onclose = () => { this.state = "detached"; this.needs = true; };
+    ws.onclose = () => {
+      // Not over a refusal: the reason the hub gave is what matters.
+      if (!this.refused) this.state = "detached";
+      this.needs = true;
+    };
     ws.onerror = () => { this.fail("could not attach"); };
   }
 
@@ -2539,6 +2620,12 @@ class App {
   // the transcript, which still shows what happened.
   openTerminal(o) {
     const a = o.data;
+    if (o.orch) {
+      // It drives the fleet from outside it: there is no process here to
+      // attach to, and saying so is better than opening an empty screen.
+      this.say(`${a.name}: ${a.role}, no terminal on this fleet`);
+      return;
+    }
     const st = stateStyle(a);
     const pos = [o.pos[0] * 0.52, 2.16, o.pos[2] * 0.52];
     const p = this.panel("terminal",
@@ -2567,11 +2654,64 @@ class App {
     if (this.xr) this.openKeys();
   }
 
+  /// An attach the hub refused. The usual cause is a seat whose CLI was
+  /// started by hand in a tmux session whose VIEW has since exited: the
+  /// process is alive and reachable by its own shim, but there is no pty
+  /// for anyone to attach to until the view is started again. So the panel
+  /// says that in the hub's own words and offers to start it.
+  attachRefused(p, why) {
+    if (!p || !p.agent) return;
+    const a = p.agent;
+    if (p.live) { p.live.close(); p.live = null; }
+    const rows = [{ label: `no live terminal for ${a.name}` }, { label: "" }];
+    for (const line of wrapWords(String(why || ""), Math.max(p.cols - 6, 24))) {
+      rows.push({ label: "  " + line });
+    }
+    rows.push({ label: "" });
+    if (a.terminal_slot && !a.terminal_live) {
+      rows.push({ label: "\u25b8 start its terminal", act: () => this.startView(a, p) });
+    }
+    rows.push({ label: "\u25b8 read the transcript instead",
+                act: () => { p.buttons = []; p.dirty = true;
+                             this.refreshTerminal().catch(() => {}); } });
+    rows.push({ label: "\u25b8 close this screen", act: () => this.closePanel(p) });
+    p.buttons = rows;
+    p.rows = Math.max(rows.length, 6);
+    p.geom();
+    p.dirty = true;
+    this.say(why);
+  }
+
+  /// Start the tmux view a seat sits in, then open its screen again. This
+  /// is the one-press version of re-adopting a pane by hand.
+  async startView(a, p) {
+    p.buttons = [{ label: `starting ${a.name}'s terminal\u2026` }];
+    p.dirty = true;
+    try {
+      await api(`/v1/slots/${encodeURIComponent(a.terminal_slot)}/spawn`, {});
+    } catch (e) {
+      this.say(`could not start it: ${e.message || e}`);
+      this.attachRefused(p, `starting it failed: ${e.message || e}`);
+      return;
+    }
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 700));
+      await this.load().catch(() => {});
+      const o = this.scene.nodes.find((n) => n.data && n.data.name === a.name);
+      if (o && o.data.terminal_live && o.data.attach_agent_id) {
+        p.buttons = [];
+        this.openTerminal(o);
+        return;
+      }
+    }
+    this.attachRefused(p, "its terminal did not come up");
+  }
+
   /// The close button on a screen: it detaches, which is the thing it
-  /// looks like it does. The wrist menu has no close button, because
-  /// closing the only way back would be a trap.
+  /// looks like it does. Closing the menu is allowed: `A` on a controller,
+  /// `m` on a keyboard and saying "menu" all bring it back.
   closePanel(p) {
-    if (!p || p.wrist) return;
+    if (!p) return;
     const name = p.live ? p.live.name : p.kind;
     if (p.live) { p.live.close(); p.live = null; }
     this.panels = this.panels.filter((q) => q !== p);
@@ -2822,9 +2962,13 @@ class App {
     return p;
   }
 
-  // Everything else the flat views can do, as a list you point at. In a
-  // headset it rides on the left wrist, so there is always a way back to
-  // the chat, to the code map, and to one team on its own.
+  // Everything else the flat views can do, as a list you point at: a
+  // screen in the room like any other, which can be moved, resized and
+  // closed. `A` on a controller brings it back, as does saying "menu" or
+  // pressing `m` on a flat screen.
+  //
+  // The teams are NOT in here: the channel signs standing around the room
+  // are the session picker, which is a better answer than a list.
   openMenu() {
     const sel = this.scene.selected;
     const who = sel && sel.data && sel.kind === "agent" ? sel.data.name : null;
@@ -2843,43 +2987,35 @@ class App {
       { label: "  what the team knows", act: () => this.openView("knowledge") },
       { label: "  files and who owns what", act: () => this.openView("files") },
     ];
-    // One line per team. This is the dropdown, in a place you can reach
-    // without taking the headset off.
-    const every = this.scene.sessions || [];
-    if (every.length > 1) {
-      buttons.push({ label: (this.scene.only ? "  " : "▸ ") + "every team",
+    // One row for the teams, and it only says where to look: the signs
+    // standing in the room are what you press.
+    if ((this.scene.sessions || []).length > 1 && this.scene.only) {
+      buttons.push({ label: "  every team (or press its sign)",
                      act: () => this.showOnly(null) });
-      for (const sname of every) {
-        buttons.push({
-          label: (this.scene.only === sname ? "▸ " : "  ") + "#" + (sname || "session"),
-          act: () => this.showOnly(sname),
-        });
-      }
     }
     if (who) {
       buttons.push({ label: "  pause " + who, act: () => this.agentAction("pause") });
       buttons.push({ label: "  start " + who, act: () => this.agentAction("spawn") });
     }
     buttons.push({ label: "  close the screens",
-                   act: () => this.closeScreens((x) => x.wrist) });
-    const mounted = this.panels.find((x) => x.wrist && x.roomSpace);
+                   act: () => this.closeScreens((x) => x.kind === "menu") });
+    // Where it stands: to one side, at reading height, turned towards the
+    // middle of the room. Wherever it has been moved to, it stays.
+    const at = this.panels.find((x) => x.kind === "menu");
     this.panel("menu", "nexmesh", {
-      wrist: true,
-      // Where it hangs when there is no wrist to hang it on: beside you,
-      // as it always did on a flat screen.
-      pos: mounted ? mounted.pos : [2.45, 2.00, -1.30],
-      yaw: mounted ? mounted.yaw : Math.atan2(-2.45, 1.30),
-      w: this.xr ? 0.30 : 1.05, cols: 28, rows: buttons.length,
+      pos: at ? at.pos : [1.62, 1.52, -1.35],
+      yaw: at ? at.yaw : Math.atan2(-1.62, 1.35),
+      w: 1.00, cols: 30, rows: buttons.length,
       buttons, accent: [.55, .65, 1.0],
     });
   }
 
-  // Show one team, or all of them. The ticks in the menu move with it.
+  // Show one team, or all of them.
   showOnly(sname) {
     this.scene.only = sname || null;
     if (this.snap) this.scene.build(this.snap);
-    this.say(sname ? `#${sname} only` : "every team");
-    this.openMenu();
+    this.say(sname ? `#${sname} on its own` : "every team");
+    if (this.panels.some((x) => x.kind === "menu")) this.openMenu();
   }
 
   async agentAction(what) {
@@ -2892,14 +3028,10 @@ class App {
     } catch (e) { this.say(`could not ${what} that: ${e.message || e}`); }
   }
 
-  // `origin`/`dir` is the ray in the room's own coordinates; `rOrigin`/
-  // `rDir` is the same ray where your body is. A panel on your wrist does
-  // not move when the room does, so it is tested against the second one.
-  hitPanels(origin, dir, rOrigin, rDir) {
+  hitPanels(origin, dir) {
     let best = null;
     for (const p of this.panels) {
-      const c = p.roomSpace ? p.cross(rOrigin || origin, rDir || dir)
-                            : p.cross(origin, dir);
+      const c = p.cross(origin, dir);
       if (c && (!best || c.t < best.c.t)) best = { p, c };
     }
     for (const p of this.panels) {
@@ -2935,7 +3067,6 @@ class App {
     for (const p of this.panels) {
       if (p.live) p.live.tick();
       if (p.dirty || !p.tex) p.redraw();
-      if (p.roomSpace) continue;        // drawn with your hands instead
       L.textured.push({ tex: p.tex, model: p.model(), alpha: 0.97, gain: 1.1 });
       const rgb = p.accent;
       L.glows.push({ at: p.pos, size: p.w * 1.5, c: rgb.map((v) => v * 0.035) });
@@ -3047,6 +3178,8 @@ class App {
       // Clicking a teammate opens their screen: that is what clicking a
       // person in this room means.
       if (andOpen !== false) this.openTerminal(o);
+    } else if (o.kind === "session") {
+      this.say(`${o.label}: ${o.sub}`);
     } else {
       this.say(`${o.label}: ${o.sub}`);
     }
@@ -3072,7 +3205,17 @@ class App {
       if (p.kind === "terminal") this.focusPanel(p);
       return;
     }
-    if (ray && ray.hit) { this.select(ray.hit.object); return; }
+    if (ray && ray.hit) {
+      // A channel sign is a control: it shows that team on its own, and
+      // shows them all again when it is pressed a second time.
+      if (ray.hit.object.kind === "session") {
+        const name = ray.hit.object.data.session;
+        this.showOnly(this.scene.only === name ? null : name);
+        return;
+      }
+      this.select(ray.hit.object);
+      return;
+    }
     if (!this.xr) { this.blurTerminal(); return; }
     this.listen();
   }
@@ -3143,7 +3286,6 @@ class App {
     const layer = this.xr.renderState.baseLayer;
     const headM = pose.transform.matrix;
     const head = [headM[12], headM[13], headM[14]];
-    this.mountWrist(head);
     this.updatePointers(xrFrame);
     this.applyGrab();
     this.applyStick();
@@ -3173,11 +3315,6 @@ class App {
     const hh = left ? 0.045 : 0.07;
     KT.push({ tex: plate.tex, model: xf(billboard(at, head), S(hh * plate.aspect, hh, 1)),
               alpha: 0.95 });
-    // Whatever is strapped to you is drawn where you are, so pulling the
-    // room past you leaves it exactly where your hand is.
-    for (const p of this.panels) {
-      if (p.roomSpace) KT.push({ tex: p.tex, model: p.model(), alpha: 0.98, gain: 1.15 });
-    }
 
     this.r.shadowPass(L.opaque);
     gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
@@ -3203,25 +3340,6 @@ class App {
     }
   }
 
-  // The menu rides a hand's breadth above the left controller, turned to
-  // face you, so turning your wrist up is how you read it. It uses the
-  // hand as of the last frame, which is a sixtieth of a second behind and
-  // looks like nothing at all.
-  mountWrist(head) {
-    const m = this.panels.find((p) => p.wrist);
-    if (!m) return;
-    const left = (this.pointers || []).find((p) => p.handed === "left" && p.grip);
-    if (!left) {
-      if (m.roomSpace) { m.roomSpace = false; m.w = 1.05; m.geom(); m.dirty = true; }
-      return;
-    }
-    if (!m.roomSpace) { m.roomSpace = true; m.w = 0.30; m.geom(); m.dirty = true; }
-    const g = left.grip;
-    const at = [g[12], g[13] + 0.17 + m.h / 2, g[14]];
-    m.pos = at;
-    m.yaw = Math.atan2(head[0] - at[0], head[2] - at[2]);
-  }
-
   // Controllers and hands: where they are, what they point at.
   updatePointers(xrFrame) {
     this.pointers = [];
@@ -3236,7 +3354,7 @@ class App {
       const dir = V3.norm(M4.dir(m, [0, 0, -1]));
       const sOrigin = M4.apply(inv, origin);
       const sDir = V3.norm(M4.dir(inv, dir));
-      const onPanel = this.hitPanels(sOrigin, sDir, origin, dir);
+      const onPanel = this.hitPanels(sOrigin, sDir);
       const hit = onPanel ? null : this.scene.hit(sOrigin, sDir);
       const gripPose = src.gripSpace ? xrFrame.getPose(src.gripSpace, this.refSpace) : null;
       const g = src.gamepad;
@@ -3265,7 +3383,7 @@ class App {
       const held = this.grab.get(p.src);
       const squeezing = p.squeeze > 0.6;
       if (squeezing && !held) {
-        const panel = p.panelHit && !p.panelHit.panel.roomSpace ? p.panelHit.panel : null;
+        const panel = p.panelHit ? p.panelHit.panel : null;
         const node = !panel && this.scene.mode === "graph" && p.hit ? p.hit.object : null;
         // A corner is a handle: squeezing one resizes the screen, squeezing
         // anywhere else on it moves the screen.
@@ -3324,10 +3442,28 @@ class App {
 
   // A thumbstick, for anyone who prefers one: push to slide, flick to turn
   // in steps rather than smoothly, which is the comfortable way.
+  //
+  // And the face buttons, which is how the menu comes back once it has been
+  // closed: a control surface you can lose with no way to ask for it again
+  // is the thing this used to get wrong.
   applyStick() {
     const now = performance.now();
+    this.btns = this.btns || new Map();
     for (const p of this.pointers) {
       const g = p.src.gamepad;
+      if (g && g.buttons) {
+        const face = !!((g.buttons[4] && g.buttons[4].pressed)
+                        || (g.buttons[5] && g.buttons[5].pressed));
+        if (face && !this.btns.get(p.src)) {
+          if (this.panels.some((q) => q.kind === "menu")) {
+            this.closeScreens((q) => q.kind !== "menu");
+            this.say("the menu");
+          } else {
+            this.openMenu();
+          }
+        }
+        this.btns.set(p.src, face);
+      }
       if (!g || !g.axes || g.axes.length < 4) continue;
       const x = g.axes[2] || 0, y = g.axes[3] || 0;
       if (p.handed === "left" && (Math.abs(x) > 0.2 || Math.abs(y) > 0.2)) {
@@ -3408,7 +3544,7 @@ App.prototype.heard = function (text) {
     this.openView(low.replace(/^(show |open )?(the )?/, "")); return;
   }
   if (/^close( everything| the screens)?$/.test(low)) {
-    this.closeScreens((q) => q.wrist); return;
+    this.closeScreens((q) => q.kind === "menu"); return;
   }
   const name = low.replace(/^(select|choose|pick|show|open|talk to|message|attach to)\s+/, "");
   const found = this.scene.active().find((o) => {
@@ -3450,9 +3586,6 @@ App.prototype.enterXR = async function () {
   session.addEventListener("end", () => {
     this.xr = null;
     this.grab.clear();
-    for (const q of this.panels) {
-      if (q.roomSpace) { q.roomSpace = false; q.w = 1.05; q.geom(); q.dirty = true; }
-    }
     this.say("left the headset");
     requestAnimationFrame((t) => this.loop(t));
   });
@@ -3462,8 +3595,8 @@ App.prototype.enterXR = async function () {
     const p = this.pointers.find((x) => x.src === ev.inputSource) || this.pointers[0];
     this.press(p);
   });
-  this.say("in the headset");
-  this.openMenu();   // so there is something on your wrist from the first second
+  this.say("in the headset \u00b7 A for the menu");
+  this.openMenu();   // a control surface from the first second, in the room
   session.requestAnimationFrame((t, f) => this.xrLoop(t, f));
 };
 
