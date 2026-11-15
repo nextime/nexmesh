@@ -238,6 +238,18 @@ pub struct ModeSpec {
     /// Argv fragment added when resuming a previous session.
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// Argv fragment that CHOOSES the conversation id at a first spawn, with
+    /// `{session_uuid}` standing for a fresh one.
+    ///
+    /// Without this, an interactive seat loses its conversation whenever its
+    /// process is replaced: the id is only learned from a CLI's structured
+    /// output, and a TUI emits none, so there was never anything to resume
+    /// with. A node restart therefore started every seat's thinking over --
+    /// files and fleet state survived, the conversation did not. Naming the
+    /// id ourselves at the first spawn makes `resume_args` usable at the
+    /// second.
+    #[serde(default)]
+    pub session_id_args: Vec<String>,
     /// Does this mode give a human-usable terminal when attached?
     #[serde(default)]
     pub attachable: bool,

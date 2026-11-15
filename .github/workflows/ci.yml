@@ -51,10 +51,19 @@ jobs:
         # tmux for session adoption; python3 drives the suites and the fakes.
         # Without tmux the adopt suite skips itself cleanly rather than
         # failing, but it is cheap to install and worth actually running.
+        #
+        # websocket-client is how three suites watch an attach from the
+        # outside: the modes a viewer is sent, a prompt left alone while
+        # somebody is attached, and keys typed at a terminal. Without it they
+        # skip those halves, which is worse here than installing it -- a
+        # check that quietly does not run is not a check.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tmux
+          python3 -m pip install --quiet --break-system-packages websocket-client \
+            || python3 -m pip install --quiet websocket-client
           python3 --version
+          python3 -c "import websocket; print('websocket-client', websocket.__version__)"
           tmux -V
 
       - name: Build the binaries the suites drive

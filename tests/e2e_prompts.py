@@ -13,7 +13,14 @@ waits to be answered, so the keystroke it received is observable.
 """
 import json, os, shutil, signal, socket, subprocess, sys, tempfile, time
 import urllib.request, urllib.error
-import websocket
+
+# The attached-viewer half of this suite needs a websocket client. Without it
+# the suite says so and skips, rather than failing on an import: a machine
+# missing a test dependency is not a broken fleet.
+try:
+    import websocket
+except ModuleNotFoundError:
+    websocket = None
 
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
@@ -181,6 +188,10 @@ def main():
               notes[0].get("kind") == "system", str(notes[0].get("kind")))
 
     # ---- attached: the choice belongs to the person ------------------------
+    if websocket is None:
+        print("  SKIP  websocket-client is not installed; the attached-viewer half "
+              "of this suite cannot run")
+        return 1 if fails else 0
     before = fake_log().count("dialog answered with")
     url = (f"ws://127.0.0.1:{PORT}/v1/attach/ws?agent={aid}&cols=100&rows=30&replay=1024")
     ws = websocket.create_connection(url, timeout=20,

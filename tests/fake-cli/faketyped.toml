@@ -12,6 +12,10 @@ extra_paths = ["tests/fake-cli"]
 [modes.interactive]
 args = []
 attachable = true
+# A TUI never says what its conversation id is, so nexmesh names it at the
+# first spawn and resumes that name afterwards.
+session_id_args = ["--session-id", "{session_uuid}"]
+resume_args = ["--resume", "{resume}"]
 
 [driver]
 kind = "stream_json"

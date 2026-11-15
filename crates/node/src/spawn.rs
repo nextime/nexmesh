@@ -261,6 +261,8 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         // it and the adoption cannot come back after a node restart.
         crate::tmux::clear_stale_view(&tmux_view(&spec.slot_id));
     }
+    // Resuming a conversation we already know the id of...
+    let mut fresh_session: Option<String> = None;
     if spec.resume_handle.is_some() {
         for a in &mode.resume_args {
             let mut s = a.clone();
@@ -269,6 +271,15 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
             }
             args.push(s);
         }
+    } else if !mode.session_id_args.is_empty() {
+        // ...or naming one, so that there IS an id to resume next time. An
+        // interactive CLI never tells anyone its conversation id, so a seat
+        // whose process was replaced used to start its thinking over.
+        let fresh = uuid::Uuid::new_v4().to_string();
+        for a in &mode.session_id_args {
+            args.push(a.replace("{session_uuid}", &fresh));
+        }
+        fresh_session = Some(fresh);
     }
 
     // How this CLI is told which model to run, when it takes a flag at all.
@@ -300,10 +311,10 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     // terminal to take over, so it gets pipes and its attach is view-only.
     if matches!(spec.mode, RunMode::Interactive) {
         spawn_on_pty(ctx, spec, bin, args, env, d.cli.env_unset.clone(),
-                     mode.prompt_on_stdin, d.driver.clone()).await
+                     mode.prompt_on_stdin, d.driver.clone(), fresh_session).await
     } else {
         spawn_on_pipes(ctx, spec, bin, args, env, d.cli.env_unset.clone(),
-                       mode.prompt_on_stdin, d.driver.clone()).await
+                       mode.prompt_on_stdin, d.driver.clone(), fresh_session).await
     }
 }
 
@@ -489,6 +500,9 @@ async fn spawn_on_pty(
     env_unset: Vec<String>,
     prompt_on_stdin: bool,
     driver: DriverSpec,
+    // The conversation id this process was TOLD to use, if the descriptor
+    // says how. Reported to the hub so the next spawn can resume it.
+    fresh_session: Option<String>,
 ) -> Result<()> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -539,6 +553,7 @@ async fn spawn_on_pty(
 
     let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pty, Some(in_tx.clone()), Some(pair.master));
     register_started(&ctx, &spec, pid, io.clone(), driver).await?;
+    report_session(&ctx, &spec, &fresh_session).await;
 
     if prompt_on_stdin {
         let _ = in_tx.send(format!("{}\n", spec.prompt).into_bytes()).await;
@@ -622,6 +637,9 @@ async fn spawn_on_pipes(
     env_unset: Vec<String>,
     prompt_on_stdin: bool,
     driver: DriverSpec,
+    // The conversation id this process was TOLD to use, if the descriptor
+    // says how. Reported to the hub so the next spawn can resume it.
+    fresh_session: Option<String>,
 ) -> Result<()> {
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
@@ -898,6 +916,7 @@ async fn spawn_on_pipes(
 
     let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pipes, Some(in_tx.clone()), None);
     register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+    report_session(&ctx, &spec, &fresh_session).await;
 
     if prompt_on_stdin {
         let line = match &driver {
@@ -952,6 +971,20 @@ async fn spawn_on_pipes(
 
 /// One place where agent output goes: into scrollback, to the hub for the
 /// transcript, and to every viewer currently attached.
+/// Tell the hub the conversation id this process was told to use, so a
+/// replacement can resume it rather than starting the thinking over.
+async fn report_session(ctx: &Arc<NodeCtx>, spec: &SpawnSpec, fresh: &Option<String>) {
+    let Some(handle) = fresh else { return };
+    let _ = ctx
+        .send_hub(&proto::NodeToHub::ResumeHandle {
+            agent_id: spec.agent_id.clone(),
+            slot_id: spec.slot_id.clone(),
+            handle: handle.clone(),
+        })
+        .await;
+    tracing::info!(agent = %spec.agent_id, %handle, "named this seat's conversation");
+}
+
 pub(crate) async fn emit_output(
     ctx: &Arc<NodeCtx>,
     agent_id: &str,

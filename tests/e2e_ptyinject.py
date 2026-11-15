@@ -134,35 +134,74 @@ def main():
     check("the hub stops holding it in flight once typed", bool(acked),
           str(q("SELECT inflight_at_ms,acked_at_ms FROM messages")))
 
+    print("\n=== a seat's conversation survives its process ===")
+    # An interactive CLI never tells anyone its conversation id, so a seat
+    # whose process was replaced used to start its thinking over: files and
+    # fleet state survived, the conversation did not. nexmesh names the
+    # conversation at the first spawn so there is something to resume.
+    first = [l for l in typed().splitlines() if "argv:" in l]
+    check("the first spawn was given a conversation id",
+          bool(first) and "--session-id" in first[0], str(first[:1]))
+    named = ""
+    if first and "--session-id" in first[0]:
+        named = first[0].split("--session-id", 1)[1].split()[0]
+    handle = (q("SELECT resume_handle FROM slots WHERE id=?", (slot,)) or [{}])[0].get("resume_handle")
+    check("and the hub recorded it as the seat's resume handle", bool(handle) and handle == named,
+          f"{handle!r} vs {named!r}")
+
+    # Replace the process and watch the next one resume that conversation.
+    pid = (q("SELECT pid FROM agents WHERE slot_id=? AND exited_at_ms IS NULL", (slot,))
+           or [{}])[0].get("pid")
+    if pid:
+        os.kill(pid, 9)
+    resumed = until(lambda: any("--resume" in l for l in typed().splitlines()
+                                if "argv:" in l), seconds=40)
+    check("the replacement resumed it rather than starting over", bool(resumed),
+          str([l for l in typed().splitlines() if "argv:" in l][-2:]))
+    again = [l for l in typed().splitlines() if "argv:" in l and "--resume" in l]
+    check("with the same conversation id, not a new one",
+          bool(again) and named and named in again[-1], f"{again[-1:]} vs {named!r}")
+
     print("\n=== a viewer arriving late is put into the program's modes ===")
     # A CLI sets its terminal modes once, at startup. A viewer that attaches
     # later finds them long gone from the replay, so the terminal in front of
     # the operator is not in the alternate screen and does not report the
     # mouse -- while the program believes it is and does. That is a TUI whose
     # scrolling has stopped working for no visible reason.
-    import websocket
-    wsu = (f"ws://127.0.0.1:{PORT}/v1/attach/ws?agent={agent['id']}"
+    try:
+        import websocket
+    except ModuleNotFoundError:
+        print("  SKIP  websocket-client is not installed; the modes a viewer is sent "
+              "cannot be read from here")
+        websocket = None
+    # The agent that is alive NOW: the section above replaces the process on
+    # purpose, so the id captured earlier belongs to a dead one.
+    live = (q("SELECT id FROM agents WHERE slot_id=? AND exited_at_ms IS NULL", (slot,))
+            or [{}])[0].get("id")
+    check("there is a live agent to attach to", bool(live), str(live))
+    wsu = (f"ws://127.0.0.1:{PORT}/v1/attach/ws?agent={live}"
            f"&cols=100&rows=30&replay=512")
     # This hub needs no token: the suite runs it on loopback, unauthenticated.
-    sock = websocket.create_connection(wsu, timeout=20)
-    sock.settimeout(4)
-    first = b""
-    t0 = time.time()
-    while time.time() - t0 < 4 and len(first) < 4096:
-        try:
-            op, data = sock.recv_data()
-        except Exception:
-            break
-        if op == websocket.ABNF.OPCODE_BINARY:
-            first += data
-    sock.close()
-    head = first[:400]
-    check("the alternate screen is re-asserted before anything is replayed",
-          b"\x1b[?1049h" in head, repr(head[:120]))
-    check("so is mouse reporting, which is how a TUI scrolls",
-          b"\x1b[?1000h" in head and b"\x1b[?1006h" in head, repr(head[:160]))
-    check("and bracketed paste, so a paste is still a paste",
-          b"\x1b[?2004h" in head, repr(head[:160]))
+    sock = websocket.create_connection(wsu, timeout=20) if websocket and live else None
+    if sock:
+        sock.settimeout(4)
+        first = b""
+        t0 = time.time()
+        while time.time() - t0 < 4 and len(first) < 4096:
+            try:
+                op, data = sock.recv_data()
+            except Exception:
+                break
+            if op == websocket.ABNF.OPCODE_BINARY:
+                first += data
+        sock.close()
+        head = first[:400]
+        check("the alternate screen is re-asserted before anything is replayed",
+              b"\x1b[?1049h" in head, repr(head[:120]))
+        check("so is mouse reporting, which is how a TUI scrolls",
+              b"\x1b[?1000h" in head and b"\x1b[?1006h" in head, repr(head[:160]))
+        check("and bracketed paste, so a paste is still a paste",
+              b"\x1b[?2004h" in head, repr(head[:160]))
 
     print("\n=== a long message is pasted the way a terminal pastes ===")
     # A burst of bytes is a PASTE as far as a TUI is concerned, and one that

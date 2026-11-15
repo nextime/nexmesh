@@ -26,6 +26,9 @@ def note(what):
         f.write(f"{time.time():.3f} {what}\n")
         f.flush()
 
+# What nexmesh actually passed us. A test reads this to prove that a first
+# spawn NAMES the conversation and a second RESUMES it.
+note("argv: " + " ".join(sys.argv[1:]))
 print(f"FAKETYPED READY tty={sys.stdin.isatty()}", flush=True)
 # What a real TUI asks of its terminal, once, at startup: the alternate
 # screen, the mouse, and bracketed paste. A viewer attaching an hour later

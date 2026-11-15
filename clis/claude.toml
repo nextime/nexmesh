@@ -28,6 +28,10 @@ attachable = false   # stream-json is a protocol, not a terminal
 [modes.interactive]
 args = ["--mcp-config", "{mcp_config}"]
 resume_args = ["--resume", "{resume}"]
+# A TUI never tells anyone its conversation id, so nexmesh names it here and
+# resumes that name after a restart. Without this an interactive seat lost its
+# whole conversation whenever its process was replaced.
+session_id_args = ["--session-id", "{session_uuid}"]
 attachable = true
 # Typing a line at this prompt is a message to the agent, not a command
 # to a shell -- so a seat the fleet put in a terminal can be reached by
