@@ -601,13 +601,26 @@ pub async fn list_sessions(
         // keyboard each, which is the plumbing showing through: every other
         // listing already leaves adopted terminals out.
         &format!(
+            // Ordered by what happened LAST, not by what was made last: the
+            // team somebody said something to a minute ago is the one you
+            // came to look at, and on a fleet with seven of them the one
+            // created most recently is rarely it. "Last activity" is the
+            // newest of: a message in it, an agent starting in it, and the
+            // session's own creation -- so a quiet team sinks and a busy one
+            // rises without anything having to touch a column.
             "SELECT s.id, s.name, s.status, s.created_at_ms,
                     (SELECT COUNT(*) FROM slots x
                       WHERE x.session_id = s.id AND NOT {term}),
                     (SELECT COUNT(*) FROM slots x
-                      WHERE x.session_id = s.id AND {term})
+                      WHERE x.session_id = s.id AND {term}),
+                    MAX(s.created_at_ms,
+                        COALESCE((SELECT MAX(m.sent_at_ms) FROM messages m
+                                   WHERE m.session_id = s.id), 0),
+                        COALESCE((SELECT MAX(a.started_at_ms) FROM agents a
+                                   JOIN slots y ON y.id = a.slot_id
+                                  WHERE y.session_id = s.id), 0)) AS last_at_ms
              FROM sessions s WHERE (?1 IS NULL OR s.id = ?1)
-             ORDER BY s.created_at_ms DESC",
+             ORDER BY last_at_ms DESC",
             term = crate::seat::is_terminal("x")
         ),
     ) else {
@@ -620,6 +633,7 @@ pub async fn list_sessions(
                 "status": r.get::<_, String>(2)?, "created_at_ms": r.get::<_, i64>(3)?,
                 "slots": r.get::<_, i64>(4)?,
                 "terminals": r.get::<_, i64>(5)?,
+                "last_at_ms": r.get::<_, i64>(6)?,
             }))
         })
         .and_then(|m| m.collect())
@@ -649,6 +663,303 @@ pub struct NewSlot {
     pub placement: Placement,
     #[serde(default)]
     pub file_ownership: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct Upload {
+    /// What to call it. A name only: any directory part is dropped.
+    pub name: String,
+    /// The bytes, base64 (a `data:` URI is accepted, which is what a browser
+    /// hands over).
+    pub data_base64: String,
+    /// Which workspace, when the session has more than one.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Which machine's copy to write to. Any that holds it, by default.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Directory inside the workspace. `uploads` unless said otherwise.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// A line for the team's chat. Absent means a plain one is written.
+    #[serde(default)]
+    pub say: Option<String>,
+}
+
+/// Put a file into a session's workspace, and tell the team where it is.
+///
+/// An agent reads files, not chat attachments: a screenshot, a PDF, a
+/// recording has to BE somewhere before anybody can be asked to look at it.
+/// So the operator's file goes into the workspace on a machine that holds it,
+/// and the path is said in the chat, which is what agents read.
+///
+/// The hub writes nothing itself. It picks the workspace and the machine and
+/// asks that node, which is the only thing with a file system here.
+pub async fn upload(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    Json(req): Json<Upload>,
+) -> ApiResult {
+    // A name, not a path: `../../etc/passwd` is a name somebody typed.
+    let base = req
+        .name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('.')
+        .to_string();
+    let safe: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._- ".contains(c) { c } else { '_' })
+        .collect();
+    let safe = safe.trim().to_string();
+    if safe.is_empty() {
+        return Err(bad("that file needs a name"));
+    }
+    let dir = req.dir.as_deref().unwrap_or("uploads").trim().trim_matches('/').to_string();
+    if dir.contains("..") {
+        return Err(bad("the directory must be inside the workspace"));
+    }
+
+    let (session_id, workspace_id, ws_name) = {
+        let db = st.db.lock().unwrap();
+        let sid = session_ref_to_id(&db, &session_ref);
+        let found: Option<(String, String)> = db
+            .query_row(
+                "SELECT id, name FROM workspaces
+                  WHERE session_id = ?1 AND (?2 IS NULL OR name = ?2 OR id = ?2)
+                  ORDER BY (?2 IS NOT NULL) DESC LIMIT 1",
+                params![sid, req.workspace],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(bad)?;
+        let Some((wid, wname)) = found else {
+            return Err(bad(
+                "this session has no workspace to put a file in. Mount one first:                  nexmesh add-workspace <session> <name> --node <machine> --path <dir>",
+            ));
+        };
+        (sid, wid, wname)
+    };
+
+    // A machine that holds this workspace AND is connected. Asked for by
+    // name when the caller said which; any that answers otherwise.
+    let mounts = crate::sync::mounts(&st, &workspace_id);
+    let pick = mounts
+        .iter()
+        .find(|(node_id, name, _)| {
+            st.node_is_connected(node_id)
+                && req.node.as_deref().is_none_or(|want| want == name || want == node_id)
+        })
+        .cloned();
+    let Some((node_id, node_name, root)) = pick else {
+        return Err(bad(format!(
+            "no connected machine holds workspace '{ws_name}' right now"
+        )));
+    };
+
+    let rel = if dir.is_empty() { safe.clone() } else { format!("{dir}/{safe}") };
+    let (req_id, rx) = st.new_sync_request();
+    st.send_to_node(
+        &node_id,
+        &proto::HubToNode::PutFile {
+            req_id,
+            workspace_id: workspace_id.clone(),
+            root: root.clone(),
+            rel: rel.clone(),
+            data_b64: req.data_base64.clone(),
+        },
+    )
+    .await
+    .map_err(bad)?;
+    // Generous: a node writing 60MB to a slow disk is not a node in trouble.
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+        .await
+        .map_err(|_| bad(format!("{node_name} did not answer in time")))?
+        .map_err(|_| bad("that machine went away while writing it"))?;
+    if answer["ok"].as_bool() != Some(true) {
+        return Err(bad(format!(
+            "{node_name} could not write it: {}",
+            answer["detail"].as_str().unwrap_or("no reason given")
+        )));
+    }
+    let path = answer["path"].as_str().unwrap_or(&rel).to_string();
+    let bytes = answer["bytes"].as_i64().unwrap_or(0);
+
+    // The team is TOLD. A file nobody knows about is a file nobody reads, and
+    // this message is the whole point of putting it there.
+    let line = match req.say.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(said) => format!("{said}
+
+The file is at {path} on {node_name} ({bytes} bytes)."),
+        None => format!(
+            "I have put {safe} in the workspace: {path} on {node_name} ({bytes} bytes).              Read it from there."
+        ),
+    };
+    {
+        let db = st.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES (?, NULL, NULL, 'system', ?, ?)",
+            params![session_id, line, now_ms()],
+        )
+        .map_err(bad)?;
+    }
+    Ok(Json(json!({
+        "ok": true, "path": path, "node": node_name, "bytes": bytes,
+        "workspace": ws_name, "rel": rel
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PlanItem {
+    pub label: String,
+    /// Which seat is to do it: a name, a role or a seat id.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Where in the list. Appended when absent.
+    #[serde(default)]
+    pub ord: Option<i64>,
+}
+
+/// Add a step to a session's plan, optionally owned by one seat.
+///
+/// The plan could only be written when the session was created, which makes
+/// it a statement of intent rather than a record of work. A task handed to a
+/// team -- by the operator, or by an orchestrator that can see the whole
+/// fleet -- belongs in it: that is where everyone looks to see what is
+/// outstanding and who has it.
+pub async fn add_plan_item(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    Json(req): Json<PlanItem>,
+) -> ApiResult {
+    let label = req.label.trim().to_string();
+    if label.is_empty() {
+        return Err(bad("a plan step needs a label"));
+    }
+    let db = st.db.lock().unwrap();
+    let session_id = session_ref_to_id(&db, &session_ref);
+    let exists: Option<i64> = db
+        .query_row("SELECT 1 FROM sessions WHERE id = ?", [&session_id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?;
+    if exists.is_none() {
+        return Err(bad(format!("no session '{session_ref}'")));
+    }
+    // The owner is a seat in THAT session, resolved the way every other
+    // reference to an agent is.
+    let owner: Option<String> = match req.owner.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        None => None,
+        Some(who) => Some(
+            db.query_row(
+                "SELECT id FROM slots
+                  WHERE session_id = ?1
+                    AND (id = ?2 OR LOWER(COALESCE(display_name,'')) = LOWER(?2)
+                         OR LOWER(COALESCE(role,'')) = LOWER(?2))",
+                params![session_id, who],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(bad)?
+            .ok_or_else(|| bad(format!("no agent called '{who}' in that session")))?,
+        ),
+    };
+    let ord = match req.ord {
+        Some(n) => n,
+        None => db
+            .query_row(
+                "SELECT COALESCE(MAX(ord), 0) + 1 FROM plan_items WHERE session_id = ?",
+                [&session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(1),
+    };
+    db.execute(
+        "INSERT INTO plan_items (session_id, ord, label, assignee_slot, updated_at_ms)
+         VALUES (?,?,?,?,?)",
+        params![session_id, ord, label, owner, now_ms()],
+    )
+    .map_err(bad)?;
+    // Answer with the NAME, since that is what the caller said and what the
+    // team reads; the slot id is the hub's business.
+    let owner_name: Option<String> = match &owner {
+        None => None,
+        Some(slot) => db
+            .query_row(
+                "SELECT COALESCE(display_name, role, id) FROM slots WHERE id = ?",
+                [slot],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(bad)?,
+    };
+    Ok(Json(json!({
+        "session": session_id, "ord": ord, "label": label,
+        "owner": owner_name, "owner_slot": owner
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct OwnsRequest {
+    /// Patterns this seat is responsible for: `verti/**`, `src/auth/*`, or a
+    /// plain name like `ombia`, which covers everything under it.
+    pub patterns: Vec<String>,
+    /// Add to what it already owns rather than replacing it.
+    #[serde(default)]
+    pub add: bool,
+}
+
+/// Say which parts of the workspace a seat is responsible for.
+///
+/// Ownership zones existed only at creation, which is the wrong moment: a
+/// team divides a repository once it knows what is in it, and a seat that
+/// turned out to be the one looking after a container had no way to be told
+/// so. Teammates read this through `list_peers` and `who_owns`, and that is
+/// what turns "four agents in one checkout" into four agents that hand work
+/// to each other.
+pub async fn set_owns(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<OwnsRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let ws: Option<String> = db
+        .query_row("SELECT workspace_id FROM slots WHERE id = ?", [&id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?
+        .flatten();
+    let Some(ws) = ws else {
+        return Err(bad(format!(
+            "slot '{id}' is not in a workspace, and an ownership zone is a part of one.              Put it in one first: nexmesh add-workspace <session> <name> ..."
+        )));
+    };
+    if !req.add {
+        db.execute("DELETE FROM ownership WHERE slot_id = ? AND workspace_id = ?",
+                   params![id, ws]).map_err(bad)?;
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for pat in &req.patterns {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        db.execute(
+            "INSERT OR IGNORE INTO ownership (workspace_id, slot_id, pattern) VALUES (?,?,?)",
+            params![ws, id, pat],
+        )
+        .map_err(bad)?;
+        kept.push(pat.to_string());
+    }
+    // What it owns NOW, which is not always what was just sent.
+    let all: Vec<String> = db
+        .prepare("SELECT pattern FROM ownership WHERE slot_id = ? AND workspace_id = ? ORDER BY 1")
+        .and_then(|mut q| {
+            q.query_map(params![id, ws], |r| r.get::<_, String>(0)).and_then(|m| m.collect())
+        })
+        .unwrap_or_default();
+    Ok(Json(json!({ "slot": id, "workspace": ws, "added": kept, "owns": all })))
 }
 
 pub async fn create_slot(
@@ -2223,6 +2534,21 @@ async fn run_command(
                 "{name} is starting on {} ({})",
                 v["node"].as_str().unwrap_or("?"),
                 v["mode"].as_str().unwrap_or("?")
+            ))
+        }
+        Cmd::Owns { who, patterns, add } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let Json(v) = set_owns(
+                State(st.clone()),
+                Path(slot),
+                Json(OwnsRequest { patterns: patterns.clone(), add: *add }),
+            )
+            .await?;
+            let owns: Vec<&str> =
+                v["owns"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+            Ok(format!(
+                "{name} owns {}",
+                if owns.is_empty() { "nothing".to_string() } else { owns.join(", ") }
             ))
         }
         Cmd::New { cli, name, mode } => {

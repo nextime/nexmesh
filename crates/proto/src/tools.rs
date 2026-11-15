@@ -61,6 +61,15 @@ pub fn team_instructions(who: &str, slot: &str) -> String {
          agents is the main way teams like this fail. list_peers says who exists, and \
          ask_capability reaches a teammate that can do what you cannot (OCR, \
          transcription, speech, images).\n\n\
+         WHOSE WORK IS WHOSE: list_peers says what each teammate OWNS as well as who they \
+         are -- a team sharing one checkout divides it, a container or a directory each. \
+         Before editing anything you did not write, ask who_owns <path>: if it belongs to \
+         somebody, send_message them what needs doing rather than doing it for them. Two \
+         agents editing one area undo each other.\n\n\
+         WHAT THE TEAM KNOWS: the memory and the code graph are the team's. Read before \
+         deciding (query_knowledge, query_code_graph) and write back what you learn \
+         (store_knowledge), as you learn it rather than at the end. Contradicting a \
+         teammate's memory is a conversation, not an overwrite.\n\n\
          THE CHAT: teammate and operator messages arrive prefixed [PENDING MESSAGES] on \
          any tool result. A message whose sender is 'operator' is the PERSON running the \
          fleet, reading the room on a dashboard, in a terminal console or on a phone -- \
@@ -227,6 +236,14 @@ pub fn team_tools() -> Vec<ToolDef> {
                     "scope": json!({ "type": "string",
                         "enum": ["agent", "group", "session", "global"] }),
                     "group": s("Group name, when scope is 'group'") }), &["key"]),
+        tool("who_owns",
+            "Who on this team is responsible for a path -- a file, a directory, a container. \
+             Ask BEFORE editing anything you did not write: a team that has divided a \
+             repository between its agents expects work inside somebody's area to be handed \
+             to them, not done for them. Answers with the teammate, the zone that covers it, \
+             and what to do about it.",
+            json!({ "path": s("Path in the workspace, e.g. 'verti/src/main.rs' or 'ombia'") }),
+            &["path"]),
         tool("ask_capability",
             "Ask a teammate that can do something you cannot -- OCR a page, transcribe audio, \
              embed text, generate an image -- and WAIT for the result. Use list_peers with a \
@@ -333,7 +350,8 @@ mod tests {
         assert!(t.contains("as 'Max'"), "{t}");
         assert!(t.contains("sl-1"));
         for word in ["operator", "claim_messages", "broadcast", "notify_operator",
-                     "[PENDING MESSAGES]", "query_knowledge", "ask_capability"] {
+                     "[PENDING MESSAGES]", "query_knowledge", "ask_capability",
+                     "who_owns", "query_code_graph", "store_knowledge"] {
             assert!(t.contains(word), "{word} missing from the handshake text");
         }
         // A seat with no name yet reads as a sentence, not as "as ''".

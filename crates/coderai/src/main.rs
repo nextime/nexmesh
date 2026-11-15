@@ -160,23 +160,92 @@ impl Service {
         }
     }
 
+    /// A multipart POST: one part is the file, the rest are text fields.
+    ///
+    /// Which field carries the bytes is the manifest's business, as is what
+    /// to call it -- several services sniff the audio format from the
+    /// filename, and answer about "unsupported format" when it is wrong.
+    async fn post_multipart(&self, c: &Capability, body: &Value) -> Result<Value> {
+        let field = c
+            .file_field
+            .clone()
+            .context("this capability is multipart but names no file field")?;
+        let raw = body
+            .get(&field)
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("'{}' needs '{field}': the file, as base64", c.label))?;
+        let bytes = unb64(raw)?;
+        let name = c.file_name.clone().unwrap_or_else(|| "upload.bin".to_string());
+        // The part's name is the SERVICE's, which is not always the asker's.
+        let part_name = c.file_part.clone().unwrap_or_else(|| field.clone());
+        let mut form = reqwest::multipart::Form::new().part(
+            part_name,
+            reqwest::multipart::Part::bytes(bytes).file_name(name),
+        );
+        // Everything else goes as a text part, which is what an
+        // OpenAI-shaped endpoint expects beside the file.
+        if let Some(obj) = body.as_object() {
+            for (k, v) in obj {
+                if *k == field {
+                    continue;
+                }
+                let text = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                form = form.text(k.clone(), text);
+            }
+        }
+        let mut req = self.http.post(format!("{}{}", self.base, c.endpoint)).multipart(form);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let res = req.send().await?;
+        self.read(&c.endpoint, res, c.binary).await
+    }
+
+    /// What came back: JSON when it is JSON, and base64 when the body is the
+    /// file itself.
+    async fn read(&self, path: &str, res: reqwest::Response, binary: bool) -> Result<Value> {
+        let status = res.status();
+        let kind = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            anyhow::bail!("{path} -> {status}: {}", text.chars().take(400).collect::<String>());
+        }
+        let jsonish = kind.contains("json") || kind.starts_with("text/");
+        if binary && !jsonish {
+            let bytes = res.bytes().await?;
+            return Ok(json!({
+                "audio_base64": b64(&bytes),
+                "content_type": if kind.is_empty() { "audio/wav" } else { &kind },
+                "bytes": bytes.len(),
+            }));
+        }
+        let text = res.text().await.unwrap_or_default();
+        Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+    }
+
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        self.post_as(path, body, false).await
+    }
+
+    /// `binary` says a non-JSON body is the file itself rather than an error
+    /// message. The service's own words are passed through on a failure:
+    /// they are far more useful than a status code, and are what told us the
+    /// transcription endpoint wanted a multipart file in the first place.
+    async fn post_as(&self, path: &str, body: &Value, binary: bool) -> Result<Value> {
         let mut req = self.http.post(format!("{}{}", self.base, path)).json(body);
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
         let res = req.send().await?;
-        let status = res.status();
-        let text = res.text().await.unwrap_or_default();
-        if !status.is_success() {
-            // The service's own message is far more useful than our status
-            // code, so it is passed through to the asking agent.
-            anyhow::bail!(
-                "{path} -> {status}: {}",
-                text.chars().take(400).collect::<String>()
-            );
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+        self.read(path, res, binary).await
     }
 }
 
@@ -287,6 +356,14 @@ fn build_request(
             body.insert(field.clone(), v.clone());
         }
     }
+    // What the install answers with when the asker did not say. A service
+    // that requires a model needs one even from an agent that has no
+    // opinion about which, and the manifest is where that answer belongs.
+    for (field, value) in &c.defaults {
+        if !body.contains_key(field) {
+            body.insert(field.clone(), manifest::toml_to_json(value));
+        }
+    }
     for field in &c.required {
         if !body.contains_key(field) {
             anyhow::bail!(
@@ -373,6 +450,54 @@ fn usage_text(name: &str, m: &Manifest, available: &[Available]) -> String {
          An ask BLOCKS until the work is done, so give slow work a generous timeout_seconds.\n",
     );
     out
+}
+
+const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// base64 in, bytes out, accepting what a browser and an agent actually send:
+/// a data URI, URL-safe characters, and newlines through the middle.
+fn unb64(s: &str) -> Result<Vec<u8>> {
+    let s = s.rsplit_once("base64,").map(|(_, b)| b).unwrap_or(s);
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for ch in s.bytes() {
+        if ch == b'=' || ch.is_ascii_whitespace() {
+            continue;
+        }
+        let v = B64
+            .iter()
+            .position(|c| *c == ch)
+            .or(match ch {
+                b'-' => Some(62),
+                b'_' => Some(63),
+                _ => None,
+            })
+            .context("the file field was not base64")? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// Turn the service's answer into something an agent can read.
@@ -790,10 +915,33 @@ async fn handle(
         }
     }
     let body = build_request(c, request, model, max_inline)?;
-    let answer = match c.method.to_uppercase().as_str() {
-        "GET" => svc.get(&c.endpoint).await?,
-        _ => svc.post(&c.endpoint, &body).await?,
+    let answer = match (c.method.to_uppercase().as_str(), c.encoding.as_str()) {
+        ("GET", _) => svc.get(&c.endpoint).await?,
+        (_, "multipart") => svc.post_multipart(c, &body).await?,
+        _ => svc.post_as(&c.endpoint, &body, c.binary).await?,
     };
+    // A capability that answers with SOUND is handed over as sound. It
+    // arrives one of two ways -- as the response body, which `read` has
+    // already turned into `audio_base64`, or inside JSON under whatever
+    // this install calls it -- and the asker gets the same shape either
+    // way, because the players on the other end read one shape.
+    if c.binary {
+        if answer.get("audio_base64").is_some() {
+            return Ok(serde_json::to_string(&answer).unwrap_or_default());
+        }
+        let found = manifest::extract_first(&answer, &c.audio_at);
+        if let Some(b64) = found.into_iter().find(|s| s.len() > 64) {
+            let kind = answer
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("audio/wav")
+                .to_string();
+            return Ok(serde_json::to_string(&json!({
+                "audio_base64": b64, "content_type": kind
+            }))
+            .unwrap_or_default());
+        }
+    }
     Ok(render_answer(c, &answer))
 }
 
@@ -904,6 +1052,52 @@ file_at = ["url"]
         assert!(t.contains("needs image \u{b7} also takes lang"), "{t}");
         assert!(t.contains("needs prompt \u{b7} also takes width"), "{t}");
         assert!(t.contains("timeout_seconds"), "slow work needs saying: {t}");
+    }
+
+    #[test]
+    fn defaults_fill_in_what_the_service_insists_on() {
+        // A service that REQUIRES a model gets one even from an agent with
+        // no opinion about which -- that 422 is what sent us here.
+        let m = Manifest::parse(
+            r#"
+[service]
+name = "svc"
+[[capability]]
+label = "transcribe"
+summary = "speech to text"
+endpoint = "/v1/audio/transcriptions"
+encoding = "multipart"
+file_field = "audio_base64"
+file_name = "speech.wav"
+model_field = "model"
+defaults = { model = "whisper3" }
+accepts = ["audio_base64", "language"]
+required = ["audio_base64"]
+"#,
+        )
+        .unwrap();
+        let c = &m.capabilities[0];
+        assert_eq!(c.encoding, "multipart");
+        assert_eq!(c.file_field.as_deref(), Some("audio_base64"));
+        let body = build_request(c, &json!({ "audio_base64": "aGk=" }), None, 1_000_000).unwrap();
+        assert_eq!(body["model"], "whisper3", "the default must be sent");
+        // A model the asker NAMED still wins over the default -- that is
+        // what the `model` argument of ask_capability is for.
+        let body = build_request(c, &json!({ "audio_base64": "aGk=" }), Some("canary"),
+                                 1_000_000).unwrap();
+        assert_eq!(body["model"], "canary");
+    }
+
+    #[test]
+    fn base64_round_trips_through_the_bridge() {
+        for n in [0usize, 1, 2, 3, 100, 257] {
+            let data: Vec<u8> = (0..n).map(|i| (i * 11 % 251) as u8).collect();
+            assert_eq!(unb64(&b64(&data)).unwrap(), data, "{n}");
+        }
+        // What a browser and an agent actually send.
+        assert_eq!(unb64("data:audio/wav;base64,aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(unb64("aGVs\nbG8=").unwrap(), b"hello");
+        assert!(unb64("not base64!!").is_err());
     }
 
     #[test]

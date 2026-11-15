@@ -217,6 +217,8 @@ pub struct App {
     /// Whether new messages are read aloud, and how far that has got.
     speaking: bool,
     spoken_up_to: i64,
+    /// The player, while it is playing, so it can be stopped.
+    saying: voice::Playing,
     /// Results from the work that must not block the screen: a transcription
     /// takes seconds, and a console that freezes while it waits looks broken.
     voice_tx: tokio::sync::mpsc::Sender<Heard>,
@@ -474,6 +476,12 @@ impl App {
         }
     }
 
+    /// Stop whatever is being said, now.
+    fn hush(&mut self) {
+        voice::hush(&self.saying);
+        self.speaking = false;
+    }
+
     /// Read new traffic aloud, in the channel being watched. Off unless
     /// asked: a console that starts talking is a console you close.
     fn read_aloud(&mut self) {
@@ -508,15 +516,16 @@ impl App {
                 self.speaking = false;
                 return;
             }
-            let (base, client, tx, audio, dir) = (
+            let (base, client, tx, audio, dir, playing) = (
                 self.base.clone(),
                 self.client.clone(),
                 self.voice_tx.clone(),
                 self.audio.clone(),
                 self.scratch(),
+                self.saying.clone(),
             );
             tokio::spawn(async move {
-                if let Err(e) = voice::speak(&base, &client, &audio, &line, &dir).await {
+                if let Err(e) = voice::speak(&base, &client, &audio, &line, &dir, &playing).await {
                     let _ = tx.send(Heard::Note(trim_err(&format!("{e:#}")))).await;
                 }
             });
@@ -793,6 +802,7 @@ pub async fn run(
         recording: None,
         speaking: false,
         spoken_up_to: 0,
+        saying: Default::default(),
         voice_tx,
         dialog: None,
         panel: true,
@@ -828,7 +838,10 @@ pub async fn run(
                 .as_ref()
                 .map(|(c, k)| (c.as_str(), k.as_str()));
             let r = crate::attach(
-                &app.base, &app.client, &session, &who, 4000,
+                // The node keeps 256 KiB of scrollback per agent; ask for
+                // all of it, so attaching from the console shows what has
+                // been happening rather than the last few lines of it.
+                &app.base, &app.client, &session, &who, 262_144,
                 app.ca_cert.as_deref(), id,
             )
             .await;
@@ -1054,6 +1067,11 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
         KeyCode::Char('V') => {
             if !app.audio.can_speak() {
                 app.notice("nothing on this machine can play sound");
+            } else if app.speaking && app.saying.lock().map(|s| s.is_some()).unwrap_or(false) {
+                // Talking right now: V is a stop. A voice you cannot
+                // interrupt is one you turn off and never turn on again.
+                app.hush();
+                app.notice("stopped talking");
             } else {
                 app.speaking = !app.speaking;
                 // From here, not from the backlog.

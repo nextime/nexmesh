@@ -25,6 +25,9 @@ of it, and how to watch a fleet without installing anything.
 - [Getting a message to a working agent](#getting-a-message-to-a-working-agent)
 - [Pausing and releasing](#pausing-and-releasing)
 - [Roles, and the one role that means something](#roles-and-the-one-role-that-means-something)
+- [Giving the team a file to look at](#giving-the-team-a-file-to-look-at)
+- [Dividing a repository between agents](#dividing-a-repository-between-agents)
+- [Delegating across teams](#delegating-across-teams)
 - [A team of unequal agents](#a-team-of-unequal-agents)
 
 **[Agents, and what counts as one](#agents-and-what-counts-as-one)**
@@ -427,6 +430,10 @@ back the last of what the agent printed. In the browser terminal the same two
 are buttons, and holding (or right-clicking) a line of the terminal reads that
 line, or whatever is selected.
 
+Anything being read aloud can be stopped: `V` again in the console, `Ctrl-_`
+again in an attached terminal, and the loudspeaker button in the browser
+becomes a stop while it is talking.
+
 In the memory pane, Enter opens the whole of the one under the cursor, because
 a memory is a paragraph and a table column is not where one gets read.
 
@@ -702,6 +709,88 @@ nexmesh set-role sl-1a2b3c4d 'qa'      # changes who approves whose work
 thing `ask_capability` routes on. A role says what somebody is for; a
 capability says what they can be asked for. See
 [Asking a teammate for something you cannot do](#asking-a-teammate-for-something-you-cannot-do).
+
+### Giving the team a file to look at
+
+An agent reads files. A screenshot, a PDF, a recording has to *be* somewhere
+before anybody can be asked to look at it — so an upload goes into the
+session's workspace, on a machine that holds it, and the path is said in the
+chat:
+
+```bash
+nexmesh upload payments ./screenshot.png
+nexmesh upload payments ./spec.pdf --say 'the API we have to match'
+```
+
+In the dashboard and the installed app, the paperclip beside the chat does
+the same, and the camera button takes a photo or a clip and puts that there
+too — which is most of what a camera is for on a fleet: a screen, a
+whiteboard, a machine with a light on it.
+
+The hub writes nothing itself: it picks the workspace and a connected machine
+that holds it and asks that **node**, which is the only component here with
+anybody's file system. The path is checked on both sides, and a name is a
+name — `../../etc/passwd` is a file called `.._.._etc_passwd` in `uploads/`.
+Up to 64MB in one go; something larger belongs in the workspace by other
+means, with a message to say where it is.
+
+What an agent can do with it then depends on the agent: a model that reads
+images can look at a PNG, and one that cannot asks the capability bridge to
+OCR or transcribe it — which is the same `ask_capability` it uses for
+anything else it cannot do itself.
+
+### Dividing a repository between agents
+
+A team often shares one checkout: four agents, one repository, several
+containers or subsystems in it. Say who is responsible for what and they hand
+work to each other instead of editing over each other:
+
+```bash
+nexmesh set-owns Max --session payments 'verti/**' ombia
+nexmesh set-owns Iris --session payments --add 'verti/db/**'   # a carve-out
+```
+
+or from the chat, wherever you are reading it:
+
+```
+/owns Max verti/** ombia
+/owns Iris +verti/db/**
+```
+
+A zone is a pattern over the workspace: a plain name like `ombia` covers
+everything under it, `verti/**` is a glob, `src/auth/*` stops at one level,
+and the **longest** pattern wins, so a carve-out means the carve-out.
+
+What the agents then see:
+
+- `list_peers` says what each teammate owns, next to who they are;
+- `who_owns <path>` answers for one path — "Max owns this, through their zone
+  `verti/**`; send_message them rather than editing it";
+- `acquire_file` still gives a lock, and says whose area it is in, because a
+  lock is not permission;
+- the first prompt tells them to ask before editing anything they did not
+  write, and to raise it with `notify_operator` if they think a zone is
+  wrong.
+
+Nothing is forbidden by force. An agent can still edit anywhere the file
+system lets it — the point is that it knows whose work it is about to touch,
+and that the operator can see who was told what.
+
+### Delegating across teams
+
+An orchestrator that can see the whole fleet can hand work to an agent in
+**another** session with `delegate_task`: the task goes into that team's plan
+owned by that agent, and is sent to them as a message. A session-scoped
+orchestrator can do the same inside its own team and nowhere else — the hub
+refuses a cross-session path for a scoped token, so the limit is not a
+convention.
+
+The plan is also writable now, which is what makes a delegated task
+something you can watch rather than a sentence in a log:
+
+```bash
+curl -XPOST .../v1/sessions/payments/plan -d '{"label":"rebuild ombia","owner":"Max"}'
+```
 
 ### A team of unequal agents
 

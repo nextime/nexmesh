@@ -58,9 +58,26 @@ text_at = ["results[*].text", "data[*].text"]
 label = "transcribe"
 summary = "Turn speech in an audio or video file into text"
 endpoint = "/v1/audio/transcriptions"
+# MULTIPART, not JSON. This endpoint follows OpenAI's shape: it wants a file
+# part called `file` and a `model` field, and answers 422 naming both to
+# anything that posts JSON -- which is exactly how this was found.
+encoding = "multipart"
+file_field = "audio_base64"
+# What the service calls that part. It is `file` here, while the field an
+# agent is told to send is `audio_base64` -- the manifest is where the two
+# names meet.
+file_part = "file"
+# The format is sniffed from the name by more than one backend here, and
+# everything nexmesh records is 16kHz mono wav.
+file_name = "speech.wav"
 model_field = "model"
-accepts = ["file", "audio", "audio_base64", "url", "language", "prompt",
+# `model` is REQUIRED by the service, and an agent asking for a transcription
+# has no opinion about which. whisper3 is this install's large-v3-turbo:
+# multilingual, which matters on a fleet that is spoken to in two languages.
+defaults = { model = "whisper3" }
+accepts = ["audio_base64", "file", "audio", "url", "language", "prompt",
            "response_format", "timestamp_granularities"]
+required = ["audio_base64"]
 text_at = ["text", "data.text", "results[*].text"]
 
 [[capability]]
@@ -77,7 +94,19 @@ endpoint = "/v1/audio/speech"
 probe = "/v1/audio/speech/capabilities"
 models_at = ["data[*].id", "voices[*].name", "engines[*].id", "[*].id"]
 model_field = "model"
-accepts = ["input", "text", "voice", "response_format", "speed"]
+# This one answers with the SOUND, not with JSON about it. The bytes come
+# back as base64 under `audio_base64`, which is what the console, the
+# attached terminal and the dashboard all already play.
+binary = true
+# Where the sound is when it comes back inside JSON: this install answers
+# {"audio": "<base64>"}, which is not in anybody's documentation.
+audio_at = ["audio", "audio_base64", "data.audio", "data.audio_base64", "audio_content"]
+# A voice and a model are required, and "say this out loud" is a request
+# nobody wants to decorate. Kokoro is small, fast and intelligible; the
+# asker can still name any model or voice the install has.
+defaults = { model = "Kokoro-82M", voice = "af_heart", response_format = "wav" }
+accepts = ["input", "text", "voice", "response_format", "speed", "language"]
+required = ["input"]
 text_at = ["text"]
 file_at = ["url", "data.url", "file", "filename"]
 

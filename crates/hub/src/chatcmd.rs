@@ -40,6 +40,7 @@ pub enum Cmd {
     Move { who: String, session: String },
     Remove { who: String, force: bool },
     Start { who: String, mode: Option<String> },
+    Owns { who: String, patterns: Vec<String>, add: bool },
     New { cli: String, name: String, mode: Option<String> },
 }
 
@@ -51,6 +52,8 @@ pub fn help() -> String {
      \u{2022} /remove <agent> [force]        \u{2014} force only if it still has a process\n\
      \u{2022} /start <agent> [interactive|headless]\n\
      \u{2022} /new <cli> <name> [interactive|headless]\n\
+     \u{2022} /owns <agent> <pattern>...     \u{2014} which parts of the workspace are theirs\n\
+     \u{2022} /owns <agent> +<pattern>       \u{2014} add one instead of replacing the list\n\
      \u{2022} /help\n\
      An agent is named by its name, its role or its seat id. Say something \
      starting with a slash by doubling it: //like this."
@@ -113,6 +116,28 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
             let who = one("an agent")?;
             Ok(Parsed::Do(Cmd::Start { who, mode: mode_of(args.get(1).copied())? }))
         }
+        "owns" | "own" | "assign" => {
+            let who = one("an agent and what it owns")?;
+            if args.len() < 2 {
+                return Err(format!(
+                    "/{verb} needs at least one pattern. {}",
+                    usage("owns")
+                ));
+            }
+            // A leading + on the first pattern means "as well as", which is
+            // how you give somebody a second container without having to
+            // repeat the first.
+            let add = args[1].starts_with('+');
+            let patterns: Vec<String> = args[1..]
+                .iter()
+                .map(|p| p.trim_start_matches('+').to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if patterns.is_empty() {
+                return Err(format!("/{verb} needs at least one pattern. {}", usage("owns")));
+            }
+            Ok(Parsed::Do(Cmd::Owns { who, patterns, add }))
+        }
         "new" | "seat" => {
             let cli = one("a cli and a name")?;
             let name = args
@@ -148,6 +173,7 @@ fn usage(verb: &str) -> String {
         "remove" | "rm" | "delete" => "/remove <agent> [force]",
         "start" | "spawn" | "launch" => "/start <agent> [interactive|headless]",
         "new" | "seat" => "/new <cli> <name> [interactive|headless]",
+        "owns" | "own" | "assign" => "/owns <agent> <pattern>... (prefix + to add)",
         _ => "/help",
     };
     format!("Usage: {line}")
@@ -240,6 +266,25 @@ mod tests {
     }
 
     #[test]
+    fn owns_assigns_parts_of_the_workspace() {
+        assert_eq!(
+            parse("/owns Max verti/** ombia").unwrap(),
+            Parsed::Do(Cmd::Owns {
+                who: "Max".into(),
+                patterns: vec!["verti/**".into(), "ombia".into()],
+                add: false
+            })
+        );
+        // A leading + adds instead of replacing.
+        assert_eq!(
+            parse("/owns Max +digesta").unwrap(),
+            Parsed::Do(Cmd::Owns { who: "Max".into(), patterns: vec!["digesta".into()], add: true })
+        );
+        let e = parse("/owns Max").unwrap_err();
+        assert!(e.contains("pattern"), "{e}");
+    }
+
+    #[test]
     fn the_verbs_have_the_aliases_an_operator_will_try() {
         assert_eq!(parse("/help").unwrap(), Parsed::Do(Cmd::Help));
         assert_eq!(parse("/HELP").unwrap(), Parsed::Do(Cmd::Help));
@@ -252,7 +297,7 @@ mod tests {
     #[test]
     fn the_help_lists_every_command_the_parser_takes() {
         let h = help();
-        for verb in ["/rename", "/move", "/remove", "/start", "/new", "/help"] {
+        for verb in ["/rename", "/move", "/remove", "/start", "/new", "/owns", "/help"] {
             assert!(h.contains(verb), "{verb} missing from the help");
         }
     }

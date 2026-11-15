@@ -150,6 +150,37 @@ context window reading files. Every edge says whether it is a fact or a
 guess, because a resolved-by-name call must not read like a syntax fact. No
 embeddings, no vector store, nothing leaves the machine.
 
+### Hand the team a file, from wherever you are
+
+An agent reads files, so an upload goes into the session's workspace on a
+machine that holds it, and the path is said in the chat:
+
+```bash
+nexmesh upload payments ./spec.pdf --say 'the API we have to match'
+```
+
+In the browser and the installed app it is the paperclip beside the chat —
+and the camera button beside it, which takes a photo or a clip straight into
+the workspace. A model that cannot read a PDF asks the capability bridge to
+OCR it, which is the same `ask_capability` it uses for anything else.
+
+### One repository, several agents, no collisions
+
+Say which parts of a workspace each agent is responsible for — a container, a
+directory, a subsystem — and the team hands work to each other instead of
+editing over each other:
+
+```
+/owns Max verti/** ombia        # from the chat, wherever you are reading it
+/owns Iris +verti/db/**         # a carve-out; the longest pattern wins
+```
+
+Teammates see it in `list_peers`, ask `who_owns <path>` before touching
+anything they did not write, and are told whose area a file is in when they
+take a lock. An orchestrator that can see the whole fleet can also
+`delegate_task` into **another** team: the work lands in that team's plan,
+owned by the agent that is going to do it.
+
 ### What the team knows, and what it is doing
 
 Shared memory with a scope (this session, or the whole fleet), a plan with an

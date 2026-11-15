@@ -104,6 +104,22 @@ take. Where a command accepts either, its help says
 .IR SEAT|NAME .
 A seat id is unambiguous anywhere; a name only means something inside one
 session.
+.SH FILES FOR AGENTS
+An agent reads files, not chat attachments.
+.B nexmesh upload
+puts one in a session's workspace, on a machine that holds it, and says the
+path in the team's chat:
+.PP
+.RS
+.nf
+nexmesh upload payments ./spec.pdf --say "the API we have to match"
+.fi
+.RE
+.PP
+The hub writes nothing itself: it asks the node, which is the only component
+with anybody's file system. Up to 64MB in one go. In the dashboard and the
+installed app the same thing is the paperclip beside the chat, and the camera
+button puts a photo or a clip there too.
 .SH ROLES
 A role is a free-form string; there is no fixed list, and nothing decides
 from it who is more capable. What it does:
@@ -296,7 +312,32 @@ inside an attached terminal:
 records and types the words into the agent's prompt \(em never submitting
 them, since Enter stays yours \(em and
 .B Ctrl-_
-reads the last of what the agent printed back.
+reads the agent's last REPLY back \(em everything it printed since you last
+pressed Enter. Pressed again while it is talking it stops; pressed again
+after that it reads the reply before, and so on back through the
+conversation, which is how a reply is chosen without a mouse. Anything the
+agent prints puts the cursor back at the newest.
+.B Ctrl-\e
+turns on reading every new reply as it arrives: the agent printing nothing
+for a second and a bit is where one reply ends.
+.PP
+All three are configurable, because
+.B Ctrl-^
+is Ctrl+Shift+6 on a US layout and awkward or impossible on others. In
+.IR ~/.nexmesh/console.toml :
+.PP
+.RS
+.nf
+dictate_key = "ctrl-g"
+speak_key   = "ctrl-t"
+aloud_key   = "ctrl-\e\e"
+.fi
+.RE
+.PP
+In the console,
+.B V
+is the same switch for the chat: it starts reading new messages aloud, and
+stops whatever is being said when it is pressed again.
 .PP
 Two themes, remembered in
 .IR ~/.nexmesh/console.toml :

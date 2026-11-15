@@ -31,6 +31,101 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+/// Which keys drive the voice inside an attached terminal.
+///
+/// Control characters, because an attach forwards everything else to the
+/// agent -- and configurable, because `Ctrl-^` is Ctrl+Shift+6 on a US
+/// layout and awkward or impossible on several others. Read from
+/// `~/.nexmesh/console.toml`:
+///
+/// ```toml
+/// dictate_key = "ctrl-^"     # or f9, ctrl-g, ...
+/// speak_key   = "ctrl-_"     # read back, or stop
+/// aloud_key   = "ctrl-\\"    # read everything the agent prints
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keys {
+    pub dictate: u8,
+    pub speak: u8,
+    pub aloud: u8,
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Keys { dictate: 0x1e, speak: 0x1f, aloud: 0x1c }
+    }
+}
+
+/// `ctrl-^`, `ctrl-g`, `^]`, `0x1e`, `30` -- whatever somebody writes down.
+pub fn key_byte(spec: &str) -> Option<u8> {
+    let s = spec.trim().to_lowercase();
+    // `^` alone is a key; `^]` is a key with a prefix. A letter on its own is
+    // NOT: `dictate_key = "x"` meaning Ctrl-X would be a surprise, and a
+    // plain letter cannot be a key here anyway, since an attach forwards
+    // every printable byte to the agent.
+    let (s, prefixed) = match s.strip_prefix("ctrl-") {
+        Some(rest) => (rest.to_string(), true),
+        None if s.len() > 1 && s.starts_with('^') => (s[1..].to_string(), true),
+        None => (s.clone(), false),
+    };
+    if let Some(hex) = s.strip_prefix("0x") {
+        return u8::from_str_radix(hex, 16).ok().filter(|b| *b < 0x20);
+    }
+    if let Ok(n) = s.parse::<u8>() {
+        return (n < 0x20).then_some(n);
+    }
+    let c = s.chars().next()?;
+    if s.chars().count() != 1 {
+        return None;
+    }
+    if !prefixed && c.is_ascii_alphanumeric() {
+        return None;
+    }
+    // Ctrl-A is 1 ... Ctrl-Z is 26, and the six after that are the symbols.
+    match c {
+        'a'..='z' => Some(c as u8 - b'a' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' | '-' | '/' => Some(0x1f),
+        '@' | ' ' => Some(0x00),
+        _ => None,
+    }
+}
+
+/// How a key reads in a status bar.
+pub fn key_name(b: u8) -> String {
+    match b {
+        0x00 => "Ctrl-@".into(),
+        0x1b => "Ctrl-[".into(),
+        0x1c => "Ctrl-\\".into(),
+        0x1d => "Ctrl-]".into(),
+        0x1e => "Ctrl-^".into(),
+        0x1f => "Ctrl-_".into(),
+        1..=26 => format!("Ctrl-{}", (b - 1 + b'A') as char),
+        other => format!("0x{other:02x}"),
+    }
+}
+
+/// Read the three keys from the console's own preferences file.
+pub fn keys_from(toml_text: &str) -> Keys {
+    let mut k = Keys::default();
+    for line in toml_text.lines() {
+        let line = line.trim();
+        let Some((name, value)) = line.split_once('=') else { continue };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let Some(b) = key_byte(value) else { continue };
+        match name.trim() {
+            "dictate_key" => k.dictate = b,
+            "speak_key" => k.speak = b,
+            "aloud_key" => k.aloud = b,
+            _ => {}
+        }
+    }
+    k
+}
+
 /// What this machine can actually do with sound.
 #[derive(Debug, Clone, Default)]
 pub struct Audio {
@@ -194,6 +289,20 @@ pub async fn transcribe(
     Ok(spoken_text(&out))
 }
 
+/// Somewhere to keep the player while it plays, so somebody else can stop
+/// it. A voice that cannot be interrupted is one you switch off for good.
+pub type Playing = std::sync::Arc<std::sync::Mutex<Option<Child>>>;
+
+/// Stop whatever is being said, now.
+pub fn hush(playing: &Playing) {
+    if let Ok(mut slot) = playing.lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Ask the fleet to turn words into sound, and play it.
 pub async fn speak(
     base: &str,
@@ -201,6 +310,7 @@ pub async fn speak(
     audio: &Audio,
     text: &str,
     dir: &Path,
+    playing: &Playing,
 ) -> Result<()> {
     let out = ask(base, client, "tts", json!({ "input": text }), 120).await?;
     let (bytes, ext) = audio_of(base, client, &out).await?;
@@ -213,8 +323,37 @@ pub async fn speak(
         audio.play_any.as_ref().or(audio.play_wav.as_ref())
     }
     .context("nothing on this machine can play sound")?;
-    let mut child = run(cmd, &path)?;
-    let _ = child.wait();
+    let child = run(cmd, &path)?;
+    if let Ok(mut slot) = playing.lock() {
+        // Anything still playing is replaced rather than talked over.
+        if let Some(mut old) = slot.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        *slot = Some(child);
+    }
+    // Waited on WITHOUT holding the lock, so `hush` can reach in and stop it.
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let done = match playing.lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+                // Somebody stopped it.
+                None => true,
+            },
+            Err(_) => true,
+        };
+        if done {
+            if let Ok(mut slot) = playing.lock() {
+                if let Some(c) = slot.as_mut() {
+                    if matches!(c.try_wait(), Ok(Some(_)) | Err(_)) {
+                        *slot = None;
+                    }
+                }
+            }
+            break;
+        }
+    }
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -508,6 +647,31 @@ mod tests {
         // A sequence cut off at the end does not take anything with it.
         assert_eq!(plain(b"text\x1b["), "text");
         assert_eq!(plain(b"text\x1b"), "text");
+    }
+
+    #[test]
+    fn a_key_can_be_written_down_several_ways() {
+        assert_eq!(key_byte("ctrl-^"), Some(0x1e));
+        assert_eq!(key_byte("^"), Some(0x1e));
+        assert_eq!(key_byte("Ctrl-_"), Some(0x1f));
+        assert_eq!(key_byte("ctrl-g"), Some(7));
+        assert_eq!(key_byte("^]"), Some(0x1d));
+        assert_eq!(key_byte("0x1c"), Some(0x1c));
+        assert_eq!(key_byte("28"), Some(28));
+        // A key that is not a control character cannot be one of ours: an
+        // attach forwards everything else to the agent.
+        assert_eq!(key_byte("x"), None);
+        assert_eq!(key_byte("0x41"), None);
+        assert_eq!(key_byte(""), None);
+    }
+
+    #[test]
+    fn the_keys_come_from_the_console_preferences() {
+        let k = keys_from("# nexmesh console\ntheme = \"deck\"\ndictate_key = \"ctrl-g\"\n");
+        assert_eq!(k.dictate, 7, "the one that was set");
+        assert_eq!(k.speak, Keys::default().speak, "and the others keep their defaults");
+        assert_eq!(key_name(7), "Ctrl-G");
+        assert_eq!(key_name(0x1e), "Ctrl-^");
     }
 
     #[test]

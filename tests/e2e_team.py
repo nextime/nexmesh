@@ -231,6 +231,57 @@ def main():
     t = max_.tool("view_file_locks")
     check("lock domain is the node (workspace inferred from cwd)", "node:" in t, t)
 
+    print("\n=== 8b. ownership zones: who does what, and delegating the rest ===")
+    s, j = http("GET", f"/v1/sessions/{sid}/status")
+    slots = {a["name"]: a["slot_id"] for a in j.get("agents", [])}
+    s, j = http("POST", f"/v1/slots/{slots['Max']}/owns",
+                {"patterns": ["verti/**", "ombia"]})
+    check("a seat can be given zones after it exists",
+          s == 200 and set(j.get("owns", [])) == {"verti/**", "ombia"}, str(j)[:200])
+    s, j = http("POST", f"/v1/slots/{slots['Max']}/owns", {"patterns": ["digesta"], "add": True})
+    check("and a zone can be added without repeating the others",
+          set(j.get("owns", [])) == {"verti/**", "ombia", "digesta"}, str(j)[:200])
+
+    t = max_.tool("who_owns", {"path": "verti/src/main.rs"})
+    check("an agent is told it owns its own area", "You own" in t, t)
+    t = max_.tool("who_owns", {"path": "elsewhere/readme.md"})
+    check("and that nobody owns what nobody owns", "Nobody owns" in t, t)
+
+    # A second CLI seat, so there is somebody to delegate TO.
+    iris = Mcpd({"NEXMESH_SESSION": sid, "NEXMESH_NAME": "Iris",
+                 "NEXMESH_ROLE": "code reviewer", "NEXMESH_CLI": "claude",
+                 "NEXMESH_CLI_SESSION": "iris-conversation"})
+    iris.call("initialize", {"protocolVersion": "2024-11-05",
+        "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}})
+    t = iris.tool("list_peers")
+    check("peers carry what each of them owns", "owns" in t and "verti/**" in t, t[:400])
+    t = iris.tool("who_owns", {"path": "ombia/docker-compose.yml"})
+    check("a path in somebody's zone names them and says to ask",
+          "Max owns" in t and "send_message" in t, t)
+    t = iris.tool("acquire_file", {"path": "verti/src/main.rs", "purpose": "edit"})
+    check("locking inside somebody's zone says whose it is",
+          "Locked" in t and "Max owns this" in t, t)
+
+    print("\n=== 8c. the plan takes a delegated task ===")
+
+    s, j = http("POST", f"/v1/sessions/{sid}/plan",
+                {"label": "rebuild the ombia container", "owner": "Max"})
+    check("a task can be added to the plan and owned", s == 200 and j.get("owner") == "Max",
+          str(j)[:200])
+    t = max_.tool("get_plan")
+    check("the owner reads it in their own plan", "ombia container" in t, t[:300])
+    s, j = http("POST", f"/v1/sessions/{sid}/plan", {"label": "x", "owner": "Nobody"})
+    check("delegating to somebody who is not there is refused", s != 200, str(j)[:160])
+
+    # Iris was here to be delegated to; she is not part of what the delivery
+    # and tidying checks below are counting, so she leaves the way a seat
+    # leaves: removed, not abandoned.
+    iris.close()
+    s, j = http("GET", f"/v1/sessions/{sid}/status")
+    iris_slot = next((a["slot_id"] for a in j.get("agents", []) if a["name"] == "Iris"), None)
+    if iris_slot:
+        http("DELETE", f"/v1/slots/{iris_slot}?force=1")
+
     print("\n=== 9. error handling ===")
     t = max_.tool("send_message", {"to": "NoSuchAgent", "text": "hi"})
     check("unknown peer is a clean error, not a hang", "no teammate" in t.lower(), t)

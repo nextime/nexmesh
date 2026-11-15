@@ -34,7 +34,7 @@ crossterm = "0.28"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
 # hub
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["trace", "fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

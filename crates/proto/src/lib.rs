@@ -400,6 +400,15 @@ pub enum NodeToHub {
         #[serde(default)]
         cli_session: Option<String>,
     },
+    /// What became of a `PutFile`.
+    PutFileResult {
+        req_id: u64,
+        ok: bool,
+        /// Absolute path it was written to, when it was.
+        path: String,
+        bytes: u64,
+        detail: String,
+    },
     SyncResult {
         req_id: u64,
         workspace_id: String,
@@ -572,6 +581,23 @@ pub enum HubToNode {
         /// Who to attribute a commit to.
         author: String,
         message: String,
+    },
+    /// Write a file into a workspace on this machine.
+    ///
+    /// The operator has something an agent needs to look at -- a screenshot,
+    /// a PDF, a recording -- and an agent reads files, not chat attachments.
+    /// So it lands in the workspace, on a machine that holds it, and the team
+    /// is told the path. The node is the only thing that may write there: the
+    /// hub has no file system of anyone else's.
+    PutFile {
+        req_id: u64,
+        workspace_id: String,
+        /// Absolute directory this workspace is mounted at on this node.
+        root: String,
+        /// Path relative to the root, already made safe by the hub.
+        rel: String,
+        /// The bytes, base64.
+        data_b64: String,
     },
     AttachResize { attach_id: String, cols: u16, rows: u16 },
     AttachClose { attach_id: String },

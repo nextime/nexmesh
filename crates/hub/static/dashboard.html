@@ -362,10 +362,27 @@
     display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
   }
   #term .thead {
-    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    display: flex; align-items: center; gap: 10px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 12px 8px;
     background: var(--panel); border-bottom: 1px solid var(--line);
   }
-  #term .thead .who { font-family: var(--mono); font-weight: 650; }
+  /* The name is the only thing here allowed to shrink. Without this an agent
+     whose CLI set a long window title pushed `detach` off the right edge of
+     a phone -- and the one control you need from a terminal you are not
+     typing in is the one that gets you out of it. */
+  #term .thead .who {
+    font-family: var(--mono); font-weight: 650;
+    min-width: 0; flex: 0 1 auto;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #term .thead button { flex: 0 0 auto; }
+  #term .thead .badge { flex: 0 0 auto; }
+  @media (max-width: 620px) {
+    /* Size and state are nice to know and not worth a thumb's width. */
+    #term .thead { gap: 6px; padding-left: 8px; padding-right: 8px; }
+    #term .thead #tSize { display: none; }
+    #term .thead button { min-height: 32px; padding: 5px 8px; }
+  }
   .nexterm {
     position: relative; overflow: hidden; padding: 3px 4px;
     background: var(--ntbg); color: var(--ntfg);
@@ -629,6 +646,20 @@
     .feed { max-height: 60vh; }
   }
   .mic.on { color: var(--bad); }
+
+  /* The camera, over everything, because taking a photo is the whole screen's
+     job for as long as it lasts. */
+  .camera {
+    position: fixed; inset: 0; z-index: 80; background: #000;
+    display: grid; grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .camera video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .camera .camkeys {
+    display: flex; gap: 10px; justify-content: center; align-items: center;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  .camera .camkeys button { min-height: 40px; padding: 8px 18px; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -783,6 +814,18 @@
       <button class="tiny" onclick="setReply(null)" title="Don't reply to it">\u00d7</button>
     </div>
     <div class="composer" id="chatComposer"></div>
+  </div>
+
+  <!-- The camera. "Look at this" is most of what a camera is for on a fleet:
+       a photo of a screen, a whiteboard, a machine with a light on it. What
+       it takes goes into the workspace, like any other upload. -->
+  <div id="camera" class="camera" hidden>
+    <video id="camView" playsinline muted></video>
+    <div class="camkeys">
+      <button onclick="camPhoto()">photo</button>
+      <button id="camRecBtn" onclick="camClip()">record</button>
+      <button class="tiny" onclick="closeCamera()">close</button>
+    </div>
   </div>
 
   <!-- An agent's terminal. The hub already speaks this protocol to
@@ -1006,13 +1049,29 @@ async function getJSON(url) {
 }
 
 async function post(url, body) {
+  // The token, when this dashboard is driven by one rather than by an
+  // account: a cookie rides along on its own, a header does not.
+  const headers = { "content-type": "application/json" };
+  if (typeof token !== "undefined" && token) headers.authorization = "Bearer " + token;
   const r = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
+    credentials: "same-origin",
     body: JSON.stringify(body),
   });
   let j = {};
   try { j = await r.json(); } catch (e) { /* an empty body is fine */ }
+  if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
+  return j;
+}
+
+/// DELETE, for the handful of things that are removals rather than actions.
+async function del(url) {
+  const headers = {};
+  if (typeof token !== "undefined" && token) headers.authorization = "Bearer " + token;
+  const r = await fetch(url, { method: "DELETE", headers, credentials: "same-origin" });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
   if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
   return j;
 }
@@ -1580,7 +1639,15 @@ function viewAgents(d, now) {
                  name, its history and whatever is waiting for it"
                  onclick="startSeat('${esc(a.slot_id)}','${
                    esc(a.name).replace(/'/g, "\\'")}')"
-                 >start</button>` : ""}</td>
+                 >start</button>` : ""}
+            <button class="tiny" title="Move this seat to another session"
+                 onclick="moveSeat('${esc(a.slot_id)}','${
+                   esc(a.name).replace(/'/g, "\\'")}','${esc(a.session || "")}')"
+                 >move</button>
+            <button class="tiny" title="Remove this seat and its history"
+                 onclick="removeSeat('${esc(a.slot_id)}','${
+                   esc(a.name).replace(/'/g, "\\'")}',${dead ? "false" : "true"})"
+                 >remove</button></td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}
             ${between ? ` <span class="badge info" title="between turns — this CLI takes its
@@ -1629,6 +1696,50 @@ async function startSeat(slot, name) {
   tick();
 }
 
+/// Move a seat to another team.
+///
+/// The agent is not restarted: its next tool call lands in the new session.
+/// Its workspace, file locks and ownership zones are released, because all
+/// three describe the team it is leaving.
+async function moveSeat(slot, name, from) {
+  const names = (snap.sessions || []).map((s) => s.name).filter((n) => n !== from);
+  if (!names.length) { note("There is no other session to move it to."); return; }
+  const to = prompt(`Move ${name} to which session?\n\n` + names.join(", "), names[0]);
+  if (!to) return;
+  try {
+    const r = await post(`/v1/slots/${encodeURIComponent(slot)}/move`, { session: to.trim() });
+    if (r && r.error) throw new Error(r.error);
+    let said = `${name} is now in ${r.session_name || to}.`;
+    if (r.messages_left_unread) said += ` ${r.messages_left_unread} unread message(s) stayed behind.`;
+    note(said);
+  } catch (e) {
+    note(e.message || "could not move that");
+  }
+  tick();
+}
+
+/// Remove a seat, with whatever history belongs to it.
+///
+/// Asked for out loud, with the one fact that decides it: removing a seat
+/// whose process is still running does not kill the process -- it orphans
+/// it, which is a different thing from stopping an agent.
+async function removeSeat(slot, name, live) {
+  const warn = live
+    ? `${name} is RUNNING. Removing the seat does not stop the process: it is left`
+      + ` where it is, orphaned.\n\nRemove the seat anyway?`
+    : `Remove ${name}? The seat and its history leave this session. This cannot be undone.`;
+  if (!confirm(warn)) return;
+  try {
+    const r = await del(`/v1/slots/${encodeURIComponent(slot)}`
+      + (live ? "?force=1" : ""));
+    if (r && r.error) throw new Error(r.error);
+    note(`${name} is gone (${r.agent_rows || 0} agent row(s) with it).`);
+  } catch (e) {
+    note(e.message || "could not remove that");
+  }
+  tick();
+}
+
 // Retiring seats nobody is in. Deliberately a button: the hub must not
 // guess which dead seat was a restart and which is a conversation that
 // might still come back.
@@ -1656,7 +1767,7 @@ function paintComposer(d) {
   if (host.hidden) return;
   const all = isAll();
   const unclaimed = ((d && d.messages) || []).filter((m) => !m.claimed).length;
-  const sig = [all, unclaimed, speaking,
+  const sig = [all, unclaimed, speaking, isSpeaking(),
                (snap.sessions || []).map((x) => x.id).join("|")].join("~");
   if (host.dataset.sig === sig) return;
   host.dataset.sig = sig;
@@ -1669,11 +1780,16 @@ function paintComposer(d) {
                `</select>` : ""}
       <input id="sendText" type="text" placeholder="message the team as the operator"
              onkeydown="if(event.key==='Enter')sendOperatorMessage()">
+      <button onclick="pickFiles()" title="put a file in the workspace for the agents to read"
+              >📎</button>
       ${(canHear() || fleetHas("transcribe")) ? `<button id="micBtn" class="mic"
               onclick="dictate()" title="dictate">🎤</button>` : ""}
       <button onclick="sendOperatorMessage()">send</button>
-      ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
-              title="read new messages aloud">${speaking ? "\u{1F50A}" : "\u{1F507}"}</button>` : ""}
+      ${(canSpeak() || fleetHas("tts")) ? `<button onclick="${
+                isSpeaking() ? "stopSpeaking()" : "toggleSpeak()"}"
+              title="${isSpeaking() ? "stop talking"
+                : (speaking ? "stop reading new messages aloud" : "read new messages aloud")}"
+              >${isSpeaking() ? "\u{23F9}" : (speaking ? "\u{1F50A}" : "\u{1F507}")}</button>` : ""}
       <button onclick="clearUnclaimed()" title="mark everything nobody has claimed as handled"
               ${unclaimed ? "" : "disabled"}>clear ${unclaimed || ""} unclaimed</button>
     </div>`;
@@ -1694,7 +1810,9 @@ let termWs = null, term = null, termAgent = null, termRO = false;
 function termUrl(agent, cols, rows) {
   const base = location.protocol === "https:" ? "wss://" : "ws://";
   return `${base}${location.host}/v1/attach/ws?agent=${encodeURIComponent(agent)}` +
-         `&cols=${cols}&rows=${rows}&replay=65536`;
+         // All of the node's ring (256 KiB): opening a terminal and finding
+         // one screenful, with everything above it gone, is the complaint.
+         `&cols=${cols}&rows=${rows}&replay=262144`;
 }
 
 function openTerm(agent, name) {
@@ -2145,7 +2263,7 @@ function renderChat(d) {
 
   // Built once, not per poll: it holds a caret.
   const host = $("chatComposer");
-  const sig = [chatChan, sessions.length, speaking,
+  const sig = [chatChan, sessions.length, speaking, isSpeaking(),
                canHear() || fleetHas("transcribe"),
                canSpeak() || fleetHas("tts")].join("~");
   if (host.dataset.sig !== sig) {
@@ -2160,15 +2278,21 @@ function renderChat(d) {
       <input id="chatText" type="text" autocomplete="off"
              placeholder="say something to ${chatChan === "*" ? "every team" : "#" + esc(chatChan)}, as the operator"
              onkeydown="if(event.key==='Enter')chatSend()">
+      <button onclick="pickFiles()" title="put a file in the workspace for the agents to read"
+              >📎</button>
+      ${navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+        ? `<button onclick="openCamera()" title="take a photo or a clip and put it in the workspace"
+              >📷</button>` : ""}
       ${(canHear() || fleetHas("transcribe")) ? `<button id="chatMic" class="mic"
               onclick="chatVoice()" title="send a voice message (${fleetHas("transcribe")
                 ? "transcribed on the fleet" : "transcribed in this browser"})"
               >🎤</button>` : ""}
       <button onclick="chatSend()">send</button>
-      ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
-              title="read new messages in this channel aloud (${fleetHas("tts")
-                ? "spoken by the fleet" : "by this browser"})"
-              >${speaking ? "\u{1F50A}" : "\u{1F507}"}</button>` : ""}`;
+      ${(canSpeak() || fleetHas("tts")) ? `<button onclick="${
+                isSpeaking() ? "stopSpeaking()" : "toggleSpeak()"}"
+              title="${isSpeaking() ? "stop talking" : `read new messages in this channel aloud (${
+                fleetHas("tts") ? "spoken by the fleet" : "by this browser"})`}"
+              >${isSpeaking() ? "\u{23F9}" : (speaking ? "\u{1F50A}" : "\u{1F507}")}</button>` : ""}`;
     if (keep && $("chatText")) $("chatText").value = keep;
   }
 }
@@ -2270,7 +2394,8 @@ function openMsgSheet(el, x, y) {
   sheet.innerHTML =
     `<div class="head">${esc(d.from)}: ${esc(d.body.slice(0, 60))}</div>` +
     ((canSpeak() || fleetHas("tts"))
-      ? `<button onclick="listenTo(${d.id})">\u{1F50A} listen to this</button>` : "") +
+      ? `<button onclick="${isSpeaking() ? "stopSpeaking()" : `listenTo(${d.id})`}">${
+            isSpeaking() ? "\u{23F9} stop" : "\u{1F50A} listen to this"}</button>` : "") +
     `<button onclick="replyTo(${d.id})">\u21a9 reply to ${esc(d.from)}</button>` +
     `<button onclick="copyMsg(${d.id})">copy</button>` +
     `<button onclick="closeMsgSheet()">cancel</button>`;
@@ -2646,6 +2771,149 @@ async function askFleet(capability, request, waitMs) {
   throw new Error("timed out waiting for " + capability);
 }
 
+// ------------------------------------------------------------- uploads ----
+// An agent reads FILES. A screenshot, a PDF, a recording has to be somewhere
+// before anybody can be asked to look at it -- so it goes into the session's
+// workspace, on a machine that holds it, and the path is said in the chat.
+// Which is also why there is no "attachment" here: there is nothing to
+// attach a file to that an agent would ever open.
+
+/// Which team the file belongs to: the channel being read, or the session on
+/// screen.
+function uploadSession() {
+  if (chatOpen && chatChan && chatChan !== "*") return chatChan;
+  const sid = currentSession();
+  if (sid && sid !== "*") return sid;
+  const first = (snap && snap.sessions || [])[0];
+  return first ? first.id : "";
+}
+
+/// Read a File as base64, without the data-URI prefix mattering: the hub
+/// accepts either.
+function asBase64(file) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result));
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+}
+
+const MAX_UPLOAD = 64 * 1024 * 1024;
+
+/// Put one file in the workspace and tell the team where it is.
+async function uploadFile(file, say) {
+  const sid = uploadSession();
+  if (!sid) { note("Pick a session first: a file goes into that team's workspace."); return; }
+  if (file.size > MAX_UPLOAD) {
+    note(`${file.name} is ${(file.size / 1048576).toFixed(1)}MB, over the 64MB limit for one `
+       + `upload. Put it in the workspace directly and say where it is.`);
+    return;
+  }
+  note(`Uploading ${file.name}\u2026`);
+  try {
+    const body = { name: file.name, data_base64: await asBase64(file) };
+    if (say) body.say = say;
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/upload`, body);
+    note(`${file.name} is in the workspace at ${r.path} on ${r.node}. The team has been told.`);
+  } catch (e) {
+    note(e.message || "could not upload that");
+  }
+  tick();
+}
+
+/// The paperclip: anything the file picker will give us, one at a time.
+function pickFiles() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.onchange = async () => {
+    const files = [...(input.files || [])];
+    const say = files.length === 1
+      ? (prompt(`A line for the team about ${files[0].name}?`, "") || "")
+      : "";
+    for (const f of files) await uploadFile(f, say);
+  };
+  input.click();
+}
+
+// ------------------------------------------------------------- camera ----
+// A phone has a camera, and "look at this" is most of what a camera is for
+// on a fleet: a photo of a screen, a whiteboard, a machine with a light on
+// it. A clip, for something that only makes sense moving.
+let camStream = null;
+let camRec = null;
+
+async function openCamera() {
+  const host = $("camera");
+  if (!host) return;
+  host.hidden = false;
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" }, audio: true,
+    });
+  } catch (e) {
+    host.hidden = true;
+    note("No camera: " + (e.message || e.name));
+    return;
+  }
+  const v = $("camView");
+  v.srcObject = camStream;
+  v.muted = true;
+  await v.play().catch(() => {});
+  $("camRecBtn").textContent = "record";
+}
+
+function closeCamera() {
+  if (camRec && camRec.state === "recording") camRec.stop();
+  camRec = null;
+  if (camStream) camStream.getTracks().forEach((t) => t.stop());
+  camStream = null;
+  const host = $("camera");
+  if (host) host.hidden = true;
+}
+
+/// A still, as a JPEG, straight into the workspace.
+async function camPhoto() {
+  const v = $("camView");
+  if (!v || !v.videoWidth) return;
+  const c = document.createElement("canvas");
+  c.width = v.videoWidth;
+  c.height = v.videoHeight;
+  c.getContext("2d").drawImage(v, 0, 0);
+  const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
+  if (!blob) { note("could not take that photo"); return; }
+  const name = `photo-${new Date().toISOString().replace(/[:.]/g, "-")}.jpg`;
+  closeCamera();
+  await uploadFile(new File([blob], name, { type: "image/jpeg" }),
+                   "A photo for the team to look at.");
+}
+
+/// A clip. Press once to start, again to stop -- a fixed length is a guess
+/// nobody can make before the thing has happened.
+async function camClip() {
+  if (!camStream) return;
+  if (camRec && camRec.state === "recording") {
+    camRec.stop();
+    return;
+  }
+  if (!window.MediaRecorder) { note("This browser cannot record video."); return; }
+  const chunks = [];
+  camRec = new MediaRecorder(camStream);
+  camRec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  camRec.onstop = async () => {
+    const type = chunks[0] ? chunks[0].type : "video/webm";
+    const blob = new Blob(chunks, { type });
+    const ext = type.includes("mp4") ? "mp4" : "webm";
+    const name = `clip-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
+    camRec = null;
+    closeCamera();
+    await uploadFile(new File([blob], name, { type }), "A clip for the team to look at.");
+  };
+  camRec.start();
+  $("camRecBtn").textContent = "stop";
+}
+
 // Record from the microphone, transcribe it on the fleet, put the words in
 // the box. Phones are where this matters: typing a sentence to a team
 // one-handed is the thing people do not do.
@@ -2737,7 +3005,10 @@ let spokenUpTo = 0;
 function toggleSpeak() {
   speaking = !speaking;
   try { localStorage.setItem("nexmesh.speak", speaking ? "1" : "0"); } catch (e) {}
-  if (!speaking && canSpeak()) window.speechSynthesis.cancel();
+  // Off means SILENT now, not "silent after this one": a three-paragraph
+  // message read out on a phone is a long time to wait for a switch to take
+  // effect.
+  if (!speaking) stopSpeaking();
   // Start from here rather than reciting the backlog.
   spokenUpTo = Math.max(spokenUpTo, lastMessageId());
   note(speaking ? "Reading new messages aloud." : "Stopped reading aloud.");
@@ -2769,17 +3040,48 @@ function speakNew() {
   }
 }
 
+// What is being said right now, so it can be stopped. A voice you cannot
+// interrupt is a voice you turn off and never turn on again -- and on a
+// phone, with a long message, that is within about four seconds.
+let saying = null;        // the <audio> playing the fleet's voice
+let sayWanted = 0;        // bumped by stopSpeaking(): answers in flight are dropped
+
+/// Stop talking, now. Safe to call when nothing is.
+function stopSpeaking() {
+  sayWanted++;
+  if (saying) {
+    try { saying.pause(); saying.currentTime = 0; } catch (e) {}
+    saying = null;
+  }
+  if (canSpeak()) {
+    try { window.speechSynthesis.cancel(); } catch (e) {}
+  }
+  render();
+}
+
+/// Whether anything is being spoken at this moment.
+function isSpeaking() {
+  if (saying && !saying.paused) return true;
+  try { return canSpeak() && window.speechSynthesis.speaking; } catch (e) { return false; }
+}
+
 // Speak a line: the fleet's own voice if it has one, the browser's if not.
 async function say(text) {
+  const mine = sayWanted;
   if (fleetHas("tts")) {
     try {
       const out = await askFleet("tts", { input: text }, 60000);
+      // Stopped while the fleet was still rendering it: say nothing.
+      if (mine !== sayWanted) return;
       const j = (() => { try { return JSON.parse(out); } catch (e) { return null; } })();
       const src = j && (j.url || (j.data && j.data.url) || j.audio_base64);
       if (src) {
         const audio = new Audio(
           String(src).startsWith("http") || String(src).startsWith("/")
             ? src : "data:audio/mpeg;base64," + src);
+        saying = audio;
+        audio.onended = () => { if (saying === audio) saying = null; render(); };
+        render();
         await audio.play().catch(() => {});
         return;
       }
@@ -2787,10 +3089,12 @@ async function say(text) {
       // Fall through to the browser rather than going silent.
     }
   }
-  if (!canSpeak()) return;
+  if (!canSpeak() || mine !== sayWanted) return;
   const u = new SpeechSynthesisUtterance(text);
   u.lang = navigator.language || "en-GB";
+  u.onend = () => render();
   window.speechSynthesis.speak(u);
+  render();
 }
 
 // The operator speaking into a team. In the combined view it has to say

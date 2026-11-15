@@ -316,6 +316,52 @@ async fn call_tool(hub: &Hub, name: &str, a: &Value) -> Result<String> {
             })
         }
 
+        "delegate_task" => {
+            let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
+            let to = need(a, "to")?;
+            let task = need(a, "task")?;
+            let why = arg_str(a, "why").unwrap_or_default();
+            // The plan first: if the seat does not exist, nothing has been
+            // said to anybody and the error names the team it looked in.
+            let item = hub
+                .post(
+                    &format!("/v1/sessions/{sid}/plan"),
+                    json!({ "label": task, "owner": to }),
+                )
+                .await?;
+            let text = if why.trim().is_empty() {
+                format!("TASK: {task}")
+            } else {
+                format!("TASK: {task}\n\nWhy: {why}")
+            };
+            let sent = hub
+                .post(
+                    &format!("/v1/sessions/{sid}/messages"),
+                    json!({ "text": text, "to": to }),
+                )
+                .await?;
+            // "Sent" is not "heard": a CLI somebody started by hand sees this
+            // when it next calls a tool, which may be a while.
+            let route = sent["seats"]
+                .as_array()
+                .and_then(|v| v.first())
+                .and_then(|s| s["route"].as_str())
+                .unwrap_or("");
+            let mut out = format!(
+                "Delegated to {} in {}: step {} of their plan.",
+                item["owner"].as_str().unwrap_or(&to),
+                sid,
+                item["ord"].as_i64().unwrap_or(0)
+            );
+            if route == "next tool call" {
+                out.push_str(
+                    " They will see it on their next tool call -- nothing can interrupt a \
+                     hand-started CLI.",
+                );
+            }
+            Ok(out)
+        }
+
         "pause_agents" | "resume_agents" => {
             let sid = hub.resolve_session(arg_str(a, "session").as_deref()).await?;
             let mut body = json!({ "paused": name == "pause_agents" });

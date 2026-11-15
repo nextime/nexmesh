@@ -371,6 +371,13 @@ async fn handle(
             }
         }
 
+        NodeToHub::PutFileResult { req_id, ok, path, bytes, detail } => {
+            st.complete_sync(
+                req_id,
+                serde_json::json!({ "ok": ok, "path": path, "bytes": bytes, "detail": detail }),
+            );
+        }
+
         NodeToHub::SyncResult {
             req_id, workspace_id, ok, conflict, head, detail, changed,
         } => {

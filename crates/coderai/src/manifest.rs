@@ -20,6 +20,7 @@
 //! wins; none of them yielding is reported as such.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
@@ -80,6 +81,46 @@ pub struct Capability {
     /// wrong "yes" would waste real time.
     #[serde(default)]
     pub probe_required: bool,
+    /// How the request is sent: `json` (the default) or `multipart`.
+    ///
+    /// Audio and document endpoints that follow OpenAI's shape take a FILE,
+    /// not a JSON field, and answer 422 to anything else -- naming the fields
+    /// they wanted, which is how this came to be here.
+    #[serde(default = "json_encoding")]
+    pub encoding: String,
+    /// For a multipart request: which accepted field carries the bytes.
+    /// Whatever the asker sent under it -- base64, a data URI -- becomes the
+    /// file part.
+    #[serde(default)]
+    pub file_field: Option<String>,
+    /// What that part is CALLED on the wire, when the service's name for it
+    /// is not the asker's. An OpenAI-shaped endpoint wants `file`; an agent
+    /// sends `audio_base64`, which is the field it was told to send.
+    #[serde(default)]
+    pub file_part: Option<String>,
+    /// What to call that part's filename. Some services sniff the format
+    /// from it, so it is worth being able to say.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// Field values to use when the asker did not say. A service that
+    /// REQUIRES a model needs one even from an agent that has no opinion
+    /// about which; this is where the install's answer goes.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, toml::Value>,
+    /// This capability answers with the FILE itself rather than JSON about
+    /// one -- speech, mostly. The bytes come back as base64 under
+    /// `audio_base64`, which is what every player in nexmesh already reads.
+    #[serde(default)]
+    pub binary: bool,
+    /// Where the sound is, when it arrives inside JSON rather than as the
+    /// body. This install answers speech as `{"audio": "<base64>"}`, which
+    /// no amount of guessing would have found.
+    #[serde(default)]
+    pub audio_at: Vec<String>,
+}
+
+fn json_encoding() -> String {
+    "json".into()
 }
 
 fn post() -> String {
@@ -290,5 +331,23 @@ text_at = ["text", "data.text"]
         });
         let got = extract(&v, "studio.endpoints[*]");
         assert_eq!(got, vec!["v1/audio/speech", "v1/ocr"]);
+    }
+}
+
+/// A manifest value as JSON, for the request body. The manifest is TOML
+/// because a person writes it; the request is JSON because a service reads
+/// it.
+pub fn toml_to_json(v: &toml::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        toml::Value::String(s) => J::String(s.clone()),
+        toml::Value::Integer(i) => J::Number((*i).into()),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number).unwrap_or(J::Null),
+        toml::Value::Boolean(b) => J::Bool(*b),
+        toml::Value::Datetime(d) => J::String(d.to_string()),
+        toml::Value::Array(a) => J::Array(a.iter().map(toml_to_json).collect()),
+        toml::Value::Table(t) => {
+            J::Object(t.iter().map(|(k, x)| (k.clone(), toml_to_json(x))).collect())
+        }
     }
 }

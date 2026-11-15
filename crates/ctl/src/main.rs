@@ -11,6 +11,7 @@
 //! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
 mod install;
+mod replies;
 mod runcmd;
 mod seatcmd;
 mod tlstrust;
@@ -171,6 +172,71 @@ so it needs --session. A name already used in that session is refused.")]
         /// Session to look the name up in. Needed when WHO is a name.
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
+    },
+    /// Put a file in a session's workspace, where its agents can read it.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh upload payments ./screenshot.png
+  nexmesh upload payments ./spec.pdf --say 'the API we have to match'
+  nexmesh upload payments ./clip.mp4 --node machine-a --dir media
+
+The file lands in the workspace on a machine that holds it, and the path is
+said in the team's chat -- because an agent reads files, and a file nobody
+has been told about is a file nobody opens.
+
+Up to 64MB in one go. Anything larger belongs in the workspace by other
+means, with `nexmesh send` to say where it is.")]
+    Upload {
+        /// Session, by name or id.
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// The file to put there.
+        #[arg(value_name = "FILE")]
+        file: String,
+        /// A line for the team's chat, instead of the plain one.
+        #[arg(long, value_name = "TEXT")]
+        say: Option<String>,
+        /// Which machine's copy to write to. Any that holds it, by default.
+        #[arg(long, value_name = "NODE")]
+        node: Option<String>,
+        /// Which workspace, when the session has more than one.
+        #[arg(long, value_name = "NAME")]
+        workspace: Option<String>,
+        /// Directory inside the workspace. `uploads` by default.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<String>,
+    },
+    /// Say which parts of the workspace a seat is responsible for.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh set-owns sl-1a2b3c4d 'verti/**' ombia      # these, and nothing else
+  nexmesh set-owns Max --session payments --add digesta
+  nexmesh set-owns Max --session payments --none     # owns nothing again
+
+A zone is a pattern over the workspace: a plain name like `ombia` covers
+everything under it, `verti/**` is a glob, and `src/auth/*` stops at one
+level.
+
+Teammates READ these: list_peers shows what each one owns, who_owns answers
+for a single path, and acquire_file says whose area a file is in. That is
+what makes four agents in one checkout hand work to each other instead of
+editing over each other.")]
+    SetOwns {
+        /// Seat id, or a name with --session.
+        #[arg(value_name = "SEAT|NAME")]
+        who: String,
+        /// Patterns. Omit them with --none to clear the list.
+        #[arg(value_name = "PATTERN")]
+        patterns: Vec<String>,
+        /// Session to look the name up in. Needed when WHO is a name.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Add to what it already owns instead of replacing the list.
+        #[arg(long)]
+        add: bool,
+        /// Clear every zone this seat has.
+        #[arg(long, conflicts_with = "add")]
+        none: bool,
     },
     /// Change what a seat is for.
     ///
@@ -615,7 +681,12 @@ ordinary terminal has none, so `spawn` or `adopt` it first.")]
         #[arg(value_name = "NAME|SEAT")]
         who: String,
         /// Bytes of scrollback to replay first.
-        #[arg(long, default_value_t = 16384)]
+        ///
+        /// The node keeps 256 KiB per agent, which is what this asks for:
+        /// coming back to a terminal and finding one screenful of context,
+        /// with everything above it gone, is the thing people complain
+        /// about. Lower it on a slow link.
+        #[arg(long, default_value_t = 262144)]
         replay: usize,
     },
     #[command(after_help = "\
@@ -780,6 +851,38 @@ fn client(ca_cert: Option<&str>, identity: Option<(&str, &str)>) -> Result<reqwe
     Ok(b.build()?)
 }
 
+/// base64, for the one thing here that carries bytes over HTTP.
+fn b64(data: &[u8]) -> String {
+    const B: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(B[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// "2m", "3h", "4d" -- how long ago something was, for a listing.
+fn ago(now: i64, then: i64) -> String {
+    let d = ((now - then) / 1000).max(0);
+    if d < 60 {
+        format!("{d}s")
+    } else if d < 3600 {
+        format!("{}m", d / 60)
+    } else if d < 86_400 {
+        format!("{}h", d / 3600)
+    } else {
+        format!("{}d", d / 86_400)
+    }
+}
+
 fn authed(r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match token() {
         Some(t) => r.bearer_auth(t),
@@ -927,14 +1030,19 @@ impl Drop for RawGuard {
 /// Ctrl-] detaches, the way telnet does. Ctrl-C cannot: in raw mode it belongs
 /// to the agent, which is the whole point of a takeover.
 const DETACH_BYTE: u8 = 0x1d;
-/// Ctrl-^ : say it instead of typing it. The words are TYPED into the agent's
-/// prompt, never submitted -- Enter stays the operator's, because dictation
-/// that presses it for you is dictation you cannot correct.
-const DICTATE_BYTE: u8 = 0x1e;
-/// Ctrl-_ : read back what is on the screen. Both are rare enough in a TUI to
-/// spend, and the alternative -- a prefix key -- would have made Ctrl-] a
-/// two-step detach for everybody.
-const SPEAK_BYTE: u8 = 0x1f;
+
+/// The voice keys, from `~/.nexmesh/console.toml`.
+///
+/// Defaults: Ctrl-^ dictates, Ctrl-_ reads a reply back, Ctrl-\ reads every
+/// new one as it arrives. All three are control characters because an attach
+/// forwards every printable byte to the agent, and all three are
+/// configurable because Ctrl-^ is Ctrl+Shift+6 on a US layout and awkward or
+/// impossible on others.
+fn voice_keys() -> voice::Keys {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let path = std::path::Path::new(&home).join(".nexmesh").join("console.toml");
+    voice::keys_from(&std::fs::read_to_string(path).unwrap_or_default())
+}
 
 /// A keyboard this viewer can WALK AWAY FROM.
 ///
@@ -1010,15 +1118,133 @@ impl Keyboard {
 /// told the screen is one row shorter than it is, and that row says whose
 /// terminal this is and which key brings you back.
 struct StatusBar {
-    text: String,
+    /// Who this is: the seat, and where it is running.
+    who: String,
+    host: String,
+    session: String,
+    /// The adopted pane a seat's CLI is sitting in, when it is reached
+    /// through one.
+    via: String,
+    /// Whether the bytes are going straight to the node.
+    direct: bool,
+    /// The keys, in the order they are given up when the width runs out.
+    keys: Vec<(String, String)>,
+    /// Passing state: `listening`, `aloud`, `reading 2 back`.
+    marks: Vec<String>,
     cols: u16,
     rows: u16,
 }
 
 impl StatusBar {
     /// The bar is skipped on a screen too short to spare a row for it.
-    fn new(text: String, cols: u16, rows: u16) -> Option<Self> {
-        (rows >= 4).then_some(StatusBar { text, cols, rows })
+    fn new(who: String, host: String, session: String, via: String, cols: u16, rows: u16)
+        -> Option<Self>
+    {
+        (rows >= 4).then_some(StatusBar {
+            who,
+            host,
+            session,
+            via,
+            direct: false,
+            keys: Vec::new(),
+            marks: Vec::new(),
+            cols,
+            rows,
+        })
+    }
+
+    fn set_mark(&mut self, name: &str, on: bool) {
+        self.marks.retain(|m| !m.starts_with(name));
+        if on {
+            self.marks.push(name.to_string());
+        }
+    }
+
+    /// A mark with something after it -- "reading 2 back" -- replacing any
+    /// earlier one with the same first word.
+    fn say_mark(&mut self, name: &str, text: String) {
+        self.marks.retain(|m| !m.starts_with(name));
+        self.marks.push(text);
+    }
+
+    /// The line, fitted to the width it has.
+    ///
+    /// The way out comes FIRST, because an attach is a takeover of somebody
+    /// else's terminal and "how do I get out of this" is the question this
+    /// row exists to answer. Then who you are talking to, in the same
+    /// `session:agent` form the window title uses -- one way of naming a
+    /// seat, everywhere. Everything after that gives way as the terminal
+    /// narrows: the machine and the pane first, then the key labels, then
+    /// the other keys, least useful first.
+    fn line(&self) -> String {
+        let w = self.cols as usize;
+        let sep = "  \u{00b7}  ";
+        let id = if self.session.is_empty() {
+            self.who.clone()
+        } else {
+            format!("{}:{}", self.session, self.who)
+        };
+        // The last key is the way out; the rest are optional.
+        let (out, rest) = match self.keys.split_last() {
+            Some(((k, what), rest)) => ((k.clone(), what.clone()), rest.to_vec()),
+            None => (("Ctrl-]".to_string(), "detach".to_string()), Vec::new()),
+        };
+        let marks: String = if self.marks.is_empty() {
+            String::new()
+        } else {
+            format!("{sep}{}", self.marks.join(sep))
+        };
+        // `keep` counts from the END of the optional keys, because the ones
+        // nearest the way out are the ones worth keeping.
+        let voice = |short: bool, keep: usize| -> String {
+            let picked: Vec<String> = rest
+                .iter()
+                .skip(rest.len().saturating_sub(keep))
+                .map(|(k, what)| if short { k.clone() } else { format!("{k} {what}") })
+                .collect();
+            if picked.is_empty() {
+                String::new()
+            } else {
+                format!("{sep}{}", picked.join(sep))
+            }
+        };
+
+        let n = rest.len();
+        let mut tries: Vec<(bool, usize)> = vec![(false, n), (true, n)];
+        for keep in (0..n).rev() {
+            tries.push((true, keep));
+        }
+        let mut shortest = String::new();
+        for (short_keys, keep) in tries {
+            for drop_level in 0..3 {
+                let mut line = format!(" {} {}{sep}{id}{marks}{}", out.0, out.1, voice(short_keys, keep));
+                if drop_level < 2 && !self.host.is_empty() && self.host != "-" {
+                    line.push_str(&format!("{sep}on {}", self.host));
+                }
+                if drop_level < 1 {
+                    if self.direct {
+                        line.push_str(&format!("{sep}direct"));
+                    }
+                    if !self.via.is_empty() {
+                        line.push_str(&format!("{sep}via {}", self.via));
+                    }
+                }
+                if line.chars().count() <= w {
+                    return line;
+                }
+                shortest = line;
+            }
+        }
+        // Narrower than the two things that cannot go: cut, rather than
+        // wrap onto the agent's screen.
+        let bare = format!(" {}{sep}{id}", out.0);
+        if bare.chars().count() <= w {
+            return bare;
+        }
+        if shortest.chars().count() > w {
+            return shortest.chars().take(w).collect();
+        }
+        shortest
     }
 
     /// Reserve the row: the agent's screen is everything above it.
@@ -1032,7 +1258,7 @@ impl StatusBar {
     /// somebody else's screen and should read as a frame around it, not as a
     /// second thing competing for attention. (Reverse video did the latter.)
     fn paint(&self) -> Vec<u8> {
-        let mut line = self.text.clone();
+        let mut line = self.line();
         let w = self.cols as usize;
         if line.chars().count() > w {
             line = line.chars().take(w).collect();
@@ -1135,15 +1361,13 @@ async fn attach(
     // A seat whose CLI sits in an adopted terminal is reached THROUGH that
     // terminal: the hub says so rather than refusing, and the bar says so
     // rather than pretending the pty is the agent's own.
-    let via = r["via"].as_str().map(|v| format!("  \u{00b7}  via {v}")).unwrap_or_default();
+    let via = r["via"].as_str().unwrap_or_default().to_string();
+    let vkeys = voice_keys();
     let mut bar = StatusBar::new(
-        format!(
-            " nexmesh \u{203a} {name}{}{}{}{}  \u{00b7}  Ctrl-] detach",
-            if host.is_empty() || host == "-" { String::new() } else { format!(" on {host}") },
-            format!("  \u{00b7}  {session}"),
-            via,
-            ""
-        ),
+        name.to_string(),
+        host.to_string(),
+        session_label.clone(),
+        via,
         cols,
         rows,
     );
@@ -1179,18 +1403,19 @@ async fn attach(
     };
     // Said out loud, because "why is this slow" should be answerable by
     // looking at the screen.
-    if voice::detect().can_hear() {
-        if let Some(b) = &mut bar {
-            b.text = b.text.replace(
-                "  \u{00b7}  Ctrl-] detach",
-                "  \u{00b7}  Ctrl-^ say it  \u{00b7}  Ctrl-] detach",
-            );
+    // The keys, least important first: that is the order they are given up
+    // in when the row is too narrow, and detach is never given up.
+    if let Some(b) = &mut bar {
+        let a = voice::detect();
+        if a.can_speak() {
+            b.keys.push((voice::key_name(vkeys.aloud), "aloud".into()));
+            b.keys.push((voice::key_name(vkeys.speak), "read".into()));
         }
-    }
-    if wire.direct {
-        if let Some(b) = &mut bar {
-            b.text = b.text.replace("  \u{00b7}  Ctrl-] detach", "  \u{00b7}  direct  \u{00b7}  Ctrl-] detach");
+        if a.can_hear() {
+            b.keys.push((voice::key_name(vkeys.dictate), "say it".into()));
         }
+        b.keys.push(("Ctrl-]".into(), "detach".into()));
+        b.direct = wire.direct;
     }
 
 
@@ -1219,14 +1444,19 @@ async fn attach(
 
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
 
-    // What the agent has put on the screen lately, in words. Shared with the
-    // key loop, which is where Ctrl-_ asks for it to be read out.
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    // What the agent has said, split into replies -- everything printed
+    // since the operator last pressed Enter is its answer to that. Shared
+    // with the key loop, which is where one of them is chosen to be read.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(replies::Replies::default()));
+    // When the last byte arrived, so "it has stopped talking" can be noticed
+    // without polling the process.
+    let quiet = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
 
     // The agent's terminal -> ours, whichever way the bytes came.
     let reader = {
         let quit_tx = quit_tx.clone();
         let heard = heard.clone();
+        let quiet = quiet.clone();
         let mut rx = std::mem::replace(&mut wire.rx, tokio::sync::mpsc::channel(1).1);
         tokio::spawn(async move {
             let mut out = tokio::io::stdout();
@@ -1238,21 +1468,13 @@ async fn attach(
                 match msg {
                     wire::In::Data(data) => {
                         let data = strip.pass(&data);
-                        // A copy of what went past, as words, so Ctrl-_ can
-                        // read it back. Capped: this is for the last thing
-                        // said, not for the session.
+                        // A copy of what went past, as words, so a reply can
+                        // be read back or read out as it arrives.
                         if let Ok(mut seen) = heard.lock() {
-                            seen.push_str(&voice::plain(&data));
-                            seen.push(' ');
-                            if seen.len() > 8192 {
-                                let cut = seen.len() - 4096;
-                                let at = seen
-                                    .char_indices()
-                                    .map(|(i, _)| i)
-                                    .find(|i| *i >= cut)
-                                    .unwrap_or(0);
-                                *seen = seen[at..].to_string();
-                            }
+                            seen.saw(&voice::plain(&data));
+                        }
+                        if let Ok(mut q) = quiet.lock() {
+                            *q = std::time::Instant::now();
                         }
                         if out.write_all(&data).await.is_err() || out.flush().await.is_err() {
                             break;
@@ -1301,12 +1523,22 @@ async fn attach(
     // is below noticing and far below costing anything.
     let mut repaint = tokio::time::interval(Duration::from_millis(250));
     repaint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Only consulted while reading aloud; cheap enough to leave running.
+    let mut settle = tokio::time::interval(Duration::from_millis(400));
+    settle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Speaking and listening, if this machine has anything to do it with and
     // the fleet has a teammate that can. An attached terminal is a place you
     // type, so it is a place you should be able to talk to -- on a phone or a
     // tablet it is the only comfortable way to put a sentence in a prompt.
     let audio = voice::detect();
     let mut rec: Option<(std::process::Child, std::path::PathBuf)> = None;
+    // The player, while it plays: the same key again stops it.
+    let playing: voice::Playing = Default::default();
+    // Reading every new reply out as it settles, rather than on request.
+    let mut aloud = false;
+    // Whether the last thing pressed was the read key, so pressing it again
+    // means "the one before that" rather than "that one again".
+    let mut spoke_once = false;
     let (said_tx, mut said_rx) = tokio::sync::mpsc::channel::<Result<String>>(4);
     let scratch = std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -1324,6 +1556,28 @@ async fn attach(
                     let _ = out.flush().await;
                 }
             }
+            // Reading every reply as it arrives means noticing when one has
+            // ENDED. An agent prints in bursts, so the boundary is silence:
+            // a second and a bit with nothing new, which is long enough that
+            // a paragraph is read as one and short enough to feel immediate.
+            _ = settle.tick(), if aloud => {
+                let idle = quiet.lock().map(|q| q.elapsed()).unwrap_or_default();
+                let talking = playing.lock().map(|p| p.is_some()).unwrap_or(false);
+                if idle >= std::time::Duration::from_millis(1200) && !talking {
+                    let text = heard.lock().ok().and_then(|mut h| h.take_settled());
+                    if let Some(text) = text {
+                        let (bs, cl, tx, a, dir, pl) = (
+                            base.to_string(), c.clone(), said_tx.clone(),
+                            audio.clone(), scratch.clone(), playing.clone(),
+                        );
+                        tokio::spawn(async move {
+                            if let Err(e) = voice::speak(&bs, &cl, &a, &text, &dir, &pl).await {
+                                let _ = tx.send(Err(e)).await;
+                            }
+                        });
+                    }
+                }
+            }
             // Words that came back from the fleet, typed into the agent's
             // prompt. Never submitted: Enter stays the operator's.
             Some(words) = said_rx.recv() => {
@@ -1333,7 +1587,7 @@ async fn attach(
                             break "connection lost".to_string();
                         }
                         if let Some(b) = &mut bar {
-                            b.text = b.text.replace("  \u{00b7}  listening", "");
+                            b.set_mark("listening", false);
                         }
                     }
                     Ok(_) => {}
@@ -1359,7 +1613,7 @@ async fn attach(
                 }
                 // Dictation: press once to start, again to send what was said
                 // to be transcribed. The key itself is never forwarded.
-                if let Some(pos) = buf[..n].iter().position(|b| *b == DICTATE_BYTE) {
+                if let Some(pos) = buf[..n].iter().position(|b| *b == vkeys.dictate) {
                     let mut rest = buf[..n].to_vec();
                     rest.remove(pos);
                     if !rest.is_empty() {
@@ -1385,14 +1639,14 @@ async fn attach(
                                 }
                             }
                             if let Some(bar) = &mut bar {
-                                bar.text = bar.text.replace("  \u{00b7}  listening", "");
+                                bar.set_mark("listening", false);
                             }
                             None
                         }
                         None => match voice::start(&audio, &scratch) {
                             Ok(r) => {
                                 if let Some(bar) = &mut bar {
-                                    bar.text.push_str("  \u{00b7}  listening");
+                                    bar.set_mark("listening", true);
                                 }
                                 Some(r)
                             }
@@ -1404,29 +1658,88 @@ async fn attach(
                     };
                     continue;
                 }
-                // Read the screen back, for when looking at it is not an
-                // option -- which is the whole reason the fleet has a voice.
-                if let Some(pos) = buf[..n].iter().position(|b| *b == SPEAK_BYTE) {
+                // Read a reply back. Which reply is the question, and the
+                // answer is a cursor: the newest, then the one before it,
+                // and so on -- so "read that again" and "read the one before
+                // it" are the same key pressed twice. Anything the agent
+                // prints puts the cursor back at the newest.
+                if let Some(pos) = buf[..n].iter().position(|b| *b == vkeys.speak) {
                     let mut rest = buf[..n].to_vec();
                     rest.remove(pos);
                     if !rest.is_empty() {
                         let _ = wire.tx.send(wire::Out::Data(rest)).await;
                     }
-                    let text = heard
-                        .lock()
-                        .map(|h| h.chars().rev().take(1200).collect::<Vec<_>>()
-                            .into_iter().rev().collect::<String>())
-                        .unwrap_or_default();
-                    if !text.trim().is_empty() {
-                        let (b, cl, tx, a, dir) =
-                            (base.to_string(), c.clone(), said_tx.clone(), audio.clone(), scratch.clone());
-                        tokio::spawn(async move {
-                            if let Err(e) = voice::speak(&b, &cl, &a, &text, &dir).await {
-                                let _ = tx.send(Err(e)).await;
+                    // Talking already? The same key is a stop.
+                    if playing.lock().map(|p| p.is_some()).unwrap_or(false) {
+                        voice::hush(&playing);
+                        continue;
+                    }
+                    let (text, back) = {
+                        match heard.lock() {
+                            Ok(mut h) => {
+                                // The second press in a row walks back; the
+                                // first reads what is newest.
+                                if spoke_once {
+                                    h.older();
+                                }
+                                (h.selected().map(|s| s.to_string()), h.back())
                             }
-                        });
+                            Err(_) => (None, 0),
+                        }
+                    };
+                    spoke_once = true;
+                    match text {
+                        Some(text) if !text.trim().is_empty() => {
+                            if let Some(b) = &mut bar {
+                                if back == 0 {
+                                    b.set_mark("reading", false);
+                                } else {
+                                    b.say_mark("reading", format!("reading {back} back"));
+                                }
+                            }
+                            let (bs, cl, tx, a, dir, pl) = (
+                                base.to_string(), c.clone(), said_tx.clone(),
+                                audio.clone(), scratch.clone(), playing.clone(),
+                            );
+                            tokio::spawn(async move {
+                                if let Err(e) = voice::speak(&bs, &cl, &a, &text, &dir, &pl).await {
+                                    let _ = tx.send(Err(e)).await;
+                                }
+                            });
+                        }
+                        _ => {
+                            let mut out = tokio::io::stdout();
+                            let _ = out
+                                .write_all(b"\r\n[nexmesh] nothing further back to read\r\n")
+                                .await;
+                            let _ = out.flush().await;
+                        }
                     }
                     continue;
+                }
+                // Read every new reply as it arrives, until told otherwise.
+                if let Some(pos) = buf[..n].iter().position(|b| *b == vkeys.aloud) {
+                    let mut rest = buf[..n].to_vec();
+                    rest.remove(pos);
+                    if !rest.is_empty() {
+                        let _ = wire.tx.send(wire::Out::Data(rest)).await;
+                    }
+                    aloud = !aloud;
+                    if !aloud {
+                        voice::hush(&playing);
+                    }
+                    if let Some(b) = &mut bar {
+                        b.set_mark("aloud", aloud);
+                    }
+                    continue;
+                }
+                // Anything the operator submits closes off the agent's last
+                // answer: what comes next is the answer to THIS.
+                if buf[..n].iter().any(|b| *b == b'\r' || *b == b'\n') {
+                    if let Ok(mut h) = heard.lock() {
+                        h.submitted();
+                    }
+                    spoke_once = false;
                 }
                 if wire.tx.send(wire::Out::Data(buf[..n].to_vec())).await.is_err() {
                     break "connection lost".to_string();
@@ -1586,11 +1899,15 @@ async fn main() -> Result<()> {
             // SEATS is who is on the team; TERMINALS is how many of them have
             // a window adopted onto them. One number covering both read as a
             // team twice its size.
-            println!("{:<14} {:<22} {:<10} {:>5}  {}", "ID", "NAME", "STATUS", "SEATS",
-                     "TERMINALS");
+            // Busiest first, because that is the order the hub answers in:
+            // the team something happened in a minute ago is the one you
+            // came to look at.
+            println!("{:<14} {:<22} {:<10} {:>5}  {:<10} {}", "ID", "NAME", "STATUS", "SEATS",
+                     "TERMINALS", "LAST");
+            let now = nexmesh_proto::now_ms();
             for s in rows {
                 println!(
-                    "{:<14} {:<22} {:<10} {:>5}  {}",
+                    "{:<14} {:<22} {:<10} {:>5}  {:<10} {}",
                     s["id"].as_str().unwrap_or("?"),
                     s["name"].as_str().unwrap_or("?"),
                     s["status"].as_str().unwrap_or("?"),
@@ -1598,6 +1915,10 @@ async fn main() -> Result<()> {
                     match s["terminals"].as_i64().unwrap_or(0) {
                         0 => "-".to_string(),
                         n => n.to_string(),
+                    },
+                    match s["last_at_ms"].as_i64() {
+                        Some(t) if t > 0 => ago(now, t),
+                        _ => "-".to_string(),
                     }
                 );
             }
@@ -1660,6 +1981,73 @@ async fn main() -> Result<()> {
                 Some(was) => println!("{slot}: \"{was}\" is now \"{}\"",
                                       v["name"].as_str().unwrap_or(&name)),
                 None => println!("{slot} is now \"{}\"", v["name"].as_str().unwrap_or(&name)),
+            }
+        }
+
+        Cmd::Upload { session, file, say, node, workspace, dir } => {
+            let bytes = std::fs::read(&file)
+                .with_context(|| format!("reading {file}"))?;
+            // 64MB, the same limit the node enforces: said here, before the
+            // bytes travel, rather than after.
+            if bytes.len() > 64 * 1024 * 1024 {
+                anyhow::bail!(
+                    "{file} is {:.1}MB, over the 64MB limit for one upload. Put it in the \
+                     workspace directly and say where it is with `nexmesh send`.",
+                    bytes.len() as f64 / 1_048_576.0
+                );
+            }
+            let name = std::path::Path::new(&file)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "upload".into());
+            let mut body = json!({ "name": name, "data_base64": b64(&bytes) });
+            if let Some(t) = say { body["say"] = json!(t); }
+            if let Some(n) = node { body["node"] = json!(n); }
+            if let Some(w) = workspace { body["workspace"] = json!(w); }
+            if let Some(d) = dir { body["dir"] = json!(d); }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/upload"), body).await?;
+            bail_on_error(&v)?;
+            println!(
+                "{} is at {} on {} ({} bytes)",
+                name,
+                v["path"].as_str().unwrap_or("?"),
+                v["node"].as_str().unwrap_or("?"),
+                v["bytes"].as_i64().unwrap_or(0)
+            );
+            println!("  the team has been told where it is");
+        }
+
+        Cmd::SetOwns { who, patterns, session, add, none } => {
+            let slot = if who.starts_with("sl-") {
+                who.clone()
+            } else {
+                let s = session.clone().ok_or_else(|| anyhow::anyhow!(
+                    "'{who}' is a name, not a seat id, so say which session: --session <name>"
+                ))?;
+                resolve_seat(&c, &base, &s, &who).await?
+            };
+            if patterns.is_empty() && !none {
+                anyhow::bail!(
+                    "say what it owns, or --none to clear it: nexmesh set-owns {who} 'verti/**'"
+                );
+            }
+            let v = post(
+                &c,
+                format!("{base}/v1/slots/{slot}/owns"),
+                json!({
+                    "patterns": if none { Vec::new() } else { patterns.clone() },
+                    "add": add,
+                }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            let owns: Vec<&str> =
+                v["owns"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+            if owns.is_empty() {
+                println!("{who} owns nothing in {}", v["workspace"].as_str().unwrap_or("?"));
+            } else {
+                println!("{who} owns: {}", owns.join(", "));
+                println!("  teammates see this in list_peers; who_owns answers for one path");
             }
         }
 
@@ -2196,4 +2584,103 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::StatusBar;
+
+    fn bar(cols: u16) -> StatusBar {
+        let mut b = StatusBar::new(
+            "Nexmesh-dev".into(),
+            "machine-b".into(),
+            "nexmesh".into(),
+            "term-Nexmesh-dev".into(),
+            cols,
+            40,
+        )
+        .unwrap();
+        b.keys = vec![
+            ("Ctrl-\\".into(), "aloud".into()),
+            ("Ctrl-_".into(), "read".into()),
+            ("Ctrl-^".into(), "say it".into()),
+            ("Ctrl-]".into(), "detach".into()),
+        ];
+        b
+    }
+
+    #[test]
+    fn the_way_out_is_first_and_the_seat_is_named_the_way_the_title_names_it() {
+        let line = bar(160).line();
+        assert!(line.trim_start().starts_with("Ctrl-] detach"), "{line}");
+        // The same form as the window title: one way of naming a seat.
+        assert!(line.contains("nexmesh:Nexmesh-dev"), "{line}");
+        assert!(line.contains("on machine-b"), "{line}");
+        assert!(line.contains("via term-Nexmesh-dev"), "{line}");
+        assert!(line.contains("Ctrl-^ say it"), "{line}");
+        assert!(line.chars().count() <= 160);
+    }
+
+    #[test]
+    fn a_narrow_one_gives_up_everything_but_the_way_out_and_the_name() {
+        // The pane goes first, then the machine, then the key labels, then
+        // the other keys. Detach and the seat survive to the last.
+        for cols in [120u16, 100, 86, 72, 60, 48, 36, 24] {
+            let line = bar(cols).line();
+            assert!(line.chars().count() <= cols as usize, "{cols}: {line}");
+            assert!(line.contains("Ctrl-]"), "{cols}: no way out on the screen: {line}");
+            if cols >= 36 {
+                assert!(line.contains("Nexmesh-dev"), "{cols}: {line}");
+            }
+        }
+        assert!(!bar(100).line().contains("via "), "the adopted pane goes first");
+        assert!(bar(100).line().contains("Ctrl-] detach"), "{}", bar(100).line());
+        assert!(bar(100).line().contains("nexmesh:Nexmesh-dev"), "{}", bar(100).line());
+    }
+
+    #[test]
+    fn a_passing_state_replaces_itself_rather_than_repeating() {
+        let mut b = bar(160);
+        b.set_mark("listening", true);
+        assert_eq!(b.line().matches("listening").count(), 1);
+        b.set_mark("listening", true);
+        assert_eq!(b.line().matches("listening").count(), 1, "pressed twice, said once");
+        b.say_mark("reading", "reading 2 back".into());
+        b.say_mark("reading", "reading 3 back".into());
+        let line = b.line();
+        assert!(line.contains("reading 3 back") && !line.contains("reading 2 back"), "{line}");
+        b.set_mark("listening", false);
+        assert!(!b.line().contains("listening"));
+    }
+}
+
+#[cfg(test)]
+mod bar_shapes {
+    use super::StatusBar;
+
+    /// What the row actually says at a few widths. Not an assertion about
+    /// taste: it is here so a change to the fitting shows up as a diff
+    /// somebody can read.
+    #[test]
+    fn the_shapes_it_takes() {
+        for cols in [160u16, 110, 90, 70, 50, 30] {
+            let mut b = StatusBar::new(
+                "Nexmesh-dev".into(),
+                "machine-b".into(),
+                "nexmesh".into(),
+                "term-Nexmesh-dev".into(),
+                cols,
+                40,
+            )
+            .unwrap();
+            b.keys = vec![
+                ("Ctrl-\\".into(), "aloud".into()),
+                ("Ctrl-_".into(), "read".into()),
+                ("Ctrl-^".into(), "say it".into()),
+                ("Ctrl-]".into(), "detach".into()),
+            ];
+            println!("{cols:>4} |{}|", b.line());
+            assert!(b.line().chars().count() <= cols as usize);
+        }
+    }
 }

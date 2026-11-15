@@ -34,6 +34,98 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Does an ownership pattern cover this path?
+///
+/// The patterns teams actually write are directory prefixes and globs:
+/// `verti/**`, `src/auth/*`, `*.sql`, `containers/ombia`. So this is a plain
+/// glob -- `*` within one path segment, `**` across segments, `?` for one
+/// character -- rather than a regex nobody would write by hand, and a bare
+/// prefix with no wildcard covers everything under it, because that is what
+/// somebody means by "this agent owns verti".
+pub fn pattern_covers(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim().trim_start_matches("./").trim_start_matches('/');
+    let path = path.trim().trim_start_matches("./").trim_start_matches('/');
+    if pattern.is_empty() || path.is_empty() {
+        return false;
+    }
+    if glob_match(pattern, path) {
+        return true;
+    }
+    // "verti" owns "verti/src/main.rs". A pattern that is a plain name or
+    // directory is a prefix; one with a wildcard in it means exactly what it
+    // says and is not widened.
+    if !pattern.contains(['*', '?']) {
+        let prefix = pattern.trim_end_matches('/');
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    false
+}
+
+/// `*` stops at a separator, `**` does not, `?` is one character.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = path.chars().collect();
+    fn go(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            '*' => {
+                // `**` crosses separators; a single `*` does not.
+                let double = p.len() > 1 && p[1] == '*';
+                let rest = if double {
+                    // `**/` also matches nothing at all, so `a/**/b` covers `a/b`.
+                    let after = &p[2..];
+                    if go(after.strip_prefix(&['/']).unwrap_or(after), t) {
+                        return true;
+                    }
+                    after
+                } else {
+                    &p[1..]
+                };
+                if go(rest, t) {
+                    return true;
+                }
+                for i in 0..t.len() {
+                    if !double && t[i] == '/' {
+                        break;
+                    }
+                    if go(rest, &t[i + 1..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            '?' => !t.is_empty() && t[0] != '/' && go(&p[1..], &t[1..]),
+            c => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+        }
+    }
+    go(&p, &t)
+}
+
+/// Who owns a path in this workspace, if anybody: (slot, name, pattern).
+///
+/// The longest pattern wins, so `verti/db/**` beats `verti/**` -- a team
+/// that carves a piece out of somebody's area means the carve-out.
+pub fn owner_of(
+    db: &Connection,
+    workspace_id: &str,
+    path: &str,
+) -> Result<Option<(String, String, String)>> {
+    let mut stmt = db.prepare(
+        "SELECT o.slot_id, COALESCE(s.display_name, s.role, 'slot-' || s.id), o.pattern
+           FROM ownership o JOIN slots s ON s.id = o.slot_id
+          WHERE o.workspace_id = ?",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([workspace_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, pat)| pattern_covers(pat, path))
+        .max_by_key(|(_, _, pat)| pat.trim().len()))
+}
+
 /// Reviewers and QA approve their own completion: nobody reviews the reviewer.
 fn is_reviewer(role: Option<&str>) -> bool {
     role.map(|r| {
@@ -457,6 +549,7 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "acquire_file" => acquire_file(ctx, args),
         "release_file" => release_file(ctx, args),
         "view_file_locks" => view_file_locks(ctx),
+        "who_owns" => who_owns(ctx, args),
         "store_knowledge" => store_knowledge(ctx, args),
         "query_knowledge" => query_knowledge(ctx, args),
         "store_memory" => store_memory(ctx, args),
@@ -483,6 +576,9 @@ struct PeerRow {
     /// What the agent reported, falling back to what the seat asked for. A
     /// reported model is the truth; a requested one is a hope.
     model: Option<String>,
+    slot: String,
+    /// The parts of the workspace this teammate is responsible for.
+    zones: Vec<String>,
 }
 
 fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
@@ -492,7 +588,7 @@ fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
         "SELECT COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
                 s.task_state, s.summary, s.participant_kind,
                 COALESCE(n.name, CASE WHEN a.provenance = 'external' THEN 'external' ELSE '-' END),
-                COALESCE(a.status, 'disconnected'), s.capabilities, a.model, s.model
+                COALESCE(a.status, 'disconnected'), s.capabilities, a.model, s.model, s.id
          FROM slots s
          LEFT JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
          LEFT JOIN nodes n ON n.id = a.node_id
@@ -514,9 +610,32 @@ fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
                 status: r.get(6)?,
                 capabilities: serde_json::from_str(&caps).unwrap_or_default(),
                 model: reported.or(requested),
+                slot: r.get(10)?,
+                zones: Vec::new(),
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+
+    // Ownership zones, per teammate, in the workspace this seat is in.
+    let mut rows = rows;
+    {
+        let mut z = ctx.db.prepare(
+            "SELECT o.slot_id, o.pattern FROM ownership o
+              WHERE o.workspace_id = (SELECT workspace_id FROM slots WHERE id = ?)
+              ORDER BY o.pattern",
+        )?;
+        let owned: Vec<(String, String)> = z
+            .query_map([&ctx.slot_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for p in rows.iter_mut() {
+            p.zones = owned
+                .iter()
+                .filter(|(slot, _)| *slot == p.slot)
+                .map(|(_, pat)| pat.clone())
+                .collect();
+        }
+    }
 
     let rows: Vec<_> = rows
         .into_iter()
@@ -551,11 +670,57 @@ fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
             out.push_str(&format!(" can={}", p.capabilities.join(",")));
         }
         out.push('\n');
+        // What this teammate is responsible for. Without it, a team that
+        // divided a repository between its agents had no way for one of them
+        // to know -- so the engineer with the whole checkout in front of it
+        // edited somebody else's container and found out at review.
+        if !p.zones.is_empty() {
+            out.push_str(&format!("    owns {}\n", p.zones.join(", ")));
+        }
         if !p.summary.is_empty() {
             out.push_str(&format!("    {}\n", p.summary));
         }
     }
+    out.push_str(
+        "Work inside somebody's zone belongs to them: ask with send_message rather than \
+         editing it. who_owns <path> answers for one path.\n",
+    );
     Ok(out)
+}
+
+/// Who is responsible for a path, and what to do about it.
+///
+/// The question an agent with a whole checkout in front of it has to be able
+/// to ask before it edits anything: a team that divided a repository between
+/// its agents gains nothing if each of them can only find that out by being
+/// told off at review.
+fn who_owns(ctx: &Ctx, args: &Value) -> Result<String> {
+    let path = arg_str(args, "path")?;
+    let workspace: Option<String> = ctx
+        .db
+        .query_row("SELECT workspace_id FROM slots WHERE id = ?", [&ctx.slot_id], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let Some(ws) = workspace else {
+        return Ok(format!(
+            "This seat is not in a workspace, so nothing here owns {path}."
+        ));
+    };
+    match owner_of(ctx.db, &ws, &path)? {
+        None => Ok(format!(
+            "Nobody owns {path}. It is unassigned: take a lock with acquire_file before \
+             editing it, and say so with send_message if it is somebody's area in spirit."
+        )),
+        Some((slot, _who, pattern)) if slot == ctx.slot_id => Ok(format!(
+            "You own {path}, through your zone `{pattern}`. Go ahead."
+        )),
+        Some((_, who, pattern)) => Ok(format!(
+            "{who} owns {path}, through their zone `{pattern}`.\n\
+             That work is theirs: send_message to {who} with what needs doing and why, \
+             rather than editing it yourself. If it genuinely has to be you, say so to \
+             {who} first and take a lock with acquire_file."
+        )),
+    }
 }
 
 fn send_message(ctx: &Ctx, args: &Value) -> Result<String> {
@@ -938,6 +1103,26 @@ fn acquire_file(ctx: &Ctx, args: &Value) -> Result<String> {
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         params![ctx.session_id, scope, path, ctx.slot_id, purpose, now, now + DEFAULT_LOCK_MS],
     )?;
+    // A lock is not permission. If this path is in somebody else's zone, the
+    // work is theirs, and saying so here is the last moment anything will --
+    // the next thing that happens is an edit.
+    let workspace: Option<String> = ctx
+        .db
+        .query_row("SELECT workspace_id FROM slots WHERE id = ?", [&ctx.slot_id], |r| r.get(0))
+        .optional()?
+        .flatten();
+    if let Some(ws) = workspace {
+        if let Some((slot, who, pattern)) = owner_of(ctx.db, &ws, &path)? {
+            if slot != ctx.slot_id {
+                return Ok(format!(
+                    "Locked {path} for 5 minutes.\n\
+                     NOTE: {who} owns this, through their zone `{pattern}`. If this is their \
+                     work, hand it to them with send_message and release the lock -- editing \
+                     inside somebody's zone is how two agents undo each other."
+                ));
+            }
+        }
+    }
     Ok(format!("Locked {path} for 5 minutes."))
 }
 
@@ -1402,6 +1587,49 @@ mod tests {
             &json!({"to": "nobody-here", "reason": "stuck"})).unwrap_err().to_string();
         assert!(err.contains("no teammate"), "{err}");
         assert_eq!(state(&db, "sl-eng"), "idle", "my state must not move if it failed");
+    }
+
+    #[test]
+    fn a_pattern_covers_what_a_team_means_by_it() {
+        // The patterns people write: a container name, a directory, a glob.
+        assert!(pattern_covers("verti", "verti/src/main.rs"));
+        assert!(pattern_covers("verti/", "verti/src/main.rs"));
+        assert!(pattern_covers("verti", "verti"));
+        assert!(!pattern_covers("verti", "vertigo/src/main.rs"));
+        assert!(!pattern_covers("verti", "ombia/src/main.rs"));
+
+        assert!(pattern_covers("verti/**", "verti/src/main.rs"));
+        assert!(pattern_covers("verti/**", "verti/a/b/c.rs"));
+        assert!(pattern_covers("src/auth/*", "src/auth/login.rs"));
+        assert!(!pattern_covers("src/auth/*", "src/auth/deep/login.rs"));
+        assert!(pattern_covers("*.sql", "schema.sql"));
+        assert!(!pattern_covers("*.sql", "db/schema.sql"));
+        assert!(pattern_covers("**/*.sql", "db/schema.sql"));
+        assert!(pattern_covers("a/**/b.rs", "a/b.rs"), "** must also match nothing");
+
+        // Leading ./ and / are noise, on either side.
+        assert!(pattern_covers("./verti/**", "/verti/src/main.rs"));
+        assert!(!pattern_covers("", "verti/x"));
+        assert!(!pattern_covers("verti", ""));
+    }
+
+    #[test]
+    fn the_longest_pattern_owns_the_path() {
+        let db = fixture();
+        db.execute(
+            "INSERT INTO ownership (workspace_id, slot_id, pattern) VALUES
+                ('w1','sl-eng','verti/**'), ('w1','sl-rev','verti/db/**')",
+            [],
+        )
+        .unwrap();
+        // A carve-out means the carve-out.
+        let (slot, who, pat) = owner_of(&db, "w1", "verti/db/schema.sql").unwrap().unwrap();
+        assert_eq!((slot.as_str(), pat.as_str()), ("sl-rev", "verti/db/**"));
+        assert_eq!(who, "Iris", "the owner is named the way teammates address it");
+        let (slot, _, _) = owner_of(&db, "w1", "verti/src/main.rs").unwrap().unwrap();
+        assert_eq!(slot, "sl-eng");
+        // Nothing covers it: nobody owns it, which is not an error.
+        assert!(owner_of(&db, "w1", "ombia/src/main.rs").unwrap().is_none());
     }
 
     #[test]

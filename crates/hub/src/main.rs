@@ -697,6 +697,9 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/workspaces", post(api::add_workspace))
         .route("/v1/slots/:id/name", post(api::rename_slot))
         .route("/v1/slots/:id/role", post(api::set_role))
+        .route("/v1/slots/:id/owns", post(api::set_owns))
+        .route("/v1/sessions/:id/plan", post(api::add_plan_item))
+        .route("/v1/sessions/:id/upload", post(api::upload))
         .route("/v1/sessions/:id/messages/clear", post(api::clear_unclaimed))
         .route("/v1/sessions/:id/seats/tidy", post(api::tidy_seats))
         // A person at the dashboard using the fleet's own services --

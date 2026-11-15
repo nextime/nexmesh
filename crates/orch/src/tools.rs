@@ -178,6 +178,22 @@ pub fn tools() -> Vec<Tool> {
             }, "required": ["name"], "additionalProperties": false }),
         },
         Tool {
+            name: "delegate_task",
+            description: "Hand a piece of work to one agent, in this session or -- if this \
+                          token sees the whole fleet -- in another one. It goes in that \
+                          team's PLAN, owned by that agent, and is sent to them as a message, \
+                          so it is a task somebody can be seen to be carrying rather than a \
+                          sentence in a log. Use it when the work belongs to somebody else's \
+                          team: the agent that owns that part of the code is the one who \
+                          knows why it is like that.",
+            schema: json!({ "type": "object", "properties": {
+                "session": s("Session the work belongs to. Omitted means the one you drive"),
+                "to": s("Agent name or role in that session"),
+                "task": s("What to do, in a sentence somebody can act on"),
+                "why": s("Why it matters, or what it unblocks")
+            }, "required": ["to", "task"], "additionalProperties": false }),
+        },
+        Tool {
             name: "message_supervisor",
             description: "Send a note to the orchestrators who can see the whole fleet. Use \
                           this when what you need is outside your own session: another team's \

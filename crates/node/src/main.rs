@@ -20,6 +20,7 @@
 //! inbound port.
 
 mod attachsock;
+mod putfile;
 mod cli_detect;
 mod codegraph;
 mod codex;
@@ -661,6 +662,27 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                     changed: r.changed,
                 })
                 .await;
+            });
+        }
+
+        HubToNode::PutFile { req_id, workspace_id, root, rel, data_b64 } => {
+            // Writing somebody's file is I/O on a thread of its own: a 20MB
+            // video must not stall spawns and attach traffic for the machine.
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let (ok, path, bytes, detail) =
+                    match putfile::write(&root, &rel, &data_b64).await {
+                        Ok((p, n)) => (true, p, n, String::new()),
+                        Err(e) => (false, String::new(), 0, format!("{e:#}")),
+                    };
+                if ok {
+                    tracing::info!(%workspace_id, %path, bytes, "wrote a file for the operator");
+                } else {
+                    tracing::warn!(%workspace_id, %rel, "could not write it: {detail}");
+                }
+                let _ = ctx
+                    .send_hub(&NodeToHub::PutFileResult { req_id, ok, path, bytes, detail })
+                    .await;
             });
         }
 

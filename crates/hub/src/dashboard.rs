@@ -306,12 +306,25 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             // be attached to, and counting it told the operator a team of
             // five was a team of ten.
             &format!(
-                "SELECT s.id, s.name, s.status, s.created_at_ms, s.last_active_ms,
+                // `last_active_ms` is bumped when an agent calls a tool,
+                // which misses a team whose last event was an operator
+                // message or an agent being started -- so activity is
+                // COMPUTED from what actually happened, the same way the API
+                // listing computes it. Two orderings that disagree is how
+                // the session you were just in ends up third on the phone
+                // and first in the terminal.
+                "SELECT s.id, s.name, s.status, s.created_at_ms,
+                        MAX(s.last_active_ms, s.created_at_ms,
+                            COALESCE((SELECT MAX(m.sent_at_ms) FROM messages m
+                                       WHERE m.session_id = s.id), 0),
+                            COALESCE((SELECT MAX(a.started_at_ms) FROM agents a
+                                       JOIN slots y ON y.id = a.slot_id
+                                      WHERE y.session_id = s.id), 0)) AS last_at_ms,
                         (SELECT COUNT(*) FROM slots x
                           WHERE x.session_id = s.id AND NOT {term}),
                         (SELECT COUNT(*) FROM slots x
                           WHERE x.session_id = s.id AND {term})
-                 FROM sessions s ORDER BY s.last_active_ms DESC",
+                 FROM sessions s ORDER BY last_at_ms DESC",
                 term = crate::seat::is_terminal("x")
             ),
         )
