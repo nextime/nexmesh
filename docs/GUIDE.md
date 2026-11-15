@@ -1768,6 +1768,32 @@ there. This is the same machinery the messages tab has always used, which is
 the point: a capability is a capability, and the dashboard asks the fleet for
 one exactly as an agent would.
 
+#### Permission prompts, and who answers them
+
+A CLI that stops to ask a human blocks a seat the fleet is driving, and the
+ways each CLI asks are not the same:
+
+| CLI | how it asks | what happens today |
+|---|---|---|
+| codex, driven | JSON-RPC requests to the app-server | threads start `approvalPolicy: "never"`; command and file-change approvals are answered `approved` / `acceptForSession`, permission-profile escalations and MCP elicitations are declined so the sandbox decides |
+| codex, interactive | a dialog in its own TUI | the seat is launched `--ask-for-approval never --sandbox workspace-write`, which is codex's documented unattended mode |
+| opencode, driven | `permission.asked` events on its HTTP stream | answered `{"reply": "always"}` — the server blocks the turn until something answers |
+| claude | its own settings, not a flag nexmesh passes | nothing is injected; in `stream-json` mode it does not prompt |
+
+**An interactive seat must not be launched into a CLI that will stop and ask.**
+The reason is specific: a teammate's message is *typed* at such a seat, and a
+dialog swallows it — the text lands in the composer behind the prompt and the
+Enter answers the dialog instead of submitting. From the outside that is
+indistinguishable from an agent ignoring you, and it was.
+`cli_descriptor.rs` holds a test over the shipped descriptors that fails if a
+typed interactive mode loses its unattended switch.
+
+The other half of that guard is in the node: `driver::awaiting_answer()` reads
+the bottom of the screen before typing, and if it looks like a prompt awaiting
+a choice, nothing is typed at all — the batch goes back in the queue. An
+injected message must never be the keystroke that approves a tool call nobody
+read.
+
 #### A terminal, in the browser
 
 The `terminal` button on an agent's row opens its real terminal in the page —

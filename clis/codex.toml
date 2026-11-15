@@ -24,7 +24,19 @@ args = ["app-server"]
 attachable = false
 
 [modes.interactive]
-args = []
+# A fleet seat has nobody sitting at its keyboard, and codex's default
+# approval policy asks before every command AND every MCP tool call -- which
+# for a seat on this fleet means the shim's own `claim_messages` raises a
+# dialog the moment a teammate writes to it. That dialog then blocks the
+# seat: the message is typed into the composer behind it, the Enter answers
+# the dialog instead of submitting, and from the outside the agent looks
+# like it is ignoring you.
+#
+# So an interactive seat is launched the way the headless driver already
+# starts its threads -- `approvalPolicy: "never"` -- with the sandbox left
+# on, which is codex's own documented unattended mode: failures go back to
+# the model instead of to a human who is not there.
+args = ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
 attachable = true
 # Typing a line at this prompt is a message to the agent, not a command
 # to a shell -- so a seat the fleet put in a terminal can be reached by

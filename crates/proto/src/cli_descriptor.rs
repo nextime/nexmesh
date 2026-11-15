@@ -639,6 +639,47 @@ mod shipped_descriptors {
         assert!(seen >= 5, "expected the shipped descriptors, found {seen}");
     }
 
+    /// An interactive seat must not be launched into a CLI that will stop
+    /// and ask a human for permission, because there is no human at it: the
+    /// message a teammate typed sits in the composer behind the dialog and
+    /// the Enter answers the dialog instead of submitting. Whatever each CLI
+    /// calls that switch, a descriptor that offers typed delivery has to
+    /// carry it.
+    #[test]
+    fn a_typed_interactive_mode_does_not_stop_to_ask_permission() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../clis");
+        // What each CLI's own unattended switch looks like on its command
+        // line. A CLI with no such flag is listed here deliberately, so
+        // adding one is a decision rather than an oversight.
+        let unattended: &[(&str, &[&str])] = &[
+            ("codex", &["--ask-for-approval", "never"]),
+            // claude and the rest take their permissions from their own
+            // configuration, not from a flag nexmesh passes.
+            ("claude", &[]),
+        ];
+        for entry in std::fs::read_dir(dir).expect("clis/ directory must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let d = CliDescriptor::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let Some(m) = d.modes.get("interactive") else { continue };
+            if !m.typed_delivery {
+                continue;
+            }
+            let Some((_, want)) = unattended.iter().find(|(id, _)| *id == d.cli.id) else {
+                continue;
+            };
+            for flag in *want {
+                assert!(
+                    m.args.iter().any(|a| a == flag),
+                    "{}: an interactive mode that is typed at must pass {flag}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     /// The named-configuration examples are not loaded by a node -- `clis/`
     /// is not scanned recursively -- so nothing else would catch a typo in
     /// them until somebody copied one and it was skipped at startup.
