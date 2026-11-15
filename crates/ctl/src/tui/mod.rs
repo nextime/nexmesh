@@ -222,6 +222,9 @@ pub struct App {
     /// Results from the work that must not block the screen: a transcription
     /// takes seconds, and a console that freezes while it waits looks broken.
     voice_tx: tokio::sync::mpsc::Sender<Heard>,
+    /// Set when the camera should take the screen: the session a picture is
+    /// for, and the agent it is for when the cursor was on one.
+    camera_for: Option<(String, Option<String>)>,
     /// A question waiting for an answer: where to move a seat, what to call
     /// it, whether to really remove it. One at a time, deliberately.
     dialog: Option<act::Dialog>,
@@ -798,6 +801,7 @@ pub async fn run(
         sort_rev: false,
         zoom: false,
         zoom_text: None,
+        camera_for: None,
         audio: voice::detect(),
         recording: None,
         speaking: false,
@@ -862,6 +866,44 @@ pub async fn run(
                     "{who}: {}",
                     reason.lines().next().unwrap_or("detached")
                 )),
+                Err(e) => app.notice(trim_err(&e.to_string())),
+            }
+            app.fetch().await;
+        }
+
+        // The camera takes the whole screen, like an attach: the console
+        // puts its own terminal back first and picks it up again after.
+        if let Some((session, to)) = app.camera_for.take() {
+            if let Err(e) = leave() {
+                break Err(e);
+            }
+            let cam = crate::camera::detect();
+            let dir = app.scratch();
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
+            let mut kb = crate::Keyboard::open();
+            let took = crate::camui::run(&mut kb, &cam, &dir, cols, rows).await;
+            drop(kb);
+            if let Err(e) = enter() {
+                break Err(e);
+            }
+            if let Err(e) = term.clear() {
+                break Err(e.into());
+            }
+            match took {
+                Ok(crate::camui::Took::File(path, what)) => {
+                    let say = format!("A {what} for the team to look at, taken just now.");
+                    let r = crate::send_file(
+                        &app.base, &app.client, &session, &path, to.as_deref(), Some(&say),
+                    )
+                    .await;
+                    let _ = std::fs::remove_file(&path);
+                    match r {
+                        Ok(said) => app.notice(said),
+                        Err(e) => app.notice(trim_err(&format!("{e:#}"))),
+                    }
+                }
+                Ok(crate::camui::Took::Failed(why)) => app.notice(why),
+                Ok(crate::camui::Took::Nothing) => {}
                 Err(e) => app.notice(trim_err(&e.to_string())),
             }
             app.fetch().await;
@@ -1062,6 +1104,29 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
             app.fetch().await;
         }
         KeyCode::Char('i') if app.pane == Pane::Chat => app.editing = true,
+        // A picture for the team, from this machine's camera.
+        KeyCode::Char('P') => {
+            let cam = crate::camera::detect();
+            if !cam.ready() {
+                app.notice(cam.why_not());
+            } else {
+                // To the agent under the cursor when there is one, so it
+                // lands on that agent's machine rather than anywhere.
+                let to = app.seat_under_cursor().map(|(_, name, _, _)| name);
+                let session = match (&to, app.scope_session()) {
+                    (Some(_), _) => app
+                        .agents_in_order()
+                        .iter()
+                        .find(|a| a["name"].as_str().map(|n| n.to_string()) == to)
+                        .and_then(|a| a["session"].as_str().map(|s| s.to_string())),
+                    (None, s) => s,
+                };
+                match session {
+                    Some(session) => app.camera_for = Some((session, to)),
+                    None => app.notice("pick a session first: s narrows the console to one"),
+                }
+            }
+        }
         // Say it rather than type it, and have it read back.
         KeyCode::Char('v') => app.listen(),
         KeyCode::Char('V') => {

@@ -220,7 +220,10 @@ fn zoomed(f: &mut Frame, area: Rect, app: &App) {
             None => return,
         },
     };
-    let w = 84u16.min(area.width.saturating_sub(4));
+    // Wide enough to cover the table behind it: a modal narrower than the
+    // rows it sits on leaves the tail of a long value sticking out to the
+    // right, which reads as a drawing fault rather than as a window.
+    let w = (area.width.saturating_sub(6)).min(120).max(40);
     let h = (area.height.saturating_sub(4)).min(24);
     let box_ = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -279,7 +282,12 @@ fn zoomed(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(th.second()),
         )));
     }
-    f.render_widget(Clear, box_);
+    // Clear the whole band, not just the box: a table row behind it is wider
+    // than the box, and its tail peeking out at the edge reads as a fault.
+    f.render_widget(
+        Clear,
+        Rect { x: area.x, y: box_.y, width: area.width, height: box_.height },
+    );
     f.render_widget(
         Paragraph::new(Text::from(text)).block(framed(
             th.label(if app.zoom_text.is_some() { "answer" } else { "memory" }),
@@ -1311,9 +1319,9 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     let keys = match app.pane {
-        Pane::Chat => " j/k channel · i type · /help commands · PgUp scroll · v say it · o open a link · ? help",
+        Pane::Chat => " j/k channel · i type · /help · v say it · P camera · o open a link · ? help",
         Pane::Graph => " 1-8 panes · j/k subsystem · w workspace · p panel · t theme · ? help · q quit",
-        Pane::Agents => " a attach · n new · S start · m move · e rename · x remove · , . sort · R reverse · ? help",
+        Pane::Agents => " a attach · n new · S start · m move · e rename · x remove · P camera · , . sort · ? help",
         Pane::Memory => " j/k move · Enter opens it · PgDn scrolls · s scope · ? help · q quit",
         _ => " 1-8 panes · j/k move · s scope · p panel · t theme · r refresh · ? help · q quit",
     };
@@ -1358,6 +1366,7 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         row("PgUp/PgDn", "scroll the chat back, or a memory down"),
         row("i", "type in the chat; arrows and Tab still work"),
         row("v", "say it instead: record, then the fleet transcribes it"),
+        row("P", "the camera: a photo or a clip, into the workspace"),
         row("V", "read new messages aloud, if the fleet has a voice"),
         row("o", "open the newest link on screen in a browser"),
         row("[ / ]", "previous / next channel"),

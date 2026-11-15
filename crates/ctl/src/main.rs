@@ -11,8 +11,10 @@
 //! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
 mod camera;
+mod camui;
 mod install;
 mod replies;
+mod termmode;
 mod runcmd;
 mod seatcmd;
 mod tlstrust;
@@ -1108,10 +1110,46 @@ impl RawGuard {
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        // Hand the terminal back the way it was handed over. See
+        // `TERMINAL_RESTORE`.
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(TERMINAL_RESTORE);
+        let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();
         println!("\r");
     }
 }
+
+/// Put somebody's terminal back the way it was found.
+///
+/// An attach hands the screen to a program that changes how the terminal
+/// behaves: a full-screen CLI turns on the alternate screen, mouse
+/// reporting, and ALTERNATE SCROLL -- the mode where the wheel is turned
+/// into cursor keys. Leave those on after a detach and the wheel scrolls
+/// the shell's command history instead of the scrollback, which is a
+/// terminal that looks broken and is fixed by `reset`. Nobody should have
+/// to know that.
+///
+/// So detaching says, in order: leave the alternate screen, turn off every
+/// mouse mode and alternate scroll, reset the scroll region, show the
+/// cursor, put wrap and insert mode back, and clear any leftover colour.
+/// Take the terminal as it is found, before the agent's first byte.
+///
+/// `?1007` is ALTERNATE SCROLL: with it on, the wheel is translated into
+/// cursor keys, so scrolling walks a CLI's input history instead of its
+/// scrollback -- Claude Code says "scroll wheel is sending arrow keys, use
+/// PgUp/Down" when it notices. xterm turns it on by default in the
+/// alternate screen, which is where every full-screen agent lives, so an
+/// attach has to turn it off rather than inherit it.
+///
+/// Bracketed paste goes too: the agent's own CLI turns it on if it wants
+/// it, and ours pasting `\x1b[200~` into somebody's prompt is not a thing
+/// anybody asked for.
+const TERMINAL_PREPARE: &[u8] = b"\x1b[?1007l\x1b[?2004l";
+
+const TERMINAL_RESTORE: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\
+\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1007l\x1b[?2004l\x1b[r\x1b[?25h\x1b[?7h\x1b[4l\x1b[0m\x1b(B";
 
 /// Ctrl-] detaches, the way telnet does. Ctrl-C cannot: in raw mode it belongs
 /// to the agent, which is the whole point of a takeover.
@@ -1422,7 +1460,9 @@ impl StatusBar {
     }
 
     fn release(&self) -> Vec<u8> {
-        format!("\x1b[r\x1b[{};1H\x1b[2K", self.rows).into_bytes()
+        let mut out = format!("\x1b[r\x1b[{};1H\x1b[2K", self.rows).into_bytes();
+        out.extend_from_slice(TERMINAL_RESTORE);
+        out
     }
 }
 
@@ -1574,7 +1614,12 @@ async fn attach(
     let _guard = RawGuard::enter()?;
 
     // The bar, and the room made for it, before a byte of the agent's output
-    // arrives.
+    // arrives -- and the terminal taken as it is found.
+    {
+        let mut out = tokio::io::stdout();
+        let _ = out.write_all(TERMINAL_PREPARE).await;
+        let _ = out.flush().await;
+    }
     if let Some(b) = &bar {
         let mut out = tokio::io::stdout();
         let _ = out.write_all(&b.scroll_region()).await;
@@ -1613,10 +1658,15 @@ async fn attach(
             // is saying which seat it shows, so those writes come out here
             // rather than being fought over.
             let mut strip = windowtitle::Strip::default();
+            // Alternate scroll is taken out of the stream rather than merely
+            // turned off at the start: tmux turns it back on in the middle,
+            // which is why the wheel started sending arrow keys "sometimes".
+            let mut modes = termmode::NoAltScroll::default();
             while let Some(msg) = rx.recv().await {
                 match msg {
                     wire::In::Data(data) => {
                         let data = strip.pass(&data);
+                        let data = modes.pass(&data);
                         // A copy of what went past, as words, so a reply can
                         // be read back or read out as it arrives.
                         if let Ok(mut seen) = heard.lock() {
@@ -1707,6 +1757,11 @@ async fn attach(
             _ = repaint.tick(), if bar.is_some() => {
                 if let Some(b) = &bar {
                     let mut out = tokio::io::stdout();
+                    // The mode is filtered out of the agent's stream, and
+                    // said again here anyway: anything that reaches the
+                    // terminal by another route is undone within a quarter
+                    // of a second rather than lasting until `reset`.
+                    let _ = out.write_all(TERMINAL_PREPARE).await;
                     let _ = out.write_all(&b.paint()).await;
                     let _ = out.flush().await;
                 }
@@ -1944,39 +1999,79 @@ async fn attach(
                                 }
                             }
                         }
-                        // The camera on this machine, straight into the
-                        // agent's workspace.
+                        // The camera on this machine. It takes over the
+                        // screen: a still taken blind is not using a camera,
+                        // since you cannot tell whether the thing you meant
+                        // to photograph is in shot.
                         voice::Act::Photo => {
                             let cam = camera::detect();
                             if !cam.ready() {
-                                let mut out = tokio::io::stdout();
-                                let _ = out
+                                let mut o = tokio::io::stdout();
+                                let _ = o
                                     .write_all(format!("\r\n[nexmesh] {}\r\n", cam.why_not()).as_bytes())
                                     .await;
-                                let _ = out.flush().await;
+                                let _ = o.flush().await;
                             } else {
-                                if let Some(b) = &mut bar {
-                                    b.set_mark("camera", true);
+                                // The bar's row is the overlay's too, and the
+                                // scroll region would keep it out of it.
+                                let mut o = tokio::io::stdout();
+                                let _ = o.write_all(b"\x1b[r").await;
+                                let _ = o.flush().await;
+                                let took =
+                                    camui::run(&mut keys, &cam, &scratch, cols, rows).await;
+                                // The agent's screen is not ours to redraw,
+                                // so the remote is resized by a row and back:
+                                // that is what makes a full-screen program
+                                // repaint itself.
+                                if let Some(b) = &bar {
+                                    let mut o = tokio::io::stdout();
+                                    let _ = o.write_all(TERMINAL_PREPARE).await;
+                                    let _ = o.write_all(&b.scroll_region()).await;
+                                    let _ = o.write_all(b"\x1b[2J").await;
+                                    let _ = o.write_all(&b.paint()).await;
+                                    let _ = o.flush().await;
                                 }
-                                let (bs, cl, tx, sess, who) = (
-                                    base.to_string(), c.clone(), said_tx.clone(),
-                                    session.to_string(), name.to_string(),
-                                );
-                                let dir = scratch.clone();
-                                tokio::spawn(async move {
-                                    let shot = camera::photo(&cam, &dir).await;
-                                    let r = match shot {
-                                        Ok(path) => {
-                                            let out = send_file(&bs, &cl, &sess, &path, Some(&who),
-                                                Some("A photo for you to look at, taken just now."))
-                                                .await;
+                                let agent_rows =
+                                    bar.as_ref().map(|b| b.agent_rows()).unwrap_or(rows);
+                                let _ = wire
+                                    .tx
+                                    .send(wire::Out::Resize {
+                                        cols,
+                                        rows: agent_rows.saturating_sub(1).max(2),
+                                    })
+                                    .await;
+                                let _ = wire
+                                    .tx
+                                    .send(wire::Out::Resize { cols, rows: agent_rows })
+                                    .await;
+                                match took {
+                                    Ok(camui::Took::File(path, what)) => {
+                                        let (bs, cl, tx, sess, who) = (
+                                            base.to_string(), c.clone(), said_tx.clone(),
+                                            session.to_string(), name.to_string(),
+                                        );
+                                        let say = format!(
+                                            "A {what} for you to look at, taken just now."
+                                        );
+                                        tokio::spawn(async move {
+                                            let r = send_file(
+                                                &bs, &cl, &sess, &path, Some(&who), Some(&say),
+                                            )
+                                            .await;
                                             let _ = std::fs::remove_file(&path);
-                                            out
-                                        }
-                                        Err(e) => Err(e),
-                                    };
-                                    let _ = tx.send(r.map(|said| format!("\u{0001}{said}"))).await;
-                                });
+                                            let _ = tx
+                                                .send(r.map(|said| format!("\u{0001}{said}")))
+                                                .await;
+                                        });
+                                    }
+                                    Ok(camui::Took::Failed(why)) => {
+                                        let _ = said_tx.send(Err(anyhow::anyhow!(why))).await;
+                                    }
+                                    Ok(camui::Took::Nothing) => {}
+                                    Err(e) => {
+                                        let _ = said_tx.send(Err(e)).await;
+                                    }
+                                }
                             }
                         }
                         voice::Act::Aloud => {
@@ -2994,5 +3089,44 @@ mod bar_shapes {
             b.command = false;
             assert!(b.line().chars().count() <= cols as usize);
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::TERMINAL_RESTORE;
+
+    #[test]
+    fn attaching_turns_off_the_mode_that_makes_the_wheel_send_arrows() {
+        let s = String::from_utf8(super::TERMINAL_PREPARE.to_vec()).unwrap();
+        // The symptom is a CLI saying "scroll wheel is sending arrow keys,
+        // use PgUp/Down". The cause is alternate scroll, which xterm turns
+        // on by default in the alternate screen -- where every full-screen
+        // agent lives.
+        assert!(s.contains("\x1b[?1007l"), "{s:?}");
+        assert!(s.contains("\x1b[?2004l"), "bracketed paste is the agent's to ask for");
+    }
+
+    #[test]
+    fn detaching_turns_off_everything_a_full_screen_cli_turns_on() {
+        let s = String::from_utf8(TERMINAL_RESTORE.to_vec()).unwrap();
+        // The one that actually bites: alternate scroll turns the wheel into
+        // cursor keys, so a shell's history scrolls instead of the
+        // scrollback, and only `reset` puts it right.
+        assert!(s.contains("\x1b[?1007l"), "alternate scroll must be turned off");
+        // The alternate screen, so the shell's own screen comes back.
+        assert!(s.contains("\x1b[?1049l"));
+        // Every mouse reporting mode a TUI might have enabled.
+        for mode in ["1000", "1002", "1003", "1006", "1015"] {
+            assert!(s.contains(&format!("\x1b[?{mode}l")), "mouse mode {mode} left on");
+        }
+        // Bracketed paste, the scroll region, the cursor, wrap, insert mode
+        // and any leftover colour.
+        assert!(s.contains("\x1b[?2004l"));
+        assert!(s.contains("\x1b[r"));
+        assert!(s.contains("\x1b[?25h"));
+        assert!(s.contains("\x1b[?7h"));
+        assert!(s.contains("\x1b[4l"));
+        assert!(s.ends_with("\x1b[0m\x1b(B"), "attributes and charset come last: {s:?}");
     }
 }
