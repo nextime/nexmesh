@@ -30,6 +30,7 @@ mod gitsync;
 mod localsock;
 mod opencode;
 mod plugin;
+mod prompts;
 mod proc;
 mod viewer;
 mod spawn;

@@ -466,6 +466,16 @@ pub enum NodeToHub {
     /// Confirms an attach and says whether the viewer can actually type.
     /// A headless agent is a protocol on a pipe, not a terminal: you can watch
     /// it, but there is nothing to take over.
+    /// Something the NODE did on an agent's behalf that a person should be
+    /// able to see afterwards: answering a permission prompt while nobody was
+    /// attached, or finding one it did not dare answer. It lands in the
+    /// session's chat as a system line, which is where the record of what the
+    /// fleet did to itself belongs -- a decision taken for somebody must be
+    /// visible to them even when they were not watching.
+    Noted {
+        agent_id: String,
+        text: String,
+    },
     AttachOpened {
         attach_id: String,
         agent_id: String,

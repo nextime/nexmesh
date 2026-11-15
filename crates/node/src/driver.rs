@@ -91,7 +91,7 @@ pub fn render_injection_line(messages: &[Envelope]) -> String {
 /// A TUI's output is mostly cursor movement and colour; `❯ 1. Yes` arrives
 /// wrapped in both. Only CSI and the two-byte escapes are handled, which is
 /// everything a CLI emits in practice.
-fn strip_ansi(raw: &str) -> String {
+pub(crate) fn strip_ansi(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {

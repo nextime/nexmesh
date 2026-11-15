@@ -16,6 +16,10 @@ if "--version" in sys.argv:
 
 LOG = os.environ.get("FAKETYPED_LOG", "/dev/null")
 HOLD = float(os.environ.get("FAKETYPED_DIALOG_SECONDS", "7"))
+# With this set, the dialog waits to be answered instead of timing out, which
+# is what a real permission prompt does and what the prompt-answering test
+# needs in order to see the keystroke.
+WAIT_FOR_ANSWER = os.environ.get("FAKETYPED_DIALOG_WAIT") == "1"
 
 def note(what):
     with open(LOG, "a") as f:
@@ -39,6 +43,21 @@ for line in sys.stdin:
         print("│   2. No", flush=True)
         print("\x1b[36m╰─────────────────────────────╯\x1b[0m", flush=True)
         sys.stdout.flush()
+        if WAIT_FOR_ANSWER:
+            # Wait to be answered, the way a real permission prompt does,
+            # so a test can prove WHO answered it and WITH WHAT. The pty is
+            # in canonical mode here, so the choice arrives as a line.
+            try:
+                choice = next(sys.stdin).strip()
+            except StopIteration:
+                break
+            note(f"dialog answered with {choice!r}")
+            if choice.startswith(("1", "y", "Y")):
+                print("\n\x1b[2mEdit applied.\x1b[0m", flush=True)
+            else:
+                print("\n\x1b[2mEdit refused.\x1b[0m", flush=True)
+            print("> ", end="", flush=True)
+            continue
         time.sleep(HOLD)
         note("dialog answered by the operator")
         print("\n\x1b[2mEdit applied.\x1b[0m", flush=True)

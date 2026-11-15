@@ -567,9 +567,32 @@ async fn spawn_on_pty(
         let io = io.clone();
         tokio::spawn(async move {
             let mut seq = 0u64;
-            while let Some(chunk) = out_rx.recv().await {
-                seq += 1;
-                emit_output(&ctx, &agent_id, &io, &chunk, seq).await;
+            loop {
+                // A pause in the output is the only moment a screen can be
+                // read for what it is: mid-burst it is half-drawn, and a
+                // prompt half-drawn is not a prompt yet.
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_millis(1200),
+                    out_rx.recv(),
+                )
+                .await;
+                match next {
+                    Ok(Some(chunk)) => {
+                        seq += 1;
+                        emit_output(&ctx, &agent_id, &io, &chunk, seq).await;
+                    }
+                    // The pty closed: the exit watcher deals with the rest.
+                    Ok(None) => break,
+                    // Every quiet tick, not only the ones that follow new
+                    // output: a prompt raised while somebody was attached,
+                    // and then abandoned when they detached, produces no
+                    // further output at all and would otherwise sit there
+                    // for ever. The check is cheap and remembers what it
+                    // has already decided about.
+                    Err(_) => {
+                        crate::prompts::manage_if_unattached(&ctx, &agent_id, &io).await;
+                    }
+                }
             }
         });
     }

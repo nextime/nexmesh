@@ -264,6 +264,33 @@ async fn handle(
             tracing::info!(node = %node_name, %agent_id, %slot_id, pid = id.pid, "agent up");
         }
 
+        NodeToHub::Noted { agent_id, text } => {
+            // Pre-claimed, like the console's own housekeeping lines: this is
+            // a record for whoever reads the room later, never a message an
+            // agent should answer.
+            let db = st.db.lock().unwrap();
+            let found: Option<(String, String)> = db
+                .query_row(
+                    "SELECT s.session_id, s.id FROM agents a JOIN slots s ON s.id = a.slot_id
+                      WHERE a.id = ?",
+                    [&agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .unwrap_or(None);
+            if let Some((session_id, slot_id)) = found {
+                let now = crate::now_ms();
+                let _ = db.execute(
+                    "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                           sent_at_ms, claimed_at_ms, claimed_by)
+                     VALUES (?1, ?2, NULL, 'system', ?3, ?4, ?4, 'node')",
+                    rusqlite::params![session_id, slot_id, text, now],
+                );
+            } else {
+                tracing::debug!(%agent_id, "a note for an agent with no seat");
+            }
+        }
+
         NodeToHub::AgentExited { agent_id, code, signal } => {
             let db = st.db.lock().unwrap();
             db.execute(

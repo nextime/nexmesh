@@ -1780,6 +1780,34 @@ ways each CLI asks are not the same:
 | opencode, driven | `permission.asked` events on its HTTP stream | answered `{"reply": "always"}` — the server blocks the turn until something answers |
 | claude | its own settings, not a flag nexmesh passes | nothing is injected; in `stream-json` mode it does not prompt |
 
+**When nobody is attached, the node answers the prompt itself.** A seat with a
+viewer on it belongs to the person looking at it, and taking the choice out
+from under them would be worse than waiting — so the node checks, every quiet
+second, whether a screen is waiting for an answer *and* whether its attach set
+is empty. Only then does it act, and two rules keep that safe to do unwatched:
+
+- **The narrowest affirmative, never the widest.** `1. Yes` and `1. Allow` are
+  taken. `Yes, and don't ask again`, `Allow for this session` and `Always
+  allow` are not: a decision taken for somebody must not also be a decision
+  taken for every future case.
+- **An unrecognised shape is left alone and reported.** A guessed keystroke at
+  an unknown prompt is how an agent comes to have approved something nobody
+  chose.
+
+Every answer is written into the agent's own transcript *and* posted to the
+session's chat as a pre-claimed system line, so a decision made while you were
+not looking can be found afterwards — in the console, the dashboard, the phone
+or the room. A prompt it declines to answer is reported the same way, once,
+rather than every second.
+
+It checks on every quiet tick rather than only after new output, because a
+prompt raised while somebody was attached and then abandoned when they
+detached produces no further output at all and would otherwise sit there for
+ever. `tests/e2e_prompts.py` covers both halves against an agent whose dialog
+waits to be answered, so the keystroke it received is observable: answered
+with `1` when unattached, untouched while a viewer is on it, answered again
+once that viewer leaves.
+
 **An interactive seat must not be launched into a CLI that will stop and ask.**
 The reason is specific: a teammate's message is *typed* at such a seat, and a
 dialog swallows it — the text lands in the composer behind the prompt and the
