@@ -129,6 +129,21 @@ impl Replies {
 
     /// Nothing has been said by anybody yet.
     #[allow(dead_code)]
+    /// The newest link the agent has printed, across everything kept.
+    ///
+    /// An attached terminal is a place links go past: an agent says where
+    /// it published something, or what it was reading, and in a terminal
+    /// inside tmux inside an attach there is no click that reaches a
+    /// browser. So the viewer finds the link itself.
+    pub fn newest_link(&self) -> Option<String> {
+        // Newest first: the current reply, then backwards through the kept
+        // ones. Within a reply, the LAST link, because that is the one most
+        // recently printed.
+        std::iter::once(&self.current)
+            .chain(self.done.iter().rev())
+            .find_map(|t| last_url(t))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.done.is_empty() && self.current.trim().is_empty()
     }
@@ -233,5 +248,53 @@ mod tests {
         r.saw("\n");
         assert!(r.is_empty());
         assert_eq!(r.latest(), None);
+    }
+}
+
+/// The last http(s) URL in a piece of text, if there is one.
+///
+/// Deliberately simple: a terminal's idea of a URL is whatever somebody
+/// printed, and anything cleverer starts eating the punctuation around it.
+fn last_url(text: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for (i, _) in text.match_indices("http") {
+        let rest = &text[i..];
+        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+            continue;
+        }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`' || c == '<')
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(['.', ',', ')', ']', '}', ';', ':']);
+        if url.len() > 10 {
+            found = Some(url.to_string());
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn the_newest_link_is_the_one_opened() {
+        let mut r = Replies::default();
+        r.saw("published at https://example.com/one and also http://example.com/two.");
+        r.submitted();
+        r.saw("see https://example.net/three, it is the new one");
+        assert_eq!(r.newest_link().as_deref(), Some("https://example.net/three"));
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_a_url() {
+        assert_eq!(last_url("go to https://example.com/x.").as_deref(),
+                   Some("https://example.com/x"));
+        assert_eq!(last_url("(https://example.com/y)").as_deref(),
+                   Some("https://example.com/y"));
+        assert_eq!(last_url("nothing here").as_deref(), None);
+        // A bare host is not a link: the terminal would not have made one
+        // either, and guessing produces a browser window for `node.js`.
+        assert_eq!(last_url("www.example.com").as_deref(), None);
     }
 }

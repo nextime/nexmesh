@@ -274,7 +274,7 @@ pub fn first_link(body: &str) -> Option<String> {
 /// Hand a URL to whatever the desktop uses. Never waits for it: `xdg-open`
 /// on a machine with no browser blocks for ever, and a console that freezes
 /// because somebody pressed a key is worse than one that does nothing.
-fn open_in_browser(url: &str) -> std::io::Result<()> {
+pub fn open_in_browser(url: &str) -> std::io::Result<()> {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     std::process::Command::new(opener)
         .arg(url)

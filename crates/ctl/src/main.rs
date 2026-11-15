@@ -1175,10 +1175,14 @@ const TERMINAL_RESTORE: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x
 /// forwards every printable byte to the agent, and all three are
 /// configurable because Ctrl-^ is Ctrl+Shift+6 on a US layout and awkward or
 /// impossible on others.
-fn voice_keys() -> voice::Keys {
+fn read_console_toml() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let path = std::path::Path::new(&home).join(".nexmesh").join("console.toml");
-    voice::keys_from(&std::fs::read_to_string(path).unwrap_or_default())
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn voice_keys() -> voice::Keys {
+    voice::keys_from(&read_console_toml())
 }
 
 /// A keyboard this viewer can WALK AWAY FROM.
@@ -1593,6 +1597,9 @@ async fn attach(
     // rather than pretending the pty is the agent's own.
     let via = r["via"].as_str().unwrap_or_default().to_string();
     let vkeys = voice_keys();
+    // Who has the mouse. The terminal, unless this machine's config says
+    // otherwise: see `voice::mouse_to_viewer`.
+    let mut mouse_ours = voice::mouse_to_viewer(&read_console_toml());
     let mut bar = StatusBar::new(
         name.to_string(),
         host.to_string(),
@@ -1651,6 +1658,8 @@ async fn attach(
         if a.can_hear() && voice::listen_cmd(&a).is_some() {
             b.menu.push((voice::key_name(vkeys.listen), "hands free".into()));
         }
+        b.menu.push((voice::key_name(vkeys.mouse), "wheel scrolls".into()));
+        b.menu.push((voice::key_name(vkeys.link), "open a link".into()));
         b.menu.push((voice::key_name(vkeys.send), "send a file".into()));
         if camera::detect().ready() {
             b.menu.push((voice::key_name(vkeys.photo), "photo".into()));
@@ -1670,7 +1679,9 @@ async fn attach(
     {
         let mut out = tokio::io::stdout();
         let _ = out.write_all(TERMINAL_PREPARE).await;
-        let _ = out.write_all(termmode::MOUSE_ON).await;
+        if mouse_ours {
+            let _ = out.write_all(termmode::MOUSE_ON).await;
+        }
         let _ = out.flush().await;
     }
     if let Some(b) = &bar {
@@ -1970,7 +1981,8 @@ async fn attach(
                 // actually scrolls with. When it IS using the mouse, every
                 // report is handed over untouched.
                 let bytes: Vec<u8> =
-                    if agent_mouse.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !mouse_ours
+                        || agent_mouse.load(std::sync::atomic::Ordering::Relaxed) {
                         buf[..n].to_vec()
                     } else {
                         let (keys, wheels) = mouse.read(&buf[..n]);
@@ -2136,6 +2148,61 @@ async fn attach(
                                     }
                                 }
                             }
+                        }
+                        voice::Act::Mouse => {
+                            // Borrowing the mouse, or giving it back. Said
+                            // out loud both ways: a mode that silently eats
+                            // selection is the thing this exists to undo.
+                            mouse_ours = !mouse_ours;
+                            let mut out = tokio::io::stdout();
+                            let _ = out
+                                .write_all(if mouse_ours {
+                                    termmode::MOUSE_ON
+                                } else {
+                                    termmode::MOUSE_OFF
+                                })
+                                .await;
+                            let said = if mouse_ours {
+                                "the wheel scrolls the agent now; selecting and clicking links \
+                                 are the terminal's again with Ctrl-F"
+                            } else {
+                                "the mouse is the terminal's: select, copy and click as usual"
+                            };
+                            let _ = out
+                                .write_all(format!("\r\n[nexmesh] {said}\r\n").as_bytes())
+                                .await;
+                            let _ = out.flush().await;
+                            if let Some(b) = &mut bar {
+                                b.set_mark("wheel", mouse_ours);
+                            }
+                        }
+                        voice::Act::Link => {
+                            // A link on an agent's screen, opened HERE.
+                            //
+                            // An attach is a terminal inside tmux inside a
+                            // viewer, and a click in one of those reaches no
+                            // browser at all -- so the viewer finds the link
+                            // and hands it to this machine's desktop, which
+                            // is where the person is.
+                            let url = heard.lock().ok().and_then(|h| h.newest_link());
+                            let mut out = tokio::io::stdout();
+                            match url {
+                                Some(u) => {
+                                    let said = match tui::open_in_browser(&u) {
+                                        Ok(()) => format!("opening {u}"),
+                                        Err(e) => format!("could not open {u}: {e}"),
+                                    };
+                                    let _ = out
+                                        .write_all(format!("\r\n[nexmesh] {said}\r\n").as_bytes())
+                                        .await;
+                                }
+                                None => {
+                                    let _ = out
+                                        .write_all(b"\r\n[nexmesh] no link on screen\r\n")
+                                        .await;
+                                }
+                            }
+                            let _ = out.flush().await;
                         }
                         voice::Act::Read => {
                             // Talking already? The same key is a stop.

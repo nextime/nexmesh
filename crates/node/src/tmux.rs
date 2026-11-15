@@ -69,21 +69,17 @@ pub fn repaint(view: &str) {
     // it is set on the session the NODE created, so it changes nothing about
     // what the operator sees in their own `tmux attach`.
     let _ = cmd().args(["set-option", "-t", view, "status", "off"]).output();
-    // And tmux takes the wheel, for this view only.
+    // The mouse is deliberately NOT taken here.
     //
-    // Scrolling an adopted pane is tmux's job and nobody else's. The pane's
-    // history belongs to tmux, not to the terminal the operator is sitting
-    // at and not to the program inside; with `mouse off` the wheel reaches
-    // neither, so an attach to an adopted terminal scrolled nothing at all
-    // while an attach to a plain pty scrolled fine. With it on, tmux asks
-    // for mouse reports itself, the viewer sees that and stops translating
-    // the wheel, and the reports go to the one thing that has the
-    // scrollback.
+    // Turning tmux's own mouse mode on makes the wheel scroll the pane's
+    // history, which is the one thing an attach to an adopted terminal
+    // could not otherwise do -- but it also takes dragging to select and
+    // clicking a link, in a pane somebody is sitting in. Losing both to
+    // gain one is a bad trade, and the viewer offers the same scrolling
+    // behind `Ctrl-F` for anyone who wants it, without touching anybody's
+    // tmux. Turn it on yourself if you prefer it:
     //
-    // Set on the session the NODE created, so it changes nothing about the
-    // operator's own `tmux attach` -- mouse is a session option, and this
-    // session is ours.
-    let _ = cmd().args(["set-option", "-t", view, "mouse", "on"]).output();
+    //     tmux set-option -t <session> mouse on
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((tty, session)) = line.split_once(' ') {
             if session == view {

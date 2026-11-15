@@ -72,6 +72,10 @@ pub struct Keys {
     pub photo: u8,
     /// Hands-free: keep listening, a sentence at a time, until told to stop.
     pub listen: u8,
+    /// Open the newest link the agent has printed, in a browser HERE.
+    pub link: u8,
+    /// Hand the mouse to the viewer, or give it back to the terminal.
+    pub mouse: u8,
 }
 
 impl Default for Keys {
@@ -93,6 +97,10 @@ impl Default for Keys {
             // Ctrl-N: next-history in readline, which is not how a line is
             // written either, and free in every TUI checked here.
             listen: 0x0e,
+            // Ctrl-B is backward-char, which nothing uses to WRITE a line.
+            link: 0x02,
+            // Ctrl-F, its pair.
+            mouse: 0x06,
         }
     }
 }
@@ -114,6 +122,10 @@ impl Keys {
             Some(Act::Photo)
         } else if b == self.listen {
             Some(Act::Listen)
+        } else if b == self.link {
+            Some(Act::Link)
+        } else if b == self.mouse {
+            Some(Act::Mouse)
         } else {
             None
         }
@@ -135,6 +147,37 @@ pub enum Act {
     Photo,
     /// Keep listening until told to stop, a sentence at a time.
     Listen,
+    /// Open the newest link on the agent's screen, on THIS machine.
+    Link,
+    /// Take the mouse, or give it back to the terminal.
+    Mouse,
+}
+
+/// Who has the mouse during an attach.
+///
+/// The TERMINAL, by default, and that default was learned the hard way.
+/// A viewer that asks for mouse reports can turn the wheel into the page
+/// keys a full-screen agent scrolls with -- but in taking the mouse it also
+/// takes dragging to select, and clicking a link, which are the two things
+/// a person actually does with a mouse in a terminal. Losing both to gain
+/// one is a bad trade, and it is not obvious from the inside that anything
+/// has been taken: the wheel simply stops working, selection selects
+/// nothing, and a link does not open.
+///
+/// So the mouse stays with the terminal, and the viewer borrows it only
+/// when asked -- `Ctrl-F` while in command mode, or `mouse = "viewer"` in
+/// `~/.nexmesh/console.toml` for anyone who wants it that way always.
+pub fn mouse_to_viewer(toml_text: &str) -> bool {
+    for line in toml_text.lines() {
+        let line = line.trim();
+        let Some((name, value)) = line.split_once('=') else { continue };
+        if name.trim() != "mouse" {
+            continue;
+        }
+        let v = value.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+        return matches!(v.as_str(), "viewer" | "nexmesh" | "wheel" | "on" | "true");
+    }
+    false
 }
 
 /// `ctrl-^`, `ctrl-g`, `^]`, `0x1e`, `30` -- whatever somebody writes down.
@@ -211,6 +254,8 @@ pub fn keys_from(toml_text: &str) -> Keys {
             "send_key" => k.send = b,
             "photo_key" => k.photo = b,
             "listen_key" => k.listen = b,
+            "link_key" => k.link = b,
+            "mouse_key" => k.mouse = b,
             _ => {}
         }
     }
@@ -227,6 +272,8 @@ pub fn keys_from(toml_text: &str) -> Keys {
         (&mut k.send, d.send),
         (&mut k.photo, d.photo),
         (&mut k.listen, d.listen),
+        (&mut k.link, d.link),
+        (&mut k.mouse, d.mouse),
     ] {
         if *field == k.command || *field == k.detach {
             *field = fallback;
@@ -762,6 +809,19 @@ fn unb64(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The default has to be the terminal's. A viewer that takes the mouse
+    /// without being asked takes selection and link-clicking with it, and
+    /// says nothing about having done so.
+    #[test]
+    fn the_terminal_keeps_the_mouse_unless_asked() {
+        assert!(!mouse_to_viewer(""));
+        assert!(!mouse_to_viewer("command_key = \"ctrl-g\"\n"));
+        assert!(!mouse_to_viewer("mouse = \"terminal\"\n"));
+        assert!(mouse_to_viewer("mouse = \"viewer\"\n"));
+        assert!(mouse_to_viewer("mouse = \"wheel\"\n"));
+        assert!(mouse_to_viewer("  mouse  =  'on'  \n"));
+    }
     use super::*;
 
     #[test]

@@ -463,6 +463,26 @@ changes colour, nothing reaches the agent, and single letters do the work:
 | `?` | list them |
 | `q`, Esc | leave command mode |
 
+An attach is a terminal inside tmux inside a viewer, and a click in one of
+those reaches no browser: the link is three layers away from the desktop
+that could open it. So `Ctrl-B` finds the newest link the agent has printed
+and hands it to this machine, which is where the person is.
+
+**The mouse stays with your terminal**, and that default was learned the
+hard way. A viewer can ask the terminal for mouse reports and turn the
+wheel into the page keys a full-screen agent scrolls with -- but in taking
+the mouse it also takes dragging to select and clicking a link, which are
+the two things a person actually does with a mouse in a terminal. Worse,
+nothing says so from the inside: the wheel stops working, selection selects
+nothing, and links stop opening, all at once and for no visible reason.
+
+So the viewer borrows it only when asked. `Ctrl-F` in command mode hands it
+over and says so on the row; `Ctrl-F` again gives it back. `mouse = "viewer"`
+in `~/.nexmesh/console.toml` makes it the default for anyone who wants it
+that way. The same applies to an adopted tmux pane: the node no longer turns
+tmux's own mouse mode on, because that takes selection in exactly the same
+way.
+
 `Ctrl-]` still detaches from either mode. A **reply** is everything the agent
 printed since you last pressed Enter: that boundary is what makes "read the
 last one" and "read the one before it" mean something on a stream of bytes.
@@ -480,6 +500,8 @@ Command mode also carries the two things that move a FILE:
 
 | key | |
 |-----|---|
+| `Ctrl-B` | open the newest link the agent has printed, in a browser on THIS machine |
+| `Ctrl-F` | borrow the mouse so the wheel scrolls the agent; press it again to give it back |
 | `Ctrl-Y` | send a file from this machine; the path is typed on the bar itself |
 | `Ctrl-P` | take a photo with this machine's camera and send that |
 
