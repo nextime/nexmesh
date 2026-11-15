@@ -29,11 +29,96 @@
 pub struct NoAltScroll {
     /// A partial `ESC [ ? ... ` being gathered across reads.
     pending: Vec<u8>,
+    /// Whether the AGENT has asked for mouse events itself. While it has,
+    /// the viewer stops translating the wheel and hands the mouse over --
+    /// a program that asked for clicks should get clicks.
+    pub agent_wants_mouse: bool,
 }
 
 /// Modes an attach refuses to let anything enable. Alternate scroll is the
 /// one that bites; the list is a list so the next one is a line of data.
 const REFUSED: &[u16] = &[1007];
+
+/// The modes a program sets when it wants to be told about the mouse.
+const MOUSE: &[u16] = &[1000, 1002, 1003];
+
+/// Mouse reporting the VIEWER turns on, so it can translate the wheel into
+/// the keys a full-screen program actually scrolls with. SGR (1006) because
+/// its reports are unambiguous past column 95, which the old encoding is
+/// not.
+pub const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+pub const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
+
+/// What a mouse report from the terminal means to us.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wheel {
+    Up,
+    Down,
+    /// A mouse event that is not the wheel: swallowed, since the program
+    /// did not ask for the mouse and would not know what to do with it.
+    Other,
+}
+
+/// Read SGR mouse reports (`ESC [ < b ; x ; y M|m`) out of the keyboard
+/// stream, saying which were wheel turns.
+///
+/// Everything else is passed back untouched, including a report that is
+/// only half here yet -- a wheel turn split across two reads must not
+/// become a stray `[<64` typed into somebody's prompt.
+#[derive(Debug, Default)]
+pub struct MouseReports {
+    pending: Vec<u8>,
+}
+
+impl MouseReports {
+    pub fn read(&mut self, data: &[u8]) -> (Vec<u8>, Vec<Wheel>) {
+        let mut keys = Vec::with_capacity(data.len());
+        let mut wheels = Vec::new();
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(data);
+        let mut i = 0;
+        while i < buf.len() {
+            // ESC [ <
+            if buf[i] != 0x1b {
+                keys.push(buf[i]);
+                i += 1;
+                continue;
+            }
+            if i + 2 >= buf.len() {
+                self.pending = buf[i..].to_vec();
+                return (keys, wheels);
+            }
+            if buf[i + 1] != b'[' || buf[i + 2] != b'<' {
+                keys.push(buf[i]);
+                i += 1;
+                continue;
+            }
+            let mut j = i + 3;
+            while j < buf.len() && buf[j] != b'M' && buf[j] != b'm' {
+                j += 1;
+            }
+            if j >= buf.len() {
+                if buf.len() - i > 32 {
+                    keys.extend_from_slice(&buf[i..]);
+                    return (keys, wheels);
+                }
+                self.pending = buf[i..].to_vec();
+                return (keys, wheels);
+            }
+            let button = std::str::from_utf8(&buf[i + 3..j])
+                .ok()
+                .and_then(|p| p.split(';').next().and_then(|b| b.trim().parse::<u32>().ok()));
+            match button {
+                // 64 and 65 are the wheel; the rest is somebody clicking.
+                Some(64) => wheels.push(Wheel::Up),
+                Some(65) => wheels.push(Wheel::Down),
+                _ => wheels.push(Wheel::Other),
+            }
+            i = j + 1;
+        }
+        (keys, wheels)
+    }
+}
 
 impl NoAltScroll {
     /// Hand on what the viewer should write, having taken out what it must
@@ -87,12 +172,17 @@ impl NoAltScroll {
             }
             let params = &buf[i + 3..j];
             let enabling = buf[j] == b'h';
-            let refused = enabling
-                && params
-                    .split(|b| *b == b';')
-                    .filter_map(|p| std::str::from_utf8(p).ok())
-                    .filter_map(|p| p.trim().parse::<u16>().ok())
-                    .any(|n| REFUSED.contains(&n));
+            let modes: Vec<u16> = params
+                .split(|b| *b == b';')
+                .filter_map(|p| std::str::from_utf8(p).ok())
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .collect();
+            // Whether the agent is asking for the mouse, so the viewer can
+            // stop competing for it.
+            if modes.iter().any(|n| MOUSE.contains(n)) {
+                self.agent_wants_mouse = enabling;
+            }
+            let refused = enabling && modes.iter().any(|n| REFUSED.contains(n));
             if !refused {
                 out.extend_from_slice(&buf[i..=j]);
             }
@@ -156,6 +246,49 @@ mod tests {
         // gets none.
         assert_eq!(through(&[b"x\x1b[?1007;1049hy"]), b"xy".to_vec());
         assert_eq!(through(&[b"x\x1b[?1049;1000hy"]), b"x\x1b[?1049;1000hy".to_vec());
+    }
+
+    #[test]
+    fn the_agent_asking_for_the_mouse_is_noticed() {
+        let mut g = NoAltScroll::default();
+        assert!(!g.agent_wants_mouse);
+        g.pass(b"\x1b[?1000h");
+        assert!(g.agent_wants_mouse, "a program that asked for clicks should get them");
+        g.pass(b"\x1b[?1000l");
+        assert!(!g.agent_wants_mouse, "and stops getting them when it stops asking");
+        g.pass(b"\x1b[?1003h");
+        assert!(g.agent_wants_mouse);
+    }
+
+    #[test]
+    fn wheel_turns_are_read_out_of_the_keyboard_stream() {
+        let mut m = MouseReports::default();
+        let (keys, wheels) = m.read(b"a\x1b[<64;10;20Mb");
+        assert_eq!(keys, b"ab".to_vec(), "typing is not eaten");
+        assert_eq!(wheels, vec![Wheel::Up]);
+
+        let (_, wheels) = m.read(b"\x1b[<65;1;1M");
+        assert_eq!(wheels, vec![Wheel::Down]);
+
+        // A click is swallowed rather than typed at a program that never
+        // asked for the mouse.
+        let (keys, wheels) = m.read(b"\x1b[<0;5;5M");
+        assert!(keys.is_empty());
+        assert_eq!(wheels, vec![Wheel::Other]);
+    }
+
+    #[test]
+    fn a_report_split_across_reads_never_lands_in_the_prompt() {
+        let whole = b"x\x1b[<64;10;20My";
+        for cut in 1..whole.len() {
+            let mut m = MouseReports::default();
+            let (mut keys, mut wheels) = m.read(&whole[..cut]);
+            let (k2, w2) = m.read(&whole[cut..]);
+            keys.extend(k2);
+            wheels.extend(w2);
+            assert_eq!(keys, b"xy".to_vec(), "cut at {cut}: {:?}", String::from_utf8_lossy(&keys));
+            assert_eq!(wheels, vec![Wheel::Up], "cut at {cut}");
+        }
     }
 
     #[test]

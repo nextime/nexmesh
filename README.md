@@ -79,13 +79,39 @@ it without disturbing your own attachment.
 
 ![The operator console: the deck](docs/images/console-deck.png)
 
-`nexmesh`, run bare from a terminal, is the whole fleet on one screen: panes
-for the deck, agents, chat, plan, memory, the code graph in braille, file
-locks and machines. Sort the agent list by any column; make a seat, start it,
-move it, rename it or remove it without leaving the screen; attach with one
-key. Two themes, and the second one is not subtle:
+`nexmesh`, run bare from a terminal, is the whole fleet on one screen. The
+deck is what you want before you know what you are looking for: the tiles,
+anything that needs a look, and the traffic as it arrives.
+
+The **agents** pane is the one you work in — sort by any column, and make a
+seat, start it, move it, rename it or remove it without leaving the screen.
+`a` attaches:
+
+![The agents pane](docs/images/console-agents.png)
+
+The **code graph**, drawn in braille: subsystems on a ring, sized by what is
+in them, with the heaviest dependencies between them and the cursor's own
+edges picked out. Only the big ones are labelled, because every label drawn
+is a label over something else:
+
+![The code graph, in braille](docs/images/console-graph.png)
+
+The **chat** is IRC: channels down one side, the room in the middle, who is
+in it on the right — and a line starting with `/` is a command:
+
+![The chat room](docs/images/console-chat.png)
+
+**Memory** is a table of what the team knows, and Enter opens one in full,
+because a memory is a paragraph and a column six words wide is not where one
+gets read:
+
+![A memory, opened](docs/images/console-memory-open.png)
+
+Two themes, remembered per machine, and the second one is not subtle:
 
 ![The agents pane, in the LCARS theme](docs/images/console-lcars-agents.png)
+
+![The code graph, in the LCARS theme](docs/images/console-lcars-graph.png)
 
 ### Chat with your fleet — and commands in the chat
 

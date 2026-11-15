@@ -1148,6 +1148,21 @@ impl Drop for RawGuard {
 /// anybody asked for.
 const TERMINAL_PREPARE: &[u8] = b"\x1b[?1007l\x1b[?2004l";
 
+/// What the wheel does inside an attach.
+///
+/// With alternate scroll refused, the wheel has nothing to do: the screen
+/// belongs to a full-screen program whose history is its own, and the
+/// terminal's scrollback is empty. So the viewer takes the wheel and sends
+/// PAGE keys -- which is what every full-screen program scrolls with, and
+/// what Claude Code asks for by name when it catches a terminal turning the
+/// wheel into arrow keys.
+///
+/// Only while the agent is not using the mouse itself. The moment it asks
+/// for mouse events the viewer gets out of the way, because a program that
+/// asked for clicks should get clicks.
+const PAGE_UP: &[u8] = b"\x1b[5~";
+const PAGE_DOWN: &[u8] = b"\x1b[6~";
+
 const TERMINAL_RESTORE: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\
 \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1007l\x1b[?2004l\x1b[r\x1b[?25h\x1b[?7h\x1b[4l\x1b[0m\x1b(B";
 
@@ -1618,6 +1633,7 @@ async fn attach(
     {
         let mut out = tokio::io::stdout();
         let _ = out.write_all(TERMINAL_PREPARE).await;
+        let _ = out.write_all(termmode::MOUSE_ON).await;
         let _ = out.flush().await;
     }
     if let Some(b) = &bar {
@@ -1638,6 +1654,10 @@ async fn attach(
 
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
 
+    // Whether the agent has taken the mouse for itself. While it has, the
+    // viewer stops translating the wheel.
+    let agent_mouse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // What the agent has said, split into replies -- everything printed
     // since the operator last pressed Enter is its answer to that. Shared
     // with the key loop, which is where one of them is chosen to be read.
@@ -1651,6 +1671,7 @@ async fn attach(
         let quit_tx = quit_tx.clone();
         let heard = heard.clone();
         let quiet = quiet.clone();
+        let agent_mouse = agent_mouse.clone();
         let mut rx = std::mem::replace(&mut wire.rx, tokio::sync::mpsc::channel(1).1);
         tokio::spawn(async move {
             let mut out = tokio::io::stdout();
@@ -1667,6 +1688,8 @@ async fn attach(
                     wire::In::Data(data) => {
                         let data = strip.pass(&data);
                         let data = modes.pass(&data);
+                        agent_mouse
+                            .store(modes.agent_wants_mouse, std::sync::atomic::Ordering::Relaxed);
                         // A copy of what went past, as words, so a reply can
                         // be read back or read out as it arrives.
                         if let Ok(mut seen) = heard.lock() {
@@ -1733,6 +1756,8 @@ async fn attach(
     let mut rec: Option<(std::process::Child, std::path::PathBuf)> = None;
     // The player, while it plays: the same key again stops it.
     let playing: voice::Playing = Default::default();
+    // Mouse reports arrive in the keyboard stream and are not keystrokes.
+    let mut mouse = termmode::MouseReports::default();
     // Reading every new reply out as it settles, rather than on request.
     let mut aloud = false;
     // Command mode: one key in, one key out, and three keys that are ours
@@ -1826,6 +1851,33 @@ async fn attach(
             }
             n = keys.read(&mut buf) => {
                 let n = match n { Ok(0) | Err(_) => break "input ended".to_string(), Ok(n) => n };
+                // The wheel first. While the agent is not using the mouse,
+                // a turn is a page key -- the thing a full-screen program
+                // actually scrolls with. When it IS using the mouse, every
+                // report is handed over untouched.
+                let bytes: Vec<u8> =
+                    if agent_mouse.load(std::sync::atomic::Ordering::Relaxed) {
+                        buf[..n].to_vec()
+                    } else {
+                        let (keys, wheels) = mouse.read(&buf[..n]);
+                        for w in wheels {
+                            let key = match w {
+                                termmode::Wheel::Up => PAGE_UP,
+                                termmode::Wheel::Down => PAGE_DOWN,
+                                // A click nobody asked for goes nowhere.
+                                termmode::Wheel::Other => continue,
+                            };
+                            if wire.tx.send(wire::Out::Data(key.to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                        keys
+                    };
+                let n = bytes.len();
+                buf[..n].copy_from_slice(&bytes);
+                if n == 0 {
+                    continue;
+                }
                 // Two keys are ours. Everything else on this keyboard
                 // belongs to the agent -- which is why the rest of what this
                 // viewer can do lives behind ONE of them rather than taking

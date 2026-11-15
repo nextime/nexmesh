@@ -113,6 +113,42 @@ class NexTerm {
 
     this.ta.addEventListener("keydown", (e) => this.onKey(e));
     this.ta.addEventListener("paste", (e) => this.onPaste(e));
+    // What a phone actually produces. Its keyboard reports most keys as
+    // "Unidentified" and tells you what was typed through `input` instead,
+    // and a long-press Paste may arrive the same way rather than as a paste
+    // event. Without this, typing and pasting on a touch screen both go
+    // nowhere.
+    this.ta.addEventListener("input", () => this.onTyped());
+    this.ta.addEventListener("compositionend", () => this.onTyped());
+    // The wheel, and a swipe, scroll the PROGRAM -- there is no scrollback
+    // here to move: this grid is the screen the agent is drawing on, and
+    // its history is its own. So a scroll is PgUp/PgDn, which is what every
+    // full-screen program understands and what Claude Code asks for by
+    // name when it sees the wheel being turned into arrow keys.
+    host.addEventListener("wheel", (e) => {
+      if (this.readOnly) return;
+      e.preventDefault();
+      const key = e.deltaY < 0 ? "\x1b[5~" : "\x1b[6~";
+      const times = Math.min(3, Math.max(1, Math.round(Math.abs(e.deltaY) / 60)));
+      for (let i = 0; i < times; i++) this.send(key);
+    }, { passive: false });
+
+    let touchY = null;
+    host.addEventListener("touchstart", (e) => {
+      touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+    }, { passive: true });
+    host.addEventListener("touchmove", (e) => {
+      if (touchY === null || this.readOnly) return;
+      const y = e.touches[0].clientY;
+      const dy = y - touchY;
+      // One page per half a finger-length of travel, which is about what a
+      // phone's own scrolling feels like.
+      if (Math.abs(dy) < 48) return;
+      touchY = y;
+      this.send(dy > 0 ? "\x1b[5~" : "\x1b[6~");
+    }, { passive: true });
+    host.addEventListener("touchend", () => { touchY = null; }, { passive: true });
+
     host.addEventListener("mousedown", (e) => {
       // Let a click-drag select text; only a plain click takes the keyboard.
       if (e.detail > 1) return;
@@ -606,10 +642,37 @@ class NexTerm {
   onPaste(e) {
     const text = (e.clipboardData || window.clipboardData).getData("text");
     e.preventDefault();
+    this.paste(text);
+  }
+
+  /// Text that arrived through the field rather than as key presses.
+  ///
+  /// Anything `onKey` has already dealt with is skipped: on a desktop both
+  /// events fire for one keystroke, and sending both would double every
+  /// letter.
+  onTyped() {
+    const text = this.ta.value;
+    this.ta.value = "";
     if (!text) return;
-    // Bracketed paste, when the program asked for it: without the markers a
-    // multi-line paste is read as a series of submits, which in an agent CLI
-    // sends half-written instructions.
+    if (Date.now() - (this.handledAt || 0) < 80) return;
+    // More than a couple of characters at once is a paste however it
+    // arrived, and is sent as one.
+    if (text.length > 2) {
+      this.paste(text);
+    } else {
+      this.send(text);
+    }
+  }
+
+  /// Paste text as a paste, from wherever it came from.
+  ///
+  /// A phone has no Ctrl-V and will not raise its own paste menu over a
+  /// hidden textarea, so the button in the header reads the clipboard and
+  /// calls this -- which must behave exactly like a real paste, markers and
+  /// all, or a multi-line paste arrives as a series of submits and an agent
+  /// gets half-written instructions.
+  paste(text) {
+    if (!text) return;
     this.send(this.bracketed ? `\x1b[200~${text}\x1b[201~` : text);
   }
 
@@ -622,7 +685,13 @@ class NexTerm {
     if (meta) return;
     if (ctrl && (k === "c" || k === "v") && shift) return;
 
-    const put = (s) => { e.preventDefault(); this.send(s); };
+    // `handledAt` tells `onTyped` that this keystroke is already on its
+    // way, so the `input` event that follows it on a desktop is ignored.
+    const put = (s) => {
+      e.preventDefault();
+      this.handledAt = Date.now();
+      this.send(s);
+    };
 
     const keys = {
       Enter: "\r", Tab: "\t", Backspace: "\x7f", Escape: "\x1b",

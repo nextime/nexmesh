@@ -59,9 +59,21 @@ def q(sql, args=()):
     finally: c.close()
 
 def until(fn, seconds=25.0, step=0.3):
+    """Poll until it answers, or the time runs out.
+
+    An exception is NOT the end: the thing being waited for is usually a
+    process that has not finished starting, and a hub that is not listening
+    yet answers a connection with a refusal, not with a false. Letting that
+    escape is how this suite came to die with `Connection refused` on a
+    loaded machine while passing on an idle one -- which reads as a flake
+    and is a missing try.
+    """
     end = time.time() + seconds
     while time.time() < end:
-        v = fn()
+        try:
+            v = fn()
+        except Exception:
+            v = None
         if v: return v
         time.sleep(step)
     return None
@@ -73,7 +85,12 @@ def main():
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
         f"127.0.0.1:{PORT}", "serve"], stdout=open(f"{T}/hub.log","w"),
         stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
-    until(lambda: http("GET", "/healthz")[1].get("ok") if _try() else None)
+    # Wait for the hub to be listening. `_try()` used to stand in for this
+    # and returned True without trying anything, so the first probe was the
+    # only probe.
+    if not until(lambda: http("GET", "/healthz")[1].get("ok"), seconds=30.0):
+        print("the hub never came up; see", f"{T}/hub.log")
+        return 2
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
         "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log","w"), stderr=subprocess.STDOUT,
@@ -177,10 +194,6 @@ def main():
     if fails:
         print(f"FAILED ({len(fails)}): " + ", ".join(fails)); return 1
     print("ALL DRIVER CHECKS PASSED"); return 0
-
-def _try():
-    try: return True
-    except Exception: return False
 
 try: rc = main()
 except Exception:

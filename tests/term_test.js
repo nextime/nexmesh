@@ -227,4 +227,59 @@ if (fails) {
   console.log(`FAILED (${fails})`);
   process.exit(1);
 }
+// ---------------------------------------------------------------- paste ----
+// A phone has no Ctrl-V and will not raise its own paste menu over the
+// hidden textarea, so the header button reads the clipboard and calls
+// `paste` -- which has to behave like a real paste, markers and all.
+{
+  const t = mk(40, 6);
+  const sent = [];
+  t.onInput((b) => sent.push(typeof b === "string" ? b : new TextDecoder().decode(b)));
+
+  t.paste("hello");
+  check("a paste without bracketing arrives as the text itself",
+        sent.join("") === "hello", JSON.stringify(sent));
+
+  sent.length = 0;
+  t.write("\x1b[?2004h");         // the program asks for bracketed paste
+  t.paste("two\nlines");
+  check("a bracketed paste is wrapped, so a newline is not a submit",
+        sent.join("") === "\x1b[200~two\nlines\x1b[201~", JSON.stringify(sent));
+
+  sent.length = 0;
+  t.paste("");
+  check("an empty clipboard sends nothing at all", sent.length === 0, JSON.stringify(sent));
+}
+
+
+// --------------------------------------------------- what a phone sends ----
+// A phone's keyboard reports most keys as "Unidentified" and says what was
+// typed through an `input` event; a long-press Paste can arrive the same
+// way. Both have to work, and a desktop keystroke -- which fires keydown AND
+// input -- must not be sent twice.
+{
+  const t = mk(40, 6);
+  const sent = [];
+  t.onInput((b) => sent.push(typeof b === "string" ? b : new TextDecoder().decode(b)));
+
+  t.ta.value = "a";
+  t.onTyped();
+  check("a character typed on a phone reaches the agent",
+        sent.join("") === "a", JSON.stringify(sent));
+  check("and the field is left empty for the next one", t.ta.value === "");
+
+  sent.length = 0;
+  t.ta.value = "a long piece of pasted text";
+  t.onTyped();
+  check("a long-press paste arrives as one paste",
+        sent.join("") === "a long piece of pasted text", JSON.stringify(sent));
+
+  sent.length = 0;
+  t.handledAt = Date.now();
+  t.ta.value = "x";
+  t.onTyped();
+  check("a keystroke already handled by keydown is not sent twice",
+        sent.length === 0, JSON.stringify(sent));
+}
+
 console.log("ALL BROWSER TERMINAL CHECKS PASSED");

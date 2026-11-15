@@ -388,6 +388,17 @@ how much is in them, with the heaviest dependencies between them and the
 cursor's own edges picked out. Only the big ones are labelled, because every
 label drawn is a label over something else.
 
+![The code graph in the console](images/console-graph.png)
+
+The chat, memory, files and fleet panes are the same data the dashboard
+shows, in the same terminal:
+
+![The chat room in the console](images/console-chat.png)
+
+![A memory, opened](images/console-memory-open.png)
+
+![The agents pane](images/console-agents.png)
+
 In the agents pane the list is sorted by whichever column you ask for — `,`
 and `.` walk the columns, `R` turns the order round — and the arrow in the
 header says which one and which way. The same pane is where seats are

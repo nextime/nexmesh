@@ -398,9 +398,24 @@
   }
   /* Where a phone's keyboard comes from, and where a paste lands. Invisible
      but focusable: a textarea with zero size is ignored by some browsers. */
+  /* On a mouse-driven screen the input field is parked off-screen, so that
+     dragging across the terminal selects its text to copy. */
   .ntinput {
     position: absolute; left: -9999px; top: 0; width: 1px; height: 1px;
     opacity: 0; border: 0; padding: 0; resize: none;
+  }
+  /* On a touch screen it covers the terminal instead, invisibly, so that a
+     long press offers Paste -- a phone offers that over a text field, and
+     over a grid of coloured spans it offers nothing at all.
+     `touch-action: pan-y` is the part that matters: without it the field
+     swallows the swipe as well, and the terminal cannot be scrolled at all. */
+  @media (pointer: coarse) {
+    .ntinput {
+      position: absolute; inset: 0; left: 0; width: 100%; height: 100%;
+      opacity: 0; color: transparent; background: transparent;
+      caret-color: transparent; z-index: 2; font-size: 16px;
+      touch-action: pan-y;
+    }
   }
   /* The keys a phone has no way to send. Only shown on a touch screen. */
   .tkeys { display: none; gap: 6px; padding: 7px 10px; background: var(--panel);
@@ -646,6 +661,11 @@
     .feed { max-height: 60vh; }
   }
   .mic.on { color: var(--bad); }
+  /* The terminal's own buttons on a phone: a thumb needs them to be there
+     and not to push `detach` off the row. */
+  @media (max-width: 620px) {
+    #term .thead #termPaste, #term .thead #termCam { padding: 5px 7px; }
+  }
 
   /* The camera, over everything, because taking a photo is the whole screen's
      job for as long as it lasts. */
@@ -843,9 +863,14 @@
               title="Read this screen aloud (or whatever is selected)">🔊</button>
       <button class="tiny" onclick="pickFiles()"
               title="Put a file in THIS agent's workspace, on its machine">📎</button>
-      ${navigator.mediaDevices && navigator.mediaDevices.getUserMedia
-        ? `<button class="tiny" onclick="openCamera()"
-              title="Photo or clip, into this agent's workspace">📷</button>` : ""}
+      <!-- Shown by openTerm() when this browser has a camera. This block is
+           STATIC html: a ${...} here is text on the screen, not an
+           expression, which is how the terminal header came to display its
+           own source on a phone. -->
+      <button class="tiny" id="termCam" hidden onclick="openCamera()"
+              title="Photo or clip, into this agent's workspace">📷</button>
+      <button class="tiny" id="termPaste" onclick="termPaste()"
+              title="Paste the clipboard into this agent's prompt">paste</button>
       <button class="tiny" onclick="termKeys()" title="Send a key a phone has no room for">keys</button>
       <button class="tiny" onclick="closeTerm()" title="Detach (the agent keeps working)">detach</button>
     </div>
@@ -1834,9 +1859,10 @@ function openTerm(agent, name) {
   term.fit();
   $("tSize").textContent = `${term.cols}\u00d7${term.rows}`;
   // Speaking and listening, if there is anything to speak or listen with.
-  const mic = $("termMic"), spk = $("termSay");
+  const mic = $("termMic"), spk = $("termSay"), cam = $("termCam");
   if (mic) mic.hidden = !(canHear() || fleetHas("transcribe"));
   if (spk) spk.hidden = !(canSpeak() || fleetHas("tts"));
+  if (cam) cam.hidden = !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   wireTermGestures();
 
   // A websocket cannot carry an Authorization header, so a token signs in
@@ -2013,6 +2039,30 @@ function wireTermGestures() {
   for (const ev of ["pointerup", "pointercancel", "pointermove", "pointerleave"]) {
     host.addEventListener(ev, () => { if (held) { clearTimeout(held); held = null; } });
   }
+}
+
+/// Paste into the agent's prompt, on a device that cannot press Ctrl-V.
+///
+/// A phone will not raise its own paste menu over the hidden textarea the
+/// terminal reads keys through, so the button asks the clipboard directly.
+/// That needs a user gesture and a secure page, which a button press on an
+/// installed app is -- and when the browser refuses, the fallback is to say
+/// what to do rather than to do nothing.
+async function termPaste() {
+  if (!term || termRO) { note("This terminal is view-only."); return; }
+  let text = "";
+  try {
+    text = await navigator.clipboard.readText();
+  } catch (e) {
+    term.focus();
+    note("This browser will not hand over the clipboard. Tap the terminal, "
+       + "hold, and use its own Paste.");
+    return;
+  }
+  if (!text) { note("The clipboard is empty."); return; }
+  term.paste(text);
+  term.focus();
+  note(`Pasted ${text.length} character${text.length === 1 ? "" : "s"}.`);
 }
 
 function termKeys() {
