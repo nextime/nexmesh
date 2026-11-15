@@ -28,3 +28,66 @@ toml = { workspace = true }
 tokio = { workspace = true }
 # fcntl, for a non-blocking handle on our own terminal: see `Keyboard`.
 nix = { workspace = true }
+
+# ---------------------------------------------------------------- packaging --
+# One package for the whole fleet's binaries, because they are one program in
+# six pieces and a machine that has the node usually wants the operator CLI
+# too. Built with `cargo deb -p nexmesh-ctl` / `cargo generate-rpm -p crates/ctl`
+# after a release build; see packaging/README.md.
+#
+# Neither package ENABLES anything. A deb that starts a hub on install would
+# start one nobody has configured, on a machine that may have wanted a node --
+# so the service step stays explicit: `nexmesh-install hub|node|coderai`.
+[package.metadata.deb]
+name = "nexmesh"
+maintainer = "Stefy Lanza <stefy@nexlab.net>"
+copyright = "2026, Stefy Lanza <stefy@nexlab.net>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """
+Agent CLIs -- Claude Code, Codex, opencode, qwen, gemini, anything that speaks
+MCP -- run as one team across several machines: one message log, one shared
+memory, one plan, one set of file locks. Watch it and drive it from a terminal,
+a browser or a phone, and attach to any agent's real terminal from anywhere.
+"""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["../../target/release/nexmesh", "usr/bin/", "755"],
+    ["../../target/release/nexmesh-hub", "usr/bin/", "755"],
+    ["../../target/release/nexmesh-node", "usr/bin/", "755"],
+    ["../../target/release/nexmesh-mcpd", "usr/bin/", "755"],
+    ["../../target/release/nexmesh-orch", "usr/bin/", "755"],
+    ["../../target/release/nexmesh-coderai", "usr/bin/", "755"],
+    ["../../docs/man/nexmesh.1", "usr/share/man/man1/", "644"],
+    ["../../clis/*.toml", "etc/nexmesh/clis/", "644"],
+    ["../../capabilities/*.toml", "etc/nexmesh/capabilities/", "644"],
+    ["../../deploy/initd/nexmesh-*", "usr/share/nexmesh/initd/", "755"],
+    ["../../deploy/systemd/*.service", "usr/share/nexmesh/systemd/", "644"],
+    ["../../deploy/install-service.sh", "usr/bin/nexmesh-install", "755"],
+    ["../../README.md", "usr/share/doc/nexmesh/", "644"],
+    ["../../docs/GUIDE.md", "usr/share/doc/nexmesh/", "644"],
+]
+maintainer-scripts = "../../packaging/deb"
+conf-files = ["/etc/nexmesh/clis", "/etc/nexmesh/capabilities"]
+
+[package.metadata.generate-rpm]
+name = "nexmesh"
+summary = "Agent CLIs as one team, across machines"
+license = "GPL-3.0-or-later"
+assets = [
+    { source = "target/release/nexmesh", dest = "/usr/bin/nexmesh", mode = "755" },
+    { source = "target/release/nexmesh-hub", dest = "/usr/bin/nexmesh-hub", mode = "755" },
+    { source = "target/release/nexmesh-node", dest = "/usr/bin/nexmesh-node", mode = "755" },
+    { source = "target/release/nexmesh-mcpd", dest = "/usr/bin/nexmesh-mcpd", mode = "755" },
+    { source = "target/release/nexmesh-orch", dest = "/usr/bin/nexmesh-orch", mode = "755" },
+    { source = "target/release/nexmesh-coderai", dest = "/usr/bin/nexmesh-coderai", mode = "755" },
+    { source = "docs/man/nexmesh.1", dest = "/usr/share/man/man1/nexmesh.1", mode = "644", doc = true },
+    { source = "clis/*.toml", dest = "/etc/nexmesh/clis/", mode = "644", config = true },
+    { source = "capabilities/*.toml", dest = "/etc/nexmesh/capabilities/", mode = "644", config = true },
+    { source = "deploy/initd/nexmesh-*", dest = "/usr/share/nexmesh/initd/", mode = "755" },
+    { source = "deploy/systemd/*.service", dest = "/usr/share/nexmesh/systemd/", mode = "644" },
+    { source = "deploy/install-service.sh", dest = "/usr/bin/nexmesh-install", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/nexmesh/README.md", mode = "644", doc = true },
+    { source = "docs/GUIDE.md", dest = "/usr/share/doc/nexmesh/GUIDE.md", mode = "644", doc = true },
+]

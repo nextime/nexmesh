@@ -980,7 +980,7 @@ fn join(
     // A CLI started by hand gives no name, and its conversation id is new
     // every time one is started rather than resumed. So closing `claude` and
     // opening another in the same folder left the old seat empty and minted
-    // `Claude-sissy-2` beside it: the team gains a stranger every morning,
+    // `Claude-machine-b-2` beside it: the team gains a stranger every morning,
     // and the name everyone addresses belongs to the seat nobody is in.
     //
     // This is a judgement, and the surrounding code is right to be wary of
@@ -1056,7 +1056,7 @@ fn join(
     // A person starting a CLI by hand has no name to give, and a nameless
     // seat is useless to read: every view shows a blank where a teammate
     // should be, and two conversations on one machine are indistinguishable.
-    // So name it after what it is and where it is -- `Claude-sissy` -- and
+    // So name it after what it is and where it is -- `Claude-machine-b` -- and
     // number it only when that is taken, which is what happens when the same
     // CLI is open twice on one machine.
     let name = match name.filter(|n| !n.trim().is_empty()) {
@@ -1199,9 +1199,9 @@ fn join(
 
 /// A readable name for a seat nobody named: the CLI, on this machine.
 ///
-/// `claude-nextime` on `sissy` becomes `Claude-sissy`, matching how these
+/// `claude-alice` on `machine-b` becomes `Claude-machine-b`, matching how these
 /// seats are named by hand, and a second one on the same machine becomes
-/// `Claude-sissy-2` rather than a duplicate -- a duplicate name is the one
+/// `Claude-machine-b-2` rather than a duplicate -- a duplicate name is the one
 /// thing that makes a session impossible to reason about, because every
 /// command that addresses an agent addresses it by name.
 fn mint_seat_name(
@@ -1355,7 +1355,7 @@ mod tests {
 
     #[test]
     fn a_cwd_outside_every_mount_matches_nothing() {
-        assert_eq!(workspace_for_cwd(&mounts(), "/home/nextime"), None);
+        assert_eq!(workspace_for_cwd(&mounts(), "/home/alice"), None);
         assert_eq!(workspace_for_cwd(&[], "/srv/app"), None);
     }
 }

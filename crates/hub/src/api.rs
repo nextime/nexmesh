@@ -29,7 +29,7 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> (StatusCode, Json<Value
 /// Every command that takes a session takes a name -- that is what you read
 /// on the dashboard and type at a terminal -- but only the handlers that
 /// happened to spell out `id = ? OR name = ?` accepted one. `nexmesh status
-/// digesta` therefore matched no rows and reported "no agents in this
+/// payments` therefore matched no rows and reported "no agents in this
 /// session" for a session with four seats in it: the worst kind of wrong
 /// answer, because it looks like news about the fleet rather than a failure
 /// to understand the question.
@@ -484,7 +484,7 @@ pub async fn set_role(
 ///
 /// A name is not decoration: it is how every command, every message and every
 /// log line addresses an agent, and a seat is usually named before anyone
-/// knows what it will do -- `Claude-zeiss-3` says where it runs and nothing
+/// knows what it will do -- `Claude-machine-c-3` says where it runs and nothing
 /// about the work. Renaming changes nothing else: same seat, same agent, same
 /// history, same inbox.
 ///
@@ -1848,8 +1848,8 @@ pub async fn resolve_agent(
     //
     // A CLI somebody started by hand has no pty the node owns -- the pty
     // belongs to the adopted tmux pane around it, which is a seat of its
-    // own. So `nexmesh attach motus Motus-dev` used to be refused, and you
-    // had to know to ask for `term-Motus-dev` instead, or go and find the
+    // own. So `nexmesh attach docs-site Docs-dev` used to be refused, and you
+    // had to know to ask for `term-Docs-dev` instead, or go and find the
     // tmux session by hand. That is the plumbing showing through: the name
     // you address an agent by should open the screen it is on.
     //
@@ -1906,7 +1906,7 @@ pub struct DirectAttach {
 /// Authorise an attach that does not go through the hub.
 ///
 /// The hub stays the only thing that decides WHO may attach to WHAT. What it
-/// need not be is the wire: a keystroke typed on sissy for an agent on sissy
+/// need not be is the wire: a keystroke typed on machine-b for an agent on machine-b
 /// made two network hops and a relay on a hub elsewhere. So this mints a
 /// one-time ticket, pushes it to the node holding that terminal over the
 /// connection it already has, and returns it to the operator, who presents it
@@ -2066,6 +2066,29 @@ pub async fn operator_message(
     if req.text.trim().is_empty() {
         return Err(bad("text must not be empty"));
     }
+    // A line beginning with `/` is an instruction, not an utterance. Done
+    // here rather than in each front end, so the console, the dashboard and
+    // the phone all got it at once.
+    let text = match crate::chatcmd::parse(&req.text).map_err(bad)? {
+        crate::chatcmd::Parsed::Say(text) => text,
+        crate::chatcmd::Parsed::Do(cmd) => {
+            let said = run_command(&st, &session_id, &cmd).await?;
+            // The outcome goes in the chat as a record: everyone watching
+            // sees what was done, and it is pre-claimed so no agent is ever
+            // handed the operator's housekeeping as a message to act on.
+            let line = format!("{} \u{2192} {said}", req.text.trim());
+            let db = st.db.lock().unwrap();
+            let now = now_ms();
+            db.execute(
+                "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                       sent_at_ms, claimed_at_ms, claimed_by)
+                 VALUES (?, NULL, NULL, 'system', ?, ?, ?, 'console')",
+                params![session_id, line, now, now],
+            )
+            .map_err(bad)?;
+            return Ok(Json(json!({ "sent": true, "command": true, "said": said })));
+        }
+    };
     let db = st.db.lock().unwrap();
     let to_slot: Option<String> = match &req.to {
         Some(t) => Some(
@@ -2085,7 +2108,7 @@ pub async fn operator_message(
     db.execute(
         "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
          VALUES (?, NULL, ?, 'system', ?, ?)",
-        params![session_id, to_slot, req.text, now_ms()],
+        params![session_id, to_slot, text, now_ms()],
     )
     .map_err(bad)?;
     // Who it is for, and by what route it can reach them.
@@ -2129,6 +2152,157 @@ pub async fn operator_message(
         })
         .unwrap_or_default();
     Ok(Json(json!({ "sent": true, "to": to_slot, "seats": seats })))
+}
+
+/// Carry out a chat command.
+///
+/// Every one of these is an existing endpoint, called as the handler it
+/// already is: `/move` is `POST /v1/slots/:id/move`, `/remove` is the DELETE,
+/// and so on. Nothing here reimplements an operation, so a command typed in
+/// the chat and the same thing done with `nexmesh move-agent` take the same
+/// path, including every refusal.
+async fn run_command(
+    st: &AppState,
+    session_id: &str,
+    cmd: &crate::chatcmd::Cmd,
+) -> std::result::Result<String, (StatusCode, Json<Value>)> {
+    use crate::chatcmd::Cmd;
+    match cmd {
+        Cmd::Help => Ok(crate::chatcmd::help()),
+        Cmd::Rename { who, name } => {
+            let (slot, was) = seat_by_ref(st, session_id, who)?;
+            let v = rename_slot(
+                State(st.clone()),
+                Path(slot),
+                Json(RenameRequest { name: name.clone() }),
+            )
+            .await?;
+            let _ = v;
+            Ok(format!("{was} is now called {name}"))
+        }
+        Cmd::Move { who, session } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let Json(v) = move_slot(
+                State(st.clone()),
+                Path(slot),
+                Json(MoveSlot { session: session.clone() }),
+            )
+            .await?;
+            let left = v["messages_left_unread"].as_i64().unwrap_or(0);
+            let mut out = format!(
+                "{name} is now in {}",
+                v["session_name"].as_str().unwrap_or(session)
+            );
+            if left > 0 {
+                out.push_str(&format!("; {left} unread message(s) stayed behind"));
+            }
+            Ok(out)
+        }
+        Cmd::Remove { who, force } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let mut q = std::collections::HashMap::new();
+            if *force {
+                q.insert("force".to_string(), "1".to_string());
+            }
+            let Json(v) =
+                remove_slot(State(st.clone()), Path(slot), axum::extract::Query(q)).await?;
+            Ok(format!(
+                "{name} is gone ({} agent row(s) with it)",
+                v["agent_rows"].as_i64().unwrap_or(0)
+            ))
+        }
+        Cmd::Start { who, mode } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let Json(v) = spawn_slot(
+                State(st.clone()),
+                Path(slot),
+                Some(Json(SpawnRequest { cli: None, mode: mode.clone() })),
+            )
+            .await?;
+            Ok(format!(
+                "{name} is starting on {} ({})",
+                v["node"].as_str().unwrap_or("?"),
+                v["mode"].as_str().unwrap_or("?")
+            ))
+        }
+        Cmd::New { cli, name, mode } => {
+            let Json(made) = create_slot(
+                State(st.clone()),
+                Path(session_id.to_string()),
+                Json(NewSlot {
+                    cli_id: Some(cli.clone()),
+                    participant_kind: None,
+                    // A seat made from a chat is one somebody means to talk
+                    // to unless they said otherwise.
+                    mode: Some(mode.clone().unwrap_or_else(|| "interactive".into())),
+                    display_name: Some(name.clone()),
+                    role: None,
+                    role_description: None,
+                    workspace: None,
+                    task: None,
+                    model: None,
+                    capabilities: vec![],
+                    // Wherever the CLI is actually installed.
+                    placement: nexmesh_proto::Placement { node: None, labels: vec![], any: true },
+                    file_ownership: vec![],
+                }),
+            )
+            .await?;
+            let slot = made["slot_id"].as_str().unwrap_or("").to_string();
+            let Json(v) = spawn_slot(
+                State(st.clone()),
+                Path(slot.clone()),
+                Some(Json(SpawnRequest {
+                    cli: None,
+                    mode: Some(mode.clone().unwrap_or_else(|| "interactive".into())),
+                })),
+            )
+            .await?;
+            Ok(format!(
+                "{name} ({slot}) is starting on {} ({})",
+                v["node"].as_str().unwrap_or("?"),
+                v["mode"].as_str().unwrap_or("?")
+            ))
+        }
+    }
+}
+
+/// A seat in this session, by name, role or id, with the name it goes by.
+///
+/// The same resolution the chat's `to:` already uses, and the same answer an
+/// operator reads on the dashboard -- a person types "Dev", not "sl-4f1c".
+fn seat_by_ref(
+    st: &AppState,
+    session_id: &str,
+    who: &str,
+) -> std::result::Result<(String, String), (StatusCode, Json<Value>)> {
+    let db = st.db.lock().unwrap();
+    db.query_row(
+        "SELECT id, COALESCE(display_name, role, id) FROM slots
+          WHERE session_id = ?1
+            AND (id = ?2 OR LOWER(COALESCE(display_name,'')) = LOWER(?2)
+                 OR LOWER(COALESCE(role,'')) = LOWER(?2))",
+        params![session_id, who],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(bad)?
+    .ok_or_else(|| {
+        // What there is, rather than only what there is not: a name typed
+        // from memory is usually nearly right.
+        let names: Vec<String> = db
+            .prepare("SELECT COALESCE(display_name, role, id) FROM slots WHERE session_id = ?
+                      ORDER BY 1")
+            .and_then(|mut q| {
+                q.query_map([session_id], |r| r.get::<_, String>(0))
+                    .and_then(|m| m.collect())
+            })
+            .unwrap_or_default();
+        bad(format!(
+            "no agent called '{who}' here. There is: {}",
+            if names.is_empty() { "nobody".to_string() } else { names.join(", ") }
+        ))
+    })
 }
 
 // ---------------------------------------------------------- participant ----

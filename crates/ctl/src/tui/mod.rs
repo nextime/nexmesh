@@ -10,6 +10,7 @@
 //! ink: panes instead of tabs, a context panel on the right, braille for the
 //! code graph, and a keyboard rather than a mouse.
 
+mod act;
 mod draw;
 mod map;
 mod theme;
@@ -24,6 +25,7 @@ use ratatui::Terminal;
 use serde_json::Value;
 use std::io::stdout;
 use std::time::{Duration, Instant};
+use crate::voice;
 use theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,6 +90,96 @@ fn save_theme(t: Theme) {
     let _ = std::fs::write(p, format!("# nexmesh console\ntheme = \"{}\"\n", t.name()));
 }
 
+/// The line being typed, and where in it the next character goes.
+///
+/// A composer that can only append and backspace is not one you can correct
+/// a word in the middle of, and indexing a line of text by byte panics the
+/// first time somebody types an accent -- so the caret counts characters and
+/// every edit goes through here.
+#[derive(Default, Debug)]
+pub struct Composer {
+    pub text: String,
+    pub caret: usize,
+}
+
+impl Composer {
+    fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// The byte offset of a character position.
+    fn byte_at(&self, chars: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(chars)
+            .map(|(i, _)| i)
+            .unwrap_or(self.text.len())
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.caret.min(self.len()));
+        self.text.insert(at, c);
+        self.caret = self.caret.min(self.len()) + 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.caret == 0 {
+            return;
+        }
+        let at = self.byte_at(self.caret - 1);
+        self.text.remove(at);
+        self.caret -= 1;
+    }
+
+    fn delete(&mut self) {
+        let at = self.byte_at(self.caret);
+        if at < self.text.len() {
+            self.text.remove(at);
+        }
+    }
+
+    /// Ctrl-W: back over the spaces, then back over the word.
+    fn delete_word(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut at = self.caret.min(chars.len());
+        while at > 0 && chars[at - 1].is_whitespace() {
+            at -= 1;
+        }
+        while at > 0 && !chars[at - 1].is_whitespace() {
+            at -= 1;
+        }
+        let (from, to) = (self.byte_at(at), self.byte_at(self.caret));
+        self.text.replace_range(from..to, "");
+        self.caret = at;
+    }
+
+    fn left(&mut self) {
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.caret = (self.caret + 1).min(self.len());
+    }
+
+    fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    fn end(&mut self) {
+        self.caret = self.len();
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.caret = 0;
+    }
+
+    fn set(&mut self, t: String) {
+        self.caret = t.chars().count();
+        self.text = t;
+    }
+}
+
 pub struct App {
     base: String,
     client: reqwest::Client,
@@ -104,8 +196,33 @@ pub struct App {
     sel: [usize; 8],
     ws: usize,
     chan: String,
-    input: String,
+    input: Composer,
     editing: bool,
+    /// How many lines back the chat feed is scrolled from the newest.
+    scroll: usize,
+    /// Which agent column the list is sorted by, and which way round.
+    sort_col: usize,
+    sort_rev: bool,
+    /// Whether the row under the cursor is open full-size. Memory values are
+    /// paragraphs; a column in a table is not where one gets read.
+    zoom: bool,
+    /// A long answer to show in the box: `/help`, mostly. Separate from the
+    /// memory the Memory pane zooms, because a command can be run from any
+    /// pane and its answer still has to be readable.
+    zoom_text: Option<String>,
+    /// What this machine can do with sound, looked at once.
+    audio: voice::Audio,
+    /// The recorder, while it is running.
+    recording: Option<(std::process::Child, std::path::PathBuf)>,
+    /// Whether new messages are read aloud, and how far that has got.
+    speaking: bool,
+    spoken_up_to: i64,
+    /// Results from the work that must not block the screen: a transcription
+    /// takes seconds, and a console that freezes while it waits looks broken.
+    voice_tx: tokio::sync::mpsc::Sender<Heard>,
+    /// A question waiting for an answer: where to move a seat, what to call
+    /// it, whether to really remove it. One at a time, deliberately.
+    dialog: Option<act::Dialog>,
     panel: bool,
     help: bool,
     theme: Theme,
@@ -116,6 +233,14 @@ pub struct App {
     /// attach takes the whole screen, so the loop has to put the terminal
     /// back first and pick it up again afterwards.
     attach_to: Option<(String, String)>,
+}
+
+/// Something the voice side has finished doing.
+pub enum Heard {
+    /// Words, for the composer.
+    Words(String),
+    /// Anything worth a line in the footer.
+    Note(String),
 }
 
 /// The first link in a message, if it has one.
@@ -218,6 +343,186 @@ impl App {
         out
     }
 
+    /// Scroll the feed back, with a stop at the oldest message it holds.
+    /// Two lines per message is a loose bound and that is the point: the
+    /// draw clamps it to the real line count, and this only keeps PgUp from
+    /// counting up for ever and PgDn from taking twenty presses to come back.
+    fn scroll_back(&mut self, by: usize) {
+        let ceiling = self.rows("messages").len() * 2 + 8;
+        self.scroll = (self.scroll + by).min(ceiling);
+    }
+
+    fn say_sort(&mut self) {
+        let col = draw::AGENT_COLS.get(self.sort_col).copied().unwrap_or("name");
+        let way = if self.sort_rev { "descending" } else { "ascending" };
+        self.notice(format!("agents by {col}, {way}"));
+    }
+
+    /// Every session, as a pick list. `without` leaves out the one a seat is
+    /// already in, which is never a useful place to move it to.
+    fn session_choices(&self, without: Option<&str>) -> Vec<act::Choice> {
+        self.sessions()
+            .iter()
+            .filter_map(|x| {
+                let name = x["name"].as_str()?.to_string();
+                if without == Some(name.as_str()) {
+                    return None;
+                }
+                let id = x["id"].as_str().unwrap_or("").to_string();
+                let seats = x["slots"].as_i64().unwrap_or(0);
+                Some(act::Choice {
+                    value: if id.is_empty() { name.clone() } else { id },
+                    label: format!("#{name}  ({seats} seat(s))"),
+                })
+            })
+            .collect()
+    }
+
+    /// Every CLI any connected machine has installed, with the machines that
+    /// have it. A seat for a CLI nothing can run is a seat that will never
+    /// start, so the list comes from the fleet rather than from a guess.
+    fn cli_choices(&self) -> Vec<act::Choice> {
+        let mut by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for n in self.nodes() {
+            let name = n["name"].as_str().unwrap_or("?").to_string();
+            for c in n["clis"].as_array().into_iter().flatten() {
+                if let Some(c) = c.as_str() {
+                    by.entry(c.to_string()).or_default().push(name.clone());
+                }
+            }
+        }
+        by.into_iter()
+            .map(|(cli, on)| act::Choice {
+                label: format!("{cli}  \u{2014} on {}", on.join(", ")),
+                value: cli,
+            })
+            .collect()
+    }
+
+    /// Whether anything on the fleet offers a capability, from the seats'
+    /// own lists -- the same question the dashboard asks before it draws a
+    /// microphone.
+    fn fleet_has(&self, cap: &str) -> bool {
+        self.rows("agents").iter().any(|a| {
+            a["capabilities"]
+                .as_array()
+                .is_some_and(|caps| {
+                    caps.iter().any(|c| {
+                        c.as_str().is_some_and(|c| c.eq_ignore_ascii_case(cap))
+                    })
+                })
+                // An older hub does not send the list; the summary is what
+                // there is.
+                || (a["capabilities"].is_null()
+                    && a["summary"].as_str().is_some_and(|s| s.contains(cap)))
+        })
+    }
+
+    fn scratch(&self) -> std::path::PathBuf {
+        std::env::var("XDG_RUNTIME_DIR")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("nexmesh-voice")
+    }
+
+    /// Press once to start, again to send. A fixed number of seconds is a
+    /// guess nobody can make before they have said the sentence.
+    fn listen(&mut self) {
+        if !self.audio.can_hear() {
+            self.notice(self.audio.why_not());
+            return;
+        }
+        if !self.fleet_has("transcribe") {
+            self.notice("nothing on the fleet offers 'transcribe' -- a capability bridge does");
+            return;
+        }
+        match self.recording.take() {
+            None => match voice::start(&self.audio, &self.scratch()) {
+                Ok(r) => {
+                    self.recording = Some(r);
+                    self.notice("listening \u{2014} v again to send it to be transcribed");
+                }
+                Err(e) => self.notice(trim_err(&e.to_string())),
+            },
+            Some((child, path)) => {
+                let bytes = match voice::stop(child, &path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.notice(trim_err(&e.to_string()));
+                        return;
+                    }
+                };
+                self.notice(format!("transcribing {} KiB\u{2026}", bytes.len() / 1024));
+                // On a task, so the screen keeps drawing while the fleet
+                // does the work.
+                let (base, client, tx) =
+                    (self.base.clone(), self.client.clone(), self.voice_tx.clone());
+                let lang = std::env::var("LANG").ok().and_then(|l| {
+                    l.split(['.', '_']).next().filter(|s| s.len() == 2).map(|s| s.to_string())
+                });
+                tokio::spawn(async move {
+                    let said = voice::transcribe(&base, &client, &bytes, lang.as_deref()).await;
+                    let _ = match said {
+                        Ok(words) if !words.trim().is_empty() => tx.send(Heard::Words(words)).await,
+                        Ok(_) => tx.send(Heard::Note("nothing was said in that".into())).await,
+                        Err(e) => tx.send(Heard::Note(trim_err(&format!("{e:#}")))).await,
+                    };
+                });
+            }
+        }
+    }
+
+    /// Read new traffic aloud, in the channel being watched. Off unless
+    /// asked: a console that starts talking is a console you close.
+    fn read_aloud(&mut self) {
+        if !self.speaking {
+            return;
+        }
+        let mut msgs: Vec<Value> = self
+            .rows("messages")
+            .into_iter()
+            .filter(|m| m["id"].as_i64().unwrap_or(0) > self.spoken_up_to)
+            .filter(|m| self.pane != Pane::Chat || self.in_channel(m))
+            .collect();
+        if msgs.is_empty() {
+            return;
+        }
+        msgs.sort_by_key(|m| m["id"].as_i64().unwrap_or(0));
+        self.spoken_up_to = msgs
+            .iter()
+            .filter_map(|m| m["id"].as_i64())
+            .max()
+            .unwrap_or(self.spoken_up_to);
+        let fleet = self.fleet_has("tts");
+        for m in msgs {
+            let from = m["from"].as_str().unwrap_or("someone").to_string();
+            let body = m["body"].as_str().unwrap_or("").to_string();
+            if body.trim().is_empty() {
+                continue;
+            }
+            let line = format!("{from} says: {body}");
+            if !fleet {
+                self.notice("nothing on the fleet offers 'tts'");
+                self.speaking = false;
+                return;
+            }
+            let (base, client, tx, audio, dir) = (
+                self.base.clone(),
+                self.client.clone(),
+                self.voice_tx.clone(),
+                self.audio.clone(),
+                self.scratch(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = voice::speak(&base, &client, &audio, &line, &dir).await {
+                    let _ = tx.send(Heard::Note(trim_err(&format!("{e:#}")))).await;
+                }
+            });
+        }
+    }
+
     fn notice(&mut self, s: impl Into<String>) {
         self.note = Some((s.into(), Instant::now()));
     }
@@ -244,46 +549,187 @@ impl App {
 
     /// Send what is in the composer to the channel the chat pane is on.
     async fn send(&mut self) {
-        let text = self.input.trim().to_string();
+        let text = self.input.text.trim().to_string();
         if text.is_empty() {
             return;
         }
+        // A command goes to ONE session -- the one the chat is on -- because
+        // `/remove Dev` typed into #all would otherwise mean it in every
+        // team at once. #all with a command sends it to the session the
+        // cursor is on, and says which.
+        let command = text.starts_with('/') && !text.starts_with("//");
         let targets: Vec<String> = if self.chan == "*" {
-            self.sessions()
-                .iter()
-                .filter_map(|s| s["id"].as_str().map(|x| x.to_string()))
-                .collect()
+            if command {
+                self.channels()
+                    .get(self.cursor().max(1))
+                    .map(|(id, _)| vec![id.clone()])
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|id| id != "*")
+                    .collect()
+            } else {
+                self.sessions()
+                    .iter()
+                    .filter_map(|s| s["id"].as_str().map(|x| x.to_string()))
+                    .collect()
+            }
         } else {
             vec![self.chan.clone()]
         };
         if targets.is_empty() {
-            self.notice("no session to send to");
+            self.notice(if command {
+                "pick a channel first: a command needs one session"
+            } else {
+                "no session to send to"
+            });
             return;
         }
         self.input.clear();
+        self.scroll = 0;
         let mut failed = 0;
+        let mut refused: Option<String> = None;
+        let mut said: Option<String> = None;
         for t in &targets {
             let url = format!("{}/v1/sessions/{}/messages", self.base, urlish(t));
             match crate::post(&self.client, url, serde_json::json!({ "text": text })).await {
-                Ok(v) if v.get("error").is_some() => failed += 1,
-                Err(_) => failed += 1,
-                _ => {}
+                Ok(v) => match v.get("error").and_then(|e| e.as_str()) {
+                    // The hub refuses a mistyped command with what it should
+                    // have been; saying "could not send that" instead threw
+                    // away the only useful part of the answer.
+                    Some(e) => {
+                        failed += 1;
+                        refused = Some(e.to_string());
+                    }
+                    None => {
+                        if let Some(s) = v.get("said").and_then(|s| s.as_str()) {
+                            said = Some(s.to_string());
+                        }
+                    }
+                },
+                Err(e) => {
+                    failed += 1;
+                    refused = Some(trim_err(&e.to_string()));
+                }
             }
         }
         if failed == targets.len() {
-            self.input = text;
-            self.notice("could not send that");
+            self.input.set(text);
+            self.notice(
+                refused.unwrap_or_else(|| "could not send that".to_string()),
+            );
         } else if failed > 0 {
             self.notice(format!("sent, except to {failed} session(s)"));
+        } else if let Some(s) = said {
+            // A command's answer, which may be the whole help.
+            self.notice(s.lines().next().unwrap_or("done").to_string());
+            if s.lines().count() > 1 {
+                self.zoom_text = Some(s);
+                self.zoom = true;
+            }
         } else if targets.len() > 1 {
             self.notice(format!("sent to all {} sessions", targets.len()));
         }
         self.fetch().await;
     }
 
+    /// Agents in the order the pane shows them, which is the order the
+    /// cursor counts in: sorting the drawn rows and not these would attach
+    /// to whichever agent used to be on that line.
+    pub fn agents_in_order(&self) -> Vec<Value> {
+        let mut rows = self.rows("agents");
+        draw::sort_agents(&mut rows, self.sort_col, self.sort_rev);
+        rows
+    }
+
+    /// Whether a message belongs to the channel the chat pane is on.
+    pub fn in_channel(&self, m: &Value) -> bool {
+        self.chan == "*" || {
+            let name = m["session"].as_str().unwrap_or("");
+            self.sessions().iter().any(|x| {
+                x["id"].as_str() == Some(self.chan.as_str())
+                    && x["name"].as_str() == Some(name)
+            })
+        }
+    }
+
+    /// The session name behind the current channel, or `None` for `#all`.
+    pub fn channel_session(&self) -> Option<String> {
+        if self.chan == "*" {
+            return None;
+        }
+        self.sessions()
+            .iter()
+            .find(|x| x["id"].as_str() == Some(self.chan.as_str()))
+            .and_then(|x| x["name"].as_str())
+            .map(|x| x.to_string())
+    }
+
+    /// The memory row under the cursor, for the detail box.
+    pub fn selected_memory(&self) -> Option<Value> {
+        self.rows("knowledge").get(self.sel[Pane::Memory.index()]).cloned()
+    }
+
+    /// Up and down in the chat move between channels, typing or not.
+    fn step_channel(&mut self, by: i64) {
+        let chans = self.channels();
+        if chans.is_empty() {
+            return;
+        }
+        let at = chans.iter().position(|(id, _)| *id == self.chan).unwrap_or(0) as i64;
+        let n = chans.len() as i64;
+        let next = ((at + by) % n + n) % n;
+        self.chan = chans[next as usize].0.clone();
+        self.sel[Pane::Chat.index()] = next as usize;
+        self.scroll = 0;
+    }
+
+    /// The seat the cursor is on: (seat id, name, session name, has a live
+    /// process). Everything an action needs to say what it is about to do.
+    fn seat_under_cursor(&self) -> Option<(String, String, String, bool)> {
+        let rows = self.agents_in_order();
+        let a = rows.get(self.sel[Pane::Agents.index()])?;
+        let slot = a["slot_id"].as_str()?.to_string();
+        let name = a["name"].as_str().unwrap_or(&slot).to_string();
+        let session = a["session"].as_str().unwrap_or("").to_string();
+        let live = matches!(a["status"].as_str(), Some("running") | Some("waiting"));
+        Some((slot, name, session, live))
+    }
+
+    /// A name nobody in the fleet is using yet, from the CLI's own name:
+    /// `Claude`, then `Claude-2`. A seat named after what it runs is what
+    /// every other part of nexmesh suggests, and a name already taken is
+    /// refused by the hub rather than silently doubled.
+    fn free_seat_name(&self, cli: &str) -> String {
+        let short = cli.split('-').next().unwrap_or(cli);
+        let mut ch = short.chars();
+        let base = match ch.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
+            None => "Seat".to_string(),
+        };
+        let taken: Vec<String> = self
+            .rows("agents")
+            .iter()
+            .filter_map(|a| a["name"].as_str().map(|x| x.to_string()))
+            .collect();
+        crate::runcmd::free_name(&base, &taken)
+    }
+
+    /// The session the console is narrowed to, by name, or `None` for all.
+    fn scope_session(&self) -> Option<String> {
+        if self.scope == "*" {
+            return None;
+        }
+        self.sessions()
+            .iter()
+            .find(|x| x["id"].as_str() == Some(self.scope.as_str()))
+            .and_then(|x| x["name"].as_str())
+            .map(|x| x.to_string())
+            .or_else(|| Some(self.scope.clone()))
+    }
+
     /// The agent the cursor is on, as (session, name) -- what `attach` wants.
     fn selected_agent(&self) -> Option<(String, String)> {
-        let rows = self.rows("agents");
+        let rows = self.agents_in_order();
         let a = rows.get(self.sel[Pane::Agents.index()])?;
         let name = a["name"].as_str()?.to_string();
         let session = a["session"]
@@ -323,6 +769,7 @@ pub async fn run(
     ca_cert: Option<String>,
     identity: Option<(String, String)>,
 ) -> Result<()> {
+    let (voice_tx, mut voice_rx) = tokio::sync::mpsc::channel::<Heard>(16);
     let mut app = App {
         base,
         client,
@@ -335,8 +782,19 @@ pub async fn run(
         sel: [0; 8],
         ws: 0,
         chan: "*".into(),
-        input: String::new(),
+        input: Composer::default(),
         editing: false,
+        scroll: 0,
+        sort_col: 0,
+        sort_rev: false,
+        zoom: false,
+        zoom_text: None,
+        audio: voice::detect(),
+        recording: None,
+        speaking: false,
+        spoken_up_to: 0,
+        voice_tx,
+        dialog: None,
         panel: true,
         help: false,
         theme: load_theme(),
@@ -398,6 +856,7 @@ pub async fn run(
 
         if app.last_fetch.elapsed() >= Duration::from_secs(1) {
             app.fetch().await;
+            app.read_aloud();
         }
         if let Err(e) = term.draw(|f| draw::all(f, &app)) {
             break Err(e.into());
@@ -405,6 +864,20 @@ pub async fn run(
 
         tokio::select! {
             _ = ticker.tick() => {}
+            heard = voice_rx.recv() => {
+                match heard {
+                    Some(Heard::Words(text)) => {
+                        app.pane = Pane::Chat;
+                        for c in text.chars() {
+                            app.input.insert(c);
+                        }
+                        app.editing = true;
+                        app.notice("transcribed; Enter sends it");
+                    }
+                    Some(Heard::Note(n)) => app.notice(n),
+                    None => {}
+                }
+            }
             ev = events.next() => {
                 match ev {
                     Some(Ok(ev)) => {
@@ -449,15 +922,46 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
         return Ok(());
     }
 
-    // While typing, almost everything is text. Only Esc and Enter are keys.
+    // A question on the screen owns the keyboard until it is answered: a
+    // stray `q` while being asked whether to remove a seat should not quit
+    // the console, and must certainly not remove the seat.
+    if app.dialog.is_some() {
+        return dialog_key(app, k.code, ctrl).await;
+    }
+
+    // While typing, printable keys are text -- but moving around is not
+    // typing. Having to press Esc to read the channel above, or to look at
+    // another pane, and then `i` again to carry on, made the composer a
+    // mode you got stuck in; everything that is not a character still works.
     if app.editing {
         match k.code {
             KeyCode::Esc => app.editing = false,
             KeyCode::Enter => app.send().await,
-            KeyCode::Backspace => {
-                app.input.pop();
+            KeyCode::Backspace => app.input.backspace(),
+            KeyCode::Delete => app.input.delete(),
+            KeyCode::Left => app.input.left(),
+            KeyCode::Right => app.input.right(),
+            KeyCode::Home => app.input.home(),
+            KeyCode::End => app.input.end(),
+            KeyCode::Up => app.step_channel(-1),
+            KeyCode::Down => app.step_channel(1),
+            KeyCode::PageUp => app.scroll_back(10),
+            KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
+            // Leaving the chat leaves the composer: the keys in another pane
+            // are not text, and what was typed is still here on the way back.
+            KeyCode::Tab | KeyCode::BackTab => {
+                app.editing = false;
+                let n = Pane::ALL.len();
+                let step = if k.code == KeyCode::Tab { 1 } else { n - 1 };
+                app.pane = Pane::ALL[(app.pane.index() + step) % n];
             }
-            KeyCode::Char(c) => app.input.push(c),
+            // Dictation into the composer, without leaving it.
+            KeyCode::Char('v') if ctrl => app.listen(),
+            KeyCode::Char('u') if ctrl => app.input.clear(),
+            KeyCode::Char('w') if ctrl => app.input.delete_word(),
+            KeyCode::Char('a') if ctrl => app.input.home(),
+            KeyCode::Char('e') if ctrl => app.input.end(),
+            KeyCode::Char(c) if !ctrl => app.input.insert(c),
             _ => {}
         }
         return Ok(());
@@ -469,6 +973,9 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
         KeyCode::Esc => {
             if app.help {
                 app.help = false;
+            } else if app.zoom {
+                app.zoom = false;
+                app.zoom_text = None;
             }
         }
         KeyCode::Char('t') => {
@@ -490,17 +997,34 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
             let i = (c as u8 - b'1') as usize;
             app.pane = Pane::ALL[i];
         }
+        // In the chat the cursor IS the channel: moving it and then having
+        // to press Enter to actually go there was a step nobody wants.
+        KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Chat => app.step_channel(1),
+        KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Chat => app.step_channel(-1),
         KeyCode::Down | KeyCode::Char('j') => {
             let n = app.len();
             if n > 0 {
                 let c = (app.cursor() + 1).min(n - 1);
                 app.set_cursor(c);
             }
+            app.scroll = 0;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let c = app.cursor().saturating_sub(1);
             app.set_cursor(c);
+            app.scroll = 0;
         }
+        KeyCode::PageUp if app.zoom => app.scroll = app.scroll.saturating_sub(10),
+        KeyCode::PageDown if app.zoom => {
+            // Bounded by the value itself, so PgUp comes straight back.
+            let bound = app
+                .selected_memory()
+                .and_then(|k| k["value"].as_str().map(|v| v.len() / 20 + 10))
+                .unwrap_or(10);
+            app.scroll = (app.scroll + 10).min(bound);
+        }
+        KeyCode::PageUp => app.scroll_back(10),
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
         KeyCode::Char('g') => app.set_cursor(0),
         KeyCode::Char('G') => {
             let n = app.len();
@@ -525,6 +1049,130 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
             app.fetch().await;
         }
         KeyCode::Char('i') if app.pane == Pane::Chat => app.editing = true,
+        // Say it rather than type it, and have it read back.
+        KeyCode::Char('v') => app.listen(),
+        KeyCode::Char('V') => {
+            if !app.audio.can_speak() {
+                app.notice("nothing on this machine can play sound");
+            } else {
+                app.speaking = !app.speaking;
+                // From here, not from the backlog.
+                app.spoken_up_to = app
+                    .rows("messages")
+                    .iter()
+                    .filter_map(|m| m["id"].as_i64())
+                    .max()
+                    .unwrap_or(0);
+                app.notice(if app.speaking {
+                    "reading new messages aloud"
+                } else {
+                    "stopped reading aloud"
+                });
+            }
+        }
+        KeyCode::Char(',') | KeyCode::Char('<') if app.pane == Pane::Agents => {
+            let n = draw::AGENT_COLS.len();
+            app.sort_col = (app.sort_col + n - 1) % n;
+            app.say_sort();
+        }
+        KeyCode::Char('.') | KeyCode::Char('>') if app.pane == Pane::Agents => {
+            app.sort_col = (app.sort_col + 1) % draw::AGENT_COLS.len();
+            app.say_sort();
+        }
+        // Doing something about a seat, rather than only looking at it.
+        KeyCode::Char('m') if app.pane == Pane::Agents => {
+            if let Some((slot, name, session, _)) = app.seat_under_cursor() {
+                let options = app.session_choices(Some(&session));
+                if options.is_empty() {
+                    app.notice("there is no other session to move it to");
+                } else {
+                    app.dialog = Some(act::Dialog::pick(
+                        format!("move {name}"),
+                        format!("it is in #{session} now"),
+                        act::Step::Move { slot, name },
+                        options,
+                    ));
+                }
+            }
+        }
+        KeyCode::Char('e') if app.pane == Pane::Agents => {
+            if let Some((slot, name, _, _)) = app.seat_under_cursor() {
+                let prefill = name.clone();
+                app.dialog = Some(act::Dialog::text(
+                    format!("rename {name}"),
+                    "teammates address it by this name",
+                    act::Step::Rename { slot, name },
+                    &prefill,
+                ));
+            }
+        }
+        KeyCode::Char('x') if app.pane == Pane::Agents => {
+            if let Some((slot, name, session, live)) = app.seat_under_cursor() {
+                app.dialog = Some(act::Dialog::confirm(
+                    format!("remove {name}"),
+                    if live {
+                        format!(
+                            "it is RUNNING in #{session}. Removing the seat kills nothing -- \
+                             the process is left where it is, orphaned."
+                        )
+                    } else {
+                        format!("the seat and its history leave #{session}. This cannot be undone.")
+                    },
+                    act::Step::Remove { slot, name, live },
+                ));
+            }
+        }
+        KeyCode::Char('S') if app.pane == Pane::Agents => {
+            if let Some((slot, name, _, live)) = app.seat_under_cursor() {
+                if live {
+                    app.notice(format!("{name} already has a process; a is attach"));
+                } else {
+                    let mut modes = act::modes();
+                    modes.truncate(2);
+                    app.dialog = Some(act::Dialog::pick(
+                        format!("start {name}"),
+                        "the seat keeps its conversation; this starts a process for it",
+                        act::Step::Start { slot, name },
+                        modes,
+                    ));
+                }
+            }
+        }
+        KeyCode::Char('n') if app.pane == Pane::Agents || app.pane == Pane::Fleet => {
+            // Which team, unless the console is already looking at one.
+            match app.scope_session() {
+                Some(session) => {
+                    let clis = app.cli_choices();
+                    if clis.is_empty() {
+                        app.notice("no machine has reported a CLI it can run");
+                    } else {
+                        app.dialog = Some(act::Dialog::pick(
+                            "new seat: which CLI",
+                            format!("it will join #{session}"),
+                            act::Step::NewCli { session },
+                            clis,
+                        ));
+                    }
+                }
+                None => {
+                    let options = app.session_choices(None);
+                    if options.is_empty() {
+                        app.notice("there is no session yet: nexmesh team <name>");
+                    } else {
+                        app.dialog = Some(act::Dialog::pick(
+                            "new seat: which session",
+                            "s narrows the console to one, and then this step is skipped",
+                            act::Step::NewSession,
+                            options,
+                        ));
+                    }
+                }
+            }
+        }
+        KeyCode::Char('R') if app.pane == Pane::Agents => {
+            app.sort_rev = !app.sort_rev;
+            app.say_sort();
+        }
         KeyCode::Char('o') => {
             // The newest link in what is on screen. A terminal cannot show a
             // picture; it can hand you the one thing that can.
@@ -562,6 +1210,13 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
                     app.attach_to = Some((s, w));
                 }
             }
+            // A memory is a paragraph in a column six words wide. Enter
+            // opens the whole of it, Esc or Enter again puts it away.
+            Pane::Memory => {
+                app.zoom_text = None;
+                app.zoom = !app.zoom;
+                app.scroll = 0;
+            }
             _ => {}
         },
         KeyCode::Char('a') => {
@@ -580,6 +1235,120 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
             app.chan = chans[(at + 1) % chans.len()].0.clone();
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The keys of a dialog, and the one place a flow steps forward.
+///
+/// Each answer either asks the next question or does the thing. Nothing is
+/// done on the way through: a half-answered creation leaves no seat behind.
+async fn dialog_key(app: &mut App, code: KeyCode, ctrl: bool) -> Result<()> {
+    let Some(d) = app.dialog.as_mut() else { return Ok(()) };
+    match code {
+        KeyCode::Esc => {
+            app.dialog = None;
+            app.notice("left alone");
+            return Ok(());
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            d.down();
+            return Ok(());
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            d.up();
+            return Ok(());
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') if matches!(d.kind, act::Kind::Confirm) => {
+            app.dialog = None;
+            app.notice("left alone");
+            return Ok(());
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') if matches!(d.kind, act::Kind::Confirm) => {}
+        KeyCode::Enter => {}
+        // A list is walked with j and k everywhere else in the console.
+        KeyCode::Char('j') if matches!(d.kind, act::Kind::Pick(_)) => {
+            d.down();
+            return Ok(());
+        }
+        KeyCode::Char('k') if matches!(d.kind, act::Kind::Pick(_)) => {
+            d.up();
+            return Ok(());
+        }
+        other => {
+            // Anything else is text, if this dialog takes any.
+            if let Some(c) = d.composer_mut() {
+                match other {
+                    KeyCode::Backspace => c.backspace(),
+                    KeyCode::Delete => c.delete(),
+                    KeyCode::Left => c.left(),
+                    KeyCode::Right => c.right(),
+                    KeyCode::Home => c.home(),
+                    KeyCode::End => c.end(),
+                    KeyCode::Char('u') if ctrl => c.clear(),
+                    KeyCode::Char('w') if ctrl => c.delete_word(),
+                    KeyCode::Char(ch) if !ctrl => c.insert(ch),
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // Answered. Either the next question, or the deed.
+    let step = d.step.clone();
+    let answer = match &d.kind {
+        act::Kind::Pick(_) => d.chosen().map(|c| c.value.clone()).unwrap_or_default(),
+        act::Kind::Text(_) => d.typed(),
+        act::Kind::Confirm => "yes".to_string(),
+    };
+    let label = d.chosen().map(|c| c.label.clone()).unwrap_or_default();
+    app.dialog = None;
+
+    match step {
+        act::Step::NewSession => {
+            let clis = app.cli_choices();
+            if clis.is_empty() {
+                app.notice("no machine has reported a CLI it can run");
+                return Ok(());
+            }
+            app.dialog = Some(act::Dialog::pick(
+                "new seat: which CLI",
+                format!("it will join {}", label.trim()),
+                act::Step::NewCli { session: answer },
+                clis,
+            ));
+        }
+        act::Step::NewCli { session } => {
+            let suggestion = app.free_seat_name(&answer);
+            app.dialog = Some(act::Dialog::text(
+                "new seat: what to call it",
+                "teammates address it by this name",
+                act::Step::NewName { session, cli: answer },
+                &suggestion,
+            ));
+        }
+        act::Step::NewName { session, cli } => {
+            if answer.is_empty() {
+                app.notice("a seat needs a name");
+                return Ok(());
+            }
+            app.dialog = Some(act::Dialog::pick(
+                format!("start {answer}?"),
+                format!("{cli} in #{session}"),
+                act::Step::NewStart { session, cli, name: answer },
+                act::modes(),
+            ));
+        }
+        done => {
+            let base = app.base.clone();
+            let client = app.client.clone();
+            match act::perform(&base, &client, &done, &answer).await {
+                Ok(said) => app.notice(said),
+                Err(e) => app.notice(trim_err(&e.to_string())),
+            }
+            app.fetch().await;
+        }
     }
     Ok(())
 }
@@ -616,6 +1385,78 @@ mod tests {
         for (i, p) in Pane::ALL.iter().enumerate() {
             assert_eq!(p.index(), i);
         }
+    }
+
+    #[test]
+    fn the_composer_edits_where_the_caret_is() {
+        let mut c = Composer::default();
+        for ch in "helo world".chars() {
+            c.insert(ch);
+        }
+        assert_eq!(c.caret, 10);
+        // Back to the typo and fix it, without retyping the rest.
+        for _ in 0..7 {
+            c.left();
+        }
+        assert_eq!(c.caret, 3);
+        c.insert('l');
+        assert_eq!(c.text, "hello world");
+        c.end();
+        c.backspace();
+        assert_eq!(c.text, "hello worl");
+        c.home();
+        c.delete();
+        assert_eq!(c.text, "ello worl");
+        assert_eq!(c.caret, 0);
+        // Left at the start and right at the end go nowhere rather than wrap.
+        c.left();
+        assert_eq!(c.caret, 0);
+        c.end();
+        c.right();
+        assert_eq!(c.caret, c.text.chars().count());
+    }
+
+    #[test]
+    fn an_accent_does_not_take_the_console_down() {
+        // The caret counts characters; the string is indexed in bytes. A
+        // composer that confuses the two panics on the first "perché".
+        let mut c = Composer::default();
+        for ch in "perché".chars() {
+            c.insert(ch);
+        }
+        assert_eq!(c.caret, 6);
+        c.backspace();
+        assert_eq!(c.text, "perch");
+        for ch in "é sì".chars() {
+            c.insert(ch);
+        }
+        c.home();
+        c.delete();
+        assert_eq!(c.text, "erché sì");
+    }
+
+    #[test]
+    fn ctrl_w_takes_the_last_word_and_its_spaces() {
+        let mut c = Composer::default();
+        c.set("deploy the hub   ".to_string());
+        c.delete_word();
+        assert_eq!(c.text, "deploy the ");
+        c.delete_word();
+        assert_eq!(c.text, "deploy ");
+        c.delete_word();
+        assert_eq!(c.text, "");
+        // And on an empty line it is not an error.
+        c.delete_word();
+        assert_eq!(c.caret, 0);
+    }
+
+    #[test]
+    fn a_failed_send_hands_the_line_back_with_the_caret_at_the_end() {
+        let mut c = Composer::default();
+        c.set("the hub said no".to_string());
+        assert_eq!(c.caret, 15);
+        c.clear();
+        assert_eq!((c.text.as_str(), c.caret), ("", 0));
     }
 
     #[test]

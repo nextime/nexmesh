@@ -685,12 +685,11 @@ async fn main() -> Result<()> {
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "nexmesh-orchestrator", "version": VERSION },
-                    "instructions":
-                        "You can run a fleet of agent teams across several machines. Call \
-                         list_nodes first to see which machines are connected and which agent \
-                         CLIs each one has, then create_team to spin up a team. Agents work on \
-                         their own and message each other; watch them with team_status and \
-                         read_log. A message marked ! has not reached its recipient yet.",
+                    // What this orchestrator may do, and who else is in the
+                    // room. The privileges are not a detail: `message_team`
+                    // speaks AS THE OPERATOR, which an orchestrator that was
+                    // not told so uses as if it were chatting.
+                    "instructions": orch_instructions(),
                 }))
             }
             "ping" => ok(id, json!({})),
@@ -715,4 +714,29 @@ async fn main() -> Result<()> {
         write_out(&response).await?;
     }
     Ok(())
+}
+
+/// What the orchestrator is told at the handshake.
+///
+/// Separate from the agents' text, because the privileges are different and
+/// an orchestrator that does not know its own is the one that does damage:
+/// `message_team` speaks AS THE OPERATOR to a room a person is also reading,
+/// and what this token can see at all depends on its scope.
+fn orch_instructions() -> &'static str {
+    "You drive a fleet of agent teams across several machines. Call list_nodes first to \
+     see which machines are connected and which agent CLIs each one has, then create_team. \
+     Agents then work on their own and message each other; watch them with team_status and \
+     read_log. A message marked ! has not reached its recipient yet.\n\n\
+     YOUR REACH depends on this token's scope. A SUPER orchestrator (no --session) sees \
+     every session and is the only thing that may create one, move a seat between two, or \
+     answer a scoped orchestrator; a SCOPED one drives its single team and cannot learn \
+     that another exists. If what you need is outside your own session -- another team's \
+     help, a seat moved, a machine you cannot see -- use message_supervisor rather than \
+     guessing; read_operator_messages is where the answer arrives.\n\n\
+     THE CHAT IS SHARED WITH A PERSON. message_team speaks into the team's chat AS THE \
+     OPERATOR, and that chat is what the human running the fleet reads on a dashboard, in \
+     a terminal console or on a phone -- so say what you would say to them, and expect \
+     them to answer there. An agent's reply addressed to 'operator' may well be meant for \
+     you. Instructions to agents belong in message_team (or an agent's task); questions \
+     about what the fleet should do belong to the person, who is reading."
 }

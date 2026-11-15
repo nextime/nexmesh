@@ -16,6 +16,15 @@ Ctrl-C stops it and removes the temporary directory it ran in.
 import json, os, shutil, signal, subprocess, sys, tempfile, time
 import urllib.request, urllib.error
 
+# A conversation id in the environment belongs to whatever CLI is running
+# THIS script -- and the shims below inherit it, so all four agents would
+# report the same conversation and collapse into one seat. Which is correct
+# behaviour by the hub and nonsense in a demonstration; the suites drop these
+# for the same reason.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+    os.environ.pop(_v, None)
+
 SCR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCR)
 BIN = f"{ROOT}/target/debug"

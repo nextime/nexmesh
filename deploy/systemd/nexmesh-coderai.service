@@ -1,0 +1,31 @@
+# The capability bridge: OCR, transcription, speech, images, video -- joined
+# to the team as an ordinary participant.
+#
+# It is the one component that holds the media service's credential, which is
+# why it is a process of its own and not part of the hub or a node.
+[Unit]
+Description=nexmesh capability bridge
+Documentation=man:nexmesh(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/nexmesh/coderai.env
+User=nexmesh
+Group=nexmesh
+ExecStart=/bin/sh -c '/usr/local/bin/nexmesh-coderai \
+  --hub "$NEXMESH_HUB_HTTP" \
+  --service "$CODERAI_URL" \
+  --manifest "${NEXMESH_MANIFEST:-/etc/nexmesh/capabilities/coderai.toml}" \
+  ${NEXMESH_SESSION:+--session "$NEXMESH_SESSION"} \
+  ${NEXMESH_CA_CERT:+--ca-cert "$NEXMESH_CA_CERT"} \
+  $NEXMESH_EXTRA'
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

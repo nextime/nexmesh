@@ -1,0 +1,46 @@
+# A node, per LOGIN rather than per machine.
+#
+# A node spawns agent CLIs as the user it runs as, so that user's own tool
+# configuration and credentials are the ones those agents use. Two accounts on
+# one machine -- separate logins, separate subscriptions -- are two nodes, and
+# the hub treats them as two, because that is what they are.
+#
+#   systemctl enable --now nexmesh-node@alice
+#
+# reads /etc/nexmesh/node-alice.env, which must name the user it runs as.
+# Nothing here is hardened the way the hub is: this process exists to start
+# other people's programs, and a sandbox that stopped it doing that would
+# stop the fleet working.
+[Unit]
+Description=nexmesh node (%i)
+Documentation=man:nexmesh(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/nexmesh/node-%i.env
+# NEXMESH_NODE_USER is in that file; a node must not run as root.
+User=%i
+# The `+` runs this one step as root -- the socket directory and the log
+# directory belong to the node's user, and only root can hand them over.
+# (`PermissionsStartOnly` did this once and is gone from current systemd.)
+ExecStartPre=+/bin/sh -c 'mkdir -p "$(dirname "${NEXMESH_SOCK:-/run/nexmesh/node.sock}")" /var/log/nexmesh && chown %i "$(dirname "${NEXMESH_SOCK:-/run/nexmesh/node.sock}")" /var/log/nexmesh' 
+ExecStart=/bin/sh -c '/usr/local/bin/nexmesh-node \
+  --hub "$NEXMESH_HUB" \
+  --name "${NEXMESH_NAME:-%H-%i}" \
+  --clis "${NEXMESH_CLIS:-/etc/nexmesh/clis}" \
+  --sock "${NEXMESH_SOCK:-/run/nexmesh/node-%i.sock}" \
+  --mcpd "${NEXMESH_MCPD:-/usr/local/bin/nexmesh-mcpd}" \
+  ${NEXMESH_CA_CERT:+--ca-cert "$NEXMESH_CA_CERT"} \
+  ${NEXMESH_CLIENT_CERT:+--client-cert "$NEXMESH_CLIENT_CERT"} \
+  ${NEXMESH_CLIENT_KEY:+--client-key "$NEXMESH_CLIENT_KEY"} \
+  $NEXMESH_EXTRA'
+Restart=always
+RestartSec=2
+# An agent CLI is a long-lived child; it must not be killed because the node
+# restarted, and it must not be charged to the node's own cgroup limits.
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

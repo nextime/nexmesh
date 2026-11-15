@@ -161,7 +161,7 @@ impl<'a> Ctx<'a> {
     /// For a node_local workspace the domain is the machine AND THE MOUNT
     /// PATH. The machine alone was not enough: it made one domain of every
     /// local workspace on a host, so an agent locking `src/main.rs` under
-    /// /AI/sentenze blocked another locking `src/main.rs` under
+    /// /srv/app blocked another locking `src/main.rs` under
     /// /storage/coderai -- same relative path, different trees, a denial
     /// naming an agent in a project you were not touching.
     fn lock_scope(&self) -> Result<String> {
@@ -1480,12 +1480,12 @@ mod tests {
     fn two_local_workspaces_on_one_machine_do_not_share_a_lock_domain() {
         // The bug this prevents: the domain was the machine alone, so every
         // node_local workspace on a host shared one. An agent locking
-        // src/main.rs under /AI/sentenze blocked another locking
+        // src/main.rs under /srv/app blocked another locking
         // src/main.rs under /storage/coderai -- different trees, and a
         // denial naming an agent in a project you were not touching.
         let db = fixture();
         let now = now_ms();
-        for (wid, path) in [("w-sentenze", "/AI/sentenze"), ("w-coderai", "/storage/coderai")] {
+        for (wid, path) in [("w-app", "/srv/app"), ("w-coderai", "/storage/coderai")] {
             db.execute(
                 "INSERT INTO workspaces (id, session_id, name, kind, node_id)
                  VALUES (?,'s1',?,'node_local','n-machine-a')",
@@ -1499,7 +1499,7 @@ mod tests {
             .unwrap();
         }
         let _ = now;
-        db.execute("UPDATE slots SET workspace_id = 'w-sentenze' WHERE id = 'sl-eng'", []).unwrap();
+        db.execute("UPDATE slots SET workspace_id = 'w-app' WHERE id = 'sl-eng'", []).unwrap();
         db.execute("UPDATE slots SET workspace_id = 'w-coderai' WHERE id = 'sl-rev'", []).unwrap();
 
         let a = dispatch(&ctx(&db, "sl-eng"), "acquire_file", &json!({"path": "src/main.rs"})).unwrap();

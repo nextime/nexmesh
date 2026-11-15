@@ -1,0 +1,44 @@
+# Hermes Agent -- an agent CLI that is also a messaging gateway.
+#
+# Verified against `hermes --help`, `hermes chat --help`, `hermes mcp --help`
+# and `hermes mcp add --help` on a venv install (`~/.hermes/hermes-agent`).
+#
+# Two things about it are unlike the other descriptors here:
+#
+# 1. There is NO [mcp] section. Hermes has no per-run configuration flag, so
+#    nexmesh cannot hand it a config file for one conversation the way it does
+#    for Claude Code. The nexmesh server is registered once in the user's own
+#    `~/.hermes/config.yaml` (see [user_install]) and the SEAT is decided by
+#    the environment the node sets, which the shim reads for itself.
+#
+#    That means the `nexmesh` entry in config.yaml must NOT pin NEXMESH_*
+#    variables of its own. If it does, every hermes conversation on that
+#    machine reports the same name and the same conversation id, and they all
+#    collapse into one seat -- which looks like a nexmesh bug and is a config
+#    file saying what it was told to say.
+#
+# 2. There is no headless mode. `hermes chat -q` is one question per process,
+#    which the fleet cannot steer mid-turn, and its agent-client protocol
+#    (`hermes acp`) has not been verified here. Interactive is a real terminal
+#    the fleet owns, which is what a seat needs: messages reach it the way
+#    they reach any bare CLI, by being typed into its prompt.
+[cli]
+id = "hermes"
+display_name = "Hermes Agent"
+command = "hermes"
+version_args = ["--version"]
+# It ships into a virtualenv of its own, which is not on a login PATH.
+extra_paths = ["~/.hermes/hermes-agent/venv/bin", "~/.local/bin"]
+model_args = ["-m", "{model}"]
+
+[modes.interactive]
+args = ["chat"]
+# `--resume SESSION_ID`, from `hermes sessions list`.
+resume_args = ["--resume", "{resume}"]
+attachable = true
+
+[user_install]
+# `hermes mcp add [--command CMD] [--args ...] [--env K=V ...] NAME`, with the
+# name LAST. No env is passed on purpose: see the note at the top.
+style = "command"
+argv = ["mcp", "add", "--command", "{command}", "{name}"]

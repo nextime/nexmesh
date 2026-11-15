@@ -13,10 +13,10 @@
 //! The hub is how an attach is *authorised*: it knows who you are, which agent
 //! you asked for and which machine holds its terminal, and nothing here
 //! changes that. What it should not have to be is the *wire*. Attaching from
-//! sissy to an agent on sissy used to send every keystroke to another machine
+//! machine-b to an agent on machine-b used to send every keystroke to another machine
 //! and back -- two LAN hops and a relay through a hub on a Celeron, measured
 //! at 2.8ms per round trip on an idle network, for bytes that never needed to
-//! leave the host. The same is true of sissy to zeiss whenever the two can see
+//! leave the host. The same is true of machine-b to machine-c whenever the two can see
 //! each other directly.
 //!
 //! So the hub hands out a ticket, and the data goes straight to the node:

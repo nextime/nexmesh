@@ -49,6 +49,24 @@ HOW TO WORK WITH THE TEAM
   Context drift between agents is the main way teams like this fail.
 - {coordination}
 
+THE CHAT, AND WHO IS IN IT
+- Every message is in the team's chat, and a person is reading it. The operator \
+  sees the whole room on a dashboard, in a terminal console and on a phone, and \
+  can say something to the team or to you by name at any time.
+- A message whose sender is 'operator' IS that person, not a teammate. Answer \
+  it with `send_message` addressed to 'operator' -- replying to a teammate \
+  instead sends your answer to somebody who never asked.
+- `send_message` is for one teammate; `broadcast` is for the room. Prefer one \
+  teammate: a room full of agents reading a message meant for one is how a \
+  team of models burns a budget.
+- Reading a message does not deal with it. `check_messages` shows what is \
+  waiting; `claim_messages` is what says you have handled it. Anything \
+  unclaimed is still on the board for whoever reads the fleet.
+- If you are stuck on something nobody on the team can settle -- a credential, \
+  a decision that is not yours, a machine that is not answering -- call \
+  `notify_operator`. It reaches your team's orchestrator, and the people \
+  running the fleet when there is none.
+
 FINISHING
 - When your task is done, call `signal_done`. Do not stop before that: your work \
   needs review, and you cannot be released until the loop completes.
@@ -92,6 +110,17 @@ mod tests {
         assert!(p.contains("/srv/app"));
         assert!(p.contains("Build the login flow."));
         assert!(p.contains("signal_done"));
+    }
+
+    #[test]
+    fn the_prompt_explains_the_chat_and_who_reads_it() {
+        // An agent that does not know a person is in the room answers the
+        // operator by messaging a teammate -- which is exactly what one did.
+        let p = first_prompt(&brief(true));
+        assert!(p.contains("operator"), "{p}");
+        assert!(p.contains("claim_messages"));
+        assert!(p.contains("notify_operator"));
+        assert!(p.contains("broadcast"));
     }
 
     #[test]

@@ -36,6 +36,45 @@ fn s(desc: &str) -> Value {
 }
 
 /// Every tool available to every participant.
+/// What a CLI is told about the team at the MCP handshake.
+///
+/// Two transports carry this -- the shim beside an agent, and the hub's own
+/// MCP front door -- and a self-seated CLI never sees the brief the fleet
+/// gives an agent it spawned. That makes this the ONLY thing some teammates
+/// are ever told, which is why it covers the chat rather than just the tools:
+/// an agent that does not know a person is in the room answers the operator
+/// by messaging a teammate, and one did exactly that.
+///
+/// `who` is the name the team addresses it by; empty when it has none yet.
+pub fn team_instructions(who: &str, slot: &str) -> String {
+    let name = if who.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" as '{}'", who.trim())
+    };
+    format!(
+        "You are part of a nexmesh team{name} (slot {slot}). Teammates may run on other \
+         machines, under other CLIs, or not be CLIs at all.\n\n\
+         WORKING WITH THEM: call query_knowledge and check_team_status before planning. \
+         set_summary whenever what you are doing changes -- peers and the operator read \
+         it. store_knowledge as you decide things, not at the end: context drift between \
+         agents is the main way teams like this fail. list_peers says who exists, and \
+         ask_capability reaches a teammate that can do what you cannot (OCR, \
+         transcription, speech, images).\n\n\
+         THE CHAT: teammate and operator messages arrive prefixed [PENDING MESSAGES] on \
+         any tool result. A message whose sender is 'operator' is the PERSON running the \
+         fleet, reading the room on a dashboard, in a terminal console or on a phone -- \
+         answer it with send_message addressed to 'operator', never by replying to a \
+         teammate. send_message is for one teammate and broadcast is for the whole room; \
+         prefer one teammate, because a room of models reading a message meant for one \
+         is how a budget goes. Reading a message does not deal with it: check_messages \
+         shows what is waiting, claim_messages is what says you have handled it, and \
+         anything unclaimed stays on the board for whoever is watching the fleet. If you \
+         are stuck on something the team cannot settle -- a credential, a decision that \
+         is not yours -- call notify_operator."
+    )
+}
+
 pub fn team_tools() -> Vec<ToolDef> {
     vec![
         tool("list_peers",
@@ -286,6 +325,21 @@ mod tests {
                 assert!(props.contains_key(key), "{}: required '{}' not in properties", t.name, key);
             }
         }
+    }
+
+    #[test]
+    fn the_handshake_text_covers_the_chat_not_only_the_tools() {
+        let t = team_instructions("Max", "sl-1");
+        assert!(t.contains("as 'Max'"), "{t}");
+        assert!(t.contains("sl-1"));
+        for word in ["operator", "claim_messages", "broadcast", "notify_operator",
+                     "[PENDING MESSAGES]", "query_knowledge", "ask_capability"] {
+            assert!(t.contains(word), "{word} missing from the handshake text");
+        }
+        // A seat with no name yet reads as a sentence, not as "as ''".
+        let anon = team_instructions("", "sl-2");
+        assert!(!anon.contains("as ''"), "{anon}");
+        assert!(anon.contains("team (slot sl-2)"), "{anon}");
     }
 
     #[test]

@@ -19,6 +19,7 @@ mod asks;
 mod attach;
 mod auth;
 mod certs;
+mod chatcmd;
 mod control;
 mod dashboard;
 mod delivery;

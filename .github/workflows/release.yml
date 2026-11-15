@@ -77,9 +77,22 @@ jobs:
           # The descriptors and the capability manifest are DATA the binaries
           # read at runtime, so a tarball without them is not a usable install.
           cp -r clis capabilities "$dir/"
+          # The service files and the installers, so a tarball can make this
+          # machine come back after a reboot without a checkout.
+          mkdir -p "$dir/deploy" "$dir/docs/man" "$dir/packaging"
+          cp -r deploy/initd deploy/systemd "$dir/deploy/"
+          cp deploy/install-service.sh "$dir/deploy/"
+          cp packaging/install.sh "$dir/packaging/"
+          cp docs/man/nexmesh.1 "$dir/docs/man/"
           cp README.md LICENSE "$dir/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          # A second name with no version in it, which is what
+          # `releases/latest/download/...` -- and so packaging/install.sh --
+          # can ask for.
+          cp "dist/${name}.tar.gz" "dist/nexmesh-${{ matrix.target }}.tar.gz"
+          ( cd dist && sha256sum "nexmesh-${{ matrix.target }}.tar.gz" \
+              > "nexmesh-${{ matrix.target }}.tar.gz.sha256" )
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           ls -la dist
 
@@ -125,8 +138,50 @@ jobs:
           path: dist/*.tar.gz*
           if-no-files-found: error
 
+  # .deb and .rpm, from the same release build. One package, `nexmesh`, with
+  # every binary, both sets of service files and `nexmesh-install` -- and it
+  # enables nothing on its own: see packaging/README.md.
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages
+      - name: Build
+        run: cargo build --release --workspace
+      - name: cargo-deb and cargo-generate-rpm
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cargo deb -p nexmesh-ctl --no-build --output dist/
+          cargo generate-rpm -p crates/ctl --output dist/
+          ( cd dist && for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+          ls -la dist
+      - name: What is actually in them
+        # A package that installs no binaries, or quietly drops the service
+        # files, looks fine until somebody installs it.
+        run: |
+          set -euo pipefail
+          deb=$(ls dist/*.deb)
+          dpkg-deb -c "$deb" | tee /tmp/deb.list
+          for want in usr/bin/nexmesh usr/bin/nexmesh-hub usr/bin/nexmesh-install \
+                      etc/nexmesh/clis/claude.toml usr/share/man/man1/nexmesh.1; do
+            grep -q "$want" /tmp/deb.list || { echo "missing from the deb: $want"; exit 1; }
+          done
+          rpm -qlp dist/*.rpm | tee /tmp/rpm.list || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, packages]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -141,5 +196,9 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.rpm
+            dist/*.deb.sha256
+            dist/*.rpm.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

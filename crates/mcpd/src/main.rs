@@ -404,13 +404,12 @@ async fn main() -> Result<()> {
                         "protocolVersion": version,
                         "capabilities": { "tools": { "listChanged": false } },
                         "serverInfo": { "name": "nexmesh", "version": VERSION },
-                        "instructions": format!(
-                            "You are part of a nexmesh team (slot {}). Teammates may run on \
-                             other machines, under other CLIs, or not be CLIs at all. Call \
-                             query_knowledge and check_team_status before planning. Teammate \
-                             messages arrive prefixed [PENDING MESSAGES] on any tool result.",
-                            link.slot_id()
-                        ),
+                        // One text for both transports, in the protocol crate:
+                        // a CLI that seated itself never sees the brief the
+                        // fleet gives an agent it spawned, so this is all it
+                        // is ever told.
+                        "instructions": nexmesh_proto::tools::team_instructions(
+                            "", &link.slot_id()),
                     }),
                 )
             }

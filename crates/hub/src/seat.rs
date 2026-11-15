@@ -200,7 +200,7 @@ mod tests {
         db.execute(
             "INSERT INTO slots (id,session_id,display_name,cli_id,cli_session,created_at_ms)
              VALUES ('sl-1','s1','Hermes','hermes',?,1)",
-            params![if pinned { Some("hermes-lisa") } else { None }],
+            params![if pinned { Some("hermes-machine-d") } else { None }],
         )
         .unwrap();
         let last_exit = now_ms() - ended_ago;

@@ -276,7 +276,7 @@ def main():
     print("\n=== a seat can be renamed from where you read it ===")
     # The dashboard is where a person looks at a team, so it is where the
     # name has to be changeable. A seat is named before anyone knows what it
-    # will do: `Claude-zeiss-3` says where it runs and nothing about the work.
+    # will do: `Claude-machine-c-3` says where it runs and nothing about the work.
     seat = [a for a in det["agents"] if a["name"] == "Iris"][0]["slot_id"]
     s, j = req(f"/v1/slots/{seat}/name", optok, "POST", {"name": "Reviewer"})
     check("renaming a seat is accepted", s == 200 and j.get("name") == "Reviewer", f"{s} {j}")

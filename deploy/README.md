@@ -22,6 +22,24 @@ Two addresses on the hub on purpose. Loopback is for nginx; the LAN address is
 for the machines. **Not `0.0.0.0`** — machine-a has public addresses on `wan0`,
 so a wildcard bind would put an API that starts processes on the internet.
 
+## One command, if you want it
+
+Everything below is the manual version, and worth reading once. To just have
+it installed and coming back after a reboot:
+
+```bash
+sudo deploy/install-service.sh hub                 # on the hub machine
+sudo deploy/install-service.sh node --user alice   # on each machine, per login
+sudo deploy/install-service.sh coderai             # beside a media service
+```
+
+It works out which init system is actually running — systemd units from
+`deploy/systemd/`, `/etc/init.d` scripts from `deploy/initd/` — installs the
+right one, **enables it at boot**, and starts it. It writes a commented
+`/etc/nexmesh/*.env` the first time and never touches it again, so running it
+after an upgrade re-installs the service and keeps your configuration.
+`--dry-run` prints what it would do and changes nothing.
+
 ## Manual pages
 
 ```bash

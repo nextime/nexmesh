@@ -7,7 +7,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS nodes (
   id               TEXT PRIMARY KEY,
-  name             TEXT NOT NULL UNIQUE,     -- "zeiss", "sissy"
+  name             TEXT NOT NULL UNIQUE,     -- "machine-c", "machine-b"
   os               TEXT NOT NULL,
   arch             TEXT NOT NULL,
   node_version     TEXT NOT NULL,
@@ -412,7 +412,7 @@ CREATE TABLE IF NOT EXISTS slots (
                                                      -- NULL for an external participant
   participant_kind  TEXT NOT NULL DEFAULT 'cli',     -- cli | external
   mode              TEXT NOT NULL DEFAULT 'headless',-- headless | interactive
-  placement         TEXT NOT NULL DEFAULT '{}',      -- {"node":"zeiss"} | {"labels":["gpu"]} | {"any":true}
+  placement         TEXT NOT NULL DEFAULT '{}',      -- {"node":"machine-c"} | {"labels":["gpu"]} | {"any":true}
   display_name      TEXT,
   role              TEXT,
   role_description  TEXT,

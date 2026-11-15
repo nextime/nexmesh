@@ -396,6 +396,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             a.id, s.mode, s.paused, a.pid,
                             COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
                                                      THEN 'tmux' END),
+                            COALESCE(s.capabilities, '[]'),
                             -- The agent an attach should open for this seat:
                             -- its own process if that has a terminal, else
                             -- the adopted terminal it sits in.
@@ -445,7 +446,14 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             // the node never started it.
                             "pid": r.get::<_, Option<i64>>(20)?,
                             "io_kind": r.get::<_, Option<String>>(21)?,
-                            "attach_agent_id": r.get::<_, Option<String>>(22)?,
+                            // What this seat says it can be asked for, as a
+                            // list. The dashboard used to look for the label
+                            // inside the seat's summary PROSE to decide
+                            // whether to offer the microphone, which made a
+                            // phone's voice input depend on a sentence.
+                            "capabilities": serde_json::from_str::<Value>(
+                                &r.get::<_, String>(22)?).unwrap_or(json!([])),
+                            "attach_agent_id": r.get::<_, Option<String>>(23)?,
                         }))
                     })
                     .and_then(|m| m.collect())

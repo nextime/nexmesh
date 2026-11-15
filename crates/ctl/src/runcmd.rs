@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 
 /// Which CLI descriptor on this machine the operator meant.
 ///
-/// A machine may have several configurations of one program -- `claude-nextime`
-/// and `claude-thinkdifferent` are two logins for claude, each its own
+/// A machine may have several configurations of one program -- `claude-alice`
+/// and `claude-work` are two logins for claude, each its own
 /// descriptor -- and nobody types the suffix. So an exact id wins, a single
 /// configuration of that program wins, and several is the one case that has to
 /// be asked about rather than guessed: picking a login for somebody is picking
@@ -95,7 +95,7 @@ pub enum Team {
     /// workspace whose mount contains it, when one does: a seat without a
     /// workspace has no directory, and the node then starts the CLI in its own
     /// home -- which is how `run` in /working/nexmesh first put a CLI in
-    /// /home/nextime.
+    /// /home/alice.
     Join(String, Option<String>),
     /// Nothing owns it: make one, and mount this directory in it.
     Make(String),
@@ -112,10 +112,10 @@ pub enum Seat {
 }
 
 /// A seat name from the CLI and the machine, which is how the fleet's seats
-/// are already named: `Claude-sissy`, `Codex-zeiss`.
+/// are already named: `Claude-machine-b`, `Codex-machine-c`.
 pub fn seat_name(cli: &str, host: &str) -> String {
     // The cli id may carry a suffix for the account it is installed under
-    // (`claude-nextime`); the seat is named after the program.
+    // (`claude-alice`); the seat is named after the program.
     let short = cli.split('-').next().unwrap_or(cli);
     let mut c = short.chars();
     let cli = match c.next() {
@@ -139,7 +139,7 @@ pub fn free_name(name: &str, taken: &[String]) -> String {
 }
 
 /// What a session covering this directory should be called: the directory's
-/// own name, which is how a person refers to it. `$HOME` is not "nextime".
+/// own name, which is how a person refers to it. `$HOME` is not "alice".
 pub fn session_name(cwd: &str, home: &str) -> String {
     let t = cwd.trim_end_matches('/');
     if !home.is_empty() && t == home.trim_end_matches('/') {
@@ -418,8 +418,8 @@ mod tests {
 
     #[test]
     fn one_configuration_of_a_program_is_the_one_meant() {
-        let have = vec!["claude-nextime".to_string(), "codex".to_string()];
-        assert_eq!(resolve_cli("claude", &have).unwrap(), "claude-nextime");
+        let have = vec!["claude-alice".to_string(), "codex".to_string()];
+        assert_eq!(resolve_cli("claude", &have).unwrap(), "claude-alice");
         assert_eq!(resolve_cli("codex", &have).unwrap(), "codex");
     }
 
@@ -428,23 +428,23 @@ mod tests {
         // Picking a login is picking whose account the work is billed to --
         // unless one of them is named after whoever is asking.
         let have = vec![
-            "claude-nextime".to_string(),
-            "claude-thinkdifferent".to_string(),
+            "claude-alice".to_string(),
+            "claude-work".to_string(),
         ];
         let e = resolve_cli_as("claude", &have, "someoneelse").unwrap_err();
-        assert!(e.contains("claude-nextime") && e.contains("claude-thinkdifferent"), "{e}");
+        assert!(e.contains("claude-alice") && e.contains("claude-work"), "{e}");
         assert!(e.contains("2 configurations"), "{e}");
         // Named exactly, there is nothing to ask.
-        assert_eq!(resolve_cli_as("claude-nextime", &have, "x").unwrap(), "claude-nextime");
+        assert_eq!(resolve_cli_as("claude-alice", &have, "x").unwrap(), "claude-alice");
     }
 
     #[test]
     fn my_own_login_is_the_default_among_several() {
         let have = vec![
-            "claude-nextime".to_string(),
-            "claude-thinkdifferent".to_string(),
+            "claude-alice".to_string(),
+            "claude-work".to_string(),
         ];
-        assert_eq!(resolve_cli_as("claude", &have, "nextime").unwrap(), "claude-nextime");
+        assert_eq!(resolve_cli_as("claude", &have, "alice").unwrap(), "claude-alice");
         // And a user who has no configuration of their own is still asked.
         assert!(resolve_cli_as("claude", &have, "").is_err());
     }
@@ -460,27 +460,27 @@ mod tests {
 
     #[test]
     fn a_seat_is_named_after_the_program_and_the_machine() {
-        assert_eq!(seat_name("claude", "sissy"), "Claude-sissy");
+        assert_eq!(seat_name("claude", "machine-b"), "Claude-machine-b");
         // The cli id carries the account it is installed under; the seat does
         // not.
-        assert_eq!(seat_name("claude-nextime", "zeiss"), "Claude-zeiss");
-        assert_eq!(seat_name("codex", "lisa"), "Codex-lisa");
+        assert_eq!(seat_name("claude-alice", "machine-c"), "Claude-machine-c");
+        assert_eq!(seat_name("codex", "machine-d"), "Codex-machine-d");
     }
 
     #[test]
     fn a_taken_name_gets_the_next_one() {
-        let taken = vec!["Claude-sissy".to_string(), "Claude-sissy-2".to_string()];
-        assert_eq!(free_name("Claude-sissy", &taken), "Claude-sissy-3");
-        assert_eq!(free_name("Codex-sissy", &taken), "Codex-sissy");
+        let taken = vec!["Claude-machine-b".to_string(), "Claude-machine-b-2".to_string()];
+        assert_eq!(free_name("Claude-machine-b", &taken), "Claude-machine-b-3");
+        assert_eq!(free_name("Codex-machine-b", &taken), "Codex-machine-b");
     }
 
     #[test]
     fn a_session_is_named_after_the_directory_but_home_is_home() {
-        assert_eq!(session_name("/working/nexmesh", "/home/nextime"), "nexmesh");
-        assert_eq!(session_name("/working/nexmesh/", "/home/nextime"), "nexmesh");
-        assert_eq!(session_name("/home/nextime", "/home/nextime"), "home");
-        assert_eq!(session_name("/home/nextime/", "/home/nextime"), "home");
-        assert_eq!(session_name("/", "/home/nextime"), "work");
+        assert_eq!(session_name("/working/nexmesh", "/home/alice"), "nexmesh");
+        assert_eq!(session_name("/working/nexmesh/", "/home/alice"), "nexmesh");
+        assert_eq!(session_name("/home/alice", "/home/alice"), "home");
+        assert_eq!(session_name("/home/alice/", "/home/alice"), "home");
+        assert_eq!(session_name("/", "/home/alice"), "work");
     }
 
     #[test]
@@ -488,24 +488,24 @@ mod tests {
         // The whole point of a stable name: run it again tomorrow and the
         // conversation that seat was on is the one that comes back.
         let seats = vec![json!({
-            "name": "Claude-sissy", "slot_id": "sl-1", "exited": true,
+            "name": "Claude-machine-b", "slot_id": "sl-1", "exited": true,
             "agent_status": "exited",
         })];
         assert_eq!(
-            pick_seat(&seats, "Claude-sissy"),
-            Seat::Reuse { slot: "sl-1".into(), name: "Claude-sissy".into() }
+            pick_seat(&seats, "Claude-machine-b"),
+            Seat::Reuse { slot: "sl-1".into(), name: "Claude-machine-b".into() }
         );
     }
 
     #[test]
     fn a_seat_somebody_is_sitting_in_is_left_alone() {
         let seats = vec![json!({
-            "name": "Claude-sissy", "slot_id": "sl-1", "exited": false,
+            "name": "Claude-machine-b", "slot_id": "sl-1", "exited": false,
             "agent_status": "running",
         })];
         assert_eq!(
-            pick_seat(&seats, "Claude-sissy"),
-            Seat::Make { name: "Claude-sissy-2".into() }
+            pick_seat(&seats, "Claude-machine-b"),
+            Seat::Make { name: "Claude-machine-b-2".into() }
         );
     }
 
@@ -514,26 +514,26 @@ mod tests {
         // A one-shot CLI is due back in that seat; its process really has
         // ended, and the seat is not empty.
         let seats = vec![json!({
-            "name": "Hermes-lisa", "slot_id": "sl-h", "exited": true,
+            "name": "Hermes-machine-d", "slot_id": "sl-h", "exited": true,
             "agent_status": "exited", "status": "waiting",
         })];
         // Reused -- which is right: `run` would start the next turn there
         // itself. What must not happen is a second seat beside it.
         assert_eq!(
-            pick_seat(&seats, "Hermes-lisa"),
-            Seat::Reuse { slot: "sl-h".into(), name: "Hermes-lisa".into() }
+            pick_seat(&seats, "Hermes-machine-d"),
+            Seat::Reuse { slot: "sl-h".into(), name: "Hermes-machine-d".into() }
         );
     }
 
     #[test]
     fn nothing_of_that_name_means_a_new_seat_of_that_name() {
         let seats = vec![json!({
-            "name": "Codex-sissy", "slot_id": "sl-c", "exited": false,
+            "name": "Codex-machine-b", "slot_id": "sl-c", "exited": false,
             "agent_status": "running",
         })];
         assert_eq!(
-            pick_seat(&seats, "Claude-sissy"),
-            Seat::Make { name: "Claude-sissy".into() }
+            pick_seat(&seats, "Claude-machine-b"),
+            Seat::Make { name: "Claude-machine-b".into() }
         );
     }
 
@@ -541,6 +541,6 @@ mod tests {
     fn a_path_survives_the_query_string() {
         assert_eq!(urlencoding("/working/nexmesh"), "/working/nexmesh");
         assert_eq!(urlencoding("/home/a b"), "/home/a%20b");
-        assert_eq!(urlencoding("sissy"), "sissy");
+        assert_eq!(urlencoding("machine-b"), "machine-b");
     }
 }

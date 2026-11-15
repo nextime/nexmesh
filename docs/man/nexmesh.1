@@ -104,6 +104,67 @@ take. Where a command accepts either, its help says
 .IR SEAT|NAME .
 A seat id is unambiguous anywhere; a name only means something inside one
 session.
+.SH ROLES
+A role is a free-form string; there is no fixed list, and nothing decides
+from it who is more capable. What it does:
+.TP
+.B it is an address
+Everything that takes a teammate \(em
+.BR "nexmesh send --to" ,
+.BR pause\ --who ,
+an agent's own
+.BR send_message ,
+the chat's
+.B /move
+\(em accepts a name
+.I or
+a role, so
+.B --to reviewer
+reaches whoever holds it.
+.TP
+.B one family approves its own work
+A role containing
+.BR review ,
+.B qa
+or
+.B test
+(case-insensitive) goes straight to
+.B approved
+on
+.BR signal_done :
+nobody reviews the reviewer. Every other role waits at
+.B done_pending_review
+for a reviewer.
+.TP
+.B it is in the agent's first prompt
+With its description, so the model is told what it is for in words.
+.TP
+.B it is what you read
+On the dashboard, in
+.B nexmesh status
+and in the console \(em and it names a seat nobody named.
+.PP
+By convention, and nothing more:
+.BR architect ,
+.BR engineer ,
+.BR "code reviewer" ,
+.BR qa ,
+.BR analyst ,
+.BR archivist ,
+.BR "doc writer" .
+What a seat
+.I can do
+that others cannot \(em
+.BR ocr ,
+.BR transcribe ,
+.BR tts ,
+.BR strong ,
+.B vision
+\(em is a
+.IR capability ,
+a separate list, and what
+.B ask_capability
+routes on.
 .SH GLOBAL OPTIONS
 .TP
 .BI \-\-hub " URL"
@@ -155,6 +216,10 @@ or
 attaches to the agent under the cursor,
 .B i
 types in the chat,
+.B v
+records a sentence for the fleet to transcribe,
+.B V
+reads new messages aloud,
 .B [
 and
 .B ]
@@ -173,6 +238,65 @@ refreshes,
 lists the keys and
 .B q
 quits.
+.PP
+In the agents pane,
+.B ,
+and
+.B .
+choose the column the list is sorted by and
+.B R
+turns the order round;
+.B n
+makes a seat,
+.B S
+starts one,
+.B m
+moves it to another session,
+.B e
+renames it and
+.B x
+removes it. Each asks first, and each calls the same endpoint the matching
+subcommand does. In the memory pane
+.B Enter
+opens the whole of one.
+.PP
+A chat line beginning with
+.B /
+is a command, not an utterance:
+.BR /rename ,
+.BR /move ,
+.BR /remove ,
+.BR /start ,
+.B /new
+and
+.BR /help .
+The hub reads them, so the console, the dashboard and the PWA all have them.
+Double the slash to say a line that starts with one.
+.PP
+.B v
+needs a recorder on this machine
+.RB ( parecord ,
+.BR arecord ,
+.BR rec ,
+.BR ffmpeg )
+and a teammate advertising
+.BR transcribe ;
+.B V
+needs a player
+.RB ( paplay ,
+.BR aplay ,
+.BR play ,
+.BR ffplay ,
+.BR mpg123 )
+and a teammate advertising
+.BR tts .
+With neither, the key says so rather than doing nothing. The same two work
+inside an attached terminal:
+.B Ctrl-^
+records and types the words into the agent's prompt \(em never submitting
+them, since Enter stays yours \(em and
+.B Ctrl-_
+reads the last of what the agent printed back.
 .PP
 Two themes, remembered in
 .IR ~/.nexmesh/console.toml :
@@ -285,7 +409,7 @@ leaves neither addressable.
 .PP
 .EX
 nexmesh rename-agent sl-1a2b3c4d Reviewer
-nexmesh rename-agent Claude-zeiss-3 Reviewer --session payments
+nexmesh rename-agent Claude-machine-c-3 Reviewer --session payments
 .EE
 .RE
 .TP
@@ -375,7 +499,7 @@ name.
 It joins the session that owns this directory, mounting the directory into
 that session if it is new to it, and makes the session itself if nothing owns
 the directory. The seat is named after the CLI and the machine \(em
-.IR Claude\-sissy " \(em"
+.IR Claude\-machine-b " \(em"
 so running it again takes that seat back, with the conversation it was on; a
 seat somebody is sitting in is never taken, and gets a numbered name beside
 it instead.
@@ -571,6 +695,49 @@ the seat
 tmux new -s mywork                     # start claude inside it
 nexmesh adopt payments --node machine-b --tmux mywork --name Reviewer
 nexmesh attach payments Reviewer       # from any machine; detach freely
+.fi
+.RE
+.PP
+Start a CLI here that the fleet owns, so it can be attached to from anywhere
+from the first keystroke \(em and have it come back by name next time:
+.PP
+.RS
+.nf
+nexmesh run claude                     # or: claude() { nexmesh run claude; }
+.fi
+.RE
+.PP
+Make a seat, start it, and move it, without leaving the chat. Any of these
+can be typed into the chat in the console, the dashboard or the phone:
+.PP
+.RS
+.nf
+/new claude Reviewer interactive
+/move Reviewer #payments
+/start Reviewer
+/rename Reviewer Iris
+/help
+.fi
+.RE
+.PP
+Have the fleet installed and come back after a reboot:
+.PP
+.RS
+.nf
+sudo deploy/install-service.sh hub
+sudo deploy/install-service.sh node --user alice
+sudo deploy/install-service.sh coderai
+.fi
+.RE
+.PP
+Say it instead of typing it, where the fleet has a teammate advertising
+.B transcribe
+and this machine has a recorder:
+.PP
+.RS
+.nf
+nexmesh                                # the console: v records, V reads aloud
+nexmesh attach payments Dev            # Ctrl-^ dictates, Ctrl-_ reads back
 .fi
 .RE
 .SH SEE ALSO

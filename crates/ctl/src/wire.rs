@@ -12,7 +12,7 @@
 //! Two routes. Through the hub, over the same websocket everything else uses:
 //! works from anywhere, including from outside the network the fleet is on.
 //! Or straight to the node that holds the terminal, which is what you want
-//! whenever you can reach it -- attaching from sissy to an agent on sissy had
+//! whenever you can reach it -- attaching from machine-b to an agent on machine-b had
 //! every keystroke crossing the network twice and waiting on a hub on a
 //! Celeron in between.
 //!
@@ -274,8 +274,8 @@ mod tests {
 
     #[test]
     fn a_direct_attach_is_only_offered_for_this_machine() {
-        assert_eq!(local_socket_for("zeiss", "sissy"), None);
-        assert_eq!(local_socket_for("", "sissy"), None);
+        assert_eq!(local_socket_for("machine-c", "machine-b"), None);
+        assert_eq!(local_socket_for("", "machine-b"), None);
     }
 
     #[test]

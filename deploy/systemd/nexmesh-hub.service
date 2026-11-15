@@ -1,0 +1,38 @@
+# The hub: all the state, and the only thing that decides what runs where.
+#
+# It never spawns a process and never signals one, so it does not need to be
+# root and is not run as root. The environment file carries the listen
+# addresses and the TLS paths; see deploy/README.md.
+[Unit]
+Description=nexmesh hub
+Documentation=man:nexmesh(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexmesh
+Group=nexmesh
+EnvironmentFile=/etc/nexmesh/hub.env
+# The flags live in the environment file as NEXMESH_HUB_ARGS, so one unit
+# serves every shape of deployment -- one listen address or three, TLS or
+# behind nginx -- without a drop-in per machine.
+ExecStart=/bin/sh -c '/usr/local/bin/nexmesh-hub --db "$NEXMESH_DB" $NEXMESH_HUB_ARGS serve'
+Restart=always
+RestartSec=2
+StateDirectory=nexmesh
+LogsDirectory=nexmesh
+# It holds the fleet CA and every token hash: give it nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nexmesh /var/log/nexmesh
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

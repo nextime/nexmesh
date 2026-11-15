@@ -302,6 +302,79 @@ fn build_request(
     Ok(Value::Object(body.into_iter().collect()))
 }
 
+/// How to actually ask, written for a reader that has no idea this is not a
+/// teammate it can talk to.
+///
+/// The bridge has no language model -- deliberately, since every agent on the
+/// team already is one -- so a sentence addressed to it cannot be acted on.
+/// What it does have is a list of capabilities with a documented request
+/// shape, and that is exactly what `ask_capability` takes. Saying so, with
+/// the fields and one worked example per capability, is the difference
+/// between a capability nobody can reach and one anybody can.
+fn usage_text(name: &str, m: &Manifest, available: &[Available]) -> String {
+    let mut out = format!(
+        "{name} is a bridge to {}, not an agent: it has no language model, so it cannot read a \
+         request written as a sentence. Reach it with the ask_capability tool, which takes the \
+         capability and a request object:\n\n",
+        m.service.name
+    );
+    // Two examples first, because an example is read and a schema is skimmed.
+    for a in available.iter().take(2) {
+        if let Some(c) = m.find(&a.label) {
+            out.push_str(&format!(
+                "  ask_capability(capability=\"{}\", request={{{}}}{})\n",
+                a.label,
+                c.required
+                    .iter()
+                    .map(|f| format!("\"{f}\": \"...\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if a.models.is_empty() {
+                    String::new()
+                } else {
+                    format!(", model=\"{}\"", a.models[0])
+                }
+            ));
+        }
+    }
+    out.push_str(&format!("\nWhat {name} can do here:\n"));
+    for a in available {
+        out.push_str(&format!("- {}: {}\n", a.label, a.summary));
+        if let Some(c) = m.find(&a.label) {
+            let also: Vec<&String> =
+                c.accepts.iter().filter(|f| !c.required.contains(f)).collect();
+            out.push_str(&format!(
+                "    needs {}{}{}\n",
+                if c.required.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    c.required.join(", ")
+                },
+                if also.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " \u{b7} also takes {}",
+                        also.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                },
+                if a.models.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \u{b7} models {}", a.models.join(", "))
+                }
+            ));
+        }
+    }
+    out.push_str(
+        "\nBinary input goes in as base64, a data URI, or a path this machine can read; anything \
+         large belongs in the service's own store, passed by reference. What comes back is text, \
+         or a file reference -- never the bytes of a video.\n\
+         An ask BLOCKS until the work is done, so give slow work a generous timeout_seconds.\n",
+    );
+    out
+}
+
 /// Turn the service's answer into something an agent can read.
 fn render_answer(c: &Capability, v: &Value) -> String {
     let text = manifest::extract_first(v, &c.text_at);
@@ -336,6 +409,10 @@ struct Hub {
     base: String,
     token: String,
     agent_id: String,
+    /// Teammates who have addressed this bridge in prose and are owed an
+    /// answer. A message cannot be acted on here, but being acked and
+    /// otherwise ignored is indistinguishable from the fleet not working.
+    prose: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Hub {
@@ -358,11 +435,19 @@ impl Hub {
         if let Some(ids) = v["messages"].as_array().filter(|a| !a.is_empty()) {
             let ids: Vec<i64> = ids.iter().filter_map(|m| m["id"].as_i64()).collect();
             for m in v["messages"].as_array().into_iter().flatten() {
+                let from = m["from_name"].as_str().unwrap_or("");
                 tracing::info!(
-                    from = %m["from_name"].as_str().unwrap_or("someone"),
+                    from = %if from.is_empty() { "someone" } else { from },
                     body = %m["body"].as_str().unwrap_or(""),
-                    "a message for the bridge; acknowledging it"
+                    "a message for the bridge; acknowledging it and saying how to ask"
                 );
+                // The operator has no slot and is answered in the chat by a
+                // person reading it; a teammate is answered directly.
+                if !from.is_empty() && from != "operator" {
+                    if let Ok(mut q) = self.prose.lock() {
+                        q.push(from.to_string());
+                    }
+                }
             }
             if !ids.is_empty() {
                 let _ = self
@@ -533,11 +618,15 @@ async fn main() -> Result<()> {
             base: base.clone(),
             token: args.token.clone(),
             agent_id: agent_id.clone(),
+            prose: Default::default(),
         })
         .collect();
 
 
-    // Say what is on offer, so teammates can read it rather than guess.
+    // Say what is on offer AND how to ask for it, so teammates can read it
+    // rather than guess -- a capability nobody knows the request shape of is
+    // a capability nobody uses.
+    let usage = usage_text(&args.name, &m, &available);
     let mut lines = format!("{} is available for:\n", args.name);
     for a in &available {
         lines.push_str(&format!(
@@ -551,7 +640,8 @@ async fn main() -> Result<()> {
             }
         ));
     }
-    lines.push_str("Reach these with ask_capability.\n");
+    lines.push_str("Reach these with ask_capability.\n\n");
+    lines.push_str(&usage);
     // Every team is told, not just the first: a seat whose summary is blank
     // reads like something that has not started.
     let summary = format!(
@@ -569,7 +659,7 @@ async fn main() -> Result<()> {
             .await;
     }
 
-    serve(&hubs, &svc, &m, &available, args.max_inline_bytes).await
+    serve(&hubs, &svc, &m, &available, args.max_inline_bytes, &usage).await
 }
 
 /// Answer requests until stopped, for every seat this bridge holds.
@@ -584,9 +674,15 @@ async fn serve(
     m: &Manifest,
     available: &[Available],
     max_inline: usize,
+    usage: &str,
 ) -> Result<()> {
     let mut idle = 0u32;
+    // Who has been told how to ask, and when. Told once and then left alone
+    // for a while: an agent that keeps talking to the bridge in prose should
+    // get the instructions, not a conversation with a wall.
+    let mut told: BTreeMap<String, std::time::Instant> = BTreeMap::new();
     loop {
+        answer_prose(hubs, usage, &mut told).await;
         let mut asks: Vec<(String, String, Value, Option<String>, &Hub)> = Vec::new();
         for hub in hubs {
             let waiting = hub.tool("pending_asks", json!({})).await;
@@ -633,6 +729,38 @@ async fn serve(
             }
         }
     }
+}
+
+/// Answer anybody who has spoken to the bridge in prose with how to ask it
+/// properly. Once per sender per ten minutes, which is often enough to be
+/// useful and rare enough not to be a loop of its own.
+async fn answer_prose(
+    hubs: &[Hub],
+    usage: &str,
+    told: &mut BTreeMap<String, std::time::Instant>,
+) {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(600);
+    for hub in hubs {
+        let waiting: Vec<String> = match hub.prose.lock() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => continue,
+        };
+        for who in waiting {
+            if told.get(&who).is_some_and(|t| t.elapsed() < QUIET) {
+                continue;
+            }
+            told.insert(who.clone(), std::time::Instant::now());
+            if let Err(e) = hub
+                .tool("send_message", json!({ "to": who, "text": usage }))
+                .await
+            {
+                tracing::warn!(%who, error = %e, "could not say how to ask");
+            }
+        }
+    }
+    // A name told long enough ago is forgotten, so the map cannot grow for
+    // ever on a long-running bridge.
+    told.retain(|_, t| t.elapsed() < QUIET * 2);
 }
 
 /// One request, end to end.
@@ -721,6 +849,61 @@ file_at = ["url"]
         )
         .unwrap();
         m.capabilities.into_iter().next().unwrap()
+    }
+
+    fn manifest() -> Manifest {
+        Manifest::parse(
+            r#"
+[service]
+name = "svc"
+[[capability]]
+label = "ocr"
+summary = "read text off a page"
+endpoint = "/v1/ocr"
+model_field = "engine"
+accepts = ["image", "lang"]
+required = ["image"]
+text_at = ["text"]
+[[capability]]
+label = "image"
+summary = "make a picture"
+endpoint = "/v1/image"
+accepts = ["prompt", "width"]
+required = ["prompt"]
+file_at = ["url"]
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_usage_text_says_how_to_ask_not_just_what_is_there() {
+        // A capability nobody knows the request shape of is a capability
+        // nobody can use -- which is what prose at a bridge with no model
+        // comes down to.
+        let m = manifest();
+        let available = vec![
+            Available {
+                label: "ocr".into(),
+                summary: "read text off a page".into(),
+                models: vec!["surya".into()],
+            },
+            Available {
+                label: "image".into(),
+                summary: "make a picture".into(),
+                models: vec![],
+            },
+        ];
+        let t = usage_text("CoderAI", &m, &available);
+        assert!(t.contains("no language model"), "{t}");
+        assert!(t.contains("ask_capability(capability=\"ocr\""), "{t}");
+        assert!(t.contains("\"image\": \"...\""), "the required field must be in the example: {t}");
+        assert!(t.contains("model=\"surya\""), "{t}");
+        // Every capability, with what it needs and what else it takes.
+        assert!(t.contains("- ocr:") && t.contains("- image:"), "{t}");
+        assert!(t.contains("needs image \u{b7} also takes lang"), "{t}");
+        assert!(t.contains("needs prompt \u{b7} also takes width"), "{t}");
+        assert!(t.contains("timeout_seconds"), "slow work needs saying: {t}");
     }
 
     #[test]

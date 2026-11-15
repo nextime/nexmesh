@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn a_tmux_name_is_safe_to_type_and_to_address() {
         assert_eq!(tmux_name_for("Orchestrator"), "nexmesh-orchestrator");
-        assert_eq!(tmux_name_for("Claude-sissy"), "nexmesh-claude-sissy");
+        assert_eq!(tmux_name_for("Claude-machine-b"), "nexmesh-claude-machine-b");
         // Dots and colons address windows and panes; spaces break every
         // shell line that follows.
         assert_eq!(tmux_name_for("Claude 2.0:dev"), "nexmesh-claude-2-0-dev");

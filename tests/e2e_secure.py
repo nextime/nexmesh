@@ -259,12 +259,12 @@ def main():
     check("reading advances that operator's cursor, so it is not served twice",
           j.get("messages") == [], str(j)[:200])
     s, j = https("POST", "/v1/operator/messages",
-                 {"text": "no GPU today, use zeiss tomorrow", "to": "alpha"}, token=optok)
+                 {"text": "no GPU today, use machine-c tomorrow", "to": "alpha"}, token=optok)
     check("a super can answer one session's orchestrator", s == 200, f"{s} {j}")
     s, j = https("GET", "/v1/operator/messages", token=scoped)
     texts = [m.get("text") for m in j.get("messages", [])]
     check("and the scoped orchestrator reads the answer",
-          any("zeiss tomorrow" in t for t in texts), str(texts)[:200])
+          any("machine-c tomorrow" in t for t in texts), str(texts)[:200])
     check("while never being shown notes addressed elsewhere",
           all(m.get("to_session") == sa for m in j.get("messages", [])), str(j)[:300])
 

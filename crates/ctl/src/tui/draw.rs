@@ -124,9 +124,170 @@ pub fn all(f: &mut Frame, app: &App) {
         side(f, body[1], app);
     }
     footer(f, rows[3], app);
+    if app.zoom && (app.pane == Pane::Memory || app.zoom_text.is_some()) {
+        zoomed(f, area, app);
+    }
+    if app.dialog.is_some() {
+        dialog(f, area, app);
+    }
     if app.help {
         help(f, area, app);
     }
+}
+
+/// The question on the screen: a list to choose from, a line to type, or a
+/// yes. Drawn over everything, because it owns the keyboard while it is up.
+fn dialog(f: &mut Frame, area: Rect, app: &App) {
+    use crate::tui::act::Kind;
+    let th = app.theme;
+    let Some(d) = app.dialog.as_ref() else { return };
+    let rows = match &d.kind {
+        Kind::Pick(v) => v.len().min(12),
+        Kind::Text(_) => 1,
+        Kind::Confirm => 1,
+    } as u16;
+    let hint = textwrap(&d.hint, 60);
+    let w = 66u16.min(area.width.saturating_sub(4));
+    let h = (rows + hint.len() as u16 + 5).min(area.height.saturating_sub(2));
+    let box_ = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    let mut text: Vec<Line> = vec![Line::from(Span::styled(
+        format!(" {}", d.title),
+        th.title().add_modifier(Modifier::BOLD),
+    ))];
+    for l in &hint {
+        text.push(Line::from(Span::styled(
+            format!(" {l}"),
+            Style::default().fg(th.faint()),
+        )));
+    }
+    text.push(Line::from(""));
+    match &d.kind {
+        Kind::Pick(options) => {
+            // A window over the list, so a fleet with twenty sessions in it
+            // does not need a box taller than the screen.
+            let room = rows as usize;
+            let first = d.at.saturating_sub(room.saturating_sub(1));
+            for (i, c) in options.iter().enumerate().skip(first).take(room) {
+                let on = i == d.at;
+                text.push(Line::from(Span::styled(
+                    format!(" {} {}", if on { "\u{25b8}" } else { " " }, clip(&c.label, w as usize - 5)),
+                    if on { th.selected() } else { Style::default().fg(th.fg()) },
+                )));
+            }
+        }
+        Kind::Text(c) => {
+            let shown = clip(&c.text, w as usize - 6);
+            text.push(Line::from(vec![
+                Span::styled("  > ", Style::default().fg(th.faint())),
+                Span::styled(shown, Style::default().fg(th.fg())),
+                Span::styled("\u{2588}", Style::default().fg(th.accent())),
+            ]));
+        }
+        Kind::Confirm => {
+            text.push(Line::from(Span::styled(
+                "  y, or Enter, to go ahead \u{b7} n or Esc to leave it",
+                Style::default().fg(th.second()),
+            )));
+        }
+    }
+    if !matches!(d.kind, Kind::Confirm) {
+        text.push(Line::from(Span::styled(
+            "  Enter to go on \u{b7} Esc to cancel",
+            Style::default().fg(th.faint()),
+        )));
+    }
+    f.render_widget(Clear, box_);
+    f.render_widget(
+        Paragraph::new(Text::from(text)).block(framed(th.label("do"), th, true)),
+        box_,
+    );
+}
+
+/// One memory, all of it. A value is a paragraph and the pane is a table, so
+/// the table shows the first line and this shows the rest.
+fn zoomed(f: &mut Frame, area: Rect, app: &App) {
+    let th = app.theme;
+    // Either a command's answer, or the memory under the cursor.
+    let k = match &app.zoom_text {
+        Some(t) => serde_json::json!({ "key": "answer", "value": t }),
+        None => match app.selected_memory() {
+            Some(k) => k,
+            None => return,
+        },
+    };
+    let w = 84u16.min(area.width.saturating_sub(4));
+    let h = (area.height.saturating_sub(4)).min(24);
+    let box_ = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    let inner = w.saturating_sub(4) as usize;
+    let mut text: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(s(&k, "key"), th.title().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled(
+            // A command's answer has no author or revision; a memory has
+            // both, and saying so is the difference between reading one and
+            // wondering where it came from.
+            if app.zoom_text.is_some() {
+                " Esc to put it away".to_string()
+            } else {
+                format!(
+                    " {} \u{b7} {} \u{b7} by {} \u{b7} rev {} \u{b7} {}",
+                    s(&k, "category"),
+                    s(&k, "scope"),
+                    s(&k, "who"),
+                    n(&k, "revision"),
+                    hhmmss(n(&k, "at_ms"))
+                )
+            },
+            Style::default().fg(th.faint()),
+        )),
+        Line::from(""),
+    ];
+    // Paragraphs are kept: a memory written as a list reads as one.
+    let body = s(&k, "value");
+    let mut wrapped: Vec<Line> = Vec::new();
+    for para in body.split('\n') {
+        if para.trim().is_empty() {
+            wrapped.push(Line::from(""));
+            continue;
+        }
+        for l in textwrap(para, inner) {
+            wrapped.push(Line::from(Span::styled(
+                format!(" {l}"),
+                Style::default().fg(th.fg()),
+            )));
+        }
+    }
+    let room = (h as usize).saturating_sub(5);
+    let back = app.scroll.min(wrapped.len().saturating_sub(room.max(1)));
+    let more = wrapped.len() > room + back;
+    text.extend(wrapped.into_iter().skip(back).take(room));
+    if more {
+        text.push(Line::from(Span::styled(
+            " \u{25bc} more \u{2014} PgDn",
+            Style::default().fg(th.second()),
+        )));
+    }
+    f.render_widget(Clear, box_);
+    f.render_widget(
+        Paragraph::new(Text::from(text)).block(framed(
+            th.label(if app.zoom_text.is_some() { "answer" } else { "memory" }),
+            th,
+            true,
+        )),
+        box_,
+    );
 }
 
 fn bar(f: &mut Frame, area: Rect, app: &App) {
@@ -160,6 +321,17 @@ fn bar(f: &mut Frame, area: Rect, app: &App) {
     ];
     if let Some(v) = hub.get("version").and_then(|v| v.as_str()) {
         spans.push(Span::styled(format!("   hub {v}"), Style::default().fg(th.faint())));
+    }
+    if app.recording.is_some() {
+        spans.push(Span::styled(
+            "   \u{25cf} listening",
+            Style::default().fg(th.bad()).add_modifier(Modifier::BOLD),
+        ));
+    } else if app.audio.can_hear() {
+        spans.push(Span::styled("   v say it", Style::default().fg(th.faint())));
+    }
+    if app.speaking {
+        spans.push(Span::styled("   \u{1F50A} reading aloud", Style::default().fg(th.second())));
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
@@ -251,76 +423,134 @@ fn deck(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
-    // What just happened, and who is adrift -- the two things a glance is for.
-    let halves = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+    // Who is adrift goes in a strip across the top, and what just happened
+    // gets everything underneath it. The other way round -- a tall list
+    // beside a narrow feed -- spent half the deck on a column that is
+    // usually empty, and cut every message in the one that is not.
+    let adrift_rows: Vec<&Value> = agents.iter().filter(|a| !present(a)).collect();
+    let stack = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2 + adrift_rows.len().clamp(1, 3) as u16),
+            Constraint::Min(3),
+        ])
         .split(rows[1]);
 
-    let w = halves[0].width.saturating_sub(4) as usize;
-    let lines: Vec<Line> = msgs
-        .iter()
-        .take(halves[0].height.saturating_sub(2) as usize)
-        .map(|m| {
-            let from = s(m, "from");
-            Line::from(vec![
-                Span::styled(hhmmss(n(m, "at_ms")), Style::default().fg(th.faint())),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:>12}", clip(&from, 12)),
-                    Style::default().fg(th.nick(&from)),
-                ),
-                Span::styled(" \u{2192} ", Style::default().fg(th.faint())),
-                Span::styled(
-                    clip(&s(m, "body"), w.saturating_sub(28)),
-                    Style::default().fg(th.fg()),
-                ),
-            ])
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).block(framed(th.label("latest"), th, false)),
-        halves[0],
-    );
-
-    let mut right: Vec<Line> = Vec::new();
-    for a in agents.iter().filter(|a| !present(a)) {
-        right.push(Line::from(vec![
+    // Three lines at the most. Past that the third line says how many are
+    // not shown, because the list is a prompt to open the agents pane, not
+    // the place to read it.
+    let shown = if adrift_rows.len() > 3 { 2 } else { adrift_rows.len() };
+    let mut look: Vec<Line> = Vec::new();
+    for a in adrift_rows.iter().take(shown) {
+        look.push(Line::from(vec![
             Span::styled(
-                format!("{:<16}", clip(&s(a, "name"), 16)),
+                format!(" {:<18}", clip(&s(a, "name"), 18)),
                 Style::default().fg(th.nick(&s(a, "name"))),
             ),
-            Span::styled(
-                format!("{:<13}", s(a, "status")),
-                Style::default().fg(th.warn()),
-            ),
+            Span::styled(format!("{:<13}", s(a, "status")), Style::default().fg(th.warn())),
+            Span::styled(format!("{:<10}", clip(&s(a, "session"), 10)), Style::default().fg(th.dim())),
             Span::styled(s(a, "host"), Style::default().fg(th.faint())),
         ]));
     }
-    if right.is_empty() {
-        right.push(Line::from(Span::styled(
+    if adrift_rows.len() > shown {
+        look.push(Line::from(Span::styled(
+            format!(
+                " and {} more \u{2014} 2 for the whole list",
+                adrift_rows.len() - shown
+            ),
+            Style::default().fg(th.faint()),
+        )));
+    }
+    if look.is_empty() {
+        look.push(Line::from(Span::styled(
             " every seat has a process behind it",
             Style::default().fg(th.ok()),
         )));
     }
     f.render_widget(
-        Paragraph::new(Text::from(right)).block(framed(th.label("needs a look"), th, false)),
-        halves[1],
+        Paragraph::new(Text::from(look)).block(framed(th.label("needs a look"), th, false)),
+        stack[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Text::from(feed_lines(
+            &msgs,
+            th,
+            stack[1].width.saturating_sub(2) as usize,
+            stack[1].height.saturating_sub(2) as usize,
+        )))
+        .block(framed(th.label("latest"), th, false)),
+        stack[1],
     );
 }
 
-fn table<'a>(
+/// The message feed, wrapped rather than cut off.
+///
+/// `msgs` is newest first, which is how it is read here: the top line is what
+/// just happened. A message too long for one line is continued underneath,
+/// indented past the sender, and capped -- one 4000-character paste must not
+/// become the whole pane.
+fn feed_lines<'a>(msgs: &[Value], th: Theme, width: usize, height: usize) -> Vec<Line<'a>> {
+    const INDENT: usize = 24;
+    const MAX_PER_MESSAGE: usize = 6;
+    let avail = width.saturating_sub(INDENT);
+    let mut lines: Vec<Line> = Vec::new();
+    for m in msgs {
+        if lines.len() >= height {
+            break;
+        }
+        let from = s(m, "from");
+        let body = s(m, "body").replace(['\n', '\r', '\t'], " ");
+        let chunks = textwrap(&body, avail);
+        let cut = chunks.len() > MAX_PER_MESSAGE;
+        for (i, c) in chunks.iter().take(MAX_PER_MESSAGE).enumerate() {
+            if lines.len() >= height {
+                return lines;
+            }
+            let tail = if cut && i + 1 == MAX_PER_MESSAGE {
+                format!("{c} \u{2026}")
+            } else {
+                c.clone()
+            };
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(hhmmss(n(m, "at_ms")), Style::default().fg(th.faint())),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{:>12}", clip(&from, 12)),
+                        Style::default().fg(th.nick(&from)),
+                    ),
+                    Span::styled(" \u{2192} ", Style::default().fg(th.faint())),
+                    Span::styled(tail, Style::default().fg(th.fg())),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(INDENT)),
+                    Span::styled(tail, Style::default().fg(th.fg())),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// `&str` column names, as `table` wants them.
+fn heads(v: &[&str]) -> Vec<String> {
+    v.iter().map(|x| x.to_string()).collect()
+}
+
+fn table(
     f: &mut Frame,
     area: Rect,
     app: &App,
     title: String,
-    head: Vec<&'a str>,
+    head: Vec<String>,
     widths: Vec<Constraint>,
     rows: Vec<Vec<String>>,
 ) {
     let th = app.theme;
     let cur = app.cursor();
-    let header = Row::new(head.into_iter().map(|h| th.label(h)).collect::<Vec<_>>())
+    let header = Row::new(head.into_iter().map(|h| th.label(&h)).collect::<Vec<_>>())
         .style(th.header());
     // The cursor is drawn on the row rather than with a highlight state, so
     // the same table renders identically whether or not it has focus.
@@ -343,47 +573,100 @@ fn table<'a>(
     f.render_widget(t, area);
 }
 
+/// The agent pane's columns, in the order they are drawn.
+///
+/// One list for the header, the cells and the sort key, so the three cannot
+/// drift apart: a table sorted by a column other than the one with the arrow
+/// on it is worse than one that cannot be sorted at all.
+pub(crate) const AGENT_COLS: [&str; 10] =
+    ["name", "session", "seat", "cli", "role", "where", "state", "agent", "pid", "io"];
+
+pub(crate) fn agent_cell(a: &Value, col: usize) -> String {
+    match col {
+        0 => s(a, "name"),
+        1 => s(a, "session"),
+        2 => s(a, "slot_id"),
+        3 => s(a, "cli"),
+        4 => s(a, "role"),
+        5 => s(a, "host"),
+        6 => s(a, "task_state"),
+        7 => s(a, "status"),
+        8 => match a.get("pid").and_then(|p| p.as_i64()) {
+            Some(p) => p.to_string(),
+            None => "-".into(),
+        },
+        _ => a.get("io_kind").and_then(|x| x.as_str()).unwrap_or("-").to_string(),
+    }
+}
+
+/// Agents in the order the pane draws them.
+///
+/// Empty and `-` sort last whichever way round the rest is: a column gets
+/// sorted to find the rows that have something in it, and an ascending sort
+/// that opens with eight dashes answers a different question. Numbers in a
+/// column are compared as numbers -- pid 9 before pid 10 -- and name breaks
+/// every tie, so the order is stable while the fleet is not.
+pub(crate) fn sort_agents(rows: &mut [Value], col: usize, rev: bool) {
+    let key = |a: &Value| -> (u8, i64, String) {
+        let cell = agent_cell(a, col);
+        let missing = u8::from(cell.is_empty() || cell == "-");
+        let num = cell.trim().parse::<i64>().unwrap_or(0);
+        (missing, num, cell.to_lowercase())
+    };
+    rows.sort_by(|a, b| {
+        let (ka, kb) = (key(a), key(b));
+        ka.0.cmp(&kb.0)
+            .then_with(|| {
+                let body = (ka.1, &ka.2).cmp(&(kb.1, &kb.2));
+                if rev {
+                    body.reverse()
+                } else {
+                    body
+                }
+            })
+            .then_with(|| s(a, "name").to_lowercase().cmp(&s(b, "name").to_lowercase()))
+    });
+}
+
 fn agents(f: &mut Frame, area: Rect, app: &App) {
-    let rows: Vec<Vec<String>> = app
-        .rows("agents")
+    let ordered = app.agents_in_order();
+    let rows: Vec<Vec<String>> = ordered
         .iter()
-        .map(|a| {
-            let tokens = if n(a, "input_tokens") + n(a, "output_tokens") == 0 {
-                "-".to_string()
+        .map(|a| (0..AGENT_COLS.len()).map(|c| agent_cell(a, c)).collect())
+        .collect();
+    // The arrow is on the column being sorted by, pointing the way the rows
+    // run. Tokens used to live here and told you nothing you could act on;
+    // which session a seat is in is the first thing you want when the fleet
+    // has seven of them.
+    let head: Vec<String> = AGENT_COLS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i == app.sort_col {
+                format!("{c}{}", if app.sort_rev { '\u{25be}' } else { '\u{25b4}' })
             } else {
-                format!("{}/{}", human(n(a, "input_tokens")), human(n(a, "output_tokens")))
-            };
-            vec![
-                s(a, "name"),
-                s(a, "slot_id"),
-                s(a, "cli"),
-                s(a, "role"),
-                s(a, "host"),
-                s(a, "task_state"),
-                s(a, "status"),
-                match a.get("pid").and_then(|p| p.as_i64()) {
-                    Some(p) => p.to_string(),
-                    None => "-".into(),
-                },
-                a.get("io_kind")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("-")
-                    .to_string(),
-                tokens,
-            ]
+                c.to_string()
+            }
         })
         .collect();
     table(
         f,
         area,
         app,
-        format!("{} ({})", app.theme.label("agents"), rows.len()),
-        vec!["name", "seat", "cli", "role", "where", "state", "agent", "pid", "io", "tokens"],
+        format!(
+            "{} ({})  \u{2014}  , . sort \u{b7} R reverse",
+            app.theme.label("agents"),
+            rows.len()
+        ),
+        head,
+        // Wide enough for what actually goes in them: a role reading
+        // "code revie" and a machine reading "machine-" is a table that has
+        // been made narrow for no one's benefit.
         vec![
-            Constraint::Length(16), Constraint::Length(13), Constraint::Length(10),
-            Constraint::Length(11), Constraint::Length(9), Constraint::Length(11),
-            Constraint::Length(13), Constraint::Length(7), Constraint::Length(6),
-            Constraint::Min(9),
+            Constraint::Length(17), Constraint::Length(13), Constraint::Length(12),
+            Constraint::Length(10), Constraint::Length(15), Constraint::Length(12),
+            Constraint::Length(14), Constraint::Length(13), Constraint::Length(6),
+            Constraint::Min(5),
         ],
         rows,
     );
@@ -441,66 +724,15 @@ fn chat(f: &mut Frame, area: Rect, app: &App) {
         cols[0],
     );
 
-    // The room itself, oldest first like a conversation.
+    // The room itself: oldest at the top, newest at the bottom, which is
+    // the way a conversation reads and the way every chat client since
+    // `irc` has drawn one. It used to take the OLDEST screenful and print it
+    // newest-first -- two reverses that cancelled the wrong way round, so the
+    // pane showed the start of the day upside down and never the last line.
     let here: Vec<Value> = app
         .rows("messages")
         .into_iter()
-        .filter(|m| {
-            app.chan == "*" || {
-                let name = s(m, "session");
-                app.sessions()
-                    .iter()
-                    .any(|x| s(x, "id") == app.chan && s(x, "name") == name)
-            }
-        })
-        .collect();
-    let inner = cols[1].height.saturating_sub(2) as usize;
-    let w = cols[1].width.saturating_sub(4) as usize;
-    let lines: Vec<Line> = here
-        .iter()
-        .rev()
-        .take(inner)
-        .rev()
-        .map(|m| {
-            let from = s(m, "from");
-            let mut spans = vec![
-                Span::styled(hhmmss(n(m, "at_ms")), Style::default().fg(th.faint())),
-                Span::styled(
-                    if b(m, "claimed") { "  " } else { " \u{25cf}" },
-                    Style::default().fg(th.warn()),
-                ),
-                Span::raw(" "),
-            ];
-            if app.chan == "*" && !s(m, "session").is_empty() {
-                spans.push(Span::styled(
-                    format!("#{} ", s(m, "session")),
-                    Style::default().fg(th.accent()),
-                ));
-            }
-            spans.push(Span::styled(
-                format!("<{}>", from),
-                Style::default().fg(th.nick(&from)).add_modifier(Modifier::BOLD),
-            ));
-            let to = s(m, "to");
-            if !to.is_empty() && to != "(team)" {
-                spans.push(Span::styled(
-                    format!(" \u{2192}{to}"),
-                    Style::default().fg(th.dim()),
-                ));
-            }
-            spans.push(Span::raw(" "));
-            // A message carrying a link says so, because the terminal
-            // cannot show what is behind it and `o` can.
-            let body = s(m, "body");
-            if crate::tui::first_link(&body).is_some() {
-                spans.push(Span::styled("\u{1F517} ", Style::default().fg(th.second())));
-            }
-            spans.push(Span::styled(
-                clip(&body, w.saturating_sub(30)),
-                Style::default().fg(th.fg()),
-            ));
-            Line::from(spans)
-        })
+        .filter(|m| app.in_channel(m))
         .collect();
 
     let name = chans
@@ -508,28 +740,120 @@ fn chat(f: &mut Frame, area: Rect, app: &App) {
         .find(|(id, _)| *id == app.chan)
         .map(|(_, l)| l.clone())
         .unwrap_or_else(|| "#all".into());
-    let title = if app.editing {
-        format!("{name}  \u{2014}  typing, Esc to stop")
-    } else {
-        format!("{name}  \u{2014}  i to type")
-    };
     let feed = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(cols[1]);
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).block(framed(title, th, true)),
-        feed[0],
-    );
-    let prompt = if app.editing {
-        format!(" > {}\u{2588}", app.input)
+    let height = feed[0].height.saturating_sub(2) as usize;
+    let w = feed[0].width.saturating_sub(2) as usize;
+
+    // Every line of the channel, then the window the operator is looking at.
+    // Building all of them costs nothing at 120 messages and is the only way
+    // a wrapped feed can be scrolled by lines rather than by messages.
+    let mut lines: Vec<Line> = Vec::new();
+    for m in here.iter().rev() {
+        let from = s(m, "from");
+        let mut spans = vec![
+            Span::styled(hhmmss(n(m, "at_ms")), Style::default().fg(th.faint())),
+            Span::styled(
+                if b(m, "claimed") { "  " } else { " \u{25cf}" },
+                Style::default().fg(th.warn()),
+            ),
+            Span::raw(" "),
+        ];
+        if app.chan == "*" && !s(m, "session").is_empty() {
+            spans.push(Span::styled(
+                format!("#{} ", s(m, "session")),
+                Style::default().fg(th.accent()),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("<{from}>"),
+            Style::default().fg(th.nick(&from)).add_modifier(Modifier::BOLD),
+        ));
+        let to = s(m, "to");
+        if !to.is_empty() && to != "(team)" {
+            spans.push(Span::styled(format!(" \u{2192}{to}"), Style::default().fg(th.dim())));
+        }
+        spans.push(Span::raw(" "));
+        // A message carrying a link says so, because the terminal cannot
+        // show what is behind it and `o` can.
+        let body = s(m, "body");
+        if crate::tui::first_link(&body).is_some() {
+            spans.push(Span::styled("\u{1F517} ", Style::default().fg(th.second())));
+        }
+        let pre: usize = spans.iter().map(|sp| sp.content.chars().count()).sum();
+        // The continuation indent is the sender's width, but capped: a long
+        // nick in a narrow pane would otherwise leave three characters for
+        // the message.
+        let indent = pre.min(w / 3);
+        let chunks = textwrap(&body.replace(['\n', '\r', '\t'], " "), w.saturating_sub(indent));
+        let mut rest = chunks.as_slice();
+        if let Some(first) = chunks.first() {
+            // The first line only joins the header if it fits beside it.
+            if pre + first.chars().count() <= w {
+                spans.push(Span::styled(first.clone(), Style::default().fg(th.fg())));
+                rest = &chunks[1..];
+            }
+        }
+        lines.push(Line::from(spans));
+        for c in rest {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(c.clone(), Style::default().fg(th.fg())),
+            ]));
+        }
+    }
+    let total = lines.len();
+    let back = app.scroll.min(total.saturating_sub(height));
+    let at = total.saturating_sub(height + back);
+    let view: Vec<Line> = lines.into_iter().skip(at).take(height.max(1)).collect();
+
+    let title = if back > 0 {
+        format!("{name}  \u{2014}  \u{25b2} {back} line(s) back, PgDn to catch up")
+    } else if app.editing {
+        format!("{name}  \u{2014}  typing; Esc stops, \u{2191}\u{2193} changes channel, /help for commands")
     } else {
-        format!(" > {}", app.input)
+        format!("{name}  \u{2014}  i to type, /help for commands")
     };
     f.render_widget(
-        Paragraph::new(prompt)
-            .style(Style::default().fg(th.fg()))
-            .block(framed(th.label("say"), th, app.editing)),
+        Paragraph::new(Text::from(view)).block(framed(title, th, true)),
+        feed[0],
+    );
+
+    // The composer, with a caret you can move. The window slides so the
+    // caret is always on screen, however long the line is.
+    let inner = feed[1].width.saturating_sub(5) as usize;
+    let chars: Vec<char> = app.input.text.chars().collect();
+    let caret = app.input.caret.min(chars.len());
+    let from = caret.saturating_sub(inner.saturating_sub(1));
+    let shown: String = chars[from..].iter().take(inner).collect();
+    let at_caret = caret - from;
+    let mut prompt = vec![
+        Span::styled(" > ", Style::default().fg(th.faint())),
+        Span::styled(
+            shown.chars().take(at_caret).collect::<String>(),
+            Style::default().fg(th.fg()),
+        ),
+    ];
+    if app.editing {
+        let under: String = shown.chars().skip(at_caret).take(1).collect();
+        prompt.push(Span::styled(
+            if under.is_empty() { "\u{2588}".to_string() } else { under },
+            Style::default().fg(th.accent()).add_modifier(Modifier::REVERSED),
+        ));
+        prompt.push(Span::styled(
+            shown.chars().skip(at_caret + 1).collect::<String>(),
+            Style::default().fg(th.fg()),
+        ));
+    } else {
+        prompt.push(Span::styled(
+            shown.chars().skip(at_caret).collect::<String>(),
+            Style::default().fg(th.fg()),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(prompt)).block(framed(th.label("say"), th, app.editing)),
         feed[1],
     );
 }
@@ -553,7 +877,7 @@ fn plan(f: &mut Frame, area: Rect, app: &App) {
         area,
         app,
         format!("{} ({})", app.theme.label("plan"), rows.len()),
-        vec!["#", "step", "status", "owner", "note"],
+        heads(&["#", "step", "status", "owner", "note"]),
         vec![
             Constraint::Length(4), Constraint::Percentage(40), Constraint::Length(14),
             Constraint::Length(14), Constraint::Min(10),
@@ -571,7 +895,7 @@ fn memory(f: &mut Frame, area: Rect, app: &App) {
                 s(k, "key"),
                 s(k, "category"),
                 s(k, "scope"),
-                s(k, "author"),
+                s(k, "who"),
                 clip(&s(k, "value").replace('\n', " "), 120),
             ]
         })
@@ -580,8 +904,12 @@ fn memory(f: &mut Frame, area: Rect, app: &App) {
         f,
         area,
         app,
-        format!("{} ({})", app.theme.label("memory"), rows.len()),
-        vec!["key", "kind", "scope", "by", "value"],
+        format!(
+            "{} ({})  \u{2014}  Enter opens the one under the cursor",
+            app.theme.label("memory"),
+            rows.len()
+        ),
+        heads(&["key", "kind", "scope", "by", "value"]),
         vec![
             Constraint::Length(22), Constraint::Length(12), Constraint::Length(10),
             Constraint::Length(14), Constraint::Min(20),
@@ -668,7 +996,7 @@ fn graph(f: &mut Frame, area: Rect, app: &App) {
         rows[1],
         app,
         app.theme.label("subsystems"),
-        vec!["size", "mostly in", "for example"],
+        heads(&["size", "mostly in", "for example"]),
         vec![Constraint::Length(6), Constraint::Percentage(45), Constraint::Min(20)],
         table_rows,
     );
@@ -702,7 +1030,7 @@ fn files(f: &mut Frame, area: Rect, app: &App) {
         area,
         app,
         format!("{} ({})", app.theme.label("files"), rows.len()),
-        vec!["what", "path", "who", "mode", "note"],
+        heads(&["what", "path", "who", "mode", "note"]),
         vec![
             Constraint::Length(6), Constraint::Percentage(40), Constraint::Length(16),
             Constraint::Length(8), Constraint::Min(10),
@@ -743,7 +1071,7 @@ fn fleet(f: &mut Frame, area: Rect, app: &App) {
         area,
         app,
         format!("{} ({})", app.theme.label("fleet"), rows.len()),
-        vec!["machine", "state", "seen", "what it has"],
+        heads(&["machine", "state", "seen", "what it has"]),
         vec![
             Constraint::Length(16), Constraint::Length(9), Constraint::Length(7),
             Constraint::Min(20),
@@ -764,7 +1092,7 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
     };
     match app.pane {
         Pane::Agents => {
-            let rows = app.rows("agents");
+            let rows = app.agents_in_order();
             if let Some(a) = rows.get(app.cursor()) {
                 out.push(Line::from(Span::styled(
                     format!(" {}", s(a, "name")),
@@ -856,9 +1184,32 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
             }
         }
         Pane::Chat => {
-            out.push(Line::from(Span::styled(" in the room", th.title())));
+            // Who is in THIS room. The panel used to list every agent on
+            // the fleet whichever channel you were in, which made it a
+            // second copy of the agents pane rather than a roster.
+            let room = app.channel_session();
+            let here: Vec<Value> = app
+                .rows("agents")
+                .into_iter()
+                .filter(|a| room.as_deref().is_none_or(|r| s(a, "session") == r))
+                .collect();
+            out.push(Line::from(Span::styled(
+                match &room {
+                    Some(r) => format!(" in #{r}"),
+                    None => " everywhere".to_string(),
+                },
+                th.title(),
+            )));
+            out.push(Line::from(Span::styled(
+                format!(
+                    " {} seat(s), {} with a process",
+                    here.len(),
+                    here.iter().filter(|a| present(a)).count()
+                ),
+                Style::default().fg(th.faint()),
+            )));
             out.push(Line::from(""));
-            for a in app.rows("agents") {
+            for a in here {
                 let name = s(&a, "name");
                 out.push(Line::from(vec![
                     Span::styled(
@@ -869,10 +1220,10 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
                             th.faint()
                         }),
                     ),
-                    Span::styled(clip(&name, 18), Style::default().fg(th.nick(&name))),
+                    Span::styled(clip(&name, 16), Style::default().fg(th.nick(&name))),
                     Span::styled(
-                        format!(" {}", clip(&s(&a, "role"), 12)),
-                        Style::default().fg(th.faint()),
+                        format!(" {}", clip(&s(&a, "session"), 14)),
+                        Style::default().fg(th.dim()),
                     ),
                 ]));
             }
@@ -960,9 +1311,10 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     let keys = match app.pane {
-        Pane::Chat => " 1-8 panes · [ ] channel · i type · o open a link · p panel · t theme · ? help · q quit",
+        Pane::Chat => " j/k channel · i type · /help commands · PgUp scroll · v say it · o open a link · ? help",
         Pane::Graph => " 1-8 panes · j/k subsystem · w workspace · p panel · t theme · ? help · q quit",
-        Pane::Agents => " 1-8 panes · j/k move · a attach · s scope · p panel · t theme · ? help · q quit",
+        Pane::Agents => " a attach · n new · S start · m move · e rename · x remove · , . sort · R reverse · ? help",
+        Pane::Memory => " j/k move · Enter opens it · PgDn scrolls · s scope · ? help · q quit",
         _ => " 1-8 panes · j/k move · s scope · p panel · t theme · r refresh · ? help · q quit",
     };
     f.render_widget(
@@ -974,8 +1326,8 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
 
 fn help(f: &mut Frame, area: Rect, app: &App) {
     let th = app.theme;
-    let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 20u16.min(area.height.saturating_sub(2));
+    let w = 68u16.min(area.width.saturating_sub(4));
+    let h = 24u16.min(area.height.saturating_sub(2));
     let box_ = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -995,7 +1347,18 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         row("j / k", "move the cursor"),
         row("g / G", "first / last"),
         row("a, Enter", "attach to the agent under the cursor"),
-        row("i", "type in the chat; Esc stops"),
+        row("n", "a new seat: CLI, name, and whether to start it"),
+        row("S", "start a process for the seat under the cursor"),
+        row("m", "move that seat into another session"),
+        row("e", "rename it"),
+        row("x", "remove it, seat and history"),
+        row(", .", "sort the agents by the previous / next column"),
+        row("R", "reverse the agent order"),
+        row("Enter", "in memory: open the whole of one"),
+        row("PgUp/PgDn", "scroll the chat back, or a memory down"),
+        row("i", "type in the chat; arrows and Tab still work"),
+        row("v", "say it instead: record, then the fleet transcribes it"),
+        row("V", "read new messages aloud, if the fleet has a voice"),
         row("o", "open the newest link on screen in a browser"),
         row("[ / ]", "previous / next channel"),
         row("w", "next workspace, in the graph"),
@@ -1055,6 +1418,104 @@ mod tests {
         let lines = textwrap("/very/long/path/with/no/spaces/at/all.rs", 10);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("all.rs"));
+    }
+
+    fn flat(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn the_latest_feed_wraps_instead_of_cutting() {
+        let long = "the node on the second machine lost its connection to the hub \
+                    and came back with a different pid, which is why the seat went \
+                    through disconnected on the way";
+        let msgs = vec![serde_json::json!({
+            "at_ms": 1_700_000_000_000i64, "from": "Orchestrator", "body": long,
+        })];
+        let lines = feed_lines(&msgs, Theme::Deck, 80, 10);
+        assert!(lines.len() > 1, "a long message must continue underneath");
+        let all = lines.iter().map(flat).collect::<Vec<_>>().join(" ");
+        // Every word of it is on the screen somewhere.
+        for word in ["disconnected", "different", "connection"] {
+            assert!(all.contains(word), "{word} missing from {all}");
+        }
+        for l in &lines {
+            assert!(flat(l).chars().count() <= 80, "{}", flat(l));
+        }
+    }
+
+    #[test]
+    fn the_feed_never_draws_more_lines_than_the_pane_has() {
+        let msgs: Vec<Value> = (0..40)
+            .map(|i| {
+                serde_json::json!({
+                    "at_ms": 1_700_000_000_000i64 + i,
+                    "from": "x",
+                    "body": "a line that is long enough to need wrapping in a narrow pane",
+                })
+            })
+            .collect();
+        for height in 0..12usize {
+            assert!(feed_lines(&msgs, Theme::Deck, 60, height).len() <= height);
+        }
+    }
+
+    #[test]
+    fn one_enormous_message_does_not_become_the_whole_pane() {
+        let body = "word ".repeat(2000);
+        let msgs = vec![
+            serde_json::json!({ "at_ms": 1i64, "from": "a", "body": body }),
+            serde_json::json!({ "at_ms": 2i64, "from": "b", "body": "and the next one" }),
+        ];
+        let lines = feed_lines(&msgs, Theme::Deck, 80, 40);
+        assert!(lines.len() <= 7, "{} lines", lines.len());
+        assert!(
+            lines.iter().any(|l| flat(l).contains("and the next one")),
+            "the message after a long one has to be reachable"
+        );
+    }
+
+    #[test]
+    fn agents_sort_by_the_column_asked_for() {
+        let rows = |v: &[Value]| -> Vec<String> {
+            v.iter().map(|a| s(a, "name")).collect()
+        };
+        let mut v = vec![
+            serde_json::json!({ "name": "b", "session": "zeta", "pid": 9 }),
+            serde_json::json!({ "name": "a", "session": "alpha", "pid": 100 }),
+            serde_json::json!({ "name": "c", "session": "alpha" }),
+        ];
+        sort_agents(&mut v, 0, false);
+        assert_eq!(rows(&v), ["a", "b", "c"]);
+        sort_agents(&mut v, 0, true);
+        assert_eq!(rows(&v), ["c", "b", "a"]);
+        // By session: alphabetical, and name breaks the tie inside one.
+        sort_agents(&mut v, 1, false);
+        assert_eq!(rows(&v), ["a", "c", "b"]);
+        // By pid: as numbers, so 9 is before 100 -- and the row with no
+        // process at all is last whichever way round the rest is.
+        sort_agents(&mut v, 8, false);
+        assert_eq!(rows(&v), ["b", "a", "c"]);
+        sort_agents(&mut v, 8, true);
+        assert_eq!(rows(&v), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn every_agent_column_has_a_cell_and_a_name() {
+        // The header, the cells and the sort key are the same list; a column
+        // the cell function does not know about would sort by nothing.
+        let a = serde_json::json!({
+            "name": "n", "session": "s", "slot_id": "sl-1", "cli": "claude",
+            "role": "dev", "host": "machine-a", "task_state": "working",
+            "status": "running", "pid": 7, "io_kind": "pty",
+        });
+        let cells: Vec<String> = (0..AGENT_COLS.len()).map(|c| agent_cell(&a, c)).collect();
+        assert_eq!(cells.len(), AGENT_COLS.len());
+        assert!(cells.iter().all(|c| !c.is_empty()), "{cells:?}");
+        assert_eq!(cells[1], "s");
+        assert!(!cells.contains(&"tokens".to_string()));
+        // Past the last column nothing panics: io is the fallback.
+        assert_eq!(agent_cell(&a, 99), "pty");
     }
 
     #[test]

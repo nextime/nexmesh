@@ -402,13 +402,7 @@ async fn initialize(
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "nexmesh", "version": VERSION },
-        "instructions": format!(
-            "You are part of a nexmesh team as '{}' (slot {slot_id}). Teammates may run on \
-             other machines, under other CLIs, or not be CLIs at all. Call query_knowledge \
-             and check_team_status before planning. Teammate messages arrive prefixed \
-             [PENDING MESSAGES] on any tool result.",
-            name
-        ),
+        "instructions": nexmesh_proto::tools::team_instructions(&name, slot_id.as_str()),
     });
     let mut res = Json(jok(id, result)).into_response();
     res.headers_mut().insert(

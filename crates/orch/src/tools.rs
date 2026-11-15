@@ -214,7 +214,7 @@ pub fn tools() -> Vec<Tool> {
             description: "Rename an agent. A name is not decoration: it is how you address an \
                           agent in every other tool, how it is addressed in messages, and what \
                           you read in the log. Seats are named before anyone knows what they \
-                          will do -- `Claude-zeiss-3` says where it runs and nothing about the \
+                          will do -- `Claude-machine-c-3` says where it runs and nothing about the \
                           work -- so name them for the job once you know it. Renaming changes \
                           nothing else: same seat, same agent, same history, same inbox.",
             schema: json!({ "type": "object", "properties": {

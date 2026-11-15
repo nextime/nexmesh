@@ -1,0 +1,24 @@
+#!/bin/sh
+# Nothing is started or enabled by installing the package: this machine may
+# want a node, or a hub, or neither, and a service that starts itself before
+# anybody has configured it is a service that fails in the logs all night.
+set -e
+case "$1" in
+    configure)
+        cat <<'NOTE'
+nexmesh is installed. Nothing is running yet -- choose what this machine is:
+
+  nexmesh-install hub                  the fleet's state, one machine
+  nexmesh-install node --user alice    spawns and drives CLIs here, per login
+  nexmesh-install coderai              the capability bridge, beside its service
+
+Each of those installs the service for whichever init this machine runs --
+systemd or sysvinit -- enables it at boot and starts it. A node needs a token
+from the hub first:  nexmesh-hub enrol <this machine's name>
+
+  nexmesh --help    what it can do, with examples
+  man nexmesh       every argument
+NOTE
+        ;;
+esac
+exit 0

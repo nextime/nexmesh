@@ -28,8 +28,20 @@
     --n5: #c4b5fd; --n6: #f9a8d4; --n7: #67e8f9; --n8: #fdba74;
     --edge: color-mix(in srgb, var(--accent) 30%, transparent);
   }
+  /* Light, two ways in: the operator picks it outright, or the operating
+     system asks for it while the dashboard is on `auto`. The palette used
+     to live only inside the media query, so choosing "light" on a machine
+     set to dark changed the menu and nothing else. The two selectors carry
+     the same declarations on purpose -- a media query cannot be part of a
+     selector list, and resolving it in JavaScript would mean a dark flash
+     on every load. */
+  :root[data-theme="light"] {
+    --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d4dae1;
+    --fg: #1d242c; --dim: #5a6673; --faint: #8794a1;
+    --ok: #047857; --warn: #92610a; --bad: #b91c1c; --info: #1d4ed8; --accent: #6d28d9;
+  }
   @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]):not([data-theme="lcars"]) {
+    :root:not([data-theme]) {
       --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d4dae1;
       --fg: #1d242c; --dim: #5a6673; --faint: #8794a1;
       --ok: #047857; --warn: #92610a; --bad: #b91c1c; --info: #1d4ed8; --accent: #6d28d9;
@@ -385,13 +397,12 @@
     --a8: #55606b; --a9: #ff8d90; --a10: #b5e0b5; --a11: #ffe0a3;
     --a12: #8fbce0; --a13: #e0b5e0; --a14: #8fe0e0; --a15: #ffffff;
   }
+  /* A terminal stays dark in a light theme. Agent output is written for a
+     dark background -- its own colours assume one -- and inverting it makes
+     every TUI unreadable. */
+  :root[data-theme="light"] { --ntbg: #10151b; --ntfg: #dde4ea; }
   @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]):not([data-theme="lcars"]) {
-      /* A terminal stays dark in a light theme. Agent output is written for
-         a dark background -- its own colours assume one -- and inverting it
-         makes every TUI unreadable. */
-      --ntbg: #10151b; --ntfg: #dde4ea;
-    }
+    :root:not([data-theme]) { --ntbg: #10151b; --ntfg: #dde4ea; }
   }
 
   /* ------------------------------------------------------------ LCARS ----
@@ -537,27 +548,84 @@
   @media (max-width: 620px) {
     .msg { grid-template-columns: 52px 14px minmax(0, 1fr); }
     th.hide, td.hide { display: none; }
-    /* A table with eight columns on a 390px screen is unreadable however it
-       is squeezed. Let it scroll sideways instead, keep the first column in
-       view so a row can still be identified, and give cells room to wrap. */
-    .panel { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    .panel table { min-width: 560px; }
-    th, td { padding: 7px 8px; }
-    td { word-break: break-word; }
-    table th:first-child, table td:first-child {
-      position: sticky; left: 0; background: var(--panel);
-      box-shadow: 1px 0 0 var(--line);
+
+    /* ------------------------------------------------- a table on a phone ----
+       A table with eight columns does not fit a 390px screen, and the two
+       usual answers are both bad: squeezing it leaves columns three
+       characters wide, and scrolling it sideways means reading a row by
+       dragging it past a sticky first cell. It was doing the second, and
+       nobody scrolls a table sideways on purpose.
+
+       So on a phone a row becomes a card: the first cell is its title, and
+       every other cell is a labelled line under it. The label comes from
+       that column's own heading, attached to each cell after render, so
+       nothing that builds a table here had to learn about phones. */
+    .panel { overflow-x: visible; }
+    .panel table { min-width: 0; width: 100%; }
+    .panel thead { display: none; }
+    .panel tbody, .panel tbody td { display: block; width: auto; }
+    /* A column, so the action buttons can be put at the foot of the card
+       rather than wherever the table happens to keep them. */
+    .panel tbody tr {
+      display: flex; flex-direction: column;
+      padding: 9px 11px;
+      border-bottom: 1px solid var(--line);
     }
-    /* The summary is prose and wraps badly beside everything else. */
-    .feed { max-height: 56vh; }
+    /* The cell with no heading is the one holding this row's buttons. */
+    .panel tbody td:not([data-l]) { order: 2; margin-top: 4px; }
+    .panel tbody td:not([data-l]):empty { display: none; }
+    .panel tbody tr:last-child { border-bottom: none; }
+    .panel tbody td {
+      border: none; padding: 1px 0;
+      display: flex; gap: 8px; align-items: baseline;
+      word-break: break-word;
+    }
+    .panel tbody td::before {
+      content: attr(data-l);
+      flex: 0 0 7.5em; min-width: 0;
+      color: var(--dim); font-size: 10.5px; text-transform: uppercase;
+      letter-spacing: .5px; line-height: 1.7;
+    }
+    /* The first cell names the row, so it is the card's heading rather than
+       another labelled line. */
+    .panel tbody td:first-child {
+      font-weight: 600; font-size: 15px; padding-bottom: 3px;
+    }
+    .panel tbody td:first-child::before { display: none; }
+    /* A cell with nothing in it is not worth a line of its own. */
+    .panel tbody td:empty { display: none; }
+    .panel tbody td.num { text-align: left; }
+    /* The sideways-scroll leftovers: no sticky column, since there is no
+       longer anything to scroll past. */
+    table th:first-child, table td:first-child { position: static; box-shadow: none; }
+
     /* Installed on a phone this is the whole app, so it gets the whole
-       width, keeps clear of the notch, and gives taps something to hit. */
+       width and keeps clear of the notch. */
     body { padding: 0 10px env(safe-area-inset-bottom) 10px; }
     header { padding-top: env(safe-area-inset-top); flex-wrap: wrap; gap: 6px; }
     #sessionSel { max-width: 48vw; }
     .composer { position: sticky; bottom: 0; background: var(--panel);
                 padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
-    .composer button, header button { min-height: 38px; }
+    /* Thumb-sized, not finger-wide. 38px tall buttons with full-size text
+       were taking two rows of the header for themselves; 32px is still a
+       comfortable target and leaves the screen for the fleet. */
+    .composer button, header button, .pair button { min-height: 32px; padding: 5px 9px; }
+    button.tiny { font-size: 11.5px; padding: 4px 7px; }
+    header { gap: 5px 7px; padding: 6px 10px; }
+    nav { padding: 8px 10px 0; gap: 1px; }
+    nav button { padding: 5px 9px; }
+    main { padding: 8px 10px 32px; }
+    /* Eight tiles at 96px each took three rows and most of the screen
+       before anything you came to read. Four across, smaller. */
+    .stats { padding: 8px 10px 0; gap: 6px; display: grid;
+             grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .tile { padding: 5px 7px; min-width: 0; border-radius: 7px; }
+    .tile .n { font-size: 15px; }
+    .tile .k { font-size: 9px; letter-spacing: .3px; }
+    /* The header is a title bar, not a toolbar: small type, one gap. */
+    header { font-size: 13px; }
+    header #hubInfo { font-size: 11px; }
+    nav { font-size: 13px; }
     .feed { max-height: 60vh; }
   }
   .mic.on { color: var(--bad); }
@@ -726,6 +794,10 @@
       <span class="badge" id="tState">connecting</span>
       <span class="tiny muted" id="tSize"></span>
       <span class="spacer"></span>
+      <button class="tiny mic" id="termMic" hidden onclick="termDictate()"
+              title="Say it instead of typing it: the words are typed into this terminal">🎤</button>
+      <button class="tiny" id="termSay" hidden onclick="termSpeak()"
+              title="Read this screen aloud (or whatever is selected)">🔊</button>
       <button class="tiny" onclick="termKeys()" title="Send a key a phone has no room for">keys</button>
       <button class="tiny" onclick="closeTerm()" title="Detach (the agent keeps working)">detach</button>
     </div>
@@ -1036,7 +1108,7 @@ function th(label, key, cls) {
 
 // Renaming a seat, in the table where you are looking at it.
 //
-// A seat is named before anyone knows what it will do -- `Claude-zeiss-3`
+// A seat is named before anyone knows what it will do -- `Claude-machine-c-3`
 // says where it runs and nothing about the work -- so the name has to be
 // changeable from the place you read it, not only from a terminal.
 async function renameAgent(slot, current) {
@@ -1385,6 +1457,7 @@ function render() {
            knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
            fleet: viewFleet })[tab](d, now);
     if (tab === "graph") wireMaps();
+    labelCells($("view"));
   }
 
   if (keep.name !== null && $("pairName")) {
@@ -1403,6 +1476,25 @@ function render() {
   if (tab === "messages") {
     const f = document.querySelector(".feed");
     if (f && f.dataset.stick !== "0") f.scrollTop = f.scrollHeight;
+  }
+}
+
+/// Give every table cell the name of its own column.
+///
+/// This is what lets a phone stack a row into a card: the stylesheet writes
+/// `data-l` in front of each cell, and a heading hidden above the table is no
+/// use to a cell shown on a line of its own. Done here, once, after a render,
+/// rather than in each of the nine places that build a table -- none of which
+/// should have to know what a narrow screen does with it.
+function labelCells(root) {
+  for (const t of (root || document).querySelectorAll("table")) {
+    const heads = [...t.querySelectorAll("thead th")].map((h) => h.textContent.trim());
+    if (!heads.length) continue;
+    for (const tr of t.querySelectorAll("tbody tr")) {
+      [...tr.children].forEach((td, i) => {
+        if (heads[i]) td.setAttribute("data-l", heads[i]);
+      });
+    }
   }
 }
 
@@ -1482,7 +1574,13 @@ function viewAgents(d, now) {
                    ? " \u2014 the adopted pane its CLI is sitting in" : ""}"
                  onclick="openTerm('${esc(a.attach_agent_id || a.agent_id)}','${
                    esc(a.name).replace(/'/g, "\\'")}')"
-                 >terminal</button>` : ""}</td>
+                 >terminal</button>` : ""}
+            ${dead && a.kind !== "external"
+            ? `<button class="tiny" title="Start a process for this seat: it keeps its
+                 name, its history and whatever is waiting for it"
+                 onclick="startSeat('${esc(a.slot_id)}','${
+                   esc(a.name).replace(/'/g, "\\'")}')"
+                 >start</button>` : ""}</td>
         <td><span class="mono">${esc(a.host)}</span>
             ${dead ? ` <span class="badge" title="agent process state">${esc(a.status)}</span>` : ""}
             ${between ? ` <span class="badge info" title="between turns — this CLI takes its
@@ -1510,6 +1608,27 @@ function viewAgents(d, now) {
 // session it belongs to -- because a fleet is several conversations at once
 // and reading them one session at a time loses the thing you actually want
 // to see, which is what happened when.
+/// Put an agent in a seat that has none.
+///
+/// A seat outlives its process, so an empty one is the normal way a team
+/// waits: the conversation, the name, the role and anything queued for it are
+/// all still there. Starting it was possible from the CLI and the console and
+/// not from here, which made the dashboard the one place you could see an
+/// empty seat and not fill it.
+async function startSeat(slot, name) {
+  // Interactive, because a seat started by hand is one somebody means to
+  // watch or type at; the fleet's own launches say headless for themselves.
+  try {
+    const r = await post(`/v1/slots/${encodeURIComponent(slot)}/spawn`,
+                         { mode: "interactive" });
+    if (r && r.error) throw new Error(r.error);
+    note(`${name} is starting on ${r.node || "its machine"} (${r.mode || "interactive"}).`);
+  } catch (e) {
+    note(e.message || "could not start that");
+  }
+  tick();
+}
+
 // Retiring seats nobody is in. Deliberately a button: the hub must not
 // guess which dead seat was a restart and which is a conversation that
 // might still come back.
@@ -1551,7 +1670,7 @@ function paintComposer(d) {
       <input id="sendText" type="text" placeholder="message the team as the operator"
              onkeydown="if(event.key==='Enter')sendOperatorMessage()">
       ${(canHear() || fleetHas("transcribe")) ? `<button id="micBtn" class="mic"
-              onclick="dictate()" title="dictate">\u{1F3A4}</button>` : ""}
+              onclick="dictate()" title="dictate">🎤</button>` : ""}
       <button onclick="sendOperatorMessage()">send</button>
       ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
               title="read new messages aloud">${speaking ? "\u{1F50A}" : "\u{1F507}"}</button>` : ""}
@@ -1591,6 +1710,11 @@ function openTerm(agent, name) {
   term = new NexTerm($("termHost"));
   term.fit();
   $("tSize").textContent = `${term.cols}\u00d7${term.rows}`;
+  // Speaking and listening, if there is anything to speak or listen with.
+  const mic = $("termMic"), spk = $("termSay");
+  if (mic) mic.hidden = !(canHear() || fleetHas("transcribe"));
+  if (spk) spk.hidden = !(canSpeak() || fleetHas("tts"));
+  wireTermGestures();
 
   // A websocket cannot carry an Authorization header, so a token signs in
   // through the subprotocol instead -- a header, not a query string, which
@@ -1684,6 +1808,90 @@ function termSend(i) {
   if (term) term.focus();
 }
 
+// ------------------------------------------------- a terminal that listens ----
+// An attached terminal is a place you type, so it is a place you should be
+// able to speak: on a phone it is the only comfortable way to put a sentence
+// into an agent's prompt. The words are TYPED, not sent -- Enter stays
+// yours, because dictation that submits is dictation you cannot correct.
+function termDictate() {
+  if (!term || termRO) { note("This terminal is view-only."); return; }
+  if (!(fleetHas("transcribe") && navigator.mediaDevices && window.MediaRecorder)) {
+    // The browser's own recogniser, where there is one.
+    if (!SR) { note("No speech recognition here, and the fleet offers none."); return; }
+    if (recog) { recog.stop(); return; }
+    recog = new SR();
+    recog.lang = navigator.language || "en-GB";
+    recog.interimResults = false;
+    recog.onresult = (e) => {
+      let said = "";
+      for (const r of e.results) said += r[0].transcript;
+      if (said && term) term.send(said);
+    };
+    recog.onerror = (e) => note("Could not hear: " + (e.error || "unknown"));
+    recog.onend = () => { recog = null; const b = $("termMic"); if (b) b.classList.remove("on"); };
+    const b = $("termMic");
+    if (b) b.classList.add("on");
+    recog.start();
+    return;
+  }
+  dictateViaFleet((text) => {
+    if (text && term) { term.send(text); term.focus(); }
+  }, $("termMic"));
+}
+
+// Read the terminal aloud: whatever is selected, or the whole screen when
+// nothing is. The same voice the chat uses -- the fleet's if it has one.
+function termSpeak() {
+  if (!term) return;
+  const picked = String(window.getSelection ? window.getSelection() : "").trim();
+  say(picked || termText());
+}
+
+/// The screen as words: rows as the terminal drew them, trailing blanks and
+/// empty lines dropped, because a reader does not want fifty "blank" pauses.
+function termText() {
+  const host = $("termHost");
+  if (!host) return "";
+  return [...host.querySelectorAll(".ntrow")]
+    .map((r) => r.textContent.replace(/\s+$/, ""))
+    .filter((l) => l.length)
+    .join(". ");
+}
+
+/// Right-click, or press and hold, a line of the terminal to hear it. The
+/// same gesture the chat uses for a message, for the same reason: on a phone
+/// there is no right button and no hover.
+function wireTermGestures() {
+  const host = $("termHost");
+  if (!host || host.dataset.voice === "1") return;
+  host.dataset.voice = "1";
+  const speakAt = (target) => {
+    const row = target && target.closest ? target.closest(".ntrow") : null;
+    const picked = String(window.getSelection ? window.getSelection() : "").trim();
+    const text = picked || (row ? row.textContent.replace(/\s+$/, "") : "");
+    if (text) say(text);
+  };
+  host.addEventListener("contextmenu", (e) => {
+    if (!(canSpeak() || fleetHas("tts"))) return;
+    e.preventDefault();
+    speakAt(e.target);
+  });
+  let held = null;
+  host.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse") return;
+    const target = e.target;
+    held = setTimeout(() => {
+      held = null;
+      if (!(canSpeak() || fleetHas("tts"))) return;
+      if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e2) {} }
+      speakAt(target);
+    }, 500);
+  });
+  for (const ev of ["pointerup", "pointercancel", "pointermove", "pointerleave"]) {
+    host.addEventListener(ev, () => { if (held) { clearTimeout(held); held = null; } });
+  }
+}
+
 function termKeys() {
   // On a desktop the bar is hidden by CSS; this makes it appear anyway for
   // anyone who wants to send a control key without a modifier.
@@ -1702,7 +1910,14 @@ function applyTheme(t) {
   else document.documentElement.dataset.theme = t;
   try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.content = t === "lcars" ? "#000000" : "#0b0f14";
+  // The browser chrome and the PWA status bar follow the choice; a light
+  // dashboard under a near-black title bar looks like a bug in the browser.
+  const light = t === "light"
+    || (t === "auto" && window.matchMedia
+        && window.matchMedia("(prefers-color-scheme: light)").matches);
+  if (meta) meta.content = t === "lcars" ? "#000000" : (light ? "#f6f8fa" : "#0b0f14");
+  document.documentElement.style.colorScheme =
+    t === "auto" ? "light dark" : (light ? "light" : "dark");
   const sel = $("themeSel");
   if (sel) sel.value = t;
 }
@@ -1721,6 +1936,8 @@ let chatOpen = false;
 let chatChan = "*";          // a session NAME, or "*" for every channel
 let chatPrevScope = null;    // the dashboard's own scope, restored on close
 let chatStick = true;        // follow the tail unless the reader scrolled up
+let chatHtml = "";           // what the room last drew, so a poll that changes
+                             // nothing does not touch the DOM or the scroll
 let chatHist = {};           // channel -> older messages, fetched once
 const SEEN_KEY = "nexmesh.chat.seen";
 let chatSeen = {};
@@ -1879,10 +2096,26 @@ function renderChat(d) {
         >&lt;${esc(m.from)}&gt;</span> ${to}${renderBody(m.body)}${tally}</span>
     </div>`;
   }).join("");
+  // Keep the reader's place. The room is rebuilt from the snapshot on every
+  // poll, and writing innerHTML drops the scroll position -- so reading
+  // anything but the last screenful lasted until the next second ticked.
+  // Two parts to not doing that: nothing is written at all unless the room
+  // actually changed, and when it does change it is the distance from the
+  // BOTTOM that is restored, because new lines arrive at the bottom and
+  // that is what keeps the line you were on under your eyes.
   const feed = $("chatFeed");
-  feed.innerHTML = rows || `<div class="empty">Nothing said in here yet.</div>`;
-  if (chatStick) feed.scrollTop = feed.scrollHeight;
-  wireChatGestures();
+  const html = rows || `<div class="empty">Nothing said in here yet.</div>`;
+  if (chatHtml !== html) {
+    const fromBottom = feed.scrollHeight - feed.scrollTop;
+    chatHtml = html;
+    feed.innerHTML = html;
+    feed.scrollTop = chatStick
+      ? feed.scrollHeight
+      : Math.max(0, feed.scrollHeight - fromBottom);
+    wireChatGestures();
+  } else if (chatStick) {
+    feed.scrollTop = feed.scrollHeight;
+  }
 
   // Who is in the room. A channel shows its seats; #all shows every seat
   // with the channel it belongs to, which is the closest thing a fleet has
@@ -1930,7 +2163,7 @@ function renderChat(d) {
       ${(canHear() || fleetHas("transcribe")) ? `<button id="chatMic" class="mic"
               onclick="chatVoice()" title="send a voice message (${fleetHas("transcribe")
                 ? "transcribed on the fleet" : "transcribed in this browser"})"
-              >\u{1F3A4}</button>` : ""}
+              >🎤</button>` : ""}
       <button onclick="chatSend()">send</button>
       ${(canSpeak() || fleetHas("tts")) ? `<button onclick="toggleSpeak()"
               title="read new messages in this channel aloud (${fleetHas("tts")
@@ -2109,6 +2342,9 @@ function wireChatGestures() {
       press.el.classList.add("held");
       // A long press that opens a menu should feel like one.
       if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e2) {} }
+      // With the speaker on, holding a message reads it: that is what the
+      // speaker being on means, and the menu is still there to reply from.
+      if (speaking) sayMessage(press.el);
       openMsgSheet(press.el, press.x, press.y);
     }, 480);
   });
@@ -2147,8 +2383,17 @@ function wireChatGestures() {
     const el = e.target.closest(".chatline");
     if (!el) return;
     e.preventDefault();
+    if (speaking) sayMessage(el);
     openMsgSheet(el, e.clientX, e.clientY);
   });
+}
+
+/// Read one message aloud, from the line in the room.
+function sayMessage(el) {
+  const d = el && lineData ? lineData(el) : null;
+  if (!d) return;
+  if (!(canSpeak() || fleetHas("tts"))) return;
+  say(`${d.from} says: ${d.body}`);
 }
 
 function endPress(reset) {
@@ -2367,9 +2612,21 @@ function canSpeak() { return "speechSynthesis" in window; }
 // Does the fleet itself offer this? Preferred over the browser's own: it
 // works where the browser has no speech API at all, and the audio stays on
 // machines you own rather than going to whoever the browser asks.
+/// Whether anything on the fleet offers a capability -- which is what
+/// decides whether the microphone and the loudspeaker are on screen at all.
+///
+/// The seat's own capability list, which is what `ask_capability` routes on.
+/// This used to search the seat's SUMMARY for the word, so a bridge that had
+/// not got round to setting one, or had set a different sentence, hid the
+/// microphone on every phone with no way to tell why.
 function fleetHas(cap) {
   const agents = (snap && snap.detail && snap.detail.agents) || [];
-  return agents.some((a) => (a.summary || "").includes(cap));
+  return agents.some((a) => {
+    if (Array.isArray(a.capabilities)
+        && a.capabilities.some((c) => String(c).toLowerCase() === cap)) return true;
+    // An older hub does not send the list; its summary is all there is.
+    return !a.capabilities && (a.summary || "").includes(cap);
+  });
 }
 
 // Run one of the fleet's capabilities and wait for the answer.
@@ -2393,8 +2650,11 @@ async function askFleet(capability, request, waitMs) {
 // the box. Phones are where this matters: typing a sentence to a team
 // one-handed is the thing people do not do.
 let recorder = null;
-async function dictateViaFleet() {
-  const btn = micButton();
+/// `deliver` says where the words go: the composer by default, the attached
+/// terminal when dictating at an agent. The recording half is the same either
+/// way, which is why it takes a callback rather than existing twice.
+async function dictateViaFleet(deliver, btnEl) {
+  const btn = btnEl || micButton();
   if (recorder) { recorder.stop(); return; }
   let stream;
   try {
@@ -2421,10 +2681,15 @@ async function dictateViaFleet() {
         fr.readAsDataURL(blob);
       });
       const out = await askFleet("transcribe", { audio_base64: b64, language: navigator.language });
-      const text = (() => { try { const j = JSON.parse(out); return j.text || out; }
-                           catch (e) { return out; } })();
-      const box = msgBox();
-      box.value = (box.value ? box.value + " " : "") + String(text).trim();
+      const text = spokenText(out) || (() => {
+        try { const j = JSON.parse(out); return j.text || out; } catch (e) { return out; }
+      })();
+      if (deliver) {
+        deliver(String(text).trim());
+      } else {
+        const box = msgBox();
+        box.value = (box.value ? box.value + " " : "") + String(text).trim();
+      }
       note("");
       $("notice").hidden = true;
     } catch (e) {

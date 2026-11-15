@@ -15,6 +15,7 @@ mod runcmd;
 mod seatcmd;
 mod tlstrust;
 mod tui;
+mod voice;
 mod wire;
 mod windowtitle;
 
@@ -24,7 +25,46 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "nexmesh", version, about = "nexmesh fleet control")]
+#[command(
+    name = "nexmesh",
+    version,
+    about = "nexmesh fleet control \u{2014} agent CLIs as one team, across machines",
+    // clap sorts subcommands alphabetically, which puts `budget` above
+    // `health` and tells a newcomer nothing. The grouped list below is the
+    // same commands in the order somebody actually meets them.
+    after_help = "\
+COMMANDS, BY WHAT YOU ARE DOING
+
+  looking        health  nodes  sessions  status  log  transcript  certs
+  teams          new-session  rename-session  remove-session  budget
+                 add-workspace  sync
+  seats          add-agent  spawn  run  move-agent  rename-agent  set-role
+                 remove-agent  release  pause  resume
+  terminals      attach  seat  adopt
+  talking        send
+  setup          pair  install-seat  install-orchestrator  revoke
+
+EXAMPLES
+
+  nexmesh                                  the operator console: the whole fleet,
+                                           one screen, j/k and Enter
+  nexmesh run claude                       start a CLI here, on a terminal the
+                                           fleet owns, attachable at once
+  nexmesh install-seat --cli claude --role engineer
+                                           make the CLI you already use a member
+                                           of the team
+  nexmesh sessions                         which teams exist
+  nexmesh status payments                  who is in one, and what they are doing
+  nexmesh attach payments Dev              that agent's real terminal, from here
+  nexmesh send payments 'staging is back'  say something to the team
+  nexmesh log payments                     what they said to each other
+
+Every command takes --hub, and --token where the hub wants one; `nexmesh pair`
+writes both into ~/.nexmesh so you do not have to pass them again.
+
+  nexmesh help <command>                   the long version, with examples
+  man nexmesh                              every argument, at the terminal"
+)]
 struct Args {
     #[arg(long, global = true, env = "NEXMESH_HUB_HTTP", default_value = "http://127.0.0.1:7870")]
     hub: String,
@@ -51,16 +91,34 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh health                     # is the hub up, and which version
+  nexmesh --hub https://hub.example.net health")]
     /// Hub health and version.
     Health,
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh nodes                      # which machines are connected
+  nexmesh nodes | grep claude        # and which of them can run claude
+
+A machine with no CLIs listed has a node running but nothing installed for
+it to launch.")]
     /// Nodes, their CLIs and whether they are connected.
     Nodes,
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh sessions                   # every team, with its seat count
+
+SEATS counts teammates; TERMINALS counts adopted panes, which are screens
+rather than team members.")]
     /// List sessions.
     Sessions,
-    /// Move a seat -- and whoever is sitting in it -- to another session.
+    /// Move a seat, and whoever is in it, to another session. 
+    ///
     /// No restart: the agent's next tool call lands in the new session. Its
-    /// workspace, file locks and ownership zones are released, since all
-    /// three describe the session being left.
+    /// workspace, file locks and ownership zones are released, since all three
+    /// describe the session being left.
     #[command(after_help = "\
 EXAMPLE
   nexmesh status payments            # find the seat in the SEAT column
@@ -77,7 +135,8 @@ starts in.")]
         #[arg(value_name = "SESSION")]
         session: String,
     },
-    /// Remove a seat from a session, with whatever history belongs to it.
+    /// Remove a seat from a session, with whatever history belongs to it. 
+    ///
     /// Refuses while someone is sitting in it unless --force.
     #[command(after_help = "\
 EXAMPLE
@@ -92,12 +151,13 @@ EXAMPLE
         #[arg(long)]
         force: bool,
     },
-    /// Rename an agent. The name is how every command, message and log line
-    /// addresses it
+    /// Rename an agent. 
+    ///
+    /// The name is how every command, message and log line addresses it
     #[command(after_help = "\
 EXAMPLES
   nexmesh rename-agent sl-1a2b3c4d Reviewer
-  nexmesh rename-agent Claude-zeiss-3 Reviewer --session payments
+  nexmesh rename-agent Claude-machine-c-3 Reviewer --session payments
 
 A seat id works on its own. A NAME only means something inside a session,
 so it needs --session. A name already used in that session is refused.")]
@@ -112,16 +172,24 @@ so it needs --session. A name already used in that session is refused.")]
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
-    /// Change what a seat is for. The role decides who gets asked for what,
-    /// and who may approve whose work
+    /// Change what a seat is for.
+    ///
+    /// The role decides who gets asked for what, and who may approve whose
+    /// work.
     #[command(after_help = "\
 EXAMPLES
   nexmesh set-role payments Reviewer reviewer
   nexmesh set-role sl-1a2b3c4d architect --description \"you decide the shape\"
 
-A role is not decoration: list_peers and the capability router use it to
-decide who to ask, and the review state machine uses it to decide who may
-approve.")]
+A role is a free-form string, and there is no fixed list. It is an ADDRESS --
+--to reviewer reaches whoever holds that role -- it goes into the agent's
+first prompt, and one family changes behaviour: a role containing review, qa
+or test approves its own work, because nobody reviews the reviewer. Everyone
+else waits for a reviewer.
+
+Common ones, by convention only: architect, engineer, code reviewer, qa,
+analyst, archivist, doc writer. What a seat CAN DO (ocr, tts, strong, vision)
+is a capability, which is a separate list and what ask_capability routes on.")]
     SetRole {
         /// Session the seat is in — or a bare seat id (sl-1a2b3c4d).
         #[arg(value_name = "SESSION|SEAT")]
@@ -136,12 +204,27 @@ approve.")]
         #[arg(long)]
         description: Option<String>,
     },
-    /// Rename a session. The name is what you read on the dashboard and in
-    /// every message, so it should be allowed to change.
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh rename-session se-1a2b3c4d payments
+  nexmesh rename-session old-name payments
+
+Nothing else changes: the same seats, the same agents, the same history.")]
+    /// Rename a session. 
+    ///
+    /// The name is what you read on the dashboard and in every message, so it
+    /// should be allowed to change.
     RenameSession {
         session: String,
         name: String,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh new-session payments
+  nexmesh new-session payments --node machine-a --path /srv/app --workspace app
+
+The workspace is how an attached CLI finds the team it belongs to: a
+conversation started in that directory joins this session by default.")]
     /// Create a session, optionally with a workspace on one node.
     NewSession {
         name: String,
@@ -164,14 +247,31 @@ approve.")]
         #[arg(long)]
         token_budget: Option<i64>,
     },
-    /// Set, raise or clear a session's token budget. Changing it re-arms the
-    /// guard, so a session paused on budget can be given more and resumed.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh budget payments 2000000        # two million tokens, then it pauses
+  nexmesh budget payments --clear        # no limit
+
+Changing it re-arms the guard, so a team paused on budget can be given more
+and carry on.")]
+    /// Set, raise or clear a session's token budget. 
+    ///
+    /// Changing it re-arms the guard, so a session paused on budget can be
+    /// given more and resumed.
     Budget {
         session: String,
         /// New ceiling in total tokens. Omit to remove the ceiling.
         #[arg(long)]
         tokens: Option<i64>,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh add-agent payments --name Reviewer --role reviewer --cli opencode
+  nexmesh add-agent payments --name Dev --cli claude --node machine-a \
+      --task 'build the login flow' --owns 'src/auth/**'
+
+This makes the SEAT. `nexmesh spawn` starts a process in it -- or pass
+--spawn to do both.")]
     /// Add a slot to a session.
     AddAgent {
         session: String,
@@ -236,8 +336,9 @@ from then on.")]
         #[arg(long, value_name = "MODE")]
         mode: Option<String>,
     },
-    /// Adopt an already-running tmux session so you can watch and drive it
-    /// from anywhere. Your own terminal stays attached.
+    /// Adopt a running tmux session, so it can be driven from anywhere. 
+    ///
+    /// Your own terminal stays attached.
     #[command(after_help = "\
 EXAMPLE
   tmux new -s mywork                 # start your CLI inside it
@@ -262,6 +363,13 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         workspace: Option<String>,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh seat payments Dev              # a tmux pane, with Dev's conversation in it
+  nexmesh seat payments Dev --no-attach  # make it, leave it running, do not attach
+
+For a seat whose CLI you started by hand: it gives that conversation a
+keyboard the fleet owns, so it can be attached to from anywhere.")]
     /// Give one of your own conversations a keyboard: a tmux pane, adopted,
     /// with that conversation resumed inside it.
     ///
@@ -291,8 +399,15 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         dry_run: bool,
     },
-    /// Remove a session and everything that belonged to it. Refuses while
-    /// anybody is still sitting in it.
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh remove-session payments
+
+Refuses while anybody is still sitting in it. Release or remove the seats
+first:  nexmesh status payments")]
+    /// Remove a session and everything that belonged to it. 
+    ///
+    /// Refuses while anybody is still sitting in it.
     RemoveSession {
         #[arg(value_name = "SESSION")]
         session: String,
@@ -300,6 +415,13 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         force: bool,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh status payments                # every seat, what it is doing
+  nexmesh status payments --watch        # the same, refreshed
+
+STATE is the work; AGENT is the process behind the seat. `waiting` means a
+CLI that takes its seat once per turn and is due back -- not a problem.")]
     /// Live status of every agent in a session.
     Status {
         session: String,
@@ -308,8 +430,20 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         terminals: bool,
     },
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh certs                      # what the fleet CA has issued, and to whom
+
+A certificate listed as revoked stops working at the TLS handshake, not at
+the API.")]
     /// List the certificates the fleet CA has issued.
     Certs,
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh revoke machine-d
+
+Takes effect at the handshake: its certificate stops working, its token is
+revoked, and any connection it is holding is closed.")]
     /// Revoke a machine or operator: its certificate stops working at the TLS
     /// handshake, its token is revoked, and any connection it holds is closed.
     Revoke {
@@ -317,8 +451,16 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Stop sending work to an agent, or to the whole team. Reversible; a
-    /// turn already running finishes.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh pause payments                     # the whole team
+  nexmesh pause payments --who Dev --reason 'waiting on the API key'
+
+A turn already running finishes. This means \"take on nothing further\", not
+\"stop this instant\".")]
+    /// Stop sending work to an agent, or to the whole team. 
+    ///
+    /// Reversible; a turn already running finishes.
     Pause {
         session: String,
         /// Agent name or role; omitted means everyone.
@@ -326,14 +468,27 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         reason: Option<String>,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh resume payments
+  nexmesh resume payments --who Dev
+
+Anything queued while they were paused is delivered.")]
     /// Start sending work again.
     Resume {
         session: String,
         /// Agent name or role; omitted means everyone.
         who: Option<String>,
     },
-    /// Accept an agent's work and let it stop. Omit the name to release the
-    /// whole team.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh release payments Dev       # accept Dev's work; it may stop
+  nexmesh release payments           # the whole team
+
+A released agent does not need to wait for review any more.")]
+    /// Accept an agent's work and let it stop. 
+    ///
+    /// Omit the name to release the whole team.
     Release {
         session: String,
         who: Option<String>,
@@ -343,6 +498,13 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long, default_value_t = 15000)]
         grace_ms: u64,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh sync payments app --status     # who holds what, and whether it matches
+  nexmesh sync payments app --publish machine-a
+  nexmesh sync payments app --pull machine-b
+
+For a workspace several machines hold a copy of.")]
     /// Publish, pull or report on a shared workspace, on every machine at once.
     Sync {
         session: String,
@@ -353,6 +515,13 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long)]
         workspace: Option<String>,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh log payments               # what the agents said to each other
+  nexmesh log payments --limit 200
+
+A line marked ! has not reached its recipient yet; ~ is a delivery in
+flight. For one agent's own output, use `nexmesh transcript`.")]
     /// Read the conversation between the agents.
     Log {
         session: String,
@@ -363,6 +532,13 @@ Your own terminal stays attached; others can watch and type too.")]
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh transcript payments Dev        # what that process actually printed
+  nexmesh transcript payments Dev --tail 200
+
+The conversation between agents is `nexmesh log`; this is one agent's own
+output, as its terminal saw it.")]
     /// Read what one agent's process actually printed.
     Transcript {
         session: String,
@@ -400,7 +576,7 @@ read or write it. This makes the terminal on the other side of the fence.")]
         /// Join this session instead of the one that owns this directory.
         #[arg(long)]
         session: Option<String>,
-        /// Name the seat. Default: the CLI and this machine, like Claude-sissy.
+        /// Name the seat. Default: the CLI and this machine, like Claude-machine-b.
         #[arg(long)]
         name: Option<String>,
         /// The machine to start it on. Default: this one.
@@ -442,7 +618,15 @@ ordinary terminal has none, so `spawn` or `adopt` it first.")]
         #[arg(long, default_value_t = 16384)]
         replay: usize,
     },
-    /// Join a fleet as an operator, using a one-time code from the dashboard.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh pair 7Q2K-9FXD                 # the code from the dashboard
+  nexmesh pair 7Q2K-9FXD --hub https://hub.example.net
+
+Your key is generated here and never leaves this machine. What arrives is a
+certificate and the fleet's CA, written to ~/.nexmesh.")]
+    /// Join a fleet as an operator, using a one-time code from the dashboard. 
+    ///
     /// Your key is generated here and never leaves this machine.
     Pair {
         /// The hub's pairing address, e.g. https://machine-a:7871
@@ -459,6 +643,13 @@ ordinary terminal has none, so `spawn` or `adopt` it first.")]
         #[arg(long)]
         insecure: bool,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh install-orchestrator --cli claude --token <operator-token>
+  nexmesh install-orchestrator --cli opencode --dry-run
+
+Gives that CLI the tools to drive the fleet: create teams, add agents, move
+them about. Scope the token with --session to limit it to one team.")]
     /// Register the orchestrator as an MCP server in one of your agent CLIs,
     /// so you can spin up teams from whatever session you are in.
     InstallOrchestrator {
@@ -478,8 +669,15 @@ ordinary terminal has none, so `spawn` or `adopt` it first.")]
         #[arg(long)]
         dry_run: bool,
     },
-    /// Mount a workspace into a session that already exists. The directory is
-    /// how an attached CLI finds the session it belongs to.
+    #[command(after_help = "\
+EXAMPLE
+  nexmesh add-workspace payments app --node machine-a --path /srv/app
+
+The directory is how an attached CLI finds the session it belongs to, so a
+conversation started in /srv/app joins `payments` by default.")]
+    /// Mount a workspace into a session that already exists. 
+    ///
+    /// The directory is how an attached CLI finds the session it belongs to.
     AddWorkspace {
         /// Session id or name.
         session: String,
@@ -498,6 +696,13 @@ ordinary terminal has none, so `spawn` or `adopt` it first.")]
         #[arg(long)]
         repo: Option<String>,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh install-seat --cli claude --role engineer
+  nexmesh install-seat --cli codex --seat-name Dev --dry-run
+
+Every conversation you start in that CLI then takes its own seat, keyed on
+the CLI's own conversation id -- so it survives a restart or a /resume.")]
     /// Make one of your own agent CLIs a member of a team: every conversation
     /// you start in it takes a seat, wherever you are running it.
     InstallSeat {
@@ -527,6 +732,13 @@ ordinary terminal has none, so `spawn` or `adopt` it first.")]
         #[arg(long)]
         dry_run: bool,
     },
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh send payments 'the staging database is back'
+  nexmesh send payments --to Dev 'rebase onto main first'
+
+You appear as the operator. Agents answer by addressing 'operator', and the
+same chat is what the dashboard and the console show.")]
     /// Send a message to the team or one agent, as the operator.
     Send {
         session: String,
@@ -715,6 +927,14 @@ impl Drop for RawGuard {
 /// Ctrl-] detaches, the way telnet does. Ctrl-C cannot: in raw mode it belongs
 /// to the agent, which is the whole point of a takeover.
 const DETACH_BYTE: u8 = 0x1d;
+/// Ctrl-^ : say it instead of typing it. The words are TYPED into the agent's
+/// prompt, never submitted -- Enter stays the operator's, because dictation
+/// that presses it for you is dictation you cannot correct.
+const DICTATE_BYTE: u8 = 0x1e;
+/// Ctrl-_ : read back what is on the screen. Both are rare enough in a TUI to
+/// spend, and the alternative -- a prefix key -- would have made Ctrl-] a
+/// two-step detach for everybody.
+const SPEAK_BYTE: u8 = 0x1f;
 
 /// A keyboard this viewer can WALK AWAY FROM.
 ///
@@ -959,6 +1179,14 @@ async fn attach(
     };
     // Said out loud, because "why is this slow" should be answerable by
     // looking at the screen.
+    if voice::detect().can_hear() {
+        if let Some(b) = &mut bar {
+            b.text = b.text.replace(
+                "  \u{00b7}  Ctrl-] detach",
+                "  \u{00b7}  Ctrl-^ say it  \u{00b7}  Ctrl-] detach",
+            );
+        }
+    }
     if wire.direct {
         if let Some(b) = &mut bar {
             b.text = b.text.replace("  \u{00b7}  Ctrl-] detach", "  \u{00b7}  direct  \u{00b7}  Ctrl-] detach");
@@ -991,9 +1219,14 @@ async fn attach(
 
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
 
+    // What the agent has put on the screen lately, in words. Shared with the
+    // key loop, which is where Ctrl-_ asks for it to be read out.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
     // The agent's terminal -> ours, whichever way the bytes came.
     let reader = {
         let quit_tx = quit_tx.clone();
+        let heard = heard.clone();
         let mut rx = std::mem::replace(&mut wire.rx, tokio::sync::mpsc::channel(1).1);
         tokio::spawn(async move {
             let mut out = tokio::io::stdout();
@@ -1005,6 +1238,22 @@ async fn attach(
                 match msg {
                     wire::In::Data(data) => {
                         let data = strip.pass(&data);
+                        // A copy of what went past, as words, so Ctrl-_ can
+                        // read it back. Capped: this is for the last thing
+                        // said, not for the session.
+                        if let Ok(mut seen) = heard.lock() {
+                            seen.push_str(&voice::plain(&data));
+                            seen.push(' ');
+                            if seen.len() > 8192 {
+                                let cut = seen.len() - 4096;
+                                let at = seen
+                                    .char_indices()
+                                    .map(|(i, _)| i)
+                                    .find(|i| *i >= cut)
+                                    .unwrap_or(0);
+                                *seen = seen[at..].to_string();
+                            }
+                        }
                         if out.write_all(&data).await.is_err() || out.flush().await.is_err() {
                             break;
                         }
@@ -1052,6 +1301,20 @@ async fn attach(
     // is below noticing and far below costing anything.
     let mut repaint = tokio::time::interval(Duration::from_millis(250));
     repaint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Speaking and listening, if this machine has anything to do it with and
+    // the fleet has a teammate that can. An attached terminal is a place you
+    // type, so it is a place you should be able to talk to -- on a phone or a
+    // tablet it is the only comfortable way to put a sentence in a prompt.
+    let audio = voice::detect();
+    let mut rec: Option<(std::process::Child, std::path::PathBuf)> = None;
+    let (said_tx, mut said_rx) = tokio::sync::mpsc::channel::<Result<String>>(4);
+    let scratch = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nexmesh-voice");
+
     let reason = loop {
         tokio::select! {
             _ = repaint.tick(), if bar.is_some() => {
@@ -1059,6 +1322,30 @@ async fn attach(
                     let mut out = tokio::io::stdout();
                     let _ = out.write_all(&b.paint()).await;
                     let _ = out.flush().await;
+                }
+            }
+            // Words that came back from the fleet, typed into the agent's
+            // prompt. Never submitted: Enter stays the operator's.
+            Some(words) = said_rx.recv() => {
+                match words {
+                    Ok(text) if !text.trim().is_empty() => {
+                        if wire.tx.send(wire::Out::Data(text.into_bytes())).await.is_err() {
+                            break "connection lost".to_string();
+                        }
+                        if let Some(b) = &mut bar {
+                            b.text = b.text.replace("  \u{00b7}  listening", "");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // One line, on the agent's screen, since there is
+                        // nowhere else to put it mid-attach.
+                        let mut out = tokio::io::stdout();
+                        let _ = out
+                            .write_all(format!("\r\n[nexmesh] {}\r\n", format!("{e:#}").lines().next().unwrap_or("that did not work").to_string()).as_bytes())
+                            .await;
+                        let _ = out.flush().await;
+                    }
                 }
             }
             n = keys.read(&mut buf) => {
@@ -1069,6 +1356,77 @@ async fn attach(
                         let _ = wire.tx.send(wire::Out::Data(buf[..pos].to_vec())).await;
                     }
                     break "detached".to_string();
+                }
+                // Dictation: press once to start, again to send what was said
+                // to be transcribed. The key itself is never forwarded.
+                if let Some(pos) = buf[..n].iter().position(|b| *b == DICTATE_BYTE) {
+                    let mut rest = buf[..n].to_vec();
+                    rest.remove(pos);
+                    if !rest.is_empty() {
+                        let _ = wire.tx.send(wire::Out::Data(rest)).await;
+                    }
+                    rec = match rec.take() {
+                        Some((child, path)) => {
+                            match voice::stop(child, &path) {
+                                Ok(bytes) => {
+                                    let (b, cl, tx) = (base.to_string(), c.clone(), said_tx.clone());
+                                    let lang = std::env::var("LANG").ok().and_then(|l| {
+                                        l.split(['.', '_']).next()
+                                            .filter(|s| s.len() == 2).map(|s| s.to_string())
+                                    });
+                                    tokio::spawn(async move {
+                                        let _ = tx
+                                            .send(voice::transcribe(&b, &cl, &bytes, lang.as_deref()).await)
+                                            .await;
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = said_tx.send(Err(e)).await;
+                                }
+                            }
+                            if let Some(bar) = &mut bar {
+                                bar.text = bar.text.replace("  \u{00b7}  listening", "");
+                            }
+                            None
+                        }
+                        None => match voice::start(&audio, &scratch) {
+                            Ok(r) => {
+                                if let Some(bar) = &mut bar {
+                                    bar.text.push_str("  \u{00b7}  listening");
+                                }
+                                Some(r)
+                            }
+                            Err(e) => {
+                                let _ = said_tx.send(Err(e)).await;
+                                None
+                            }
+                        },
+                    };
+                    continue;
+                }
+                // Read the screen back, for when looking at it is not an
+                // option -- which is the whole reason the fleet has a voice.
+                if let Some(pos) = buf[..n].iter().position(|b| *b == SPEAK_BYTE) {
+                    let mut rest = buf[..n].to_vec();
+                    rest.remove(pos);
+                    if !rest.is_empty() {
+                        let _ = wire.tx.send(wire::Out::Data(rest)).await;
+                    }
+                    let text = heard
+                        .lock()
+                        .map(|h| h.chars().rev().take(1200).collect::<Vec<_>>()
+                            .into_iter().rev().collect::<String>())
+                        .unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        let (b, cl, tx, a, dir) =
+                            (base.to_string(), c.clone(), said_tx.clone(), audio.clone(), scratch.clone());
+                        tokio::spawn(async move {
+                            if let Err(e) = voice::speak(&b, &cl, &a, &text, &dir).await {
+                                let _ = tx.send(Err(e)).await;
+                            }
+                        });
+                    }
+                    continue;
                 }
                 if wire.tx.send(wire::Out::Data(buf[..n].to_vec())).await.is_err() {
                     break "connection lost".to_string();

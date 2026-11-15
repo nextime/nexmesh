@@ -20,9 +20,11 @@ of it, and how to watch a fleet without installing anything.
 - [Orchestrators, scoped and super](#orchestrators-scoped-and-super)
 - [Running the fleet from whatever CLI you use](#running-the-fleet-from-whatever-cli-you-use)
 - [The console](#the-console)
+- [Commands in the chat](#commands-in-the-chat)
 - [Watching the team](#watching-the-team)
 - [Getting a message to a working agent](#getting-a-message-to-a-working-agent)
 - [Pausing and releasing](#pausing-and-releasing)
+- [Roles, and the one role that means something](#roles-and-the-one-role-that-means-something)
 - [A team of unequal agents](#a-team-of-unequal-agents)
 
 **[Agents, and what counts as one](#agents-and-what-counts-as-one)**
@@ -107,13 +109,37 @@ does, and the shim reports it:
 
 So two windows on the same project get two seats, and `/resume` returns to
 its own. For a long-lived assistant that publishes no id of its own, pin one:
-set `NEXMESH_CLI_SESSION=hermes-lisa` and every reconnect reclaims that seat
+set `NEXMESH_CLI_SESSION=hermes-machine-d` and every reconnect reclaims that seat
 instead of taking another.
 
-A seat nobody named is named after what it is and where it is — `Claude-sissy`,
-then `Claude-sissy-2` when the same CLI is open twice on one machine. Nothing
+A seat nobody named is named after what it is and where it is — `Claude-machine-b`,
+then `Claude-machine-b-2` when the same CLI is open twice on one machine. Nothing
 is left blank and nothing is named twice, because every command that addresses
 an agent addresses it by name.
+
+#### What `/new` does, and what a closed window leaves behind
+
+Starting a fresh conversation in a CLI that holds a seat — `/new` in Claude
+Code, a new thread in Codex — means a new conversation id, so the hub sees
+somebody it has never met:
+
+- it joins **the same team**: the session pinned when the seat was installed,
+  or the one that owns the directory it was started in;
+- it gets **its own seat**, with its own inbox, task state and summary. The
+  old seat is not taken over while anything is live in it;
+- the seat it gets is a **reused empty one** when the last conversation in
+  that folder, in that CLI, has ended — same team, same machine, same
+  directory, nothing live in it, not released. That is what stops a folder
+  collecting a new `Claude-machine-b-2` every morning;
+- otherwise it is a new seat, named after the CLI and the machine.
+
+The conversation you left does not disappear: its seat stays, marked
+`disconnected` once the process is gone, and `/resume` on that conversation
+comes back to exactly that seat — which is the point of keying on the
+conversation id rather than the directory. Seats nobody is coming back to are
+retired on purpose, never guessed at: `nexmesh status <team>` shows them, the
+dashboard offers "retire N empty seats", and `/remove <name>` in the chat or
+`x` in the console removes one.
 
 #### Making your own CLI a team member
 
@@ -179,7 +205,7 @@ different machines, or in different directories on one machine, do not.
 
 The mount path is in the domain for a reason. Without it, every local
 workspace on a host shared one domain: an agent locking `src/main.rs` under
-`/AI/sentenze` blocked another locking `src/main.rs` under `/storage/coderai`
+`/srv/app` blocked another locking `src/main.rs` under `/storage/coderai`
 — same relative path, different trees — and the denial named an agent in a
 project you were not touching.
 
@@ -231,7 +257,7 @@ Driving a fleet and driving a team are different jobs, and an operator token
 now says which one it is for:
 
 ```bash
-nexmesh-hub operator-token sentenze-lead --session digesta   # one team
+nexmesh-hub operator-token payments-lead --session payments   # one team
 nexmesh-hub operator-token fleet-boss                        # the whole fleet
 ```
 
@@ -359,6 +385,51 @@ how much is in them, with the heaviest dependencies between them and the
 cursor's own edges picked out. Only the big ones are labelled, because every
 label drawn is a label over something else.
 
+In the agents pane the list is sorted by whichever column you ask for — `,`
+and `.` walk the columns, `R` turns the order round — and the arrow in the
+header says which one and which way. The same pane is where seats are
+managed rather than only watched:
+
+| key | what it does |
+|-----|--------------|
+| `a`, Enter | attach to it |
+| `n` | a new seat: which CLI, what to call it, whether to start it |
+| `S` | start a process for a seat that has none |
+| `m` | move it into another session |
+| `e` | rename it |
+| `x` | remove it, seat and history |
+
+Each of those asks before it acts, and each is the same hub endpoint
+`nexmesh move-agent` and friends call — so an action taken here and the same
+action taken from a script are the same action, including every refusal.
+
+The chat pane is a chat: `j`/`k` change channel, `i` starts typing, and while
+you are typing the arrows and `Tab` still work — the composer has a caret you
+can move, `Ctrl-W` eats a word, and `PgUp` reads back through what was said.
+Messages wrap rather than being cut off at the edge of the pane.
+
+A line that starts with `/` is a command rather than something to say; see
+[Commands in the chat](#commands-in-the-chat). `//like this` says a line that
+begins with a slash.
+
+If the machine has a microphone and the fleet has a teammate advertising
+`transcribe`, `v` records until you press it again and puts the words in the
+composer — `Ctrl-V` does the same without leaving it. `V` reads new messages
+aloud through a teammate advertising `tts`. Recording uses whatever is
+installed (`parecord`, `arecord`, `rec`, `ffmpeg`) and playing likewise
+(`paplay`, `aplay`, `play`, `ffplay`, `mpg123`); with neither, the key says so
+instead of doing nothing.
+
+The same two keys work inside an attached terminal, where they matter most on
+a phone or a tablet: `Ctrl-^` records and types the words into the agent's own
+prompt — never submitting them, because Enter stays yours — and `Ctrl-_` reads
+back the last of what the agent printed. In the browser terminal the same two
+are buttons, and holding (or right-clicking) a line of the terminal reads that
+line, or whatever is selected.
+
+In the memory pane, Enter opens the whole of the one under the cursor, because
+a memory is a paragraph and a table column is not where one gets read.
+
 Two themes, remembered in `~/.nexmesh/console.toml` and switched with `t`:
 `deck` is quiet and modern, and `lcars` is black, blocky, capitalised, and
 painted in the trans flag — which is both the point and, as it happens, very
@@ -367,6 +438,30 @@ close to canon LCARS pastels.
 From a script or a pipe there is no console: `nexmesh` prints help and exits
 non-zero. A program that clears your screen because it was called without
 arguments is a program that ends up wrapped in `</dev/null` for ever.
+
+### Commands in the chat
+
+The chat is where an operator already is — in the console, in the dashboard, on
+a phone — so a line beginning with `/` is read as an instruction instead of an
+utterance:
+
+```
+/rename Dev the new dev
+/move Dev #payments          — the # is optional
+/remove Dev [force]          — force only if it still has a process
+/start Dev [interactive|headless]
+/new claude Dev [interactive|headless]
+/help
+```
+
+An agent is named by its name, its role or its seat id. The hub parses these,
+not the front ends, so the console, the dashboard and the PWA all got them at
+once — and each one runs the endpoint the matching `nexmesh` subcommand runs.
+The outcome is posted into the channel as a record of what was done, pre-claimed
+so no agent is handed the operator's housekeeping as a message to act on. A
+mistyped command is refused with the shape it should have had, and nothing is
+said to the team. To say something that begins with a slash, double it:
+`//rename is a command`.
 
 ### Watching the team
 
@@ -574,6 +669,40 @@ nexmesh release se-1234abcd            # everyone; the session's work is done
 From a CLI, the orchestrator offers `pause_agents`, `resume_agents` and
 `release_agents`.
 
+### Roles, and the one role that means something
+
+A role is a **free-form string**. There is no fixed list, and nexmesh never
+decides who is more capable from it. What a role actually does:
+
+- **It is an address.** Everything that takes a teammate — `send_message`,
+  `nexmesh send --to`, `/move`, `pause --who`, the orchestrator's
+  `message_team` — accepts a name *or* a role, so `--to reviewer` reaches
+  whoever holds that role without anybody knowing their name.
+- **One family is special: review.** A role containing `review`, `qa` or
+  `test` (case-insensitive) **approves its own work**: `signal_done` from that
+  seat goes straight to `approved`, because nobody reviews the reviewer. Every
+  other role goes to `done_pending_review` and waits for a reviewer's
+  `approve` or feedback.
+- **It goes into the agent's first prompt**, with its description, so the
+  model is told what it is for in words rather than inferring it from a label.
+- **It is what you read** on the dashboard, in `nexmesh status` and in the
+  console — and it is the fallback name for a seat nobody named.
+
+The roles used throughout these docs are a convention, not an enum:
+`architect`, `engineer`, `code reviewer`, `qa`, `analyst`, `archivist`,
+`doc writer`. Invent whatever fits; only the review family changes behaviour.
+
+```bash
+nexmesh add-agent payments --name Iris --role 'code reviewer' --cli opencode
+nexmesh set-role sl-1a2b3c4d 'qa'      # changes who approves whose work
+```
+
+**Roles are not capabilities.** What a seat can *do* that others cannot —
+`ocr`, `transcribe`, `tts`, `strong`, `vision` — is a separate list, and the
+thing `ask_capability` routes on. A role says what somebody is for; a
+capability says what they can be asked for. See
+[Asking a teammate for something you cannot do](#asking-a-teammate-for-something-you-cannot-do).
+
 ### A team of unequal agents
 
 Agents differ. One seat is an expensive model that reasons well, another is
@@ -670,6 +799,19 @@ the node down, and `cargo test` validates every shipped descriptor.
 > split of its own — `opencode serve --port N --hostname H` plus `opencode attach
 > <url>`. For opencode, remote access needs no pty multiplexing from us at all,
 > which is what driver kind `http_server` does.
+
+#### A CLI with no per-run configuration
+
+Most CLIs take a configuration file on the command line, which is how nexmesh
+hands one conversation its own MCP shim without touching your global config.
+Some do not. `clis/hermes.toml` is the worked example: the shim is registered
+once in the CLI's own config, and the **seat is decided by the environment the
+node sets** — which the shim reads for itself.
+
+The trap, when you do it that way: if that global entry pins `NEXMESH_NAME`,
+`NEXMESH_SESSION` or `NEXMESH_CLI_SESSION` of its own, every conversation on
+that machine reports the same identity and they all collapse into one seat.
+Leave the environment out of the config file and let the node supply it.
 
 ### Writing a driver plugin
 
@@ -1204,7 +1346,7 @@ nexmesh run claude        # where you would have typed `claude`
 It works out which session owns the directory you are standing in (mounting
 the directory into that session if it is new to it, creating the session if
 nothing owns it), takes the seat named for this CLI and this machine —
-`Claude-sissy` — asks the local node to start the CLI on a pty it owns, and
+`Claude-machine-b` — asks the local node to start the CLI on a pty it owns, and
 relays that pty to your terminal with the usual one-line bar and `Ctrl-]` to
 leave. From the outside it is an ordinary interactive agent: attachable from
 any machine, drivable by the hub, recorded. It also outlives the window, so
@@ -1218,7 +1360,7 @@ claude() { nexmesh run claude; }
 
 Running it again in the same directory takes the same seat back, which means
 the conversation that seat was on resumes. A seat somebody is already sitting
-in is never taken: that run gets `Claude-sissy-2` beside it.
+in is never taken: that run gets `Claude-machine-b-2` beside it.
 
 A CLI you start by hand still *joins* — it registers through `mcpd`, takes a
 seat, sends and receives, holds locks. What it cannot have is a screen anyone
@@ -1227,7 +1369,7 @@ else can see.
 ### Where an attach's bytes actually go
 
 The hub decides *who may attach to what*. It does not have to be the wire, and
-when it is, it costs: attaching from sissy to an agent on sissy sent every
+when it is, it costs: attaching from machine-b to an agent on machine-b sent every
 keystroke to the hub machine and back — two network hops and a relay in
 between, measured at 2.8 ms per round trip on an idle LAN, for bytes that never
 needed to leave the host.
@@ -1248,7 +1390,7 @@ honour it, only for the agent it names, only once, and only for the next thirty
 seconds. One left unspent costs nothing.
 
 Node-to-node is the same ticket and the same framing over TLS, so attaching
-from sissy to zeiss can skip the hub too — that needs the node to advertise an
+from machine-b to machine-c can skip the hub too — that needs the node to advertise an
 address the hub can pass on, and is the next piece rather than something to
 guess from a hostname.
 
@@ -1352,6 +1494,19 @@ Then one of:
   operator API on anything but loopback, and says so.
 - **A node:** `NEXMESH_TOKEN=... nexmesh-node --hub wss://hub:7870 --clis /etc/nexmesh/clis`,
   after `nexmesh-hub enrol <name>` on the hub.
+
+To have it installed and come back by itself after a reboot:
+
+```bash
+sudo deploy/install-service.sh hub
+sudo deploy/install-service.sh node --user alice
+sudo deploy/install-service.sh coderai
+```
+
+That works out which init system is running, installs the systemd unit or the
+`/etc/init.d` script, **enables it at boot** and starts it; `--dry-run` shows
+what it would do. It writes a commented environment file the first time and
+leaves it alone afterwards, so it is safe to re-run on every upgrade.
 
 `deploy/` has the rest for a real installation: sysvinit scripts for the hub,
 a node and the bridge, an nginx vhost for the dashboard, and a runbook in
