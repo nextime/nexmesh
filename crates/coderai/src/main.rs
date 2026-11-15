@@ -646,6 +646,9 @@ struct Hub {
     /// answer. A message cannot be acted on here, but being acked and
     /// otherwise ignored is indistinguishable from the fleet not working.
     prose: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// This bridge's own seat, so a message addressed to it can be told
+    /// apart from one said to the room.
+    slot_id: String,
 }
 
 impl Hub {
@@ -669,14 +672,29 @@ impl Hub {
             let ids: Vec<i64> = ids.iter().filter_map(|m| m["id"].as_i64()).collect();
             for m in v["messages"].as_array().into_iter().flatten() {
                 let from = m["from_name"].as_str().unwrap_or("");
+                let body = m["body"].as_str().unwrap_or("");
+                // A BROADCAST is not a question for the bridge. It used to
+                // be treated as one, so every line said to the team came
+                // back as the capability sheet, once per sender -- which on
+                // a busy channel is a storm, and on a restart starts again
+                // because the "told them recently" map lives in memory.
+                //
+                // So the sheet is sent only when somebody has actually
+                // addressed this bridge AND is asking what it can do, or
+                // has tried to ask for something and got the shape wrong.
+                // Everything else is acknowledged in silence: an ack is
+                // what stops a message being handed out for ever, and it
+                // costs nobody a line in the channel.
+                let addressed = m["to_slot"].as_str().is_some_and(|t| t == self.slot_id);
+                let wants_help = addressed && asking_for_help(body);
                 tracing::info!(
                     from = %if from.is_empty() { "someone" } else { from },
-                    body = %m["body"].as_str().unwrap_or(""),
-                    "a message for the bridge; acknowledging it and saying how to ask"
+                    addressed, wants_help,
+                    "a message for the bridge; acknowledging it"
                 );
                 // The operator has no slot and is answered in the chat by a
                 // person reading it; a teammate is answered directly.
-                if !from.is_empty() && from != "operator" {
+                if wants_help && !from.is_empty() && from != "operator" {
                     if let Ok(mut q) = self.prose.lock() {
                         q.push(from.to_string());
                     }
@@ -809,7 +827,9 @@ async fn main() -> Result<()> {
         .await?;
     // `seats` when the hub seated it in several teams, and the single-session
     // fields otherwise -- which is also what an older hub answers with.
-    let seats: Vec<(String, String)> = match joined["seats"].as_array() {
+    // (agent, session, seat). The SEAT is how the bridge later tells a
+    // message addressed to it from one said to the room.
+    let seats: Vec<(String, String, String)> = match joined["seats"].as_array() {
         Some(list) if !list.is_empty() => list
             .iter()
             .filter_map(|v| {
@@ -820,6 +840,7 @@ async fn main() -> Result<()> {
                         .or_else(|| v["session_id"].as_str())
                         .unwrap_or("?")
                         .to_string(),
+                    v["slot_id"].as_str().unwrap_or("").to_string(),
                 ))
             })
             .collect(),
@@ -829,6 +850,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("the hub refused the join: {joined}"))?
                 .to_string(),
             joined["session_id"].as_str().unwrap_or("?").to_string(),
+            joined["slot_id"].as_str().unwrap_or("").to_string(),
         )],
     };
     for r in joined["refused"].as_array().into_iter().flatten() {
@@ -840,18 +862,19 @@ async fn main() -> Result<()> {
     }
     tracing::info!(
         seats = seats.len(), capabilities = available.len(),
-        teams = %seats.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>().join(", "),
+        teams = %seats.iter().map(|(_, s, _)| s.clone()).collect::<Vec<_>>().join(", "),
         "joined"
     );
 
     let hubs: Vec<Hub> = seats
         .iter()
-        .map(|(agent_id, _)| Hub {
+        .map(|(agent_id, _, slot_id)| Hub {
             http: http.clone(),
             base: base.clone(),
             token: args.token.clone(),
             agent_id: agent_id.clone(),
             prose: Default::default(),
+            slot_id: slot_id.clone(),
         })
         .collect();
 
@@ -962,6 +985,33 @@ async fn serve(
             }
         }
     }
+}
+
+/// Is this somebody asking what the bridge can do, or getting an ask wrong?
+///
+/// A bridge has no model and cannot hold a conversation, so the only useful
+/// thing it can say in prose is how to ask it properly -- and the only time
+/// that is worth saying is when somebody is trying. Everything else said to
+/// it is acknowledged and left alone.
+fn asking_for_help(body: &str) -> bool {
+    let b = body.to_lowercase();
+    // Asking outright.
+    const ASKING: &[&str] = &[
+        "what can you", "what do you", "capabilit", "abilities", "/help", "help?",
+        "how do i ask", "how should i ask", "usage", "what are you for",
+        "can you do", "are you able",
+    ];
+    if ASKING.iter().any(|k| b.contains(k)) {
+        return true;
+    }
+    // Or trying to ask for something it serves, in prose rather than with
+    // `ask_capability` -- which is the other moment a correction helps.
+    const WORK: &[&str] = &[
+        "ocr", "transcrib", "diariz", "speech", "text to speech", "tts",
+        "embed", "rerank", "moderat", "subtitle", "upscale", "image",
+    ];
+    const TRYING: &[&str] = &["can you", "could you", "please", "i need", "we need", "?"];
+    WORK.iter().any(|k| b.contains(k)) && TRYING.iter().any(|k| b.contains(k))
 }
 
 /// Answer anybody who has spoken to the bridge in prose with how to ask it

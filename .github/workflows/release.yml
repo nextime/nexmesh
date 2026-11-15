@@ -173,7 +173,15 @@ jobs:
                       etc/nexmesh/clis/claude.toml usr/share/man/man1/nexmesh.1; do
             grep -q "$want" /tmp/deb.list || { echo "missing from the deb: $want"; exit 1; }
           done
-          rpm -qlp dist/*.rpm | tee /tmp/rpm.list || true
+          # The same list, from the rpm. `|| true` here meant a package
+          # with nothing in it passed this step silently, which is the one
+          # thing the step exists to catch.
+          sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+          rpm -qlp dist/*.rpm | tee /tmp/rpm.list
+          for want in /usr/bin/nexmesh /usr/bin/nexmesh-hub /usr/bin/nexmesh-install \
+                      /etc/nexmesh/clis/claude.toml; do
+            grep -qx "$want" /tmp/rpm.list || { echo "missing from the rpm: $want"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: packages

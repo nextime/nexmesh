@@ -70,7 +70,7 @@ class CDP:
         import base64 as b64, hashlib, os as _os
         host, rest = target[len("ws://"):].split("/", 1)
         h, p = host.split(":")
-        self.sock = socket.create_connection((h, int(p)), timeout=10)
+        self.sock = socket.create_connection((h, int(p)), timeout=180)
         key = b64.b64encode(_os.urandom(16)).decode()
         self.sock.sendall((
             f"GET /{rest} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
@@ -124,7 +124,7 @@ class CDP:
             if op == 8:
                 raise RuntimeError("the browser hung up")
 
-    def call(self, method, params=None, timeout=60):
+    def call(self, method, params=None, timeout=180):
         self.id += 1
         mine = self.id
         self._send(json.dumps({"id": mine, "method": method, "params": params or {}}))
@@ -152,10 +152,13 @@ class CDP:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--frames", type=int, default=90, help="frames in the animation")
-    ap.add_argument("--fps", type=int, default=12, help="frames a second in the gif")
-    ap.add_argument("--width", type=int, default=1100)
-    ap.add_argument("--height", type=int, default=560)
+    ap.add_argument("--frames", type=int, default=110, help="frames in the animation")
+    ap.add_argument("--fps", type=int, default=16, help="frames a second in the gif")
+    ap.add_argument("--width", type=int, default=1600)
+    ap.add_argument("--height", type=int, default=900)
+    ap.add_argument("--gifw", type=int, default=900, help="gif width")
+    ap.add_argument("--stillw", type=int, default=1280, help="still width")
+    ap.add_argument("--colors", type=int, default=160, help="gif palette size")
     ap.add_argument("--keep", action="store_true", help="keep the frame pngs")
     args = ap.parse_args()
 
@@ -222,43 +225,46 @@ def main():
         frames = os.path.join(tmp, "frames")
         os.makedirs(frames, exist_ok=True)
 
+        errs = cdp.js("JSON.stringify(window.__errs || [])")
+        if errs and errs != "[]":
+            print("  page errors:", errs[:600], file=sys.stderr)
+
+        # Every picture is an INSTANT of the tour, asked for by time. So the
+        # stills are frames of the film rather than a separate set-up, and
+        # the same millisecond always gives the same picture.
         print("stills")
+        # The legs are room 0-3400, close 3400-6800, terminal 6800-10400,
+        # screens 10400-13000, graph 13000-17600.
         shots = [
-            # The room, nothing open: who is on the team and what they are.
-            ("xr-team.png", "team", -0.5, 0.0, 1, "a.panels = []; a.select(list[1], false);"),
-            # A teammate's screen, open in front of them.
-            ("xr-team-selected.png", "team", 0.12, -0.03, 2,
-             "a.panels = []; a.select(list[2]);"),
-            # Everything else, as things in the room.
-            ("xr-panels.png", "team", -0.25, -0.02, 2,
-             "a.select(list[2]); a.openMenu(); a.openChat();"),
-            # The map, from inside it.
-            ("xr-graph.png", "graph", 0.45, 0.04, 3,
-             "a.panels = []; a.select(list[3 % list.length], false);"),
+            ("xr-team.png", 2100),            # the room, and who is in it
+            ("xr-figure.png", 5600),          # one of them, up close
+            ("xr-team-selected.png", 9400),   # a terminal, open
+            ("xr-panels.png", 12300),         # the chat and the menu
+            ("xr-graph.png", 15600),          # the code map, from inside
         ]
-        for name, mode, yaw, pitch, pick, act in shots:
-            cdp.js(f"""(() => {{
-              const a = window.nexmeshXR;
-              a.setMode("{mode}");
-              a.cam.yaw = {yaw}; a.cam.pitch = {pitch}; a.cam.dist = 0.2;
-              const list = a.scene.active().filter((o) => !o.flat);
-              {act}
-              a.scene.hovered = null;
-              return true;
-            }})()""")
-            time.sleep(0.8)
-            cdp.shot(os.path.join(OUT, name))
-            print("  ", name)
+        for name, at in shots:
+            cdp.js(f"window.nexmeshXR.renderAt({at})")
+            full = os.path.join(tmp, name)
+            cdp.shot(full)
+            # Down to a width a README is read at, which also resolves the
+            # supersampling into something sharper than drawing it small.
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", full,
+                            "-vf", f"scale={args.stillw}:-1:flags=lanczos",
+                            os.path.join(OUT, name)], check=True)
+            print("  ", name, f"{os.path.getsize(os.path.join(OUT, name))//1024} KB")
 
+        frames = os.path.join(tmp, "frames")
+        os.makedirs(frames, exist_ok=True)
         print(f"filming {args.frames} frames")
-        # The page's own tour drives the camera; this only takes pictures of
-        # it, so the motion is the same every time.
-        cdp.js("window.nexmeshXR.tour()")
+        # Not real time: the page renders any instant of its tour on demand,
+        # so a software renderer at two frames a second still produces a film
+        # that plays at sixteen -- and the same film every time.
+        span = cdp.js("TOUR_MS") or 20000
         for i in range(args.frames):
+            cdp.js(f"window.nexmeshXR.renderAt({span * i / args.frames:.1f})")
             cdp.shot(os.path.join(frames, f"f{i:04d}.png"))
-            time.sleep(1.0 / max(args.fps, 1))
 
-        gif = os.path.join(OUT, "xr-tour.gif")
+        gif = os.path.join(tmp, "xr-tour.gif")
         pal = os.path.join(tmp, "palette.png")
         # Two passes, because a gif has 256 colours and letting ffmpeg choose
         # them from the actual frames is the difference between this looking
@@ -266,24 +272,26 @@ def main():
         # 640 wide and a 96-colour palette: a README is read on a phone as
         # often as not, and a three-megabyte animation is one nobody waits
         # for. The scene is mostly flat colour, so the loss is invisible.
-        vf = f"fps={args.fps},scale=640:-1:flags=lanczos"
+        vf = f"fps={args.fps},scale={args.gifw}:-1:flags=lanczos"
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(args.fps),
                         "-i", os.path.join(frames, "f%04d.png"),
-                        "-vf", f"{vf},palettegen=max_colors=96:stats_mode=diff", pal],
+                        "-vf", f"{vf},palettegen=max_colors={args.colors}:stats_mode=diff", pal],
                        check=True)
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(args.fps),
                         "-i", os.path.join(frames, "f%04d.png"), "-i", pal,
-                        "-lavfi", f"{vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=3",
+                        "-lavfi", f"{vf} [x]; [x][1:v] paletteuse=dither=sierra2_4a:diff_mode=rectangle",
                         "-loop", "0", gif], check=True)
         mp4 = os.path.join(OUT, "xr-tour.mp4")
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(args.fps),
                         "-i", os.path.join(frames, "f%04d.png"),
                         "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-crf", "20", "-preset", "slow",
                         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", mp4], check=True)
         size = os.path.getsize(gif) / 1024
-        print(f"  xr-tour.gif  {size:.0f} KB")
+        print(f"  xr-tour.gif  {size:.0f} KB  (kept out of the repo: the mp4 is"
+              f" sharper and smaller)")
         print(f"  xr-tour.mp4  {os.path.getsize(mp4)/1024:.0f} KB")
-        if size > 3000:
+        if size > 5000:
             print("  (over 3MB: rerun with --frames 60 --fps 10 for a lighter one)")
         if args.keep:
             print("  frames in", frames)

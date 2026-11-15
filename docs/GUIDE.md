@@ -377,7 +377,7 @@ instead. Either way the token never appears in the output, including
 `nexmesh`, with no command, from a terminal:
 
 ```
- nexmesh console   scope every session   hub 0.1.0  ● live
+ nexmesh console   scope every session   hub 0.2.0  ● live
   1·deck   2·agents   3·chat   4·plan   5·memory   6·graph   7·files   8·fleet
 ```
 

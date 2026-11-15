@@ -21,8 +21,19 @@ you want while developing.
 ```bash
 cargo install cargo-deb cargo-generate-rpm       # once
 cargo build --release --workspace
-cargo deb -p nexmesh-ctl                         # target/debian/nexmesh_*.deb
+cargo deb -p nexmesh-ctl --no-build              # target/debian/nexmesh_*.deb
 cargo generate-rpm -p crates/ctl                 # target/generate-rpm/nexmesh-*.rpm
+```
+
+`--no-build` because the assets are the whole workspace's binaries, which
+`cargo deb` does not build for you: it builds the one crate it was pointed at
+and then looks for the other five where the release build left them. Without
+it you get a package whose binaries are whatever was there last time.
+
+Or in one line, which is what the release workflow runs:
+
+```bash
+packaging/build-packages.sh                      # both, from a clean release build
 ```
 
 One package, `nexmesh`, with all six binaries, the man page, the CLI

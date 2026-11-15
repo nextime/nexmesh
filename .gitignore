@@ -10,3 +10,9 @@
 # this very repository. A photo or a recording from somebody's webcam is not
 # something `git add -A` should ever be able to pick up.
 /uploads/
+# Notes agents leave for each other in the tree. They are addressed to
+# somebody here, not to whoever clones this, and they tend to carry the
+# addresses of real machines -- which is exactly what a public repository
+# must not learn.
+/docs/*HANDOFF*.md
+/docs/*-handoff-*.md

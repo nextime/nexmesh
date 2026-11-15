@@ -2266,12 +2266,19 @@ function attachHtml(f) {
   const kind = (f.media_type || "");
   const name = esc(f.name || "file");
   if (kind.startsWith("image/")) {
-    // `data-src`, not `src`: an <img> sends cookies but never an
-    // Authorization header, so a dashboard signed in with a TOKEN rather
-    // than a session would show a broken picture. `hydrateShots` fetches it
-    // the same way as every other call and hands the tag a blob.
-    return `<div class="attach"><img class="shot" alt="${name}"
-       data-src="${esc(f.url)}" data-id="${esc(f.id)}" data-name="${name}"></div>`;
+    // The plain URL first, because that is what works: an <img> sends the
+    // session cookie, the hub serves the bytes, and an animated gif animates
+    // with nothing held in memory.
+    //
+    // It is the TOKEN case that cannot do this -- an <img> never sends an
+    // Authorization header -- so a failure falls back to fetching the bytes
+    // and handing the tag a blob. Starting with no `src` at all was worse
+    // than either: until the fetch finished, every picture in the room was
+    // a broken-image icon.
+    return `<div class="attach"><img class="shot" alt="${name}" loading="lazy"
+       src="${esc(f.url)}" data-id="${esc(f.id)}" data-name="${name}"
+       data-url="${esc(f.url)}" data-full="${esc(f.url)}"
+       onerror="shotFallback(this)"></div>`;
   }
   const size = f.bytes ? ` <span class="muted tiny">${fmtBytes(f.bytes)}</span>` : "";
   return `<div class="attach"><a class="filelink" href="${esc(f.url)}"
@@ -2283,33 +2290,45 @@ function attachHtml(f) {
 // it. An upload's bytes never change, so a blob URL is good for the session.
 const shotCache = new Map();
 
-async function hydrateShots(root) {
-  for (const img of root.querySelectorAll("img.shot[data-src]")) {
-    const id = img.dataset.id;
-    const had = shotCache.get(id);
-    if (had) { img.src = had; img.dataset.full = had; img.removeAttribute("data-src"); continue; }
-    const url = img.dataset.src;
-    img.removeAttribute("data-src");      // never fetched twice at once
-    try {
-      const r = await fetch(url, {
-        headers: token ? { authorization: "Bearer " + token } : {},
-        credentials: "same-origin", cache: "no-store",
-      });
-      if (!r.ok) throw new Error(r.status);
-      const blob = await r.blob();
-      const made = URL.createObjectURL(blob);
-      shotCache.set(id, made);
-      img.src = made;
-      img.dataset.full = made;
-    } catch (e) {
-      // The machine that holds it may be off. Say so in the line rather
-      // than leaving a broken-image icon, which reads like a bug here.
-      const box = img.parentElement;
-      if (box) {
-        box.innerHTML = `<span class="muted tiny">[${esc(img.alt || "image")} \u2014 ` +
-                        `the machine holding it is not reachable]</span>`;
-      }
+// The plain <img> could not load it. Either this dashboard is driven by a
+// token rather than an account, or the machine holding the file has gone.
+// Fetch it the way every other call is made, which settles which.
+async function shotFallback(img) {
+  if (img.dataset.tried) return;        // once, or a failing blob loops
+  img.dataset.tried = "1";
+  const id = img.dataset.id;
+  const had = shotCache.get(id);
+  if (had) { img.src = had; img.dataset.full = had; return; }
+  try {
+    const r = await fetch(img.dataset.url, {
+      headers: token ? { authorization: "Bearer " + token } : {},
+      credentials: "same-origin", cache: "no-store",
+    });
+    if (!r.ok) throw new Error(r.status);
+    const blob = await r.blob();
+    const made = URL.createObjectURL(blob);
+    shotCache.set(id, made);
+    img.src = made;
+    img.dataset.full = made;
+  } catch (e) {
+    // Say which of the two it was, in the line, rather than leaving a
+    // broken-image icon to be interpreted.
+    const box = img.parentElement;
+    if (box) {
+      box.innerHTML = `<span class="muted tiny">[${esc(img.alt || "image")} \u2014 ` +
+                      `${String(e.message) === "404" || String(e.message) === "400"
+                        ? "the machine holding it is not reachable"
+                        : "could not be loaded: " + esc(String(e.message || e))}]</span>`;
     }
+  }
+}
+
+async function hydrateShots(root) {
+  // Pictures already fetched in this session are reused; everything else
+  // loads as an ordinary image and only falls back if that fails.
+  for (const img of root.querySelectorAll("img.shot[data-id]")) {
+    const had = shotCache.get(img.dataset.id);
+    if (had && img.src !== had) { img.src = had; img.dataset.full = had; }
   }
 }
 
