@@ -566,12 +566,15 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             attachsock::open(&ctx, attach_id, agent_id, cols, rows, replay_bytes).await;
         }
 
-        HubToNode::AttachTicket { ticket, agent_id, expires_at_ms, operator } => {
+        HubToNode::AttachTicket { req_id, ticket, agent_id, expires_at_ms, operator } => {
             // The hub has decided this operator may attach to this agent. The
             // node holds the ticket until it is spent or it expires; the data
             // then goes straight between them. See `proto::attachsock`.
             tracing::info!(%agent_id, %operator, "a direct attach is authorised");
             ctx.add_ticket(ticket, agent_id, expires_at_ms);
+            // Said only after it is in the map, so the operator who is told
+            // "here is your ticket" can spend it on the next line.
+            let _ = ctx.send_hub(&NodeToHub::TicketStored { req_id }).await;
         }
 
         HubToNode::AttachData { attach_id, data } => {

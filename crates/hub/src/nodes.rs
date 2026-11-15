@@ -371,6 +371,10 @@ async fn handle(
             }
         }
 
+        NodeToHub::TicketStored { req_id } => {
+            st.complete_sync(req_id, serde_json::json!({ "ok": true }));
+        }
+
         NodeToHub::PutFileResult { req_id, ok, path, bytes, detail } => {
             st.complete_sync(
                 req_id,

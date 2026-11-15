@@ -226,6 +226,8 @@ def main():
     check("the hub mints one", s == 200 and bool(j.get("ticket")), str(j))
     check("naming the machine that holds the terminal", j.get("node") == NODE, str(j))
     check("and an expiry", isinstance(j.get("expires_at_ms"), int), str(j))
+    check("and does not answer until the node holds it", j.get("confirmed") is True,
+          str(j))
     ticket = j["ticket"]
     d = Direct()
     d.open(ticket, agent)

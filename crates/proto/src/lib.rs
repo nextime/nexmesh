@@ -401,6 +401,13 @@ pub enum NodeToHub {
         cli_session: Option<String>,
     },
     /// What became of a `PutFile`.
+    /// This machine now holds a direct-attach ticket and will honour it.
+    ///
+    /// The hub pushes a ticket over a connection and answers the operator
+    /// over another; without this the answer can arrive first, and a ticket
+    /// presented a millisecond later is refused as one this machine was
+    /// never given. See `attachsock`.
+    TicketStored { req_id: u64 },
     PutFileResult {
         req_id: u64,
         ok: bool,
@@ -606,6 +613,11 @@ pub enum HubToNode {
     /// says so to the node that holds the terminal, and is the only reason a
     /// node accepts a direct attach at all.
     AttachTicket {
+        /// Correlates the node's `TicketStored` with the operator still
+        /// holding the HTTP request: a ticket is worth nothing until the
+        /// machine that must honour it actually has it.
+        #[serde(default)]
+        req_id: u64,
         ticket: String,
         agent_id: String,
         /// Wall-clock milliseconds after which it is worth nothing.
@@ -708,6 +720,22 @@ mod tests {
         let n = LockScope::Node { node_id: "machine-a".into() };
         let w = LockScope::Workspace { workspace_id: "machine-a".into() };
         assert_ne!(n.as_key(), w.as_key());
+    }
+
+    /// A node built before tickets were acknowledged sends no `req_id`, and
+    /// an old hub sends none either. Neither is a reason to drop the frame
+    /// that authorises an attach.
+    #[test]
+    fn an_attach_ticket_without_a_req_id_still_parses() {
+        let json = r#"{"t":"attach_ticket","ticket":"t","agent_id":"ag-1",
+                        "expires_at_ms":1,"operator":"me"}"#;
+        match serde_json::from_str::<HubToNode>(json).unwrap() {
+            HubToNode::AttachTicket { req_id, ticket, .. } => {
+                assert_eq!(req_id, 0);
+                assert_eq!(ticket, "t");
+            }
+            other => panic!("wrong frame: {other:?}"),
+        }
     }
 
     #[test]

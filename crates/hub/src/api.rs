@@ -2337,9 +2337,17 @@ pub async fn attach_ticket(
     };
     let ticket = uuid::Uuid::new_v4().to_string();
     let expires_at_ms = now_ms() + nexmesh_proto::attachsock::TICKET_TTL_MS;
+    // The ticket goes to the node over its own connection and the answer
+    // comes back over this one, so the two race. Whoever is told "here is
+    // your ticket" will spend it immediately, and a node that has not got it
+    // yet refuses it as one it was never given -- which reads like a denial
+    // rather than the timing accident it is. So wait for the node to say it
+    // holds the ticket before handing it over.
+    let (req_id, rx) = st.new_sync_request();
     st.send_to_node(
         &node_id,
         &nexmesh_proto::HubToNode::AttachTicket {
+            req_id,
             ticket: ticket.clone(),
             agent_id: req.agent.clone(),
             expires_at_ms,
@@ -2348,9 +2356,18 @@ pub async fn attach_ticket(
     )
     .await
     .map_err(bad)?;
+    // A node too old to answer, or too busy to answer yet, is not a reason to
+    // refuse an attach that would have worked: the wait is a courtesy with a
+    // bound, and `confirmed` says which of the two happened.
+    let confirmed = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+        .await
+        .is_ok();
+    if !confirmed {
+        tracing::warn!(%node_id, "the node did not confirm a direct-attach ticket in time");
+    }
     Ok(Json(json!({
         "ticket": ticket, "node": node_name, "agent": req.agent,
-        "expires_at_ms": expires_at_ms,
+        "expires_at_ms": expires_at_ms, "confirmed": confirmed,
     })))
 }
 
