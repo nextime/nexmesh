@@ -183,6 +183,25 @@ console.log("\n=== what it answers, because a program that asks will wait ===");
   t.write("\x1b[c");
   check("and a device-attributes query gets an answer at all",
         sent.join("").startsWith("\x1b[?"), JSON.stringify(sent.join("")));
+  // What a current agent CLI opens with: it negotiates the keyboard
+  // protocol, asks which firmware this is, and asks what colour the screen
+  // is. Answered wrongly or not at all, some of them wait at a splash
+  // screen for ever -- which is indistinguishable from a hung agent.
+  sent.length = 0;
+  t.write("\x1b[>4;0m\x1b[>7u\x1b[>c");
+  check("a SECONDARY device-attributes query is answered as one",
+        sent.join("") === "\x1b[>0;276;0c", JSON.stringify(sent.join("")));
+  sent.length = 0;
+  t.write("\x1b]10;?\x07\x1b]11;?\x1b\\");
+  const colours = sent.join("");
+  check("the foreground colour query is answered",
+        /\x1b\]10;rgb:[0-9a-f/]+\x1b\\/.test(colours), JSON.stringify(colours));
+  check("and the background colour query too",
+        /\x1b\]11;rgb:[0-9a-f/]+\x1b\\/.test(colours), JSON.stringify(colours));
+  sent.length = 0;
+  t.write("\x1b]0;a title\x07");
+  check("a title is still a title, not a colour answer", sent.join("") === "",
+        JSON.stringify(sent.join("")));
 }
 
 console.log("\n=== keys ===");

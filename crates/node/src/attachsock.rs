@@ -138,10 +138,32 @@ pub async fn input(ctx: &Arc<NodeCtx>, attach_id: String, data: Vec<u8>) {
                 let _ = v.input.send(data).await;
                 return;
             }
-            let Some(io) = ctx.io_for_attach(&attach_id) else { return };
+            // Keystrokes with nowhere to go used to be dropped in silence,
+            // which is the worst possible answer: "it does not take input"
+            // with nothing on the screen to say why is a long hunt. Every
+            // path now reports itself into the terminal the person is
+            // looking at.
+            let Some(io) = ctx.io_for_attach(&attach_id) else {
+                let _ = ctx
+                    .send_hub(&NodeToHub::AttachData {
+                        attach_id,
+                        data: b"\r\n[nexmesh] this attach is no longer wired to a terminal                                 here; detach and open it again\r\n"
+                            .to_vec(),
+                    })
+                    .await;
+                return;
+            };
             match &io.input {
                 Some(tx) => {
-                    let _ = tx.send(data).await;
+                    if tx.send(data).await.is_err() {
+                        let _ = ctx
+                            .send_hub(&NodeToHub::AttachData {
+                                attach_id,
+                                data: b"\r\n[nexmesh] the terminal behind this agent has gone:                                         what you type is going nowhere\r\n"
+                                    .to_vec(),
+                            })
+                            .await;
+                    }
                 }
                 // Typing at a headless agent would go nowhere; say so once
                 // rather than silently swallowing the keystrokes.

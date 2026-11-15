@@ -1786,6 +1786,24 @@ waits for ever, which looks exactly like a hung agent. All of it is tested
 headlessly in `tests/term_test.js`, against the sequences rather than against
 a screenshot.
 
+**What it answers, and why that matters.** A current agent CLI opens by
+negotiating with the terminal: `CSI > 4 ; 0 m` and `CSI > 7 u` for the keyboard
+protocol, `CSI > c` for the firmware, `OSC 10 ; ?` and `OSC 11 ; ?` for the
+foreground and background colours, plus the older cursor-position and primary
+device-attribute queries. Several of those are *questions*, and a program that
+asks and is never told can wait for ever at a splash screen — which looks
+exactly like a hung agent and is the hardest thing in this system to diagnose
+from the outside. So the emulator answers all of them, and answers a secondary
+device-attributes query as a secondary one rather than replying with a primary
+answer, which is its own kind of wrong.
+
+The node makes the matching promise on its side: keystrokes that cannot be
+delivered are reported into the terminal rather than dropped. An attach whose
+agent has no input channel says it is headless; one whose pty has gone says
+what you type is going nowhere; one no longer wired to a terminal says to
+detach and open it again. "It does not take input", with nothing on screen to
+say why, is a long hunt.
+
 Two details worth knowing:
 
 - **A websocket cannot carry an `Authorization` header.** A dashboard account

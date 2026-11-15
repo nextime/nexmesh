@@ -277,6 +277,17 @@ class NexTerm {
 
   oscDone() {
     const m = /^(\d+);([\s\S]*)$/.exec(this.osc);
+    // The colour queries. A TUI asks what the foreground and background
+    // actually are so it can pick contrasting colours, and some of them
+    // WAIT for the answer: unanswered, the agent looks hung at a splash
+    // screen with no way to tell why. These are this terminal's own
+    // colours, in the form xterm replies with.
+    if (m && m[2] === "?" && (m[1] === "10" || m[1] === "11" || m[1] === "12")) {
+      const say = { 10: "dfdf/e6e6/f2f2", 11: "0808/0909/0d0d", 12: "dfdf/e6e6/f2f2" };
+      this.send(`\x1b]${m[1]};rgb:${say[m[1]]}\x1b\\`);
+      this.osc = "";
+      return;
+    }
     if (m && (m[1] === "0" || m[1] === "2") && this.titleCb) this.titleCb(m[2]);
     this.osc = "";
   }
@@ -322,7 +333,13 @@ class NexTerm {
 
   csi(final) {
     const priv = this.params.startsWith("?");
-    const raw = priv ? this.params.slice(1) : this.params;
+    // `>` and `=` are private prefixes of their own: `CSI > c` is a
+    // SECONDARY device-attributes query and must not be answered with a
+    // primary one, and `CSI > 4 ; 0 m` / `CSI > 7 u` are the keyboard
+    // protocol negotiations a modern TUI opens with.
+    const gt = this.params.startsWith(">");
+    const eq = this.params.startsWith("=");
+    const raw = priv || gt || eq ? this.params.slice(1) : this.params;
     const ps = raw.split(";").map((x) => (x === "" ? null : parseInt(x, 10) || 0));
     const p = (i, d) => (ps[i] === null || ps[i] === undefined ? d : ps[i]);
 
@@ -367,7 +384,11 @@ class NexTerm {
         if (p(0, 0) === 5) this.send("\x1b[0n");
         return;
       case "c":
-        this.send("\x1b[?62;c");      // "a VT220, with no options"
+        // Primary: what kind of terminal. Secondary: which firmware, which
+        // a TUI reads to decide what it may use. Tertiary: a unit id.
+        if (gt) this.send("\x1b[>0;276;0c");
+        else if (eq) this.send("\x1bP!|00000000\x1b\\");
+        else this.send("\x1b[?62;c");
         return;
       default:
         return;
