@@ -153,20 +153,22 @@ pub enum Act {
     Mouse,
 }
 
-/// Who has the mouse during an attach.
+/// Whether the VIEWER takes the mouse during an attach.
 ///
-/// The TERMINAL, by default, and that default was learned the hard way.
-/// A viewer that asks for mouse reports can turn the wheel into the page
-/// keys a full-screen agent scrolls with -- but in taking the mouse it also
-/// takes dragging to select, and clicking a link, which are the two things
-/// a person actually does with a mouse in a terminal. Losing both to gain
-/// one is a bad trade, and it is not obvious from the inside that anything
-/// has been taken: the wheel simply stops working, selection selects
-/// nothing, and a link does not open.
+/// It does not, by default. The wheel belongs to whatever is drawing the
+/// screen -- tmux in a pane, which is the only thing that can scroll a
+/// pane's history -- and holding Shift gives the mouse back to the terminal
+/// you are sitting at for as long as you hold it, which is how every
+/// mouse-enabled terminal program works.
 ///
-/// So the mouse stays with the terminal, and the viewer borrows it only
-/// when asked -- `Ctrl-F` while in command mode, or `mouse = "viewer"` in
-/// `~/.nexmesh/console.toml` for anyone who wants it that way always.
+/// A viewer that asks for mouse reports instead can turn the wheel into the
+/// page keys a full-screen agent scrolls with, which suits an agent that
+/// paints its own screen with no tmux underneath. That is `Ctrl-F` while in
+/// command mode, or `mouse = "viewer"` in `~/.nexmesh/console.toml` for
+/// anyone who wants it that way always. The cost either way is that a
+/// terminal reporting clicks is not selecting text with them, and nothing
+/// says so from the inside -- so it is a key that says what it does rather
+/// than a default.
 pub fn mouse_to_viewer(toml_text: &str) -> bool {
     for line in toml_text.lines() {
         let line = line.trim();

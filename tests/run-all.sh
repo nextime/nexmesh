@@ -24,9 +24,10 @@ export NEXMESH_IDENTITY=/nonexistent/nexmesh-identity
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
         control dashboard orchestrator mtls pairing revoke bind plugin mcpdoor
         capability memory codegraph coderai webauth reconnect ptyinject termlink
-        oneshot run direct uploads)
+        oneshot run direct uploads xrroom)
 TIMEOUT=${TIMEOUT:-420}
 failed=()
+skipped=()
 
 # Unit tests first, and a build failure in them counts as a failure.
 #
@@ -73,8 +74,15 @@ for t in "${SUITES[@]}"; do
     out=$(timeout "$TIMEOUT" python3 -u -I "tests/e2e_$t.py" 2>&1)
     rc=$?
     verdict=$(printf '%s\n' "$out" | grep -E "ALL .* PASSED|FAILED \(" | head -1)
+    skip=$(printf '%s\n' "$out" | grep -E "^SKIP " | head -1)
     if [ $rc -eq 0 ] && [[ "$verdict" == ALL* ]]; then
         echo "$verdict"
+    # A suite that needs something this machine does not have says so and is
+    # not counted either way. It must still be the suite's own decision:
+    # anything else that exits 0 without a verdict is a failure.
+    elif [ $rc -eq 0 ] && [ -n "$skip" ] && [ -z "$verdict" ]; then
+        echo "$skip"
+        skipped+=("$t")
     else
         failed+=("$t")
         if [ -z "$verdict" ]; then
@@ -88,6 +96,10 @@ done
 
 echo
 if [ ${#failed[@]} -eq 0 ]; then
+    if [ ${#skipped[@]} -gt 0 ]; then
+        echo "$(( ${#SUITES[@]} - ${#skipped[@]} )) suites passed, skipped: ${skipped[*]}"
+        exit 0
+    fi
     echo "all ${#SUITES[@]} suites passed"
 else
     echo "FAILED: ${failed[*]}"

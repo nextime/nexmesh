@@ -230,10 +230,11 @@ so a glance across the room is a status report:
 ![A teammate, up close](docs/images/xr-figure.png)
 
 **Click a teammate and their terminal opens**, above them, facing you, filling
-as they work. Two more screens float in the room rather than hiding behind a
-key: the chat, and a menu of what the flat dashboard does — switch view, open
-a terminal, pause or start a seat, speak. A ray lands on a button exactly as
-it lands on a person.
+as they work. The chat is another screen in the room, and the menu — switch
+view, open a terminal, pause or start a seat, speak, show one team on its own
+— rides on your left wrist in a headset, because a menu you have to go and
+find is a menu nobody finds. A ray lands on a button exactly as it lands on a
+person, and screens can be taken hold of and moved wherever you want them.
 
 | | |
 |---|---|
@@ -250,8 +251,11 @@ subsystem's own edges are picked out.
 
 Your own arms are drawn where the headset says your hands are, elbows worked
 out from your shoulders, in the same suit the team wears. **Grab empty space
-and the room moves past you**; grab a subsystem and it follows your hand; the
-thumbsticks slide and snap-turn for anyone who prefers that. Speech is the
+and the room moves past you**; grab a subsystem and it follows your hand; grab
+a screen and it comes with you, turning to stay readable; the thumbsticks
+slide and snap-turn for anyone who prefers that. A fleet running several teams
+at once is a crowd until you ask for one of them, so the menu lists them and
+the room rebuilds around the one you pick. Speech is the
 input that suits a headset, since there is no keyboard: the trigger on empty
 space starts listening, and what you say is a command ("the code graph"), a
 name ("Iris"), or a sentence, which goes to whoever is selected or to the

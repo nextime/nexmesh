@@ -16,3 +16,4 @@
 # must not learn.
 /docs/*HANDOFF*.md
 /docs/*-handoff-*.md
+tests/__pycache__/

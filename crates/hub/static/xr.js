@@ -1599,14 +1599,20 @@ class Scene {
   }
 
   build(snap) {
-    const agents = ((snap && snap.detail && snap.detail.agents) || [])
+    const all = ((snap && snap.detail && snap.detail.agents) || [])
       .filter((a) => a.cli !== "tmux");
-    const sessions = [];
-    for (const a of agents) {
+    const every = [];
+    for (const a of all) {
       const s = a.session || "";
-      if (!sessions.includes(s)) sessions.push(s);
+      if (!every.includes(s)) every.push(s);
     }
-    sessions.sort();
+    every.sort();
+    // `only` is the dropdown the flat views have: one team on its own,
+    // which on a fleet running four of them is the difference between a
+    // crowd and a room you can read.
+    const one = this.only && every.includes(this.only) ? this.only : null;
+    const agents = one ? all.filter((a) => (a.session || "") === one) : all;
+    const sessions = one ? [one] : every;
     const keep = this.selected && this.selected.data ? this.selected.data.name : null;
     this.nodes = [];
     this.signs = [];
@@ -1646,7 +1652,7 @@ class Scene {
       }
     });
     if (keep && !(this.selected && this.nodes.includes(this.selected))) this.selected = null;
-    this.sessions = sessions;
+    this.sessions = every;
     this.buildGraph(snap);
   }
 
@@ -1912,6 +1918,12 @@ class Panel {
     this.tex = null;
     this.dirty = true;
     this.row = -1;
+    // A panel either stands in the room -- and so moves with the room when
+    // you pull it past you -- or rides on your wrist and comes with you.
+    // The menu is the second kind: a menu you have to go and find is a
+    // menu nobody finds. `roomSpace` is set while it is actually mounted.
+    this.wrist = !!opts.wrist;
+    this.roomSpace = false;
     this.geom();
   }
 
@@ -2278,7 +2290,12 @@ class App {
   async refreshTerminal() {
     const p = this.panels.find((x) => x.kind === "terminal");
     if (!p || !p.agent) return;
-    if (DEMO || !p.agent.agent_id) {
+    // The agent that HAS the terminal, which for a seat sitting in an
+    // adopted tmux pane is the pane's agent and not the seat's. Reading the
+    // seat's own transcript there returns nothing at all, which is a blank
+    // screen with no explanation.
+    const who = p.agent.attach_agent_id || p.agent.agent_id;
+    if (DEMO || !who) {
       // Arriving a line at a time, the way a terminal does.
       const all = demoTranscript(p.agent);
       const n = clamp(5 + Math.floor((this.now() - p.opened) / 240), 5, all.length);
@@ -2287,11 +2304,20 @@ class App {
     }
     try {
       const v = await api(
-        `/v1/agents/${encodeURIComponent(p.agent.agent_id)}/transcript?tail=6000`);
+        `/v1/agents/${encodeURIComponent(who)}/transcript?tail=6000`);
       const text = (v.transcript || "")
         .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b[()][A-Z0-9]/g, "")
         .replace(/\r/g, "");
-      p.set(text.split("\n").filter((l) => l.trim() !== ""));
+      const lines = text.split("\n").filter((l) => l.trim() !== "");
+      // Nothing is not the same as a blank screen: a seat whose process has
+      // printed nothing yet, or whose transcript lives elsewhere, should
+      // say so rather than look broken.
+      p.set(lines.length ? lines : [
+        `${p.agent.name} has printed nothing yet.`,
+        "",
+        "A seat that was just started, or one whose CLI writes only to its",
+        "own screen, has an empty transcript until it says something.",
+      ]);
     } catch (e) {
       p.set([`could not read ${p.agent.name}'s screen: ${e.message || e}`]);
     }
@@ -2320,26 +2346,59 @@ class App {
     } catch (e) { p.set(["could not read the log"]); }
   }
 
-  // Everything else the flat views can do, as a list you point at.
+  // Everything else the flat views can do, as a list you point at. In a
+  // headset it rides on the left wrist, so there is always a way back to
+  // the chat, to the code map, and to one team on its own.
   openMenu() {
     const sel = this.scene.selected;
     const who = sel && sel.data && sel.kind === "agent" ? sel.data.name : null;
+    const here = (m) => (this.scene.mode === m ? "▸ " : "  ");
     const buttons = [
-      { label: "▸ the team", act: () => this.setMode("team") },
-      { label: "◆ the code graph", act: () => this.setMode("graph") },
-      { label: "⌨ open " + (who ? who + "'s terminal" : "a terminal"),
+      { label: here("team") + "the team", act: () => this.setMode("team") },
+      { label: here("graph") + "the code map", act: () => this.setMode("graph") },
+      { label: "  the chat", act: () => this.openChat() },
+      { label: "  " + (who ? who + "'s screen" : "a screen — point first"),
         act: () => (sel && sel.kind === "agent" ? this.openTerminal(sel)
                                                 : this.say("point at somebody first")) },
-      { label: "✉ the chat", act: () => this.openChat() },
-      { label: "● say something", act: () => this.listen() },
-      { label: "‖ pause " + (who || "a seat"), act: () => this.agentAction("pause") },
-      { label: "▶ start " + (who || "a seat"), act: () => this.agentAction("spawn") },
-      { label: "✕ close the screens", act: () => { this.panels = []; } },
+      { label: "  say something", act: () => this.listen() },
     ];
-    this.panel("menu", "what this can do", {
-      pos: [2.45, 2.00, -1.30], yaw: Math.atan2(-2.45, 1.30),
-      w: 1.05, cols: 34, rows: 8, buttons, accent: [.55, .65, 1.0],
+    // One line per team. This is the dropdown, in a place you can reach
+    // without taking the headset off.
+    const every = this.scene.sessions || [];
+    if (every.length > 1) {
+      buttons.push({ label: (this.scene.only ? "  " : "▸ ") + "every team",
+                     act: () => this.showOnly(null) });
+      for (const sname of every) {
+        buttons.push({
+          label: (this.scene.only === sname ? "▸ " : "  ") + "#" + (sname || "session"),
+          act: () => this.showOnly(sname),
+        });
+      }
+    }
+    if (who) {
+      buttons.push({ label: "  pause " + who, act: () => this.agentAction("pause") });
+      buttons.push({ label: "  start " + who, act: () => this.agentAction("spawn") });
+    }
+    buttons.push({ label: "  close the screens",
+                   act: () => { this.panels = this.panels.filter((x) => x.wrist); } });
+    const mounted = this.panels.find((x) => x.wrist && x.roomSpace);
+    this.panel("menu", "nexmesh", {
+      wrist: true,
+      // Where it hangs when there is no wrist to hang it on: beside you,
+      // as it always did on a flat screen.
+      pos: mounted ? mounted.pos : [2.45, 2.00, -1.30],
+      yaw: mounted ? mounted.yaw : Math.atan2(-2.45, 1.30),
+      w: this.xr ? 0.30 : 1.05, cols: 28, rows: buttons.length,
+      buttons, accent: [.55, .65, 1.0],
     });
+  }
+
+  // Show one team, or all of them. The ticks in the menu move with it.
+  showOnly(sname) {
+    this.scene.only = sname || null;
+    if (this.snap) this.scene.build(this.snap);
+    this.say(sname ? `#${sname} only` : "every team");
+    this.openMenu();
   }
 
   async agentAction(what) {
@@ -2352,10 +2411,14 @@ class App {
     } catch (e) { this.say(`could not ${what} that: ${e.message || e}`); }
   }
 
-  hitPanels(origin, dir) {
+  // `origin`/`dir` is the ray in the room's own coordinates; `rOrigin`/
+  // `rDir` is the same ray where your body is. A panel on your wrist does
+  // not move when the room does, so it is tested against the second one.
+  hitPanels(origin, dir, rOrigin, rDir) {
     let best = null;
     for (const p of this.panels) {
-      const c = p.cross(origin, dir);
+      const c = p.roomSpace ? p.cross(rOrigin || origin, rDir || dir)
+                            : p.cross(origin, dir);
       if (c && (!best || c.t < best.c.t)) best = { p, c };
     }
     for (const p of this.panels) {
@@ -2371,6 +2434,7 @@ class App {
   panelsInto(L) {
     for (const p of this.panels) {
       if (p.dirty || !p.tex) p.redraw();
+      if (p.roomSpace) continue;        // drawn with your hands instead
       L.textured.push({ tex: p.tex, model: p.model(), alpha: 0.97, gain: 1.1 });
       const rgb = p.accent;
       L.glows.push({ at: p.pos, size: p.w * 1.5, c: rgb.map((v) => v * 0.035) });
@@ -2383,15 +2447,23 @@ class App {
     let down = false, lx = 0, ly = 0, sx = 0, sy = 0;
     c.addEventListener("pointerdown", (e) => {
       down = true; lx = sx = e.clientX; ly = sy = e.clientY;
+      // Dragging a screen moves the screen; dragging anywhere else turns
+      // the room. Same hand, same gesture, in a headset and here.
+      this.dragPanel = this.lastRay && this.lastRay.panelHit
+        ? this.lastRay.panelHit.panel : null;
       c.setPointerCapture(e.pointerId);
     });
     c.addEventListener("pointerup", (e) => {
       down = false;
+      this.dragPanel = null;
       try { c.releasePointerCapture(e.pointerId); } catch (err) {}
       if (Math.abs(e.clientX - sx) < 4 && Math.abs(e.clientY - sy) < 4) this.press(this.lastRay);
     });
     c.addEventListener("pointermove", (e) => {
-      if (down) {
+      if (down && this.dragPanel) {
+        this.movePanel(this.dragPanel, e.clientX - lx, e.clientY - ly);
+        lx = e.clientX; ly = e.clientY;
+      } else if (down) {
         this.cam.yaw -= (e.clientX - lx) * 0.005;
         this.cam.pitch = clamp(this.cam.pitch + (e.clientY - ly) * 0.004, -0.25, 1.2);
         lx = e.clientX; ly = e.clientY;
@@ -2411,6 +2483,20 @@ class App {
       if (e.key === "m") this.openMenu();
       if (e.key === "Escape") { this.panels = []; this.cam.focus = null; }
     });
+  }
+
+  // A screen pushed by so many pixels of mouse, which is a distance in the
+  // room that depends on how far away the screen is: near ones follow the
+  // hand, far ones drift, exactly as a thing at that distance should.
+  movePanel(q, dx, dy) {
+    const cam = this.desktopCamera();
+    const vd = V3.norm(V3.sub(q.pos, cam.eye));
+    const right = V3.norm(V3.cross(vd, [0, 1, 0]));
+    const up = V3.norm(V3.cross(right, vd));
+    const depth = Math.max(0.5, V3.len(V3.sub(q.pos, cam.eye)));
+    const k = 2 * Math.tan(cam.fov / 2) * depth / Math.max(this.canvas.clientHeight, 1);
+    q.pos = V3.add(q.pos, V3.add(V3.mul(right, dx * k), V3.mul(up, -dy * k)));
+    q.yaw = Math.atan2(cam.eye[0] - q.pos[0], cam.eye[2] - q.pos[2]);
   }
 
   setMode(mode) {
@@ -2503,13 +2589,15 @@ class App {
     const pose = xrFrame.getViewerPose(this.refSpace);
     if (!pose) return;
     const layer = this.xr.renderState.baseLayer;
+    const headM = pose.transform.matrix;
+    const head = [headM[12], headM[13], headM[14]];
+    this.mountWrist(head);
     this.updatePointers(xrFrame);
     this.applyGrab();
     this.applyStick();
     const world = this.worldMatrix();
     const inv = M4.invert(world);
-    const headM = pose.transform.matrix;
-    const head = [headM[12], headM[13], headM[14]];
+    this.headAt = M4.apply(inv, head);
     const L = this.scene.collect(t, M4.apply(inv, head));
     this.panelsInto(L);
     // Everything that is yours rather than the room's: arms, rays, and
@@ -2533,6 +2621,11 @@ class App {
     const hh = left ? 0.045 : 0.07;
     KT.push({ tex: plate.tex, model: xf(billboard(at, head), S(hh * plate.aspect, hh, 1)),
               alpha: 0.95 });
+    // Whatever is strapped to you is drawn where you are, so pulling the
+    // room past you leaves it exactly where your hand is.
+    for (const p of this.panels) {
+      if (p.roomSpace) KT.push({ tex: p.tex, model: p.model(), alpha: 0.98, gain: 1.15 });
+    }
 
     this.r.shadowPass(L.opaque);
     gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
@@ -2558,6 +2651,25 @@ class App {
     }
   }
 
+  // The menu rides a hand's breadth above the left controller, turned to
+  // face you, so turning your wrist up is how you read it. It uses the
+  // hand as of the last frame, which is a sixtieth of a second behind and
+  // looks like nothing at all.
+  mountWrist(head) {
+    const m = this.panels.find((p) => p.wrist);
+    if (!m) return;
+    const left = (this.pointers || []).find((p) => p.handed === "left" && p.grip);
+    if (!left) {
+      if (m.roomSpace) { m.roomSpace = false; m.w = 1.05; m.geom(); m.dirty = true; }
+      return;
+    }
+    if (!m.roomSpace) { m.roomSpace = true; m.w = 0.30; m.geom(); m.dirty = true; }
+    const g = left.grip;
+    const at = [g[12], g[13] + 0.17 + m.h / 2, g[14]];
+    m.pos = at;
+    m.yaw = Math.atan2(head[0] - at[0], head[2] - at[2]);
+  }
+
   // Controllers and hands: where they are, what they point at.
   updatePointers(xrFrame) {
     this.pointers = [];
@@ -2572,7 +2684,7 @@ class App {
       const dir = V3.norm(M4.dir(m, [0, 0, -1]));
       const sOrigin = M4.apply(inv, origin);
       const sDir = V3.norm(M4.dir(inv, dir));
-      const onPanel = this.hitPanels(sOrigin, sDir);
+      const onPanel = this.hitPanels(sOrigin, sDir, origin, dir);
       const hit = onPanel ? null : this.scene.hit(sOrigin, sDir);
       const gripPose = src.gripSpace ? xrFrame.getPose(src.gripSpace, this.refSpace) : null;
       const g = src.gamepad;
@@ -2591,21 +2703,36 @@ class App {
     this.scene.hovered = hovered;
   }
 
-  // Taking hold. Squeezing on empty space grabs the ROOM and pulls it past
-  // you; squeezing on a subsystem takes that one, so a map can be put into
-  // the shape in your head.
+  // Taking hold. Squeezing on a screen moves that screen, squeezing on a
+  // subsystem takes that one, and squeezing on empty space grabs the ROOM
+  // and pulls it past you -- so both the map and the screens around it can
+  // be put into the shape in your head. The trigger still presses buttons,
+  // so holding a thing and using it are different hands' work.
   applyGrab() {
     for (const p of this.pointers) {
       const held = this.grab.get(p.src);
       const squeezing = p.squeeze > 0.6;
       if (squeezing && !held) {
-        const node = this.scene.mode === "graph" && p.hit ? p.hit.object : null;
-        this.grab.set(p.src, { at: p.sOrigin, node, nodeAt: node ? node.pos.slice() : null });
+        const panel = p.panelHit && !p.panelHit.panel.roomSpace ? p.panelHit.panel : null;
+        const node = !panel && this.scene.mode === "graph" && p.hit ? p.hit.object : null;
+        this.grab.set(p.src, {
+          at: p.sOrigin, node, panel,
+          nodeAt: node ? node.pos.slice() : null,
+          panelAt: panel ? panel.pos.slice() : null,
+        });
       } else if (!squeezing && held) {
         this.grab.delete(p.src);
       } else if (squeezing && held) {
         const d = V3.sub(p.sOrigin, held.at);
-        if (held.node) {
+        if (held.panel) {
+          const q = held.panel;
+          q.pos = V3.add(held.panelAt, d);
+          // It turns to keep facing you as it goes, because a screen you
+          // have pushed to one side edge-on is a screen you have lost.
+          if (this.headAt) {
+            q.yaw = Math.atan2(this.headAt[0] - q.pos[0], this.headAt[2] - q.pos[2]);
+          }
+        } else if (held.node) {
           held.node.pos = V3.add(held.nodeAt, d);
           held.node.bounds = [{ c: held.node.pos, r: held.node.size * 0.75 }];
         } else {
@@ -2697,7 +2824,9 @@ App.prototype.heard = function (text) {
   if (/^(show |open |go to )?(the )?(team|agents|room)$/.test(low)) { this.setMode("team"); return; }
   if (/^(show |open )?(the )?chat$/.test(low)) { this.openChat(); return; }
   if (/^(show |open )?(the )?menu$/.test(low)) { this.openMenu(); return; }
-  if (/^close( everything| the screens)?$/.test(low)) { this.panels = []; return; }
+  if (/^close( everything| the screens)?$/.test(low)) {
+    this.panels = this.panels.filter((q) => q.wrist); return;
+  }
   const name = low.replace(/^(select|choose|pick|show|open|talk to|message|attach to)\s+/, "");
   const found = this.scene.active().find((o) => {
     const n = (o.label || (o.data && o.data.name) || "").toLowerCase();
@@ -2738,6 +2867,9 @@ App.prototype.enterXR = async function () {
   session.addEventListener("end", () => {
     this.xr = null;
     this.grab.clear();
+    for (const q of this.panels) {
+      if (q.roomSpace) { q.roomSpace = false; q.w = 1.05; q.geom(); q.dirty = true; }
+    }
     this.say("left the headset");
     requestAnimationFrame((t) => this.loop(t));
   });
@@ -2748,6 +2880,7 @@ App.prototype.enterXR = async function () {
     this.press(p);
   });
   this.say("in the headset");
+  this.openMenu();   // so there is something on your wrist from the first second
   session.requestAnimationFrame((t, f) => this.xrLoop(t, f));
 };
 

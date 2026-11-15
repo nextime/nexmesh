@@ -1258,6 +1258,7 @@ impl Keyboard {
 /// question it always raises is "how do I get out of this?". The remote is
 /// told the screen is one row shorter than it is, and that row says whose
 /// terminal this is and which key brings you back.
+#[derive(Clone)]
 struct StatusBar {
     /// Who this is: the seat, and where it is running.
     who: String,
@@ -1272,6 +1273,9 @@ struct StatusBar {
     keys: Vec<(String, String)>,
     /// Passing state: `aloud`, `reading 2 back`.
     marks: Vec<String>,
+    /// Which entry the command row starts at. `?` moves it on and wraps,
+    /// so every key is reachable from the row itself.
+    page: usize,
     /// Recording, and since when. The bar goes RED and says so: a mode you
     /// cannot see is a microphone you forget is on. `hands_free` is the
     /// difference between one sentence and a conversation.
@@ -1303,6 +1307,7 @@ impl StatusBar {
             direct: false,
             keys: Vec::new(),
             marks: Vec::new(),
+            page: 0,
             recording: None,
             hands_free: false,
             command: false,
@@ -1311,6 +1316,72 @@ impl StatusBar {
             cols,
             rows,
         })
+    }
+
+    /// How many menu entries fit on a row of `w`, starting at `self.page`.
+    ///
+    /// Measured against the row this will actually draw, labels and all:
+    /// a count worked out from an average width is a count that is wrong
+    /// at both ends of the menu.
+    fn page_len(&self, w: usize) -> usize {
+        let sep = "  \u{00b7}  ";
+        let labelled: Vec<String> =
+            self.menu.iter().map(|(k, what)| format!("{k} {what}")).collect();
+        if labelled.is_empty() {
+            return 0;
+        }
+        let from = self.page.min(labelled.len() - 1);
+        let room = labelled.len() - from;
+        for n in (1..=room).rev() {
+            // The widest shape this could end up as, so a row that fits
+            // here still fits once the hint and the marks are on it.
+            let body = labelled[from..from + n].join(sep);
+            let hint = if n < labelled.len() { format!("{sep}? 9/9") } else { String::new() };
+            if format!(" COMMANDS{sep}{body}{hint}").chars().count() <= w {
+                return n;
+            }
+        }
+        1
+    }
+
+    /// How many pages the menu takes at this width, and which one is up.
+    /// Counted by walking from the start, because the pages are not all
+    /// the same size: the labels differ in length.
+    fn pages(&self, w: usize) -> usize {
+        let mut at = 0usize;
+        let mut pages = 0usize;
+        let mut probe = StatusBar { page: 0, ..self.clone() };
+        while at < self.menu.len() && pages < 32 {
+            probe.page = at;
+            at += probe.page_len(w).max(1);
+            pages += 1;
+        }
+        pages.max(1)
+    }
+
+    fn page_no(&self, w: usize) -> usize {
+        let mut at = 0usize;
+        let mut n = 0usize;
+        let mut probe = StatusBar { page: 0, ..self.clone() };
+        while at < self.menu.len() && n < 32 {
+            if at >= self.page {
+                return n;
+            }
+            probe.page = at;
+            at += probe.page_len(w).max(1);
+            n += 1;
+        }
+        n.saturating_sub(1)
+    }
+
+    /// `?`: on to the next few, and round to the first.
+    fn next_page(&mut self) {
+        let w = self.cols as usize;
+        let n = self.page_len(w).max(1);
+        self.page += n;
+        if self.page >= self.menu.len() {
+            self.page = 0;
+        }
     }
 
     fn set_mark(&mut self, name: &str, on: bool) {
@@ -1372,18 +1443,19 @@ impl StatusBar {
             let bare = format!(" {what}: {typed}\u{2588}");
             return bare.chars().skip(bare.chars().count().saturating_sub(w)).collect();
         }
-        // In command mode the row IS the menu: what the letters do, and how
+        // In command mode the row IS the menu: what the keys do, and how
         // to get out. Nothing else on it matters while it is up.
+        //
+        // More keys than fit on one row, so the row PAGES. `?` turns to the
+        // next few and wraps round to the first -- which keeps everything
+        // in the one place somebody is already looking, instead of printing
+        // a list into the middle of the agent's screen.
         if self.command {
             let id = if self.session.is_empty() {
                 self.who.clone()
             } else {
                 format!("{}:{}", self.session, self.who)
             };
-            // A key with no label is not a key anybody can use. When the
-            // row runs out of width it drops whole ENTRIES, never the words
-            // that say what they do -- and says `? more`, so what was
-            // dropped is one keystroke away rather than guesswork.
             let marks: String = if self.marks.is_empty() {
                 String::new()
             } else {
@@ -1391,26 +1463,33 @@ impl StatusBar {
             };
             let labelled: Vec<String> =
                 self.menu.iter().map(|(k, what)| format!("{k} {what}")).collect();
-            for keep in (0..=labelled.len()).rev() {
-                let mut shown: Vec<String> = labelled[..keep].to_vec();
-                if keep < labelled.len() {
-                    shown.push("? more".to_string());
-                }
-                let body = shown.join(sep);
-                // With the seat's name, then without it, then without the
-                // marks: the name is the first thing worth giving up here,
-                // because the row above has been saying it all along.
-                for line in [
-                    format!(" COMMANDS{sep}{body}{marks}{sep}{id}"),
-                    format!(" COMMANDS{sep}{body}{marks}"),
-                    format!(" COMMANDS{sep}{body}"),
-                ] {
-                    if line.chars().count() <= w {
-                        return line;
-                    }
+            if labelled.is_empty() {
+                return format!(" COMMANDS{sep}{id}").chars().take(w).collect();
+            }
+            let from = self.page.min(labelled.len() - 1);
+            let n = self.page_len(w);
+            let more = n < labelled.len();
+            let shown = &labelled[from..(from + n).min(labelled.len())];
+            // `? 2/3` rather than `? more`: where you are, and how much
+            // there is, which is what somebody pressing it again wants.
+            let hint = if more {
+                format!("{sep}? {}/{}", self.page_no(w) + 1, self.pages(w))
+            } else {
+                String::new()
+            };
+            let body = shown.join(sep);
+            // The seat's name is the first thing to give up when the row is
+            // tight: the row above has been saying it all along.
+            for line in [
+                format!(" COMMANDS{sep}{body}{hint}{marks}{sep}{id}"),
+                format!(" COMMANDS{sep}{body}{hint}{marks}"),
+                format!(" COMMANDS{sep}{body}{hint}"),
+            ] {
+                if line.chars().count() <= w {
+                    return line;
                 }
             }
-            return " COMMANDS \u{00b7} ? for the keys".chars().take(w).collect();
+            return format!(" COMMANDS{sep}{body}{hint}").chars().take(w).collect();
         }
         let id = if self.session.is_empty() {
             self.who.clone()
@@ -2091,6 +2170,10 @@ async fn attach(
                         command = !command;
                         if let Some(b) = &mut bar {
                             b.command = command;
+                            // Back to the first page: the mode is entered
+                            // to do one thing, and the keys for it should
+                            // be where they were last time.
+                            b.page = 0;
                         }
                         continue;
                     }
@@ -2102,19 +2185,18 @@ async fn attach(
                     // row can only hold a few, so this is where the rest
                     // live -- and it was promised in the documentation long
                     // before it existed.
+                    // `?` turns the row to the next few keys and wraps
+                    // round. In the row, because that is where somebody
+                    // asking "what are these" is already looking -- and
+                    // printing a list would scroll the agent's own screen
+                    // to say it.
                     if command && byte == b'?' {
-                        let mut out = tokio::io::stdout();
-                        let mut text = String::from("\r\n[nexmesh] in command mode:\r\n");
-                        for (k, what) in bar.as_ref().map(|b| b.menu.clone()).unwrap_or_default() {
-                            text.push_str(&format!("  {k:<10} {what}\r\n"));
+                        if let Some(b) = &mut bar {
+                            b.next_page();
+                            let mut out = tokio::io::stdout();
+                            let _ = out.write_all(&b.paint()).await;
+                            let _ = out.flush().await;
                         }
-                        text.push_str(&format!(
-                            "  {:<10} leave command mode\r\n  {:<10} detach\r\n",
-                            voice::key_name(vkeys.command),
-                            voice::key_name(vkeys.detach),
-                        ));
-                        let _ = out.write_all(text.as_bytes()).await;
-                        let _ = out.flush().await;
                         continue;
                     }
                     let Some(act) = (if command { vkeys.act(byte) } else { None }) else {
@@ -3387,29 +3469,63 @@ mod bar_tests {
         assert!(bar(80).line().contains("nexmesh:Nexmesh-dev"), "{}", bar(80).line());
     }
 
-    /// A key with no label is useless, so the row drops whole entries and
-    /// points at `?` rather than listing bare chords nobody can read.
-    #[test]
-    fn a_narrow_row_drops_entries_not_their_words() {
-        let mut b = bar(58);
+    fn menu_bar(cols: u16) -> StatusBar {
+        let mut b = bar(cols);
         b.command = true;
         b.menu.clear();
         for (k, what) in [("Ctrl-G", "say it"), ("Ctrl-O", "read it back"),
                           ("Ctrl-T", "read everything"), ("Ctrl-N", "hands free"),
-                          ("Ctrl-F", "plain mouse"), ("Ctrl-B", "open a link")] {
+                          ("Ctrl-F", "plain mouse"), ("Ctrl-B", "open a link"),
+                          ("Ctrl-Y", "send a file"), ("Ctrl-P", "camera")] {
             b.menu.push((k.into(), what.into()));
         }
+        b
+    }
+
+    /// A key with no label is useless. The row shows as many whole entries
+    /// as fit, never a bare chord, and says which page of them this is.
+    #[test]
+    fn a_narrow_row_keeps_the_words_and_says_there_are_more() {
+        let b = menu_bar(58);
         let line = b.line();
         assert!(line.contains("Ctrl-G say it"), "{line}");
-        assert!(line.contains("? more"), "and a way to the rest: {line}");
+        assert!(line.contains("? 1/"), "and where the rest are: {line}");
         assert!(line.chars().count() <= 58, "{} chars", line.chars().count());
-        // Never a chord without its words.
         assert!(!line.contains("Ctrl-B  "), "a bare key with no label: {line}");
-        // Wide enough, and everything is there with its words.
-        b.cols = 160;
-        let wide = b.line();
-        assert!(wide.contains("Ctrl-B open a link"), "{wide}");
-        assert!(!wide.contains("? more"), "nothing was dropped: {wide}");
+    }
+
+    /// `?` walks the whole menu and comes back to the start, so nothing is
+    /// unreachable and nobody is left on a page they cannot leave.
+    #[test]
+    fn the_question_mark_cycles_every_key_and_wraps() {
+        let mut b = menu_bar(58);
+        let mut seen: Vec<String> = Vec::new();
+        let mut firsts: Vec<usize> = Vec::new();
+        for _ in 0..12 {
+            let line = b.line();
+            for (k, what) in &b.menu {
+                if line.contains(&format!("{k} {what}")) && !seen.contains(k) {
+                    seen.push(k.clone());
+                }
+            }
+            if firsts.contains(&b.page) {
+                break;              // wrapped
+            }
+            firsts.push(b.page);
+            b.next_page();
+        }
+        assert_eq!(seen.len(), b.menu.len(), "every key is reachable: saw {seen:?}");
+        assert_eq!(b.page, 0, "and it comes back to the first page");
+    }
+
+    /// A row wide enough for all of them shows all of them, and says
+    /// nothing about pages that do not exist.
+    #[test]
+    fn a_wide_row_needs_no_pages() {
+        let b = menu_bar(200);
+        let line = b.line();
+        assert!(line.contains("Ctrl-P camera"), "{line}");
+        assert!(!line.contains("?"), "nothing was dropped: {line}");
     }
 
     #[test]

@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-coderai"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-ctl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-hub"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-mcpd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-node"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-orch"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "nexmesh-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "rcgen",

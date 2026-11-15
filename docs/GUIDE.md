@@ -377,7 +377,7 @@ instead. Either way the token never appears in the output, including
 `nexmesh`, with no command, from a terminal:
 
 ```
- nexmesh console   scope every session   hub 0.2.0  ● live
+ nexmesh console   scope every session   hub 0.2.1  ● live
   1·deck   2·agents   3·chat   4·plan   5·memory   6·graph   7·files   8·fleet
 ```
 
@@ -468,20 +468,35 @@ those reaches no browser: the link is three layers away from the desktop
 that could open it. So `Ctrl-B` finds the newest link the agent has printed
 and hands it to this machine, which is where the person is.
 
-**The mouse stays with your terminal**, and that default was learned the
-hard way. A viewer can ask the terminal for mouse reports and turn the
-wheel into the page keys a full-screen agent scrolls with -- but in taking
-the mouse it also takes dragging to select and clicking a link, which are
-the two things a person actually does with a mouse in a terminal. Worse,
-nothing says so from the inside: the wheel stops working, selection selects
-nothing, and links stop opening, all at once and for no visible reason.
+**tmux keeps the wheel** in the view the node creates, because a pane's
+history belongs to tmux: the terminal you are sitting at has no scrollback
+for a full-screen program, and the viewer in between has none either. The
+thing to know, rather than to discover by losing it, is that **holding
+SHIFT** gives the terminal back for as long as you hold it: Shift-drag
+selects, Shift-click opens a link. That is how every mouse-enabled terminal
+program works.
 
-So the viewer borrows it only when asked. `Ctrl-F` in command mode hands it
-over and says so on the row; `Ctrl-F` again gives it back. `mouse = "viewer"`
-in `~/.nexmesh/console.toml` makes it the default for anyone who wants it
-that way. The same applies to an adopted tmux pane: the node no longer turns
-tmux's own mouse mode on, because that takes selection in exactly the same
-way.
+`Ctrl-F` turns it off entirely for anyone who would rather have the plain
+terminal and no wheel. The row in command mode pages with `?` rather than
+listing everything at once, so a narrow terminal never shows a key without
+the words that say what it does.
+
+An earlier version of this took the mouse away from everything by default
+to protect selection, and that was wrong in the other direction: it removed
+the scrolling that already worked, which was the thing somebody was actually
+using. The cost of mouse mode is real -- a terminal that is reporting clicks
+is not selecting text with them, and nothing says so from the inside -- but
+the answer is a key that says what it does, not a default that takes a
+working feature away.
+
+So: tmux has the wheel, Shift borrows the terminal back for as long as you
+hold it, and `Ctrl-F` in command mode turns mouse mode off for good and says
+so on the row; `Ctrl-F` again hands it back. In a tmux pane that key asks the
+node to set **tmux's own** mouse mode, which is the only thing that can
+scroll a pane's history, rather than translating the wheel into keys tmux
+never sees. Whatever was borrowed is returned on detach. `mouse = "viewer"`
+in `~/.nexmesh/console.toml` makes the viewer take the mouse from the start
+instead, for an agent that paints its own screen with no tmux underneath.
 
 `Ctrl-]` still detaches from either mode. A **reply** is everything the agent
 printed since you last pressed Enter: that boundary is what makes "read the
@@ -501,7 +516,8 @@ Command mode also carries the two things that move a FILE:
 | key | |
 |-----|---|
 | `Ctrl-B` | open the newest link the agent has printed, in a browser on THIS machine |
-| `Ctrl-F` | borrow the mouse so the wheel scrolls the agent; press it again to give it back |
+| `Ctrl-F` | give the mouse back to the terminal, so a plain click selects; again to let tmux have the wheel |
+| `?` | turn the row to the next few keys, and round to the first |
 | `Ctrl-Y` | send a file from this machine; the path is typed on the bar itself |
 | `Ctrl-P` | take a photo with this machine's camera and send that |
 
@@ -1789,6 +1805,46 @@ never at the expense of reading a number. `LCARS` is the other one: black,
 blocks, elbows, condensed capitals, and the trans flag for its palette, which
 is as close to canon pastels as it is to the point. Both are CSS tokens on
 `:root`, so nothing is loaded from anywhere to render either.
+
+#### The room
+
+`/xr` is the same fleet as a place: the team standing in a room, the code
+graph as something with a far side. It is one file of WebGL2 and WebXR
+(`xr.js`), served by the hub like everything else, and it works on a flat
+screen as well as in a headset.
+
+On a flat screen: drag to look, scroll to step back, click a teammate to open
+their terminal, **drag a screen to move it** — it turns to keep facing you —
+and `g`, `c`, `m`, `v` for the graph, the chat, the menu and speech, with
+`Escape` to clear the screens.
+
+In a headset, the trigger presses whatever the ray is on and **squeeze takes
+hold of it**: a screen moves with your hand, a subsystem follows it, and empty
+space grabs the room and pulls it past you. The thumbsticks slide and
+snap-turn for anyone who prefers that.
+
+The menu rides on your **left wrist**, mounted the moment you enter and never
+closed by *close the screens*, because a menu you have to go and find is a
+menu nobody finds in a headset -- turn your wrist up to read it, point at it
+with the other hand to use it. Everything the flat views can do is on it,
+including **one line per team**: a fleet running four sessions at once is a
+crowd until you can ask for one of them, which is the dropdown the flat
+dashboard has. Picking a team rebuilds the room with that team alone; *every
+team* puts them all back.
+
+Whatever is strapped to you is drawn where your body is rather than where the
+room is, so pulling the room past you leaves the menu exactly where your hand
+is.
+
+Speech is the input a headset actually has: the trigger on empty space starts
+listening, and what you say is a command (`the code graph`, `the chat`), a
+name, or a sentence, which goes to whoever is selected or to the team.
+
+The controls are tested in `tests/e2e_xrroom.py`, which drives the real page
+in headless chromium against the demo fleet — the menu's rows, filtering to
+one team, that closing the screens leaves the menu, and that a held screen
+moves by exactly what the hand moved. It skips itself where there is no
+chromium rather than failing.
 
 #### Signing in
 
