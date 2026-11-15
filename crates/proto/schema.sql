@@ -552,6 +552,17 @@ CREATE TABLE IF NOT EXISTS messages (
   -- sanctioned way a reply crosses a session.
   reply_to_slot    TEXT,
   reply_to_session TEXT,
+  -- A RECORD, not a message: the console's housekeeping lines, the node's
+  -- notes about what it did while nobody was attached, an answer addressed to
+  -- the operator. It belongs in the chat a person reads and must never be
+  -- handed to an agent as work.
+  --
+  -- This is a flag of its own because the obvious shortcut is wrong: these
+  -- rows are also pre-claimed, and filtering delivery on the CLAIM took a
+  -- team message away from every other seat the moment one of them claimed
+  -- it -- which is the one thing the delivery query's own comment warns
+  -- about, since a team message's state is per RECIPIENT.
+  record           INTEGER NOT NULL DEFAULT 0,
   -- When the sender was told this message is not getting through. A message
   -- to a seat whose process has died, or whose machine has gone, waits for
   -- ever and silently: the sender believes it was heard. Reported once, which

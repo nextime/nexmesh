@@ -2757,8 +2757,8 @@ pub async fn operator_message(
             let now = now_ms();
             db.execute(
                 "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
-                                       sent_at_ms, claimed_at_ms, claimed_by)
-                 VALUES (?, NULL, NULL, 'system', ?, ?, ?, 'console')",
+                                       sent_at_ms, claimed_at_ms, claimed_by, record)
+                 VALUES (?, NULL, NULL, 'system', ?, ?, ?, 'console', 1)",
                 params![session_id, line, now, now],
             )
             .map_err(bad)?;

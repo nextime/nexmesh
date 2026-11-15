@@ -356,9 +356,9 @@ impl<'a> Ctx<'a> {
             None => {
                 self.db.execute(
                     "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
-                                           sent_at_ms, claimed_at_ms, claimed_by,
+                                           sent_at_ms, claimed_at_ms, claimed_by, record,
                                            reply_to_slot, reply_to_session)
-                     VALUES (?1, ?2, NULL, 'text', ?3, ?4, ?4, 'operator', ?2, ?1)",
+                     VALUES (?1, ?2, NULL, 'text', ?3, ?4, ?4, 'operator', 1, ?2, ?1)",
                     params![self.session_id, self.slot_id, text, now],
                 )?;
                 Ok("Answered the operator in this chat. Your teammates were not sent it.".into())
@@ -471,13 +471,17 @@ pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Res
          FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
          WHERE m.session_id = ?1
            AND m.from_slot IS NOT ?2
-           -- A PRE-CLAIMED message is a record, not a message: the console's
-           -- own housekeeping lines and the node's notes about what it did
-           -- while nobody was attached. The MCP floor has always skipped
-           -- them; the push and typed paths did not, so they were delivered
-           -- to agents -- and a seat that joined later was typed at with the
-           -- whole backlog of them at once.
-           AND m.claimed_at_ms IS NULL
+           -- A RECORD is not a message: the console's own housekeeping
+           -- lines, the node's notes about what it did while nobody was
+           -- attached, an answer addressed to the operator. They were being
+           -- delivered to agents -- a seat that joined later was typed at
+           -- with the whole backlog of them at once.
+           --
+           -- Filtering on the CLAIM instead looked equivalent and was not:
+           -- a team message's state is per RECIPIENT, so one seat claiming
+           -- it took it from all the others and `seen` never caught up with
+           -- the audience.
+           AND m.record = 0
            -- Addressed to me: the message's own state is the whole story.
            -- Addressed to the team: MY copy is, because one teammate acking
            -- must not take it from the rest.
@@ -1507,6 +1511,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// One seat claiming a TEAM message must not take it from the others.
+    ///
+    /// Records are kept out of delivery by a flag of their own. Filtering on
+    /// the CLAIM instead looked equivalent and was not: a team message's
+    /// state is per recipient, and claiming is per message, so the first seat
+    /// to claim one emptied it for everybody else and the audience never
+    /// caught up. CI found it; this keeps it found.
+    #[test]
+    fn claiming_a_team_message_leaves_it_pending_for_the_other_seats() {
+        let db = fixture();
+        let now = now_ms();
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', NULL, NULL, 'text', 'who is awake in here?', ?)",
+            params![now],
+        )
+        .unwrap();
+        let id = db.last_insert_rowid();
+        assert!(pending_for_slot(&db, "s1", "sl-eng").unwrap().iter().any(|m| m.id == id));
+        assert!(pending_for_slot(&db, "s1", "sl-rev").unwrap().iter().any(|m| m.id == id));
+        // The engineer deals with it...
+        claim_messages(&db, "Max", &[id]).unwrap();
+        // ...and the reviewer has still not seen it.
+        assert!(
+            pending_for_slot(&db, "s1", "sl-rev").unwrap().iter().any(|m| m.id == id),
+            "one seat claiming a team message took it from the rest"
+        );
+    }
+
     /// Answering is `reply`, and it goes to ONE place.
     ///
     /// Before this, delivery told an agent to answer the operator with
@@ -1627,13 +1660,13 @@ mod tests {
     /// joining later and being typed at with the whole backlog of them at
     /// once, which killed it.
     #[test]
-    fn a_pre_claimed_record_is_never_delivered_to_an_agent() {
+    fn a_record_is_never_delivered_to_an_agent() {
         let db = fixture();
         let now = now_ms();
         db.execute(
             "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
-                                   sent_at_ms, claimed_at_ms, claimed_by)
-             VALUES ('s1', NULL, NULL, 'system', 'answered a prompt for you', ?, ?, 'node')",
+                                   sent_at_ms, claimed_at_ms, claimed_by, record)
+             VALUES ('s1', NULL, NULL, 'system', 'answered a prompt for you', ?, ?, 'node', 1)",
             params![now, now],
         )
         .unwrap();

@@ -343,8 +343,8 @@ pub async fn stalled_tick(st: &AppState) {
             // pre-claimed so no agent is handed somebody else's postmark.
             None => db.execute(
                 "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
-                                       claimed_at_ms, claimed_by)
-                 VALUES (?1, NULL, NULL, 'system', ?2, ?3, ?3, 'operator')",
+                                       claimed_at_ms, claimed_by, record)
+                 VALUES (?1, NULL, NULL, 'system', ?2, ?3, ?3, 'operator', 1)",
                 rusqlite::params![session, body, now],
             ),
         };

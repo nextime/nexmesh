@@ -282,8 +282,8 @@ async fn handle(
                 let now = crate::now_ms();
                 let _ = db.execute(
                     "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
-                                           sent_at_ms, claimed_at_ms, claimed_by)
-                     VALUES (?1, ?2, NULL, 'system', ?3, ?4, ?4, 'node')",
+                                           sent_at_ms, claimed_at_ms, claimed_by, record)
+                     VALUES (?1, ?2, NULL, 'system', ?3, ?4, ?4, 'node', 1)",
                     rusqlite::params![session_id, slot_id, text, now],
                 );
             } else {

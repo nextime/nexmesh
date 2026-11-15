@@ -103,6 +103,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("messages", "reply_to_session", "TEXT"),
         // When the sender was told a message is not getting through.
         ("messages", "stalled_at_ms", "INTEGER"),
+        // A record for the chat, never a message for an agent. See schema.sql
+        // for why this is not just "pre-claimed".
+        ("messages", "record", "INTEGER NOT NULL DEFAULT 0"),
         // A seat that supervises the fleet: what agents raise to the
         // supervisors is delivered into its session as an ordinary message,
         // so a seat acting as orchestrator can hear what it supervises. The

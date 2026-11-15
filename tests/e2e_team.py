@@ -349,7 +349,11 @@ def main():
     # read as ignored.
     check("the operator is named as the operator, not as a teammate",
           "from the OPERATOR" in t, t[:400])
-    check("and the way back to them is spelled out", "broadcast" in t, t[:400])
+    # The way back must name `reply`, not `broadcast`. This check used to
+    # assert the opposite, and the delivery text used to say it: every
+    # exchange with one agent became a message to the whole team.
+    check("and the way back to them is reply, not a broadcast at the team",
+          "reply" in t and "reply(to:" in t, t[:400])
     m = team_msg()
     check("once every seat has seen it, it is delivered",
           m.get("seen") == m.get("audience") and m.get("delivered") is True, str(m)[:300])
