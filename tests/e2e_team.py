@@ -400,10 +400,10 @@ def main():
     # identified by directory, by pid, or by name alone. The CLI publishes
     # the conversation id -- CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID -- and
     # that is what a seat follows.
-    def talk(conversation, name="Window"):
+    def talk(conversation, name="Window", var="NEXMESH_CLI_SESSION"):
         e = dict(os.environ, NEXMESH_SOCK=SOCK, NEXMESH_CLI="handmade",
-                 NEXMESH_NAME=name, NEXMESH_ROLE="tester", NEXMESH_SESSION=sid,
-                 NEXMESH_CLI_SESSION=conversation)
+                 NEXMESH_NAME=name, NEXMESH_ROLE="tester", NEXMESH_SESSION=sid)
+        e[var] = conversation
         p = subprocess.Popen([f"{BIN}/nexmesh-mcpd"], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              text=True, env=e, bufsize=1, cwd=WS_DIR)
@@ -420,6 +420,25 @@ def main():
     one = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
     check("a conversation takes a seat", len(one) == base + 1, f"{base} -> {len(one)}")
 
+    # Whose id is it? `NEXMESH_CLI_SESSION` is a LABEL -- an operator or a
+    # config file naming a seat. hermes has to be pinned that way, because it
+    # strips the environment of its MCP servers, so nothing the node sets
+    # reaches the shim. A label is not a conversation the CLI can be asked to
+    # resume: passing one to `--resume` asks for a conversation nobody ever
+    # had, and hermes answers "Session not found" and starts a blank one
+    # wearing the right name, on every start. An id the CLI published itself
+    # is the opposite: that IS the resume handle.
+    def _slots(where):
+        import sqlite3 as _s
+        c = _s.connect(DB); c.row_factory = _s.Row
+        rows = [dict(r) for r in c.execute(
+            f"SELECT cli_session, cli_session_own FROM slots WHERE {where}")]
+        c.close()
+        return rows
+    owned = _slots("cli_session = 'conv-aaa'")
+    check("a pinned label is recorded as not the CLI's own",
+          bool(owned) and owned[0]["cli_session_own"] == 0, str(owned))
+
     # Same folder, same name, DIFFERENT conversation: a second window.
     talk("conv-bbb")
     two = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
@@ -431,6 +450,11 @@ def main():
     three = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
     check("resuming a conversation returns to its own seat, however often",
           len(three) == base + 2, f"expected {base + 2}, got {len(three)}")
+
+    talk("claude-published-this", name="Published", var="CLAUDE_CODE_SESSION_ID")
+    pub = _slots("cli_session = 'claude-published-this'")
+    check("an id the CLI published itself is recorded as its own",
+          bool(pub) and pub[0]["cli_session_own"] == 1, str(pub))
 
     # And it can move: the same identity pointed at another session takes a
     # seat there, and stops occupying the one it left.

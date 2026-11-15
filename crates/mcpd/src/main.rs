@@ -127,6 +127,7 @@ async fn register(
         role: args.role.clone(),
         name: args.name.clone(),
         cli_session: cli_session_id(),
+        cli_session_is_own: cli_session().1,
     })
     .await?;
     match node.recv().await? {
@@ -321,17 +322,32 @@ const CLI_SESSION_VARS: &[&str] = &[
     "GEMINI_SESSION_ID",
 ];
 
-/// Which conversation this shim belongs to, if the CLI says.
-fn cli_session_id() -> Option<String> {
+/// Which conversation this shim belongs to, if the CLI says -- and whether
+/// the CLI is what said it.
+///
+/// The difference matters once a conversation id is used to RESUME one. A
+/// value from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID` is the CLI's own
+/// handle on its own conversation, and `--resume <that>` continues it. A
+/// value from `NEXMESH_CLI_SESSION` is whatever an operator or a config file
+/// chose to call this seat -- a label. Resuming from a label asks the CLI to
+/// continue a conversation that never existed: hermes answers "Session not
+/// found: hermes-lisa" and starts a blank one wearing the same name, every
+/// time the seat is started.
+fn cli_session() -> (Option<String>, bool) {
     for key in CLI_SESSION_VARS {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim().to_string();
             if !v.is_empty() {
-                return Some(v);
+                return (Some(v), *key != "NEXMESH_CLI_SESSION");
             }
         }
     }
-    None
+    (None, false)
+}
+
+/// Which conversation this shim belongs to, if the CLI says.
+fn cli_session_id() -> Option<String> {
+    cli_session().0
 }
 
 #[tokio::main]
@@ -539,5 +555,17 @@ mod tests {
     fn the_two_cli_variables_we_verified_are_there() {
         assert!(CLI_SESSION_VARS.contains(&"CLAUDE_CODE_SESSION_ID"));
         assert!(CLI_SESSION_VARS.contains(&"CODEX_THREAD_ID"));
+    }
+
+    /// Only the CLI's own id may be handed back to it to resume with. The
+    /// override is a name for a seat, and `--resume <a name>` asks for a
+    /// conversation nobody ever had.
+    #[test]
+    fn only_the_cli_owns_an_id_it_published_itself() {
+        let own = |k: &str| k != "NEXMESH_CLI_SESSION";
+        assert!(!own(CLI_SESSION_VARS[0]));
+        for key in &CLI_SESSION_VARS[1..] {
+            assert!(own(key), "{key} is a CLI's own variable");
+        }
     }
 }

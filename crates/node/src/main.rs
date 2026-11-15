@@ -689,6 +689,27 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             });
         }
 
+        HubToNode::GetFile { req_id, root, rel } => {
+            // Off the session loop, like PutFile: reading 20MB off a slow
+            // disk must not stall spawns and attach traffic for the machine.
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let (ok, data_b64, media_type, detail) =
+                    match putfile::read(&root, &rel, proto::MAX_FETCH_BYTES).await {
+                        Ok((bytes, kind)) => {
+                            (true, proto::b64::encode(&bytes), kind, String::new())
+                        }
+                        Err(e) => (false, String::new(), String::new(), format!("{e:#}")),
+                    };
+                if !ok {
+                    tracing::warn!(%rel, "could not read it for the hub: {detail}");
+                }
+                let _ = ctx
+                    .send_hub(&NodeToHub::FileBytes { req_id, ok, data_b64, media_type, detail })
+                    .await;
+            });
+        }
+
         HubToNode::AttachResize { attach_id, cols, rows } => {
             attachsock::resize(&ctx, &attach_id, cols, rows);
         }

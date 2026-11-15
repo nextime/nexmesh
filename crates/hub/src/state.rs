@@ -50,6 +50,21 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // and one you can only read -- which used to be discoverable only by
         // attaching and finding out.
         ("agents", "io_kind", "TEXT"),
+        // Set when the node reports that this agent sits at its own prompt in
+        // a terminal the node spawned, so the hub may type at it even though
+        // nothing drives it. See `delivery::interactive_tick`.
+        ("agents", "typed_delivery", "INTEGER NOT NULL DEFAULT 0"),
+        // Is `cli_session` the CLI's OWN conversation id, or a label someone
+        // pinned? Only the first can be handed back to resume with. See
+        // `mcpd::cli_session`.
+        ("slots", "cli_session_own", "INTEGER NOT NULL DEFAULT 0"),
+        // The upload a message is about, when it is about one, so the chat
+        // can show the picture rather than the path to it.
+        ("messages", "attachment", "TEXT"),
+        // Which voice reads this seat's words out, when the fleet is being
+        // listened to rather than read. On the SEAT, so every front end and
+        // every listener hears the same team.
+        ("slots", "voice", "TEXT"),
         // A seat whose CLI is sitting in a terminal some node has adopted.
         // `terminal_via` is the adopted agent whose pty the keystrokes go
         // through, and the pid/ticks are the CLI that must still be in that
@@ -448,6 +463,29 @@ impl Operator {
 }
 
 
+/// A client that has gone quiet for this long is no longer sharing.
+pub const VIEW_TTL_MS: i64 = 12_000;
+/// One frame. Generous for a 640-wide jpeg, far too small for a video.
+pub const MAX_VIEW_BYTES: usize = 900 * 1024;
+/// How many clients may share at once.
+pub const MAX_VIEWS: usize = 8;
+
+/// The newest picture from one operator client.
+#[derive(Clone, Debug)]
+pub struct ViewFrame {
+    /// What it is: "xr", "dashboard", a name an operator chose.
+    pub label: String,
+    pub kind: String,
+    pub w: u32,
+    pub h: u32,
+    pub at_ms: i64,
+    /// The image itself, already encoded by the browser that drew it.
+    pub bytes: Vec<u8>,
+    pub media_type: String,
+    /// What that client is doing, in words, for the list.
+    pub status: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
@@ -457,6 +495,14 @@ pub struct AppState {
     /// Slots currently being respawned. One at a time per slot, or a slow node
     /// would get two agents for the same seat.
     respawning: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// What the operator clients are looking at, for anybody else to watch.
+    ///
+    /// In memory and nowhere else. A mirror frame is worth a few seconds and
+    /// is replaced several times a second; writing it to SQLite would be
+    /// writing a video into a database a Celeron has to answer queries from.
+    /// One frame per client, the newest, and a client nobody has heard from
+    /// in `VIEW_TTL_MS` is gone.
+    views: Arc<Mutex<HashMap<String, ViewFrame>>>,
     /// Outstanding workspace-sync requests, awaiting the node's answer.
     sync_waiters: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     sync_seq: Arc<std::sync::atomic::AtomicU64>,
@@ -585,6 +631,7 @@ impl AppState {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
+            views: Arc::new(Mutex::new(HashMap::new())),
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
             graph_parts: Arc::new(Mutex::new(HashMap::new())),
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -610,6 +657,7 @@ impl AppState {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             attaches: Arc::new(Mutex::new(HashMap::new())),
             respawning: Arc::new(Mutex::new(Default::default())),
+            views: Arc::new(Mutex::new(HashMap::new())),
             sync_waiters: Arc::new(Mutex::new(HashMap::new())),
             graph_parts: Arc::new(Mutex::new(HashMap::new())),
             sync_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -648,6 +696,51 @@ impl AppState {
     }
 
     /// Hand a node's answer to whoever asked. False when nobody is there to
+    /// Take the newest frame from an operator client, for others to watch.
+    ///
+    /// Bounded in three ways, because this is the one endpoint that accepts
+    /// a picture several times a second: a frame larger than
+    /// `MAX_VIEW_BYTES` is refused, only `MAX_VIEWS` clients are kept, and
+    /// stale ones are dropped on every write rather than by a sweeper.
+    pub fn put_view(&self, id: &str, frame: ViewFrame) -> Result<(), &'static str> {
+        if frame.bytes.len() > MAX_VIEW_BYTES {
+            return Err("that frame is too large");
+        }
+        let mut v = self.views.lock().unwrap();
+        let now = nexmesh_proto::now_ms();
+        v.retain(|_, f| now - f.at_ms < VIEW_TTL_MS);
+        if !v.contains_key(id) && v.len() >= MAX_VIEWS {
+            return Err("too many clients are already sharing a view");
+        }
+        v.insert(id.to_string(), frame);
+        Ok(())
+    }
+
+    /// Who is sharing, and how fresh each one is.
+    pub fn views(&self) -> Vec<(String, ViewFrame)> {
+        let now = nexmesh_proto::now_ms();
+        let v = self.views.lock().unwrap();
+        let mut out: Vec<(String, ViewFrame)> = v
+            .iter()
+            .filter(|(_, f)| now - f.at_ms < VIEW_TTL_MS)
+            .map(|(k, f)| (k.clone(), ViewFrame { bytes: Vec::new(), ..f.clone() }))
+            .collect();
+        out.sort_by(|a, b| a.1.label.cmp(&b.1.label));
+        out
+    }
+
+    /// One client's newest frame, bytes and all.
+    pub fn view(&self, id: &str) -> Option<ViewFrame> {
+        let now = nexmesh_proto::now_ms();
+        let v = self.views.lock().unwrap();
+        v.get(id).filter(|f| now - f.at_ms < VIEW_TTL_MS).cloned()
+    }
+
+    /// Stop sharing, said out loud rather than waited out.
+    pub fn drop_view(&self, id: &str) {
+        self.views.lock().unwrap().remove(id);
+    }
+
     /// take it any more -- the caller timed out, or went away -- which is
     /// worth knowing for an answer that cost minutes to produce.
     pub fn complete_sync(&self, req_id: u64, value: serde_json::Value) -> bool {

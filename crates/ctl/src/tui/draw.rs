@@ -1364,6 +1364,7 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         row("R", "reverse the agent order"),
         row("Enter", "in memory: open the whole of one"),
         row("PgUp/PgDn", "scroll the chat back, or a memory down"),
+        row("wheel", "the same, three lines at a time"),
         row("i", "type in the chat; arrows and Tab still work"),
         row("v", "say it instead: record, then the fleet transcribes it"),
         row("P", "the camera: a photo or a clip, into the workspace"),
@@ -1379,6 +1380,10 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             "  Everything here is the same snapshot the dashboard reads.",
+            Style::default().fg(th.faint()),
+        )),
+        Line::from(Span::styled(
+            "  The mouse is the console's while it runs: hold SHIFT to select.",
             Style::default().fg(th.faint()),
         )),
     ]);

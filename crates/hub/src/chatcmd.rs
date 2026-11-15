@@ -42,6 +42,9 @@ pub enum Cmd {
     Start { who: String, mode: Option<String> },
     Owns { who: String, patterns: Vec<String>, add: bool },
     New { cli: String, name: String, mode: Option<String> },
+    /// Which voice reads this agent's words out. A seat, not a machine:
+    /// whoever is listening hears the same team.
+    Voice { who: String, voice: String },
 }
 
 /// What the chat can be told to do, as the chat itself explains it.
@@ -54,6 +57,7 @@ pub fn help() -> String {
      \u{2022} /new <cli> <name> [interactive|headless]\n\
      \u{2022} /owns <agent> <pattern>...     \u{2014} which parts of the workspace are theirs\n\
      \u{2022} /owns <agent> +<pattern>       \u{2014} add one instead of replacing the list\n\
+     \u{2022} /voice <agent> <voice|none>   \u{2014} which voice reads that agent aloud\n\
      \u{2022} /help\n\
      An agent is named by its name, its role or its seat id. Say something \
      starting with a slash by doubling it: //like this."
@@ -116,6 +120,20 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
             let who = one("an agent")?;
             Ok(Parsed::Do(Cmd::Start { who, mode: mode_of(args.get(1).copied())? }))
         }
+        "voice" | "speaks" => {
+            let who = one("an agent and a voice")?;
+            let voice = args[1..].join(" ");
+            if voice.trim().is_empty() {
+                return Err(format!("/{verb} needs a voice. {}", usage("voice")));
+            }
+            // `none` is how a setting is taken off: an empty argument is one
+            // the parser cannot see.
+            let voice = match voice.trim().to_lowercase().as_str() {
+                "none" | "default" | "off" => String::new(),
+                _ => voice.trim().to_string(),
+            };
+            Ok(Parsed::Do(Cmd::Voice { who, voice }))
+        }
         "owns" | "own" | "assign" => {
             let who = one("an agent and what it owns")?;
             if args.len() < 2 {
@@ -174,6 +192,7 @@ fn usage(verb: &str) -> String {
         "start" | "spawn" | "launch" => "/start <agent> [interactive|headless]",
         "new" | "seat" => "/new <cli> <name> [interactive|headless]",
         "owns" | "own" | "assign" => "/owns <agent> <pattern>... (prefix + to add)",
+        "voice" | "speaks" => "/voice <agent> <voice|none>",
         _ => "/help",
     };
     format!("Usage: {line}")

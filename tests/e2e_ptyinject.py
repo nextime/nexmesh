@@ -28,7 +28,7 @@ TYPED = f"{T}/typed.log"
 CLIS = f"{T}/clis"; os.makedirs(CLIS)
 for f in os.listdir(f"{ROOT}/clis"):
     if f.endswith(".toml"): shutil.copy(f"{ROOT}/clis/{f}", CLIS)
-for name in ("faketyped", "faketui"):
+for name in ("faketyped", "faketui", "fakeprompt"):
     d = open(f"{SCR}/fake-cli/{name}.toml").read().replace(
         'extra_paths = ["tests/fake-cli"]', f'extra_paths = ["{SCR}/fake-cli"]')
     open(f"{CLIS}/{name}.toml", "w").write(d)
@@ -189,6 +189,42 @@ def main():
           bool(q("SELECT 1 FROM messages WHERE body LIKE '%rm -rf would be typed%' "
                  "AND acked_at_ms IS NULL")),
           str(q("SELECT body,acked_at_ms FROM messages WHERE body LIKE '%rm -rf%'")))
+
+    print("\n=== a prompt its descriptor vouches for IS typed at, driver or not ===")
+    # hermes, qwen and gemini have no driver, so nothing can push to them. A
+    # seat the fleet itself put in a terminal was therefore reachable by
+    # nobody: the hub cannot push, no pane is adopted, and a CLI sitting at a
+    # prompt with nothing to do may never call a tool. `fakeprompt` is
+    # `faketui` with `typed_delivery = true` added, which is the whole
+    # difference between this case and the one above.
+    s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "fakeprompt",
+        "mode": "interactive", "display_name": "Solo", "role": "helper",
+        "workspace": "local", "task": "sit at a prompt", "placement": {"node": "machine-b"}})
+    solo = j["slot_id"]
+    http("POST", f"/v1/slots/{solo}/spawn")
+    solo_agent = until(lambda: (q("SELECT id,push_capable,io_kind,typed_delivery FROM agents "
+                                  "WHERE slot_id=? AND exited_at_ms IS NULL", (solo,)) or [None])[0])
+    check("it is running with a terminal of its own",
+          solo_agent and solo_agent["io_kind"] == "pty", str(solo_agent))
+    check("nothing drives it", solo_agent and solo_agent["push_capable"] == 0, str(solo_agent))
+    check("but its descriptor says its prompt is the agent's",
+          solo_agent and solo_agent["typed_delivery"] == 1, str(solo_agent))
+    s, j = http("POST", f"/v1/sessions/{sid}/messages",
+                {"to": "Solo", "text": "ping-the-driverless-prompt"})
+    check("the hub says it has a keyboard for it",
+          any(x.get("name") == "Solo" and x.get("route") == "terminal"
+              for x in (j.get("seats") or [])), str(j))
+    t0 = time.time()
+    got = until(lambda: "ping-the-driverless-prompt" in (
+        http("GET", f"/v1/agents/{solo_agent['id']}/transcript?tail=65536")[1].get("transcript") or ""),
+        seconds=25)
+    check(f"and it was typed at the prompt ({time.time()-t0:.1f}s)", bool(got),
+          (http("GET", f"/v1/agents/{solo_agent['id']}/transcript?tail=4096")[1].get("transcript") or "")[-300:])
+    check("the hub stops holding it in flight once typed",
+          bool(until(lambda: q("SELECT 1 FROM messages WHERE body LIKE '%ping-the-driverless-prompt%' "
+                               "AND acked_at_ms IS NOT NULL"), seconds=15)),
+          str(q("SELECT body,acked_at_ms,inflight_agent FROM messages "
+                "WHERE body LIKE '%ping-the-driverless%'")))
 
     print()
     if fails:

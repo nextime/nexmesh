@@ -24,7 +24,7 @@ export NEXMESH_IDENTITY=/nonexistent/nexmesh-identity
 SUITES=(team spawn attach secure driver adopt codex opencode workspace
         control dashboard orchestrator mtls pairing revoke bind plugin mcpdoor
         capability memory codegraph coderai webauth reconnect ptyinject termlink
-        oneshot run direct)
+        oneshot run direct uploads)
 TIMEOUT=${TIMEOUT:-420}
 failed=()
 

@@ -84,7 +84,15 @@ text_at = ["text", "data.text", "results[*].text"]
 label = "diarize"
 summary = "Say who spoke when in an audio file"
 endpoint = "/v1/audio/diarization"
-accepts = ["file", "audio", "audio_base64", "url", "num_speakers"]
+# Multipart, like transcribe next door, and found the same way: posting JSON
+# answers 422 naming the `file` part it wanted. The route was advertised and
+# never called, which is how a manifest entry stays wrong.
+encoding = "multipart"
+file_field = "audio_base64"
+file_part = "file"
+file_name = "speech.wav"
+accepts = ["audio_base64", "file", "audio", "url", "num_speakers"]
+required = ["audio_base64"]
 text_at = ["text", "data.text", "segments[*].speaker"]
 
 [[capability]]
@@ -107,7 +115,11 @@ audio_at = ["audio", "audio_base64", "data.audio", "data.audio_base64", "audio_c
 # joined back together. 700 characters is comfortably inside it for both
 # languages this fleet is spoken to in.
 chunk_field = "input"
-chunk_chars = 700
+# Kokoro's context is 510 PHONEMES, not characters, so this is a guess at a
+# limit in another unit: dense text overflows a width that loose text fits.
+# Deliberately below the widest that has worked, because a piece that is
+# still refused is halved and retried rather than failing the request.
+chunk_chars = 420
 # A voice and a model are required, and "say this out loud" is a request
 # nobody wants to decorate. Kokoro is small, fast and intelligible; the
 # asker can still name any model or voice the install has.

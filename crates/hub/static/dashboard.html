@@ -248,6 +248,27 @@
   .chatline .ch { color: var(--accent); }
   .chatline.sys .txt { color: var(--dim); font-style: italic; }
   .chatline:target, .chatline.mine { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  /* The picture sits under the line that announced it, in the text column,
+     so the timestamp gutter stays a gutter. */
+  .chatline .attach { grid-column: 3; margin: 4px 0 2px; }
+  .chatline .attach img.shot {
+    max-width: min(320px, 100%); max-height: 200px; width: auto; height: auto;
+    border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in;
+    display: block; background: var(--panel);
+  }
+  .chatline .attach img.shot:hover { border-color: var(--accent); }
+  .chatline .attach .filelink { color: var(--accent); text-decoration: none; }
+  .chatline .attach .filelink:hover { text-decoration: underline; }
+  .lightbox {
+    position: fixed; inset: 0; z-index: 90; display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+    background: rgba(0, 0, 0, .82); padding: 16px; cursor: zoom-out;
+  }
+  .lightbox img {
+    max-width: 96vw; max-height: 86vh; width: auto; height: auto;
+    border-radius: 8px; box-shadow: 0 10px 40px rgba(0, 0, 0, .5);
+  }
+  .lightbox .cap { color: #e8e8e8; font-size: 12px; text-align: center; }
   /* A line you can act on: swipe it to reply, hold it to hear it. */
   .chatline { touch-action: pan-y; position: relative; transition: transform .12s ease-out; }
   .chatline.swiping { transition: none; }
@@ -1814,6 +1835,10 @@ function paintComposer(d) {
               >📎</button>
       ${(canHear() || fleetHas("transcribe")) ? `<button id="micBtn" class="mic"
               onclick="dictate()" title="dictate">🎤</button>` : ""}
+      ${fleetHas("transcribe") ? `<button id="freeBtn" class="mic${handsFree ? " on" : ""}"
+              onclick="toggleHandsFree()" title="${handsFree
+                ? "stop listening" : "hands free: keep listening, a sentence at a time"}"
+              >🗘</button>` : ""}
       <button onclick="sendOperatorMessage()">send</button>
       ${(canSpeak() || fleetHas("tts")) ? `<button onclick="${
                 isSpeaking() ? "stopSpeaking()" : "toggleSpeak()"}"
@@ -2220,6 +2245,98 @@ async function loadChatHistory(name) {
   } catch (e) { /* the live window still shows */ }
 }
 
+// A file somebody handed the team, in the line that announced it.
+//
+// A picture is shown; anything else is a link that downloads. The path is
+// still in the message text, which is what an AGENT needs -- it reads the
+// file off its own disk -- but a person reading the chat on a phone cannot
+// do anything with a path on another machine, and the thumbnail is the
+// whole point of having sent it.
+function attachHtml(f) {
+  if (!f || !f.id) return "";
+  const kind = (f.media_type || "");
+  const name = esc(f.name || "file");
+  if (kind.startsWith("image/")) {
+    // `data-src`, not `src`: an <img> sends cookies but never an
+    // Authorization header, so a dashboard signed in with a TOKEN rather
+    // than a session would show a broken picture. `hydrateShots` fetches it
+    // the same way as every other call and hands the tag a blob.
+    return `<div class="attach"><img class="shot" alt="${name}"
+       data-src="${esc(f.url)}" data-id="${esc(f.id)}" data-name="${name}"></div>`;
+  }
+  const size = f.bytes ? ` <span class="muted tiny">${fmtBytes(f.bytes)}</span>` : "";
+  return `<div class="attach"><a class="filelink" href="${esc(f.url)}"
+     target="_blank" rel="noopener">\u{1f4ce} ${name}</a>${size}</div>`;
+}
+
+// Pictures already fetched, by upload id. The room is rebuilt whenever it
+// changes, and without this every new line would re-download every image in
+// it. An upload's bytes never change, so a blob URL is good for the session.
+const shotCache = new Map();
+
+async function hydrateShots(root) {
+  for (const img of root.querySelectorAll("img.shot[data-src]")) {
+    const id = img.dataset.id;
+    const had = shotCache.get(id);
+    if (had) { img.src = had; img.dataset.full = had; img.removeAttribute("data-src"); continue; }
+    const url = img.dataset.src;
+    img.removeAttribute("data-src");      // never fetched twice at once
+    try {
+      const r = await fetch(url, {
+        headers: token ? { authorization: "Bearer " + token } : {},
+        credentials: "same-origin", cache: "no-store",
+      });
+      if (!r.ok) throw new Error(r.status);
+      const blob = await r.blob();
+      const made = URL.createObjectURL(blob);
+      shotCache.set(id, made);
+      img.src = made;
+      img.dataset.full = made;
+    } catch (e) {
+      // The machine that holds it may be off. Say so in the line rather
+      // than leaving a broken-image icon, which reads like a bug here.
+      const box = img.parentElement;
+      if (box) {
+        box.innerHTML = `<span class="muted tiny">[${esc(img.alt || "image")} \u2014 ` +
+                        `the machine holding it is not reachable]</span>`;
+      }
+    }
+  }
+}
+
+function fmtBytes(n) {
+  if (!n) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+// Full size, on click. Escape or a click anywhere closes it; the picture
+// itself is scaled to fit the window rather than the phone's width, so a
+// screenshot of a terminal is readable instead of merely present.
+function openShot(url, name) {
+  let box = $("lightbox");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "lightbox";
+    box.className = "lightbox";
+    box.addEventListener("click", closeShot);
+    document.body.appendChild(box);
+  }
+  box.innerHTML = `<img src="${esc(url)}" alt="${esc(name || "")}">
+    <div class="cap">${esc(name || "")} <span class="muted">— click to close</span></div>`;
+  box.style.display = "flex";
+}
+
+function closeShot() {
+  const box = $("lightbox");
+  if (box) box.style.display = "none";
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeShot();
+});
+
 function renderChat(d) {
   if (!chatOpen) return;
   const sessions = chatSessions();
@@ -2267,6 +2384,7 @@ function renderChat(d) {
       <span class="m" title="${esc(title)}">${mark}</span>
       <span class="txt">${ch}<span class="nick" style="color:${nickColor(m.from)}"
         >&lt;${esc(m.from)}&gt;</span> ${to}${renderBody(m.body)}${tally}</span>
+      ${attachHtml(m.file)}
     </div>`;
   }).join("");
   // Keep the reader's place. The room is rebuilt from the snapshot on every
@@ -2286,6 +2404,7 @@ function renderChat(d) {
       ? feed.scrollHeight
       : Math.max(0, feed.scrollHeight - fromBottom);
     wireChatGestures();
+    hydrateShots(feed);
   } else if (chatStick) {
     feed.scrollTop = feed.scrollHeight;
   }
@@ -2342,6 +2461,10 @@ function renderChat(d) {
               onclick="chatVoice()" title="send a voice message (${fleetHas("transcribe")
                 ? "transcribed on the fleet" : "transcribed in this browser"})"
               >🎤</button>` : ""}
+      ${fleetHas("transcribe") ? `<button id="chatFree" class="mic${handsFree ? " on" : ""}"
+              onclick="toggleHandsFree()" title="${handsFree
+                ? "stop listening" : "hands free: keep listening, a sentence at a time"}"
+              >🗘</button>` : ""}
       <button onclick="chatSend()">send</button>
       ${(canSpeak() || fleetHas("tts")) ? `<button onclick="${
                 isSpeaking() ? "stopSpeaking()" : "toggleSpeak()"}"
@@ -2486,7 +2609,7 @@ function listenTo(id) {
   closeMsgSheet();
   if (!el) return;
   const d = lineData(el);
-  say(`${d.from} says: ${d.body}`);
+  say(`${d.from} says: ${d.body}`, d.from);
 }
 
 function replyTo(id) {
@@ -2512,7 +2635,19 @@ function wireChatGestures() {
   if (!feed || feed.dataset.wired === "1") return;
   feed.dataset.wired = "1";
 
+  // A tap on a picture opens it, and goes no further: the swipe-to-reply
+  // and long-press-for-the-menu gestures below belong to the line, not to
+  // the image in it.
+  feed.addEventListener("click", (e) => {
+    const img = e.target.closest("img.shot");
+    if (!img) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openShot(img.dataset.full, img.dataset.name);
+  });
+
   feed.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("img.shot")) return;
     const el = e.target.closest(".chatline");
     if (!el) return;
     press = { el, x: e.clientX, y: e.clientY, dx: 0, moved: false, long: false };
@@ -2573,7 +2708,7 @@ function sayMessage(el) {
   const d = el && lineData ? lineData(el) : null;
   if (!d) return;
   if (!(canSpeak() || fleetHas("tts"))) return;
-  say(`${d.from} says: ${d.body}`);
+  say(`${d.from} says: ${d.body}`, d.from);
 }
 
 function endPress(reset) {
@@ -2600,42 +2735,7 @@ async function chatVoice() {
   // The fleet's own ears first: they work on a desktop Firefox, which has
   // no speech API at all, and they keep the audio on machines you own.
   if (fleetHas("transcribe") && navigator.mediaDevices && window.MediaRecorder) {
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch (e) {
-      note("No microphone: " + (e.message || e.name));
-      return;
-    }
-    const chunks = [];
-    voiceRec = new MediaRecorder(stream);
-    if (btn) { btn.classList.add("on"); btn.textContent = "\u23F9"; }
-    note("Recording — press the button again to send.");
-    voiceRec.ondataavailable = (e) => chunks.push(e.data);
-    voiceRec.onstop = async () => {
-      stream.getTracks().forEach((t) => t.stop());
-      voiceRec = null;
-      if (btn) { btn.classList.remove("on"); btn.textContent = "\u{1F3A4}"; }
-      const blob = new Blob(chunks, { type: chunks[0] ? chunks[0].type : "audio/webm" });
-      if (!blob.size) return;
-      note("Transcribing…");
-      try {
-        const b64 = await new Promise((res, rej) => {
-          const fr = new FileReader();
-          fr.onload = () => res(String(fr.result).split(",")[1]);
-          fr.onerror = rej;
-          fr.readAsDataURL(blob);
-        });
-        const out = await askFleet("transcribe",
-          { audio: `data:${blob.type};base64,${b64}` }, 180000);
-        const text = spokenText(out);
-        if (!text) { note("Nothing was heard in that."); return; }
-        await sendChatText(text);
-      } catch (e) {
-        note("Could not transcribe that: " + (e.message || e));
-      }
-    };
-    voiceRec.start();
+    await recordOnce(btn);
     return;
   }
 
@@ -2654,6 +2754,156 @@ async function chatVoice() {
   r.onerror = () => note("That did not come through.");
   r.onend = () => { if (btn) btn.classList.remove("on"); };
   r.start();
+}
+
+// Hands-free listening in the browser.
+//
+// The same thing the attached terminal does with sox, done with the Web Audio
+// API because a browser has no sox: watch the microphone's own level, treat
+// two seconds under the floor as the end of a sentence, send that, and listen
+// again. Without this, talking to the team means a press at each end of every
+// sentence, which is exactly the thing you cannot do while your hands are
+// somewhere else.
+let handsFree = false;
+let handsFreeStop = null;
+
+async function toggleHandsFree() {
+  const btn = $("chatFree") || $("freeBtn");
+  if (handsFree) {
+    handsFree = false;
+    if (handsFreeStop) { try { handsFreeStop(); } catch (e) {} }
+    handsFreeStop = null;
+    if (btn) btn.classList.remove("on");
+    if (voiceRec) { try { voiceRec.stop(); } catch (e) {} }
+    note("Hands-free off.");
+    return;
+  }
+  if (!(fleetHas("transcribe") && navigator.mediaDevices && window.MediaRecorder)) {
+    note("Hands-free needs a teammate that can transcribe.");
+    return;
+  }
+  handsFree = true;
+  if (btn) btn.classList.add("on");
+  note("Listening. It sends each sentence when you pause.");
+  while (handsFree) {
+    // Half duplex. With the loudspeaker on as well, an open microphone hears
+    // the reply being read out, transcribes it and sends the agent its own
+    // words back. So speaking wins: wait for the room to be quiet, with a
+    // breath after it, before listening again.
+    while (handsFree && isSpeaking()) await sleep(250);
+    if (!handsFree) break;
+    await sleep(300);
+    const said = await recordOnce(micButton(), true);
+    // A failure stops the loop rather than spinning on a broken microphone.
+    if (said === false) { handsFree = false; if (btn) btn.classList.remove("on"); break; }
+  }
+}
+
+/// One sentence. `untilQuiet` makes it stop by itself when you stop talking.
+async function recordOnce(btn, untilQuiet) {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    note("No microphone: " + (e.message || e.name));
+    return false;
+  }
+  const chunks = [];
+  voiceRec = new MediaRecorder(stream);
+  if (btn) { btn.classList.add("on"); btn.textContent = "\u23F9"; }
+  if (!untilQuiet) note("Recording — press the button again to send.");
+
+  let watcher = null;
+  if (untilQuiet) watcher = watchForQuiet(stream, () => {
+    if (voiceRec && voiceRec.state === "recording") {
+      try { voiceRec.stop(); } catch (e) {}
+    }
+  }, () => isSpeaking());
+  handsFreeStop = () => { if (watcher) watcher(); };
+
+  const done = new Promise((resolve) => {
+    voiceRec.ondataavailable = (e) => chunks.push(e.data);
+    voiceRec.onstop = async () => {
+      if (watcher) watcher();
+      stream.getTracks().forEach((t) => t.stop());
+      voiceRec = null;
+      if (btn) { btn.classList.remove("on"); btn.textContent = "\u{1F3A4}"; }
+      const blob = new Blob(chunks, { type: chunks[0] ? chunks[0].type : "audio/webm" });
+      // Too short to be speech: a cough, or the loop coming straight back
+      // round. Not worth a round trip to the transcriber.
+      if (blob.size < 2000) { resolve(true); return; }
+      if (!untilQuiet) note("Transcribing…");
+      try {
+        const b64 = await new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(String(fr.result).split(",")[1]);
+          fr.onerror = rej;
+          fr.readAsDataURL(blob);
+        });
+        const out = await askFleet("transcribe",
+          { audio: `data:${blob.type};base64,${b64}` }, 180000);
+        const text = spokenText(out);
+        if (!text) { if (!untilQuiet) note("Nothing was heard in that."); resolve(true); return; }
+        await sendChatText(text);
+      } catch (e) {
+        note("Could not transcribe that: " + (e.message || e));
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    };
+  });
+  voiceRec.start();
+  return done;
+}
+
+/// Call `onQuiet` after two seconds below the noise floor, having first
+/// heard something. Returns a function that stops watching.
+function watchForQuiet(stream, onQuiet, speakingNow) {
+  let ctx;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (e) {
+    // No Web Audio: fall back to a plain ceiling, so the loop still turns.
+    const t = setTimeout(onQuiet, 12000);
+    return () => clearTimeout(t);
+  }
+  const src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  src.connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  let spoke = false;
+  let quietSince = 0;
+  const started = Date.now();
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    // Whatever the microphone picks up while the fleet is talking is the
+    // fleet talking. It is not the end of your sentence and it is not the
+    // start of one either, so the clock simply stops.
+    if (speakingNow && speakingNow()) { requestAnimationFrame(tick); return; }
+    an.getByteTimeDomainData(buf);
+    let peak = 0;
+    for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
+    const loud = peak > 6;                       // ~5% of full scale
+    const now = Date.now();
+    if (loud) { spoke = true; quietSince = 0; }
+    else if (!quietSince) quietSince = now;
+    // Two seconds of quiet AFTER something was said ends the sentence; 20
+    // seconds ends it regardless, so a noisy room cannot record for ever.
+    if ((spoke && quietSince && now - quietSince > 2000) || now - started > 20000) {
+      stopped = true;
+      onQuiet();
+      return;
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  return () => {
+    stopped = true;
+    try { src.disconnect(); ctx.close(); } catch (e) {}
+  };
 }
 
 /// Pull the words out of whatever shape a transcription service answers in.
@@ -3113,7 +3363,7 @@ function speakNew() {
   spokenUpTo = Math.max(spokenUpTo, ...msgs.map((m) => m.id));
   for (const m of msgs) {
     const where = isAll() && m.session ? `in ${m.session}, ` : "";
-    say(`${where}${m.from} says: ${m.body}`);
+    say(`${where}${m.from} says: ${m.body}`, m.from);
   }
 }
 
@@ -3143,11 +3393,26 @@ function isSpeaking() {
 }
 
 // Speak a line: the fleet's own voice if it has one, the browser's if not.
-async function say(text) {
+// A teammate's own voice, when one has been chosen for it.
+//
+// Set per SEAT (`/voice <agent> <name>`), so a team read aloud sounds like
+// several people rather than one. Unknown names are the service's business:
+// it answers with the voices it has, and the reader says so.
+function voiceOf(who) {
+  if (!who) return "";
+  const a = ((snap && snap.detail && snap.detail.agents) || []).find(
+    (x) => x.name === who || x.role === who);
+  return (a && a.voice) || "";
+}
+
+async function say(text, who) {
   const mine = sayWanted;
   if (fleetHas("tts")) {
     try {
-      const out = await askFleet("tts", { input: text }, 60000);
+      const req = { input: text };
+      const v = voiceOf(who);
+      if (v) req.voice = v;
+      const out = await askFleet("tts", req, 60000);
       // Stopped while the fleet was still rendering it: say nothing.
       if (mine !== sayWanted) return;
       const j = (() => { try { return JSON.parse(out); } catch (e) { return null; } })();

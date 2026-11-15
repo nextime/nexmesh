@@ -109,6 +109,21 @@ pub fn seen(m: &str) -> String {
     )
 }
 
+/// Which agent a seat IS, when several are alive in it at once.
+///
+/// One CLI can put more than one process on a seat. hermes is the case that
+/// forced this: it filters the environment of its MCP servers, so every
+/// hermes process on a machine reports the same identity and shares one
+/// seat, and the gateway's short-lived turns (`hermes chat -q`, cron jobs,
+/// webhook turns) join it for a few seconds each. Newest-first then showed
+/// the seat as whichever turn happened to be running, and the long-lived
+/// conversation that actually holds the terminal vanished from the display
+/// every half-minute.
+///
+/// So: alive first, then the one with I/O the node owns -- a pty or pipes --
+/// and only then the newest. A process the fleet is holding a terminal for
+/// is what the seat is; a shim that passed through is not.
+///
 /// The seats a team message is for: the FROM and WHERE of both counts above,
 /// written once so they can never disagree.
 fn audience_seats(m: &str, extra: &str) -> String {
@@ -116,7 +131,7 @@ fn audience_seats(m: &str, extra: &str) -> String {
         "FROM slots s2
           LEFT JOIN agents a2 ON a2.id = (
               SELECT id FROM agents WHERE slot_id = s2.id
-              ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+              ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
          WHERE s2.session_id = {m}.session_id
            AND ({m}.from_slot IS NULL OR s2.id <> {m}.from_slot)
            AND COALESCE(s2.task_state,'') <> 'released'
@@ -149,7 +164,7 @@ pub fn eligible_seats() -> String {
            FROM slots s2
            LEFT JOIN agents a2 ON a2.id = (
                SELECT id FROM agents WHERE slot_id = s2.id
-               ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+               ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
           WHERE COALESCE(s2.task_state,'') <> 'released'
             AND NOT {term}
             AND a2.id IS NOT NULL
@@ -230,7 +245,7 @@ mod tests {
                 "SELECT {w} FROM slots s
                  LEFT JOIN agents a ON a.id = (
                      SELECT id FROM agents WHERE slot_id = s.id
-                     ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                     ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
                  WHERE s.id = 'sl-1'"
             ),
             [],

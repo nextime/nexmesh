@@ -173,6 +173,88 @@ pub async fn typed_tick(st: &AppState) {
     }
 }
 
+/// Hand queued messages to seats the fleet itself put in a terminal.
+///
+/// `spawn --mode interactive` on a CLI with no driver produced a seat that
+/// could be watched and typed at by a person, and reached by nothing else:
+/// no driver to push to, no adoption to type at, so its only route was its
+/// own next tool call -- which a CLI sitting at a prompt with nothing to do
+/// may never make. A message to it was accepted, queued, and never arrived.
+///
+/// The node already holds that pty and knows how to type at it; it was only
+/// never asked. There is no pane to re-check here, unlike an adoption: the
+/// node spawned the process, is its parent, and has no io for it once it is
+/// gone -- so an `Inject` for a dead agent fails rather than typing into
+/// somebody else's terminal.
+pub async fn interactive_tick(st: &AppState) {
+    // (agent_id, node_id, slot_id, session_id)
+    let targets: Vec<(String, String, String, String)> = {
+        let db = st.db.lock().unwrap();
+        let Ok(mut stmt) = db.prepare(
+            // Alive, at a prompt its own descriptor vouches for, and
+            // driven by nothing. An adopted seat is excluded because
+            // `typed_tick` owns it: there the keystrokes go to the pane's own
+            // agent, not to this one.
+            "SELECT a.id, a.node_id, s.id, s.session_id
+             FROM agents a
+             JOIN slots s ON s.id = a.slot_id
+             JOIN sessions se ON se.id = s.session_id
+             WHERE a.exited_at_ms IS NULL AND a.node_id IS NOT NULL
+               AND a.push_capable = 0 AND a.typed_delivery = 1
+               AND s.terminal_via IS NULL
+               AND s.task_state NOT IN ('released')
+               AND s.paused = 0 AND se.status = 'active'",
+        ) else {
+            return;
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .and_then(|m| m.collect())
+            .unwrap_or_default()
+    };
+
+    for (agent_id, node_id, slot_id, session_id) in targets {
+        if !st.node_is_connected(&node_id) {
+            continue;
+        }
+        let batch = {
+            let db = st.db.lock().unwrap();
+            match tools::pending_for_slot(&db, &session_id, &slot_id) {
+                Ok(m) if !m.is_empty() => {
+                    let ids: Vec<i64> = m.iter().map(|x| x.id).collect();
+                    if tools::mark_inflight(&db, &agent_id, &slot_id, &ids).is_err() {
+                        continue;
+                    }
+                    m
+                }
+                _ => continue,
+            }
+        };
+        let count = batch.len();
+        if let Err(e) = st
+            .send_to_node(&node_id, &HubToNode::Inject {
+                agent_id: agent_id.clone(),
+                messages: batch.clone(),
+                // The node resolves this agent's own pty by id. A process
+                // that has gone has no io, which is the check.
+                expect_cli: None,
+            })
+            .await
+        {
+            tracing::warn!(%agent_id, error = %e, "could not type that; requeueing");
+            let db = st.db.lock().unwrap();
+            for m in &batch {
+                let _ = db.execute(
+                    "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
+                     WHERE id = ? AND acked_at_ms IS NULL",
+                    [m.id],
+                );
+            }
+        } else {
+            tracing::debug!(slot = %slot_id, count, "typing at a seat's own terminal");
+        }
+    }
+}
+
 /// Bring back managed agents that died with work still outstanding.
 pub async fn recovery_tick(st: &AppState) {
     // A slot needs recovery when its last managed agent has exited, the work

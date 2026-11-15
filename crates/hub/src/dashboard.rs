@@ -37,6 +37,8 @@ pub fn build_id() -> &'static str {
         let mut h = Sha256::new();
         h.update(PAGE.as_bytes());
         h.update(include_str!("../static/term.js").as_bytes());
+        h.update(include_str!("../static/xr.html").as_bytes());
+        h.update(include_str!("../static/xr.js").as_bytes());
         hex::encode(h.finalize())[..10].to_string()
     })
 }
@@ -135,6 +137,32 @@ pub async fn app_icon_png(axum::extract::Path(size): axum::extract::Path<String>
 /// service worker is: a VT parser is a parser and a page is a page. Served
 /// from the hub like everything else, so a fleet with no route to the
 /// internet still has a working terminal.
+/// The room: the same fleet, as something you can stand in.
+///
+/// Served from the hub like everything else, with no CDN and no library, so
+/// a headset on a network with no route to the internet still gets a scene.
+pub async fn xr_page() -> Response {
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        Html(include_str!("../static/xr.html")),
+    )
+        .into_response()
+}
+
+pub async fn xr_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+        ],
+        include_str!("../static/xr.js"),
+    )
+        .into_response()
+}
+
 pub async fn term_js() -> Response {
     (
         [
@@ -418,12 +446,13 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                     (SELECT v.id FROM agents v
                                       WHERE v.id = s.terminal_via
                                         AND v.exited_at_ms IS NULL)
-                                END, a.id)
+                                END, a.id),
+                            s.voice
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
                         SELECT id FROM agents WHERE slot_id = s.id
-                        ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                        ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
                      LEFT JOIN nodes n ON n.id = a.node_id
                      WHERE (?1 = '*' OR s.session_id = ?1)
                        -- Adopted terminals are not teammates: they are the
@@ -467,6 +496,9 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "capabilities": serde_json::from_str::<Value>(
                                 &r.get::<_, String>(22)?).unwrap_or(json!([])),
                             "attach_agent_id": r.get::<_, Option<String>>(23)?,
+                            // Which voice reads this one out, when the fleet
+                            // is being listened to rather than read.
+                            "voice": r.get::<_, Option<String>>(24)?,
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -486,11 +518,13 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             COALESCE(mx.name, ''),
                             m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, ''),
                             COALESCE(m.from_slot, ''), COALESCE(m.to_slot, ''),
-                            m.session_id
+                            m.session_id,
+                            m.attachment, u.name, u.media_type, u.bytes, u.node_name
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
                      LEFT JOIN sessions mx ON mx.id = m.session_id
+                     LEFT JOIN uploads u ON u.id = m.attachment
                      WHERE (?1 = '*' OR m.session_id = ?1) ORDER BY m.id DESC LIMIT 120",
                 )
                 .and_then(|mut stmt| {
@@ -514,6 +548,22 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "to_slot": to_slot,
                             "seen": delivery.seen(id, &from_slot),
                             "audience": delivery.audience(&msg_session, &from_slot),
+                            // The file this message is about, so the chat can
+                            // show it rather than name a path on a machine the
+                            // reader may not even be able to reach.
+                            "file": match r.get::<_, Option<String>>(14)? {
+                                Some(up) => json!({
+                                    "id": up,
+                                    "name": r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                                    "media_type":
+                                        r.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                                    "bytes": r.get::<_, Option<i64>>(17)?.unwrap_or(0),
+                                    "node": r.get::<_, Option<String>>(18)?.unwrap_or_default(),
+                                    "url": format!("/v1/uploads/{}",
+                                                   r.get::<_, String>(14)?),
+                                }),
+                                None => Value::Null,
+                            },
                         }))
                     })
                     .and_then(|m| m.collect())

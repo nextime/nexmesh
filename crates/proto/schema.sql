@@ -497,6 +497,28 @@ CREATE INDEX IF NOT EXISTS agents_by_slot ON agents(slot_id) WHERE exited_at_ms 
 
 -- Addressed slot-to-slot, not process-to-process: a message queued for a slot
 -- is still there for whatever agent next occupies it, on whatever machine.
+-- A file handed to the team, so the chat can show it again later.
+--
+-- The bytes are NOT here. They live on the machine the file was written to,
+-- which is the whole point of an upload: an agent reads files, and a file an
+-- agent can read is a file on its own disk. This row is how the dashboard
+-- asks that machine for them again -- see `GET /v1/uploads/:id`.
+CREATE TABLE IF NOT EXISTS uploads (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  workspace_id  TEXT,
+  node_id       TEXT NOT NULL,
+  node_name     TEXT NOT NULL,
+  root          TEXT NOT NULL,          -- the workspace mount on that machine
+  rel           TEXT NOT NULL,          -- path inside it
+  path          TEXT NOT NULL,          -- absolute, as the node reported it
+  name          TEXT NOT NULL,
+  media_type    TEXT NOT NULL,
+  bytes         INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS uploads_session ON uploads(session_id, created_at_ms);
+
 CREATE TABLE IF NOT EXISTS messages (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

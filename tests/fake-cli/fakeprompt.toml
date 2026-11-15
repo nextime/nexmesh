@@ -1,0 +1,19 @@
+# Test-only descriptor: an interactive agent with NO driver whose descriptor
+# says its prompt is the agent's own -- the shape of hermes, qwen and gemini.
+# Nothing can push to it, so being typed at is its only route that does not
+# wait for a tool call it may never make.
+#
+# Next to `faketui`, which is the same binary with the claim left out and so
+# must never be typed at, this is the pair that pins the gate: the descriptor,
+# not the terminal.
+[cli]
+id = "fakeprompt"
+display_name = "Fake prompt"
+command = "faketui"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.interactive]
+args = []
+attachable = true
+typed_delivery = true

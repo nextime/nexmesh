@@ -519,6 +519,15 @@ impl App {
                 self.speaking = false;
                 return;
             }
+            // The speaker's own voice, when their seat has been given one
+            // with `/voice`. A team read aloud in one voice is a wall of
+            // text with a sound card.
+            let voice = self
+                .rows("agents")
+                .into_iter()
+                .find(|a| a["name"].as_str() == Some(from.as_str()))
+                .and_then(|a| a["voice"].as_str().map(|v| v.to_string()))
+                .filter(|v| !v.trim().is_empty());
             let (base, client, tx, audio, dir, playing) = (
                 self.base.clone(),
                 self.client.clone(),
@@ -528,7 +537,10 @@ impl App {
                 self.saying.clone(),
             );
             tokio::spawn(async move {
-                if let Err(e) = voice::speak(&base, &client, &audio, &line, &dir, &playing).await {
+                if let Err(e) =
+                    voice::speak(&base, &client, &audio, &line, voice.as_deref(), &dir, &playing)
+                        .await
+                {
                     let _ = tx.send(Heard::Note(trim_err(&format!("{e:#}")))).await;
                 }
             });
@@ -953,12 +965,75 @@ pub async fn run(
 
 fn enter() -> Result<()> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, crossterm::cursor::Hide)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        // Without this the wheel does nothing here at all. A full-screen
+        // program is on the alternate screen, where the terminal has no
+        // scrollback to give you, so unless the console asks to be told
+        // about the mouse and scrolls itself, turning the wheel is silence.
+        //
+        // The cost is that the terminal stops handling the mouse: dragging
+        // to select text selects nothing while this is running. Every
+        // terminal worth using bypasses that with SHIFT held down, which is
+        // what the footer says.
+        crossterm::event::EnableMouseCapture,
+    )?;
     Ok(())
+}
+
+/// One notch of the wheel, on whatever is on the screen.
+///
+/// The wheel means "move the content", which is a different thing in each
+/// pane: a list moves its cursor, a room of text moves its scrollback, and an
+/// opened memory moves the paragraph. Three lines per notch rather than the
+/// ten a PgUp moves, because a wheel is turned repeatedly and a page at a
+/// time overshoots.
+///
+/// A question on the screen owns the keyboard, and the wheel with it.
+fn wheel(app: &mut App, up: bool) {
+    const STEP: usize = 3;
+    if app.dialog.is_some() {
+        return;
+    }
+    // An opened memory is a paragraph being read: the wheel moves the text,
+    // not the row behind it.
+    if app.zoom {
+        app.scroll = if up { app.scroll.saturating_add(STEP) } else { app.scroll.saturating_sub(STEP) };
+        return;
+    }
+    match app.pane {
+        // The chat scrolls its room. Up the wheel goes back through what was
+        // said, which is the direction PgUp goes.
+        Pane::Chat | Pane::Deck => {
+            if up {
+                app.scroll_back(STEP);
+            } else {
+                app.scroll = app.scroll.saturating_sub(STEP);
+            }
+        }
+        // Everything else is a list, and a list scrolls by moving its cursor:
+        // the view follows it.
+        _ => {
+            let n = app.len();
+            if n == 0 {
+                return;
+            }
+            let c = if up {
+                app.cursor().saturating_sub(STEP)
+            } else {
+                (app.cursor() + STEP).min(n - 1)
+            };
+            app.set_cursor(c);
+            app.scroll = 0;
+        }
+    }
 }
 
 fn leave() -> Result<()> {
     let mut out = stdout();
+    let _ = out.execute(crossterm::event::DisableMouseCapture);
     let _ = out.execute(crossterm::cursor::Show);
     let _ = out.execute(LeaveAlternateScreen);
     let _ = disable_raw_mode();
@@ -966,6 +1041,14 @@ fn leave() -> Result<()> {
 }
 
 async fn handle(app: &mut App, ev: Event) -> Result<()> {
+    if let Event::Mouse(m) = ev {
+        match m.kind {
+            crossterm::event::MouseEventKind::ScrollUp => wheel(app, true),
+            crossterm::event::MouseEventKind::ScrollDown => wheel(app, false),
+            _ => {}
+        }
+        return Ok(());
+    }
     let Event::Key(k) = ev else { return Ok(()) };
     // Windows sends press AND release; without this every key acts twice.
     if k.kind != KeyEventKind::Press {
@@ -1439,6 +1522,95 @@ async fn dialog_key(app: &mut App, code: KeyCode, ctrl: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An App with nothing behind it, for the parts that are pure state.
+    fn bare_app() -> App {
+        let (voice_tx, _rx) = tokio::sync::mpsc::channel(1);
+        App {
+            base: "http://127.0.0.1:1".into(),
+            client: reqwest::Client::new(),
+            ca_cert: None,
+            identity: None,
+            snap: None,
+            err: None,
+            note: None,
+            pane: Pane::Deck,
+            sel: [0; 8],
+            ws: 0,
+            chan: "*".into(),
+            input: Composer::default(),
+            editing: false,
+            scroll: 0,
+            sort_col: 0,
+            sort_rev: false,
+            zoom: false,
+            zoom_text: None,
+            camera_for: None,
+            audio: voice::Audio::default(),
+            recording: None,
+            speaking: false,
+            spoken_up_to: 0,
+            saying: Default::default(),
+            voice_tx,
+            dialog: None,
+            panel: true,
+            help: false,
+            theme: Theme::Deck,
+            scope: "*".into(),
+            last_fetch: Instant::now(),
+            quit: false,
+            attach_to: None,
+        }
+    }
+
+    /// The wheel has to DO something. On the alternate screen the terminal
+    /// has no scrollback to offer, so a console that ignores mouse events
+    /// is a console where scrolling is silence -- which is exactly what it
+    /// was, twice.
+    #[test]
+    fn the_wheel_scrolls_the_chat_and_knows_which_way_is_back() {
+        let mut app = bare_app();
+        app.pane = Pane::Chat;
+        wheel(&mut app, true);
+        assert!(app.scroll > 0, "up the wheel goes BACK through what was said");
+        let back = app.scroll;
+        wheel(&mut app, false);
+        assert!(app.scroll < back, "down comes forward again");
+    }
+
+    /// A list scrolls by moving its cursor, and must not run off either end.
+    #[test]
+    fn the_wheel_moves_a_list_without_leaving_it() {
+        let mut app = bare_app();
+        app.pane = Pane::Agents;
+        app.snap = Some(serde_json::json!({ "detail": {
+            "agents": (0..10).map(|i| serde_json::json!({ "name": format!("a{i}") }))
+                             .collect::<Vec<_>>()
+        }}));
+        wheel(&mut app, false);
+        assert_eq!(app.cursor(), 3);
+        for _ in 0..20 {
+            wheel(&mut app, false);
+        }
+        assert_eq!(app.cursor(), 9, "stops at the last row, never past it");
+        for _ in 0..20 {
+            wheel(&mut app, true);
+        }
+        assert_eq!(app.cursor(), 0, "and at the first");
+    }
+
+    /// A question on the screen owns the keyboard, and the wheel with it:
+    /// scrolling the list behind a dialog moves a cursor the dialog is
+    /// about to act on.
+    #[test]
+    fn a_dialog_takes_the_wheel_too() {
+        let mut app = bare_app();
+        app.pane = Pane::Chat;
+        app.dialog = Some(act::Dialog::confirm(
+            "remove the seat?", "y / n", act::Step::NewSession));
+        wheel(&mut app, true);
+        assert_eq!(app.scroll, 0);
+    }
 
     #[test]
     fn a_session_name_is_escaped_into_the_query() {

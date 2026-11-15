@@ -6,3 +6,7 @@
 *.sock
 # Per-workspace agent state the node writes next to a project.
 .nexmesh/
+# Files handed to the team land in the workspace, which may be a checkout of
+# this very repository. A photo or a recording from somebody's webcam is not
+# something `git add -A` should ever be able to pick up.
+/uploads/

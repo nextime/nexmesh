@@ -1266,8 +1266,13 @@ struct StatusBar {
     direct: bool,
     /// The keys, in the order they are given up when the width runs out.
     keys: Vec<(String, String)>,
-    /// Passing state: `listening`, `aloud`, `reading 2 back`.
+    /// Passing state: `aloud`, `reading 2 back`.
     marks: Vec<String>,
+    /// Recording, and since when. The bar goes RED and says so: a mode you
+    /// cannot see is a microphone you forget is on. `hands_free` is the
+    /// difference between one sentence and a conversation.
+    recording: Option<std::time::Instant>,
+    hands_free: bool,
     /// Command mode: the keys below are letters, and nothing reaches the
     /// agent until it is left again.
     command: bool,
@@ -1294,6 +1299,8 @@ impl StatusBar {
             direct: false,
             keys: Vec::new(),
             marks: Vec::new(),
+            recording: None,
+            hands_free: false,
             command: false,
             menu: Vec::new(),
             ask: None,
@@ -1328,6 +1335,30 @@ impl StatusBar {
     fn line(&self) -> String {
         let w = self.cols as usize;
         let sep = "  \u{00b7}  ";
+        // Recording owns the row above everything except a question, and
+        // says how long it has been going: a counter that moves is the proof
+        // the microphone is actually open, which a static word is not.
+        if let (Some(since), None) = (self.recording, self.ask.as_ref()) {
+            let secs = since.elapsed().as_secs();
+            let what = if self.hands_free { "LISTENING" } else { "RECORDING" };
+            let how = if self.hands_free {
+                "stops when you stop talking"
+            } else {
+                "press again to send it"
+            };
+            let line = format!(
+                " \u{25cf} {what} {}:{:02}{sep}{how}",
+                secs / 60,
+                secs % 60
+            );
+            if line.chars().count() <= w {
+                return line;
+            }
+            return format!(" \u{25cf} {what} {}:{:02}", secs / 60, secs % 60)
+                .chars()
+                .take(w)
+                .collect();
+        }
         // A question owns the row while it is up.
         if let Some((what, typed)) = &self.ask {
             let line = format!(" {what}: {typed}\u{2588}{sep}Enter sends \u{b7} Esc cancels");
@@ -1456,7 +1487,10 @@ impl StatusBar {
         // coloured while this row does. The difference has to be visible
         // from the corner of an eye, because the whole point of a mode is
         // knowing which one you are in without trying a key.
-        let colour = if self.ask.is_some() {
+        let colour = if self.recording.is_some() && self.ask.is_none() {
+            // Red, and the only red this row ever is.
+            "\x1b[41m\x1b[97m\x1b[1m"
+        } else if self.ask.is_some() {
             // A question is a third state and looks like one.
             "\x1b[44m\x1b[97m\x1b[1m"
         } else if self.command {
@@ -1614,6 +1648,9 @@ async fn attach(
             b.menu.push((voice::key_name(vkeys.read), "read".into()));
             b.menu.push((voice::key_name(vkeys.aloud), "aloud".into()));
         }
+        if a.can_hear() && voice::listen_cmd(&a).is_some() {
+            b.menu.push((voice::key_name(vkeys.listen), "hands free".into()));
+        }
         b.menu.push((voice::key_name(vkeys.send), "send a file".into()));
         if camera::detect().ready() {
             b.menu.push((voice::key_name(vkeys.photo), "photo".into()));
@@ -1748,12 +1785,19 @@ async fn attach(
     // Only consulted while reading aloud; cheap enough to leave running.
     let mut settle = tokio::time::interval(Duration::from_millis(400));
     settle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Only consulted while hands-free is on.
+    let mut listen_tick = tokio::time::interval(Duration::from_millis(300));
+    listen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Speaking and listening, if this machine has anything to do it with and
     // the fleet has a teammate that can. An attached terminal is a place you
     // type, so it is a place you should be able to talk to -- on a phone or a
     // tablet it is the only comfortable way to put a sentence in a prompt.
     let audio = voice::detect();
     let mut rec: Option<(std::process::Child, std::path::PathBuf)> = None;
+    // Hands-free: a recorder that ends its own sentence. Separate from `rec`
+    // because the two are started and stopped by different things -- one by a
+    // key at each end, the other by silence.
+    let mut listening: Option<(std::process::Child, std::path::PathBuf)> = None;
     // The player, while it plays: the same key again stops it.
     let playing: voice::Playing = Default::default();
     // Mouse reports arrive in the keyboard stream and are not keystrokes.
@@ -1791,6 +1835,72 @@ async fn attach(
                     let _ = out.flush().await;
                 }
             }
+            // A hands-free sentence ends when the recorder exits, which is
+            // sox deciding the talking stopped. Checked on the same cheap
+            // tick as everything else rather than with a thread of its own.
+            _ = listen_tick.tick(), if bar.as_ref().map(|b| b.hands_free).unwrap_or(false) => {
+                // Half duplex, on purpose. A microphone that is open while the
+                // fleet is reading a reply aloud hears the reply, transcribes
+                // it, and types the agent's own words back at it -- a loop
+                // that costs money and looks like the machine talking to
+                // itself. So speaking wins: the recorder is stopped, whatever
+                // it had is thrown away rather than sent, and listening
+                // resumes when the room is quiet again.
+                let talking = playing.lock().map(|p| p.is_some()).unwrap_or(false);
+                if talking {
+                    if let Some((mut child, _)) = listening.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    if let Some(b) = &mut bar {
+                        b.recording = None;
+                    }
+                    continue;
+                }
+                if listening.is_none() {
+                    match voice::listen(&audio, &scratch) {
+                        Ok(r) => {
+                            listening = Some(r);
+                            if let Some(b) = &mut bar {
+                                b.recording = Some(std::time::Instant::now());
+                            }
+                        }
+                        Err(e) => {
+                            let _ = said_tx.send(Err(e)).await;
+                            if let Some(b) = &mut bar {
+                                b.recording = None;
+                                b.hands_free = false;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let done = listening.as_mut().and_then(|(child, path)| {
+                    voice::listened(child, path).map(|bytes| (bytes, path.clone()))
+                });
+                if let Some((bytes, _)) = done {
+                    listening = None;
+                    if !bytes.is_empty() {
+                        let (b, cl, tx) = (base.to_string(), c.clone(), said_tx.clone());
+                        let lang = std::env::var("LANG").ok().and_then(|l| {
+                            l.split(['.', '_']).next()
+                                .filter(|s| s.len() == 2)
+                                .map(|s| s.to_string())
+                        });
+                        tokio::spawn(async move {
+                            let _ = tx
+                                .send(voice::transcribe(&b, &cl, &bytes, lang.as_deref()).await)
+                                .await;
+                        });
+                    }
+                    // The next tick starts the next sentence, once nothing
+                    // is being read aloud. Doing it here instead would open
+                    // the microphone into the fleet's own reply.
+                    if let Some(b) = &mut bar {
+                        b.recording = None;
+                    }
+                }
+            }
             // Reading every reply as it arrives means noticing when one has
             // ENDED. An agent prints in bursts, so the boundary is silence:
             // a second and a bit with nothing new, which is long enough that
@@ -1806,7 +1916,7 @@ async fn attach(
                             audio.clone(), scratch.clone(), playing.clone(),
                         );
                         tokio::spawn(async move {
-                            if let Err(e) = voice::speak(&bs, &cl, &a, &text, &dir, &pl).await {
+                            if let Err(e) = voice::speak(&bs, &cl, &a, &text, None, &dir, &pl).await {
                                 let _ = tx.send(Err(e)).await;
                             }
                         });
@@ -1833,8 +1943,12 @@ async fn attach(
                         if wire.tx.send(wire::Out::Data(text.into_bytes())).await.is_err() {
                             break "connection lost".to_string();
                         }
+                        // Hands-free is still on: the next sentence is
+                        // already being recorded, so the row stays red.
                         if let Some(b) = &mut bar {
-                            b.set_mark("listening", false);
+                            if !b.hands_free {
+                                b.recording = None;
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -1975,14 +2089,16 @@ async fn attach(
                                         }
                                     }
                                     if let Some(b) = &mut bar {
-                                        b.set_mark("listening", false);
+                                        b.recording = None;
+                                        b.hands_free = false;
                                     }
                                     None
                                 }
                                 None => match voice::start(&audio, &scratch) {
                                     Ok(r) => {
                                         if let Some(b) = &mut bar {
-                                            b.set_mark("listening", true);
+                                            b.recording = Some(std::time::Instant::now());
+                                            b.hands_free = false;
                                         }
                                         Some(r)
                                     }
@@ -1992,6 +2108,34 @@ async fn attach(
                                     }
                                 },
                             };
+                        }
+                        voice::Act::Listen => {
+                            // Hands-free: the recorder stops itself when you
+                            // stop talking, so a conversation does not need a
+                            // keypress at each end of every sentence.
+                            if listening.is_some() {
+                                if let Some((mut child, _)) = listening.take() {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                                if let Some(b) = &mut bar {
+                                    b.recording = None;
+                                    b.hands_free = false;
+                                }
+                            } else {
+                                match voice::listen(&audio, &scratch) {
+                                    Ok(r) => {
+                                        listening = Some(r);
+                                        if let Some(b) = &mut bar {
+                                            b.recording = Some(std::time::Instant::now());
+                                            b.hands_free = true;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = said_tx.send(Err(e)).await;
+                                    }
+                                }
+                            }
                         }
                         voice::Act::Read => {
                             // Talking already? The same key is a stop.
@@ -2024,7 +2168,7 @@ async fn attach(
                                     );
                                     tokio::spawn(async move {
                                         if let Err(e) =
-                                            voice::speak(&bs, &cl, &a, &text, &dir, &pl).await
+                                            voice::speak(&bs, &cl, &a, &text, None, &dir, &pl).await
                                         {
                                             let _ = tx.send(Err(e)).await;
                                         }
@@ -3092,16 +3236,55 @@ mod bar_tests {
     #[test]
     fn a_passing_state_replaces_itself_rather_than_repeating() {
         let mut b = bar(160);
-        b.set_mark("listening", true);
-        assert_eq!(b.line().matches("listening").count(), 1);
-        b.set_mark("listening", true);
-        assert_eq!(b.line().matches("listening").count(), 1, "pressed twice, said once");
+        b.set_mark("aloud", true);
+        assert_eq!(b.line().matches("aloud").count(), 1);
+        b.set_mark("aloud", true);
+        assert_eq!(b.line().matches("aloud").count(), 1, "pressed twice, said once");
         b.say_mark("reading", "reading 2 back".into());
         b.say_mark("reading", "reading 3 back".into());
         let line = b.line();
         assert!(line.contains("reading 3 back") && !line.contains("reading 2 back"), "{line}");
-        b.set_mark("listening", false);
-        assert!(!b.line().contains("listening"));
+        b.set_mark("aloud", false);
+        assert!(!b.line().contains("aloud"));
+    }
+
+    /// An open microphone has to be impossible to miss. A word among other
+    /// words on a grey row is missable, and was missed: the row itself says
+    /// it now, in the only red it is ever painted, with a counter that moves
+    /// so you can see it is live rather than left over.
+    #[test]
+    fn recording_takes_the_whole_row_and_says_how_long() {
+        let mut b = bar(120);
+        b.keys.push(("Ctrl-]".into(), "detach".into()));
+        assert!(!b.line().contains("RECORDING"));
+        b.recording = Some(std::time::Instant::now());
+        let line = b.line();
+        assert!(line.contains("RECORDING"), "{line}");
+        assert!(line.contains("0:00"), "a counter, from zero: {line}");
+        assert!(line.contains("press again"), "and how to end it: {line}");
+        assert!(String::from_utf8(b.paint()).unwrap().contains("\x1b[41m"), "red");
+
+        // Hands-free says a different thing, because it ends differently.
+        b.hands_free = true;
+        let line = b.line();
+        assert!(line.contains("LISTENING"), "{line}");
+        assert!(line.contains("stops when you stop talking"), "{line}");
+
+        b.recording = None;
+        assert!(!b.line().contains("LISTENING"));
+        assert!(!String::from_utf8(b.paint()).unwrap().contains("\x1b[41m"));
+    }
+
+    /// A question is the one thing that outranks it: it is on the row being
+    /// typed into, and taking it away mid-answer loses what was typed.
+    #[test]
+    fn a_question_still_owns_the_row_while_recording() {
+        let mut b = bar(120);
+        b.recording = Some(std::time::Instant::now());
+        b.ask = Some(("file".into(), "/tmp/x".into()));
+        let line = b.line();
+        assert!(line.contains("file: /tmp/x"), "{line}");
+        assert!(!line.contains("RECORDING"), "{line}");
     }
 }
 

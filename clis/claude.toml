@@ -29,6 +29,11 @@ attachable = false   # stream-json is a protocol, not a terminal
 args = ["--mcp-config", "{mcp_config}"]
 resume_args = ["--resume", "{resume}"]
 attachable = true
+# Typing a line at this prompt is a message to the agent, not a command
+# to a shell -- so a seat the fleet put in a terminal can be reached by
+# keyboard even with no driver to push to. `tmux` does not say this: what
+# is at ITS prompt is a shell.
+typed_delivery = true
 
 [driver]
 kind = "stream_json"

@@ -9,9 +9,9 @@
 use crate::{state::AppState, tools};
 use axum::{
     extract::{Path, Query, State},
-    Extension,
     http::{HeaderMap, StatusCode},
-    Json,
+    response::IntoResponse,
+    Extension, Json,
 };
 use nexmesh_proto::{self as proto, now_ms, Placement};
 use rusqlite::{params, OptionalExtension};
@@ -743,7 +743,7 @@ pub async fn upload(
                        FROM slots s
                        JOIN agents a ON a.id = (
                             SELECT id FROM agents WHERE slot_id = s.id
-                             ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                             ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
                       WHERE s.session_id = ?1
                         AND (s.id = ?2 OR LOWER(COALESCE(s.display_name,'')) = LOWER(?2)
                              OR LOWER(COALESCE(s.role,'')) = LOWER(?2))",
@@ -857,19 +857,132 @@ The file is at {path} on {node_name} ({bytes} bytes)."),
             "I have put {safe} in the workspace: {path} on {node_name} ({bytes} bytes).              Read it from there."
         ),
     };
+    // Remembered, so the chat can show the picture later rather than the
+    // path to it. The bytes stay on the machine that holds them; this is the
+    // note that says which machine, and where. See `upload_bytes`.
+    let upload_id = format!("up-{}", &uuid::Uuid::new_v4().to_string()[..12]);
+    let media_type = media_type_of(&safe);
     {
         let db = st.db.lock().unwrap();
         db.execute(
-            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
-             VALUES (?, NULL, NULL, 'system', ?, ?)",
-            params![session_id, line, now_ms()],
+            "INSERT INTO uploads (id, session_id, workspace_id, node_id, node_name, root, rel,
+                                  path, name, media_type, bytes, created_at_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![upload_id, session_id, workspace_id, node_id, node_name, root, rel,
+                    path, safe, media_type, bytes, now_ms()],
+        )
+        .map_err(bad)?;
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
+                                   attachment)
+             VALUES (?, NULL, NULL, 'system', ?, ?, ?)",
+            params![session_id, line, now_ms(), upload_id],
         )
         .map_err(bad)?;
     }
     Ok(Json(json!({
         "ok": true, "path": path, "node": node_name, "bytes": bytes,
-        "workspace": ws_name, "rel": rel
+        "workspace": ws_name, "rel": rel, "upload_id": upload_id, "media_type": media_type
     })))
+}
+
+/// What a file is, from its name, for a chat deciding whether to show it.
+///
+/// The node sniffs the real bytes when they are fetched and its answer wins;
+/// this is only so the chat knows whether to try. Guessing wrong here costs
+/// a thumbnail that does not render, not a wrong content type on the wire.
+fn media_type_of(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "txt" | "md" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// The bytes of an upload, fetched from the machine that holds them.
+///
+/// The hub stores no files. A picture in the chat is this: the row says which
+/// machine and where, the node reads it back, and the browser gets it with
+/// the type the node sniffed from the bytes themselves. Served inline so an
+/// `<img>` renders it, and never as anything a browser would run: a file
+/// somebody uploaded is not script on the hub's own origin.
+pub async fn upload_bytes(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> std::result::Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let found: Option<(String, String, String, String)> = {
+        let db = st.db.lock().unwrap();
+        db.query_row(
+            "SELECT node_id, root, rel, name FROM uploads WHERE id = ?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(bad)?
+    };
+    let Some((node_id, root, rel, name)) = found else {
+        return Err(bad("no such upload"));
+    };
+    if !st.node_is_connected(&node_id) {
+        return Err(bad("the machine holding that file is not connected"));
+    }
+    let (req_id, rx) = st.new_sync_request();
+    st.send_to_node(&node_id, &nexmesh_proto::HubToNode::GetFile { req_id, root, rel })
+        .await
+        .map_err(bad)?;
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
+        .await
+        .map_err(|_| bad("that machine did not answer in time"))?
+        .map_err(|_| bad("that machine went away while reading it"))?;
+    if answer["ok"].as_bool() != Some(true) {
+        return Err(bad(format!(
+            "could not read it: {}",
+            answer["detail"].as_str().unwrap_or("no reason given")
+        )));
+    }
+    let bytes = nexmesh_proto::b64::decode(answer["data_b64"].as_str().unwrap_or(""))
+        .map_err(|e| bad(format!("that machine sent something unreadable: {e}")))?;
+    let kind = answer["media_type"].as_str().unwrap_or("application/octet-stream");
+    // Only shapes a browser renders are served as themselves. Anything else
+    // downloads, so an uploaded .html or .svg cannot run as a page on this
+    // origin and read the dashboard's own session.
+    let inline = matches!(kind, "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                                | "application/pdf" | "audio/wav" | "audio/mpeg"
+                                | "video/mp4" | "video/webm");
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._- ".contains(c) { c } else { '_' })
+        .collect();
+    let disposition = if inline {
+        format!("inline; filename=\"{safe_name}\"")
+    } else {
+        format!("attachment; filename=\"{safe_name}\"")
+    };
+    let kind = if inline { kind.to_string() } else { "application/octet-stream".to_string() };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, kind),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+            (
+                axum::http::header::HeaderName::from_static("x-content-type-options"),
+                "nosniff".to_string(),
+            ),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=3600".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -1846,6 +1959,107 @@ pub async fn operator_ask(
     )))
 }
 
+#[derive(Deserialize)]
+pub struct ViewPost {
+    /// Who is sharing. A client picks its own and keeps it, so a reconnect
+    /// replaces its own frame rather than adding a second viewer.
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub w: u32,
+    #[serde(default)]
+    pub h: u32,
+    /// The frame, as a data URI or bare base64. Whatever the browser's own
+    /// encoder produced: it already has one, and the hub has no business
+    /// re-encoding a picture it only passes on.
+    pub frame: String,
+}
+
+/// Take the newest frame from an operator client.
+///
+/// A headset is a client nobody else can see into. This is how somebody at
+/// a desk watches what the person in it is looking at: the client that is
+/// drawing the scene flattens it to one picture a few times a second and
+/// posts it here, and the hub keeps only the newest.
+pub async fn publish_view(
+    State(st): State<AppState>,
+    Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
+    Json(req): Json<ViewPost>,
+) -> ApiResult {
+    let id = req.id.trim();
+    if id.is_empty() || id.len() > 64 {
+        return Err(bad("a view needs an id"));
+    }
+    let raw = req.frame.rsplit_once("base64,").map(|(_, b)| b).unwrap_or(&req.frame);
+    let bytes = nexmesh_proto::b64::decode(raw.trim())
+        .map_err(|e| bad(format!("that frame is not base64: {e}")))?;
+    if bytes.is_empty() {
+        st.drop_view(id);
+        return Ok(Json(json!({ "ok": true, "sharing": false })));
+    }
+    let media_type = match bytes.as_slice() {
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        _ if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" => "image/webp",
+        // A frame that is not a picture is not stored: this endpoint hands
+        // whatever arrives straight back to another browser.
+        _ => return Err(bad("a frame must be a jpeg, a png or a webp")),
+    };
+    let frame = crate::state::ViewFrame {
+        label: if req.label.trim().is_empty() { op.label.clone() } else { req.label.trim().to_string() },
+        kind: if req.kind.trim().is_empty() { "client".into() } else { req.kind.trim().to_string() },
+        status: req.status.chars().take(160).collect(),
+        w: req.w,
+        h: req.h,
+        at_ms: now_ms(),
+        bytes,
+        media_type: media_type.to_string(),
+    };
+    st.put_view(id, frame).map_err(bad)?;
+    Ok(Json(json!({ "ok": true, "sharing": true })))
+}
+
+/// Who is sharing a view right now.
+pub async fn list_views(State(st): State<AppState>) -> Json<Value> {
+    let now = now_ms();
+    let views: Vec<Value> = st
+        .views()
+        .into_iter()
+        .map(|(id, f)| {
+            json!({
+                "id": id, "label": f.label, "kind": f.kind, "status": f.status,
+                "w": f.w, "h": f.h, "age_ms": now - f.at_ms,
+            })
+        })
+        .collect();
+    Json(json!({ "views": views }))
+}
+
+/// One client's newest frame, as a picture a browser can show.
+pub async fn get_view(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> std::result::Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let Some(f) = st.view(&id) else {
+        return Err(bad("nobody is sharing that view"));
+    };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, f.media_type),
+            // Never cached: the whole point is that the next request gets a
+            // different picture.
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate".to_string()),
+        ],
+        f.bytes,
+    )
+        .into_response())
+}
+
 /// Has it answered yet? The dashboard polls this.
 pub async fn operator_ask_result(
     State(st): State<AppState>,
@@ -1922,7 +2136,7 @@ pub async fn tidy_seats(
                FROM slots s
                LEFT JOIN agents a ON a.id = (
                    SELECT id FROM agents WHERE slot_id = s.id
-                    ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                    ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
               WHERE s.session_id = ?1 AND s.participant_kind = 'cli'",
         )
         .and_then(|mut q| {
@@ -2012,7 +2226,7 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
          FROM slots s
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
-             ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+             ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
          LEFT JOIN nodes n ON n.id = a.node_id
          WHERE s.session_id = ? ORDER BY 2",
         word = crate::seat::agent_word("s", "a"),
@@ -2091,10 +2305,12 @@ pub async fn session_log(
                      ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
                 {delivered},
                 m.inflight_at_ms IS NOT NULL,
-                {seen}, {audience}
+                {seen}, {audience},
+                m.attachment, u.name, u.media_type, u.bytes, u.node_name
          FROM messages m
          LEFT JOIN slots sf ON sf.id = m.from_slot
          LEFT JOIN slots st2 ON st2.id = m.to_slot
+         LEFT JOIN uploads u ON u.id = m.attachment
          WHERE m.session_id = ?1 AND m.id > ?2
          ORDER BY m.id ASC LIMIT ?3",
         delivered = crate::seat::delivered("m"),
@@ -2119,6 +2335,19 @@ pub async fn session_log(
                 // matter: one teammate acking is not the team hearing you.
                 "seen": r.get::<_, i64>(8)?,
                 "audience": r.get::<_, i64>(9)?,
+                // The file this message is about, when it is about one, so
+                // the chat can show the picture instead of its path.
+                "file": match r.get::<_, Option<String>>(10)? {
+                    Some(id) => json!({
+                        "id": id,
+                        "name": r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                        "media_type": r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                        "bytes": r.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                        "node": r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                        "url": format!("/v1/uploads/{}", r.get::<_, String>(10)?),
+                    }),
+                    None => Value::Null,
+                },
             }))
         })
         .and_then(|m| m.collect())
@@ -2514,12 +2743,16 @@ pub async fn operator_message(
                     CASE WHEN a.provenance = 'external' THEN 'polls'
                          WHEN a.push_capable = 1 THEN 'driven'
                          WHEN s.terminal_via IS NOT NULL THEN 'terminal'
+                         -- A seat the fleet put in a terminal of its own has
+                         -- a keyboard too; see `delivery::interactive_tick`.
+                         WHEN a.typed_delivery = 1 AND a.exited_at_ms IS NULL
+                              THEN 'terminal'
                          ELSE 'next tool call' END,
                     {word}
                FROM slots s
                LEFT JOIN agents a ON a.id = (
                    SELECT id FROM agents WHERE slot_id = s.id
-                   ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                   ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
               WHERE s.session_id = ?1 AND (?2 IS NULL OR s.id = ?2)
                 AND COALESCE(s.task_state,'') <> 'released'
                 AND a.id IS NOT NULL
@@ -2567,6 +2800,22 @@ async fn run_command(
             .await?;
             let _ = v;
             Ok(format!("{was} is now called {name}"))
+        }
+        Cmd::Voice { who, voice } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            {
+                let db = st.db.lock().unwrap();
+                db.execute(
+                    "UPDATE slots SET voice = ? WHERE id = ?",
+                    params![if voice.is_empty() { None } else { Some(voice.clone()) }, slot],
+                )
+                .map_err(bad)?;
+            }
+            Ok(if voice.is_empty() {
+                format!("{name} is read in the default voice again")
+            } else {
+                format!("{name} is read in {voice}")
+            })
         }
         Cmd::Move { who, session } => {
             let (slot, name) = seat_by_ref(st, session_id, who)?;

@@ -305,6 +305,11 @@ pub enum NodeToHub {
         /// which until now could be discovered only by trying.
         #[serde(default)]
         io_kind: Option<String>,
+        /// True when this agent is at its own prompt in a terminal the node
+        /// spawned, so a line typed at it is a message to the agent. The
+        /// hub's only other route to such a seat is its next tool call.
+        #[serde(default)]
+        typed_delivery: bool,
     },
     /// This seat is sitting in a terminal the node has adopted, so it can be
     /// typed at even though nothing drives it.
@@ -399,8 +404,20 @@ pub enum NodeToHub {
         /// `McpdToNode::Register::cli_session`.
         #[serde(default)]
         cli_session: Option<String>,
+        /// True when `cli_session` is the CLI's own conversation id rather
+        /// than an operator's label; see `localsock`.
+        #[serde(default)]
+        cli_session_is_own: bool,
     },
     /// What became of a `PutFile`.
+    /// The bytes of a file this machine was asked for, base64.
+    FileBytes {
+        req_id: u64,
+        ok: bool,
+        data_b64: String,
+        media_type: String,
+        detail: String,
+    },
     /// This machine now holds a direct-attach ticket and will honour it.
     ///
     /// The hub pushes a ticket over a connection and answers the operator
@@ -606,6 +623,18 @@ pub enum HubToNode {
         /// The bytes, base64.
         data_b64: String,
     },
+    /// Read a file back out of a workspace on this machine.
+    ///
+    /// The mirror of `PutFile`. The hub keeps no files of anyone's, so the
+    /// only way to show an uploaded picture in the chat again is to ask the
+    /// machine that holds it. Bounded: a node refuses anything larger than
+    /// `MAX_FETCH_BYTES`, because this answer goes through the hub's
+    /// WebSocket and a 2GB video would stall every other agent on it.
+    GetFile {
+        req_id: u64,
+        root: String,
+        rel: String,
+    },
     AttachResize { attach_id: String, cols: u16, rows: u16 },
     AttachClose { attach_id: String },
     /// An operator may attach to this agent directly, bypassing the hub as a
@@ -628,10 +657,16 @@ pub enum HubToNode {
     Ping { seq: u64 },
 }
 
+/// The most a node will read back out of a workspace in one answer.
+///
+/// A picture in a chat is the use; a whole recording is not. The limit is the
+/// hub's own socket, which every node and every attach shares.
+pub const MAX_FETCH_BYTES: u64 = 24 * 1024 * 1024;
+
 // --------------------------------------------------------------- utils ----
 
 /// Base64 for pty bytes: terminal output is not valid UTF-8 in general.
-mod b64 {
+pub mod b64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

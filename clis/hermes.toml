@@ -11,17 +11,29 @@
 #    `~/.hermes/config.yaml` (see [user_install]) and the SEAT is decided by
 #    the environment the node sets, which the shim reads for itself.
 #
-#    That means the `nexmesh` entry in config.yaml must NOT pin NEXMESH_*
-#    variables of its own. If it does, every hermes conversation on that
-#    machine reports the same name and the same conversation id, and they all
-#    collapse into one seat -- which looks like a nexmesh bug and is a config
-#    file saying what it was told to say.
+#    Those variables are the ONLY channel there is. Hermes filters the
+#    environment of a stdio MCP server down to an allowlist -- PATH, HOME,
+#    USER, LANG, LC_ALL, TERM, SHELL, TMPDIR and XDG_* (`_SAFE_ENV_KEYS` in
+#    its mcp_tool.py) -- so nothing the node sets for the hermes process
+#    reaches the shim, NEXMESH_AGENT_ID included. Pin them in config.yaml or
+#    the shim knows nothing: no CLI, no session, and a join the hub refuses.
+#
+#    The cost is that every hermes process on the machine then reports the
+#    same name and conversation id and shares ONE seat. Short-lived ones --
+#    `hermes chat -q`, cron jobs, webhook turns -- take that seat for a few
+#    seconds each and hand it back, so a pin aimed at the team seat means
+#    the team's messages wait for whichever of them is holding it. Give the
+#    gateway's own turns a seat of their own (their own NEXMESH_NAME and
+#    NEXMESH_CLI_SESSION) and leave the team seat to a long-lived
+#    conversation.
 #
 # 2. There is no headless mode. `hermes chat -q` is one question per process,
 #    which the fleet cannot steer mid-turn, and its agent-client protocol
 #    (`hermes acp`) has not been verified here. Interactive is a real terminal
-#    the fleet owns, which is what a seat needs: messages reach it the way
-#    they reach any bare CLI, by being typed into its prompt.
+#    the fleet owns, which is what a seat needs: messages reach it by being
+#    typed into its prompt, which is what `typed_delivery` below asks for.
+#    Hermes has no driver, so that is its only route that does not wait for a
+#    tool call it may never make.
 [cli]
 id = "hermes"
 display_name = "Hermes Agent"
@@ -36,6 +48,11 @@ args = ["chat"]
 # `--resume SESSION_ID`, from `hermes sessions list`.
 resume_args = ["--resume", "{resume}"]
 attachable = true
+# Typing a line at this prompt is a message to the agent, not a command
+# to a shell -- so a seat the fleet put in a terminal can be reached by
+# keyboard even with no driver to push to. `tmux` does not say this: what
+# is at ITS prompt is a shell.
+typed_delivery = true
 
 [user_install]
 # `hermes mcp add [--command CMD] [--args ...] [--env K=V ...] NAME`, with the

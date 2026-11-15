@@ -70,6 +70,8 @@ pub struct Keys {
     pub send: u8,
     /// Take a photo with this machine's camera and send that.
     pub photo: u8,
+    /// Hands-free: keep listening, a sentence at a time, until told to stop.
+    pub listen: u8,
 }
 
 impl Default for Keys {
@@ -88,6 +90,9 @@ impl Default for Keys {
             // moment command mode is off.
             send: 0x19,
             photo: 0x10,
+            // Ctrl-N: next-history in readline, which is not how a line is
+            // written either, and free in every TUI checked here.
+            listen: 0x0e,
         }
     }
 }
@@ -107,6 +112,8 @@ impl Keys {
             Some(Act::Send)
         } else if b == self.photo {
             Some(Act::Photo)
+        } else if b == self.listen {
+            Some(Act::Listen)
         } else {
             None
         }
@@ -126,6 +133,8 @@ pub enum Act {
     Send,
     /// Take a photo here and send that.
     Photo,
+    /// Keep listening until told to stop, a sentence at a time.
+    Listen,
 }
 
 /// `ctrl-^`, `ctrl-g`, `^]`, `0x1e`, `30` -- whatever somebody writes down.
@@ -201,6 +210,7 @@ pub fn keys_from(toml_text: &str) -> Keys {
             "aloud_key" => k.aloud = b,
             "send_key" => k.send = b,
             "photo_key" => k.photo = b,
+            "listen_key" => k.listen = b,
             _ => {}
         }
     }
@@ -216,6 +226,7 @@ pub fn keys_from(toml_text: &str) -> Keys {
         (&mut k.aloud, d.aloud),
         (&mut k.send, d.send),
         (&mut k.photo, d.photo),
+        (&mut k.listen, d.listen),
     ] {
         if *field == k.command || *field == k.detach {
             *field = fallback;
@@ -334,6 +345,56 @@ fn run(cmd: &[String], file: &Path) -> Result<Child> {
 /// Start recording. The child keeps going until `stop` is called, which is
 /// what makes this press-to-start, press-again-to-send rather than a fixed
 /// number of seconds nobody can judge in advance.
+/// A recorder that stops ITSELF when you stop talking.
+///
+/// Push-to-talk needs a key at each end. Hands-free needs the recorder to
+/// know where the sentence ended, and only sox can be asked that from a
+/// command line: `silence 1 0.1 3% 1 2.0 3%` means "start when there is
+/// sound, stop after two seconds of quiet". The process exiting is the
+/// end-of-utterance signal, which is why the caller watches for it rather
+/// than timing anything.
+///
+/// Nothing else here can do it. arecord and parecord record until they are
+/// killed, and ffmpeg's silencedetect reports silence without acting on it;
+/// chopping the microphone into fixed six-second windows instead would cut
+/// sentences in half, which is worse than saying so.
+pub fn listen_cmd(audio: &Audio) -> Option<Vec<String>> {
+    // Only sox. `audio.record` says what this machine has; this asks for one
+    // specific tool because only that tool has the feature.
+    if !have("rec") {
+        return None;
+    }
+    let _ = audio;
+    Some(words(&[
+        "rec", "-q", "-c", "1", "-r", "16000", "{}",
+        // Begin on the first sound above the floor, and end after 2s under
+        // it. 3% is quiet enough for a room with a fan in it and loud enough
+        // not to trigger on breathing.
+        "silence", "1", "0.1", "3%", "1", "2.0", "3%",
+    ]))
+}
+
+/// Start a recorder that will stop on its own. `None` when this machine has
+/// no tool that can do that.
+pub fn listen(audio: &Audio, dir: &Path) -> Result<(Child, PathBuf)> {
+    let cmd = listen_cmd(audio).context(
+        "hands-free listening needs sox (the `rec` command): every other recorder here \
+         has to be told when to stop",
+    )?;
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join(format!("heard-{}.wav", nexmesh_proto::now_ms()));
+    let child = run(&cmd, &path)?;
+    Ok((child, path))
+}
+
+/// Has a self-stopping recorder finished? The bytes, when it has.
+pub fn listened(child: &mut Child, path: &Path) -> Option<Vec<u8>> {
+    match child.try_wait() {
+        Ok(Some(_)) => std::fs::read(path).ok(),
+        _ => None,
+    }
+}
+
 pub fn start(audio: &Audio, dir: &Path) -> Result<(Child, PathBuf)> {
     let cmd = audio.record.as_ref().context("nothing on this machine can record")?;
     let _ = std::fs::create_dir_all(dir);
@@ -407,10 +468,19 @@ pub async fn speak(
     client: &reqwest::Client,
     audio: &Audio,
     text: &str,
+    voice: Option<&str>,
     dir: &Path,
     playing: &Playing,
 ) -> Result<()> {
-    let out = ask(base, client, "tts", json!({ "input": text }), 120).await?;
+    // A teammate's own voice, when the seat has been given one. The service
+    // decides whether it has that voice; an unknown name comes back as an
+    // error naming the ones it does have, which is more use than a silent
+    // fallback to the default.
+    let mut req = json!({ "input": text });
+    if let Some(v) = voice.filter(|v| !v.trim().is_empty()) {
+        req["voice"] = json!(v);
+    }
+    let out = ask(base, client, "tts", req, 120).await?;
     let (bytes, ext) = audio_of(base, client, &out).await?;
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join(format!("said-{}.{ext}", nexmesh_proto::now_ms()));

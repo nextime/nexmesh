@@ -241,6 +241,20 @@ pub struct ModeSpec {
     /// Does this mode give a human-usable terminal when attached?
     #[serde(default)]
     pub attachable: bool,
+    /// Is this mode the agent's OWN prompt, so that a line typed at it is a
+    /// message to the agent rather than a command to a shell?
+    ///
+    /// Only meaningful for a terminal the node spawned itself. It is what
+    /// lets a CLI with no driver be reached at all: without it such a seat
+    /// can be watched and attached to, and nothing the team says ever
+    /// arrives, because its only route is a tool call it may never make.
+    ///
+    /// Default false, and deliberately so. `tmux` is a registered CLI whose
+    /// interactive mode is a SHELL, where a teammate's message and a newline
+    /// would be executed; so is anything else whose prompt is not an agent's.
+    /// A CLI claims this in its descriptor or does not get typed at.
+    #[serde(default)]
+    pub typed_delivery: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

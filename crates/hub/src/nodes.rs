@@ -237,22 +237,24 @@ async fn handle(
 
         NodeToHub::AgentUp {
             agent_id, slot_id, proc: id, provenance, cwd, resume_handle, push_capable, io_kind,
+            typed_delivery,
         } => {
             let db = st.db.lock().unwrap();
             let now = now_ms();
             db.execute(
                 "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance,
                                      status, cwd, started_at_ms, last_seen_ms, push_capable,
-                                     io_kind)
-                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9,?10)
+                                     io_kind, typed_delivery)
+                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9,?10,?11)
                  ON CONFLICT(id) DO UPDATE SET status = 'running', last_seen_ms = ?8,
                                                -- Up again is not exited.
                                                exited_at_ms = NULL,
-                                               io_kind = COALESCE(?10, io_kind)",
+                                               io_kind = COALESCE(?10, io_kind),
+                                               typed_delivery = ?11",
                 params![
                     agent_id, slot_id, node_id, id.pid, id.start_ticks,
                     serde_json::to_value(provenance)?.as_str().unwrap_or("managed"),
-                    cwd, now, push_capable as i64, io_kind
+                    cwd, now, push_capable as i64, io_kind, typed_delivery as i64
                 ],
             )?;
             db.execute("UPDATE slots SET status = 'connected' WHERE id = ?", [&slot_id])?;
@@ -371,6 +373,15 @@ async fn handle(
             }
         }
 
+        NodeToHub::FileBytes { req_id, ok, data_b64, media_type, detail } => {
+            st.complete_sync(
+                req_id,
+                serde_json::json!({
+                    "ok": ok, "data_b64": data_b64, "media_type": media_type, "detail": detail
+                }),
+            );
+        }
+
         NodeToHub::TicketStored { req_id } => {
             st.complete_sync(req_id, serde_json::json!({ "ok": true }));
         }
@@ -436,8 +447,10 @@ async fn handle(
 
         NodeToHub::JoinRequest {
             req_id, session_hint, cli_id, role, name, cwd, proc: pid, cli_session,
+            cli_session_is_own,
         } => {
-            let granted = join(st, node_id, session_hint, cli_id, role, name, cwd, pid, cli_session);
+            let granted = join(st, node_id, session_hint, cli_id, role, name, cwd, pid,
+                               cli_session, cli_session_is_own);
             let frame = match granted {
                 Ok((slot_id, session_id, agent_id, display_name, role)) => HubToNode::JoinGranted {
                     req_id, slot_id, session_id, agent_id, display_name, role,
@@ -808,6 +821,7 @@ fn join(
     cwd: Option<String>,
     pid: Option<proto::ProcIdentity>,
     cli_session: Option<String>,
+    cli_session_is_own: bool,
 ) -> Result<(String, String, String, Option<String>, Option<String>)> {
     let db = st.db.lock().unwrap();
     let now = now_ms();
@@ -1100,13 +1114,14 @@ fn join(
                     // resume of THIS one comes straight back to it rather
                     // than going round the same reclaim again.
                     db.execute(
-                        "UPDATE slots SET cli_session = ? WHERE id = ?",
-                        params![cs, id],
+                        "UPDATE slots SET cli_session = ?, cli_session_own = ? WHERE id = ?",
+                        params![cs, cli_session_is_own as i64, id],
                     )?;
                 } else {
                     db.execute(
-                        "UPDATE slots SET cli_session = ? WHERE id = ? AND cli_session IS NULL",
-                        params![cs, id],
+                        "UPDATE slots SET cli_session = ?, cli_session_own = ?
+                          WHERE id = ? AND cli_session IS NULL",
+                        params![cs, cli_session_is_own as i64, id],
                     )?;
                 }
             }
@@ -1132,9 +1147,10 @@ fn join(
                 // come back on another.
                 "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
                                     display_name, role, status, created_at_ms, cli_session,
-                                    placement)
-                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?,?,?)",
+                                    cli_session_own, placement)
+                 VALUES (?,?,?,?,'cli','interactive',?,?,'connected',?,?,?,?)",
                 params![id, session_id, workspace_id, cli_id, name, role, now, cli_session,
+                        cli_session_is_own as i64,
                         serde_json::json!({ "node": node_name }).to_string()],
             )?;
             id

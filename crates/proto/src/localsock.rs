@@ -36,6 +36,12 @@ pub enum McpdToNode {
         /// same folder, which is exactly what a seat should follow.
         #[serde(default)]
         cli_session: Option<String>,
+        /// True when `cli_session` came from the CLI itself rather than from
+        /// `NEXMESH_CLI_SESSION`. Only the CLI's own id can be handed back to
+        /// it to RESUME that conversation; an operator's label cannot, and
+        /// trying produces a blank conversation wearing the right name.
+        #[serde(default)]
+        cli_session_is_own: bool,
     },
     Tool {
         req_id: u64,

@@ -622,6 +622,7 @@ async fn main() -> Result<()> {
                 tick.tick().await;
                 delivery::push_tick(&st).await;
                 delivery::typed_tick(&st).await;
+                delivery::interactive_tick(&st).await;
                 delivery::recovery_tick(&st).await;
             }
         });
@@ -704,6 +705,10 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/seats/tidy", post(api::tidy_seats))
         // A person at the dashboard using the fleet's own services --
         // transcription, speech -- rather than only agents being able to.
+        .route("/v1/uploads/:id", get(api::upload_bytes))
+        .route("/v1/operator/view", post(api::publish_view))
+        .route("/v1/operator/views", get(api::list_views))
+        .route("/v1/operator/view/:id", get(api::get_view))
         .route("/v1/capabilities/ask", post(api::operator_ask))
         .route("/v1/capabilities/ask/:id", get(api::operator_ask_result))
         .route("/v1/workspaces/:id/graph", post(api::build_graph))
@@ -756,6 +761,8 @@ async fn main() -> Result<()> {
         .route("/:icon_png", get(dashboard::app_icon_png))
         .route("/sw.js", get(dashboard::service_worker))
         .route("/term.js", get(dashboard::term_js))
+        .route("/xr", get(dashboard::xr_page))
+        .route("/xr.js", get(dashboard::xr_js))
         .route("/healthz", get(api::health))
         // Signing in cannot itself require being signed in. These three are
         // the only unauthenticated write paths on the hub, and each is

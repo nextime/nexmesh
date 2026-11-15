@@ -76,6 +76,75 @@ pub async fn write(root: &str, rel: &str, data_b64: &str) -> Result<(String, u64
     Ok((path.to_string_lossy().to_string(), bytes.len() as u64))
 }
 
+/// Read a file back out of a workspace, for the hub to hand to a browser.
+///
+/// The mirror of `write`, and deliberately the same shape: the same join that
+/// refuses to leave the workspace, the same refusal to carry something huge
+/// through the hub's one socket. A directory, a device or a dangling symlink
+/// is an error with a reason rather than an empty answer.
+pub async fn read(root: &str, rel: &str, max: u64) -> Result<(Vec<u8>, String)> {
+    let path = safe_join(root, rel)?;
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .with_context(|| format!("looking at {}", path.display()))?;
+    if meta.is_dir() {
+        bail!("{} is a directory", path.display());
+    }
+    if meta.len() > max {
+        bail!("that file is {} bytes, over the {max}-byte limit for one read", meta.len());
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    let kind = media_type(&path, &bytes);
+    Ok((bytes, kind))
+}
+
+/// What this is, from its own first bytes where they say, else its name.
+///
+/// Sniffed first on purpose: the extension is whatever somebody typed, and
+/// the browser is going to be told to render whatever this says.
+pub fn media_type(path: &Path, bytes: &[u8]) -> String {
+    let magic = match bytes {
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'%', b'P', b'D', b'F', ..] => Some("application/pdf"),
+        _ if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" => {
+            Some("image/webp")
+        }
+        _ if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" => {
+            Some("audio/wav")
+        }
+        _ if bytes.len() > 12 && &bytes[4..12] == b"ftypmp42" => Some("video/mp4"),
+        _ if bytes.len() > 12 && &bytes[4..8] == b"ftyp" => Some("video/mp4"),
+        _ => None,
+    };
+    if let Some(m) = magic {
+        return m.to_string();
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain; charset=utf-8",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// base64, including the data-URI and URL-safe shapes a browser produces.

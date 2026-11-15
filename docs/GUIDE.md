@@ -1,11 +1,11 @@
-# nexmesh — the guide
+# nexmesh: the guide
 
 Everything past first contact: how a seat finds its session, what a lock
 arbitrates, who may drive what, how any CLI becomes a team member, and how to
 run this on real machines.
 
-The [README](../README.md) is the short version — what nexmesh is, the shape
-of it, and how to watch a fleet without installing anything.
+The [README](../README.md) is the short version: what nexmesh is, the shape of
+it, and how to watch a fleet without installing anything.
 
 ## Contents
 
@@ -66,7 +66,8 @@ of it, and how to watch a fleet without installing anything.
 **A directory does not decide a session.** Two CLIs open in the same folder
 may belong to different teams, and one team's seats may sit in a dozen
 different folders on half a dozen machines. Session membership belongs to the
-seat, not to the filesystem — so it is something you set, and it stays set.
+seat rather than to the filesystem, so it is something you set, and it stays
+set.
 
 A CLI launched by hand still has to end up somewhere, and the hub works that
 out in this order:
@@ -78,11 +79,11 @@ out in this order:
    `move-agent` stick: without it the next restart resolved the session afresh
    and quietly undid the move.
 3. **The directory**, as a default for a conversation that has never been
-   placed — if a session has a workspace mounted at or above your working
+   placed, if a session has a workspace mounted at or above your working
    directory *on this machine*. A path is a claim about one host, so only
    mounts on this node count, and the longest match wins. Two sessions may
-   mount the same directory; that makes the directory unable to answer, not
-   forbidden, and a conversation starting there is told to say which.
+   mount the same directory. That makes the directory unable to answer rather
+   than forbidden, and a conversation starting there is told to say which.
 4. The only active session, if there is exactly one.
 5. Otherwise it refuses and names the active sessions, rather than guessing.
 
@@ -98,32 +99,37 @@ From then on that conversation returns to that session on every restart,
 difference.
 
 A **seat** is a different question from a session. Several conversations can
-live in one directory — claude and opencode both keep more than one per
-project — and resuming one starts a new process with a new pid, so neither
-the directory nor the pid identifies a seat. The CLI's own conversation id
-does, and the shim reports it:
+live in one directory (claude and opencode both keep more than one per
+project), and resuming one starts a new process with a new pid, so neither the
+directory nor the pid identifies a seat. The CLI's own conversation id does,
+and the shim reports it:
 
 | CLI | variable | verified |
 |---|---|---|
 | claude | `CLAUDE_CODE_SESSION_ID` | yes, by dumping the environment it gives an MCP server |
 | codex | `CODEX_THREAD_ID` | yes |
-| opencode | — | publishes none; falls back to directory and name |
+| opencode | none | publishes none; falls back to directory and name |
 | anything | `NEXMESH_CLI_SESSION` | an explicit override, consulted first |
 
-So two windows on the same project get two seats, and `/resume` returns to
-its own. For a long-lived assistant that publishes no id of its own, pin one:
-set `NEXMESH_CLI_SESSION=hermes-machine-d` and every reconnect reclaims that seat
+So two windows on the same project get two seats, and `/resume` returns to its
+own. For a long-lived assistant that publishes no id of its own, pin one: set
+`NEXMESH_CLI_SESSION=hermes-machine-d` and every reconnect reclaims that seat
 instead of taking another.
 
-A seat nobody named is named after what it is and where it is — `Claude-machine-b`,
-then `Claude-machine-b-2` when the same CLI is open twice on one machine. Nothing
-is left blank and nothing is named twice, because every command that addresses
-an agent addresses it by name.
+A pinned value is a label for a seat, not a conversation the CLI can be asked
+to resume, and nexmesh keeps the two apart: only an id the CLI published itself
+is ever handed back to it with `--resume`. Pinning one otherwise produces a
+blank conversation wearing the right name on every restart.
+
+A seat nobody named is named after what it is and where it is:
+`Claude-machine-b`, then `Claude-machine-b-2` when the same CLI is open twice
+on one machine. Nothing is left blank and nothing is named twice, since every
+command that addresses an agent addresses it by name.
 
 #### What `/new` does, and what a closed window leaves behind
 
-Starting a fresh conversation in a CLI that holds a seat — `/new` in Claude
-Code, a new thread in Codex — means a new conversation id, so the hub sees
+Starting a fresh conversation in a CLI that holds a seat (`/new` in Claude
+Code, a new thread in Codex) means a new conversation id, so the hub sees
 somebody it has never met:
 
 - it joins **the same team**: the session pinned when the seat was installed,
@@ -131,18 +137,18 @@ somebody it has never met:
 - it gets **its own seat**, with its own inbox, task state and summary. The
   old seat is not taken over while anything is live in it;
 - the seat it gets is a **reused empty one** when the last conversation in
-  that folder, in that CLI, has ended — same team, same machine, same
+  that folder, in that CLI, has ended: same team, same machine, same
   directory, nothing live in it, not released. That is what stops a folder
   collecting a new `Claude-machine-b-2` every morning;
 - otherwise it is a new seat, named after the CLI and the machine.
 
-The conversation you left does not disappear: its seat stays, marked
+The conversation you left does not disappear. Its seat stays, marked
 `disconnected` once the process is gone, and `/resume` on that conversation
-comes back to exactly that seat — which is the point of keying on the
+comes back to exactly that seat, which is the point of keying on the
 conversation id rather than the directory. Seats nobody is coming back to are
-retired on purpose, never guessed at: `nexmesh status <team>` shows them, the
-dashboard offers "retire N empty seats", and `/remove <name>` in the chat or
-`x` in the console removes one.
+retired on purpose and never guessed at: `nexmesh status <team>` shows them,
+the dashboard offers "retire N empty seats", and `/remove <name>` in the chat
+or `x` in the console removes one.
 
 #### Making your own CLI a team member
 
@@ -163,14 +169,14 @@ That is `managed` versus `attached` as a choice rather than an accident, and
   keyed on the CLI's conversation id, so it survives a restart, a `/resume`,
   and the node being restarted underneath it.
 
-The shim holds no credentials and never speaks to the hub — it finds the node
-on its own machine over a unix socket, and the node asks for the seat — so a
-seat costs the CLI nothing but one MCP server, and a compromised agent gains
-no fleet access. Conversations already open pick it up when they restart.
+The shim holds no credentials and never speaks to the hub. It finds the node
+on its own machine over a unix socket, and the node asks for the seat, so a
+seat costs the CLI nothing but one MCP server and a compromised agent gains no
+fleet access. Conversations already open pick it up when they restart.
 
-A pinned identity is one process, so joining somewhere marks it gone
-everywhere else — which is what lets it **move**: point it at another session
-and it takes, or returns to, its seat there.
+A pinned identity is one process, so joining somewhere marks it gone everywhere
+else. That is what lets it **move**: point it at another session and it takes,
+or returns to, its seat there.
 
 To move an agent that is already running, without restarting it:
 
@@ -182,8 +188,8 @@ The orchestrator offers the same thing as `move_agent`, addressed by the name
 `team_status` shows rather than a slot id, so a CLI driving the fleet can
 reorganise it without anyone at a terminal. `rename_session` is there too.
 
-An agent's session is not something it carries — a tool call resolves it
-through the agent's slot — so moving the seat moves whoever is in it,
+An agent's session is not something it carries. A tool call resolves it
+through the agent's slot, so moving the seat moves whoever is in it,
 mid-conversation. Its workspace, file locks and ownership zones are released
 rather than carried: all three describe the session being left, and a lock on
 `src/**` there says nothing about anywhere else. Anything it had not yet read
@@ -196,26 +202,26 @@ lock's domain is the thing being edited rather than the session asking:
 
 | the agent's workspace | lock domain |
 |---|---|
-| `node_local` | `node:<node>:<mount path>` — that directory, on that machine |
-| `repo` | `ws:<workspace>` — the shared tree, across every machine |
-| none | `session:<session>` — a fallback, so locks still arbitrate |
+| `node_local` | `node:<node>:<mount path>`, that directory on that machine |
+| `repo` | `ws:<workspace>`, the shared tree across every machine |
+| none | `session:<session>`, a fallback so locks still arbitrate |
 
-`acquire_file` matches on that domain and does **not** filter by session. So
-two sessions mounting the same directory on the same machine contend there,
-which is what makes sharing a directory between teams safe rather than a
-quiet race — and two agents editing their own local `src/main.rs` on
-different machines, or in different directories on one machine, do not.
+`acquire_file` matches on that domain and does **not** filter by session. Two
+sessions mounting the same directory on the same machine therefore contend
+there, which is what makes sharing a directory between teams safe rather than
+a quiet race. Two agents editing their own local `src/main.rs` on different
+machines, or in different directories on one machine, do not contend.
 
 The mount path is in the domain for a reason. Without it, every local
 workspace on a host shared one domain: an agent locking `src/main.rs` under
-`/srv/app` blocked another locking `src/main.rs` under `/storage/coderai`
-— same relative path, different trees — and the denial named an agent in a
-project you were not touching.
+`/srv/app` blocked another locking `src/main.rs` under `/srv/docs`, the same
+relative path in a different tree, and the denial named an agent in a project
+you were not touching.
 
 An agent that is not inside any workspace mount falls back to a session-wide
-domain, which contends with nobody outside its own session. The hub says so
-in its log when that happens, because it is usually a workspace that was
-never mounted where the agent actually works.
+domain, which contends with nobody outside its own session. The hub says so in
+its log when that happens, since it usually means a workspace was never mounted
+where the agent actually works.
 
 ### Shared workspaces
 
@@ -229,9 +235,9 @@ nexmesh sync se-1234abcd --op publish    # push everyone's work
 nexmesh sync se-1234abcd --op refresh    # pull it everywhere
 ```
 
-Agents get `publish_work`, `sync_workspace` and `workspace_status`, and two
+Agents get `publish_work`, `sync_workspace` and `workspace_status`. Two
 moments happen without being asked: a machine is given a checkout **before its
-agent starts**, and `signal_done` **publishes automatically** — finishing is
+agent starts**, and `signal_done` **publishes automatically**. Finishing is
 exactly when teammates need to see the work, and an agent should not have to
 remember a second call. A publish also messages the team, so nobody has to
 guess that there is something to pull.
@@ -246,8 +252,8 @@ Three decisions worth stating:
   disjoint globs, so in normal running two of them never touch the same file.
 - **A conflict is reported, never resolved.** Guessing at a merge would
   silently destroy somebody's work. The publish is rolled back, the agent is
-  told which files collided, and its own files are left exactly as they were —
-  there is a test asserting precisely that.
+  told which files collided, and its own files are left exactly as they were.
+  There is a test asserting precisely that.
 
 `sync = "shared_fs"` means the filesystem already does this and nexmesh stays
 out of the way.
@@ -265,7 +271,7 @@ nexmesh-hub operator-token fleet-boss                        # the whole fleet
 ```
 
 A **scoped** orchestrator drives one session. It never has to name that
-session — it is the only one it can see — and it cannot name another. It may
+session, being the only one it can see, and it cannot name another. It may
 add, rename, pause, release and message the agents in its own team, read its
 own log, and sync its own workspace. It may not create a session, list the
 machines, touch the certificates, move a seat to another session, or *learn
@@ -274,17 +280,17 @@ else, because a list of names is how you would go looking for something to
 ask for.
 
 A **super** orchestrator is the fleet: every session, and the only one that
-can arrange who is where. There can be as many as you like — the orchestrator
-is a stateless MCP client, so it is the token that carries the authority, and
-each one can be revoked on its own. A signed-in dashboard account is a super,
-because a person at the dashboard is looking at the whole fleet.
+can arrange who is where. There can be as many as you like. The orchestrator is
+a stateless MCP client, so it is the token that carries the authority, and each
+one can be revoked on its own. A signed-in dashboard account is a super, since
+a person at the dashboard is looking at the whole fleet.
 
-This is enforced in the authentication middleware rather than in each
-handler, for the same reason authentication is: a route added later is
-covered without anyone having to remember. One deliberate subtlety — a
-scoped token naming a session that does not exist gets the ordinary "no such
-session", not a refusal. Saying "out of scope" there would confirm that some
-*other* session owns that name, which is exactly what scoping hides.
+This is enforced in the authentication middleware rather than in each handler,
+for the same reason authentication is: a route added later is covered without
+anyone having to remember. One deliberate subtlety: a scoped token naming a
+session that does not exist gets the ordinary "no such session" rather than a
+refusal. Saying "out of scope" there would confirm that some *other* session
+owns that name, which is exactly what scoping hides.
 
 #### Asking for what you cannot see
 
@@ -297,13 +303,12 @@ out, and it is the honest one: ask somebody whose reach is wider.
 | `message_orchestrator` | a super, to one session's orchestrator |
 | `read_operator_messages` | either, for its own notes |
 
-It does not need to know who the supervisors are — "the supers" is an
-address, not a person, so one can be added or revoked without telling
-anybody. The read cursor is per operator, so two supervisors each see a
-request rather than the first reader consuming it. And a scoped orchestrator
-addressing another session directly is refused rather than quietly
-redirected: believing you reached a team you cannot address is worse than
-being told you cannot.
+It does not need to know who the supervisors are. "The supers" is an address
+rather than a person, so one can be added or revoked without telling anybody.
+The read cursor is per operator, so two supervisors each see a request instead
+of the first reader consuming it. A scoped orchestrator addressing another
+session directly is refused rather than quietly redirected: believing you
+reached a team you cannot address is worse than being told you cannot.
 
 #### An agent raising its hand
 
@@ -318,29 +323,29 @@ point:
    cannot mean "a token exists": an orchestrator nobody is running would
    otherwise swallow every request an agent made, silently, for as long as its
    token did.
-3. **The supervisors regardless**, when the agent passes `escalate` — for when
+3. **The supervisors regardless**, when the agent passes `escalate`, for when
    the orchestrator itself is the problem.
 
-The note is tagged `from_kind = 'agent'`, because an orchestrator reading its
-inbox has to be able to tell a peer's message from one of its own team asking
-for help. Replies come back the ordinary way, through `check_messages`.
+The note is tagged `from_kind = 'agent'`, so an orchestrator reading its inbox
+can tell a peer's message from one of its own team asking for help. Replies
+come back the ordinary way, through `check_messages`.
 
 This closes a real asymmetry. A message from an operator is pushed into an
-agent's next tool result, while an agent's signals — `set_summary`,
-`signal_done` — sat in the session until somebody looked. `notify_operator` is
+agent's next tool result, while an agent's own signals (`set_summary`,
+`signal_done`) sat in the session until somebody looked. `notify_operator` is
 how an agent makes something *arrive*. It is not for progress reports: the
 summary and the review state are what the people watching already read.
 
-This channel is between the programs *driving* sessions. The agents inside
-them still cannot see or address each other across a session — that wall is
-what makes a session a unit of isolation, with its own locks, budget, log and
+This channel is between the programs *driving* sessions. The agents inside them
+still cannot see or address each other across a session. That wall is what
+makes a session a unit of isolation, with its own locks, budget, log and
 inbox.
 
 ### Running the fleet from whatever CLI you use
 
 Driving a fleet should not require one particular CLI. `nexmesh-orch` is a
-plain MCP stdio server, so Claude Code, Codex, opencode, qwen, Gemini — or a
-program of your own — can load it and spin up teams from the session you are
+plain MCP stdio server, so Claude Code, Codex, opencode, qwen, Gemini, or a
+program of your own, can load it and spin up teams from the session you are
 already in.
 
 ```bash
@@ -355,16 +360,17 @@ nexmesh install-orchestrator --cli opencode --token <operator-token>
 Its tools are the operator's verbs, not an agent's: `list_nodes`,
 `create_team`, `add_agent`, `team_status`, `read_log`, `message_team`,
 `adopt_terminal`, `read_transcript`, `list_sessions`. `create_team` is one
-call — session, workspace, plan, and every agent placed and started.
+call: session, workspace, plan, and every agent placed and started.
 
 Unlike `nexmesh-mcpd`, which deliberately holds no credentials, this one holds
 an **operator token**: its tools start processes on every machine in the fleet.
 Install it only into a CLI you trust with that.
 
 `install-orchestrator` uses each CLI's own `mcp add` where one exists, rather
-than editing a config format that may change underneath us; for opencode, whose
+than editing a config format that may change underneath us. For opencode, whose
 `mcp add` is interactive and so unscriptable, it writes the documented config
-instead. Either way the token never appears in the output, including `--dry-run`.
+instead. Either way the token never appears in the output, including
+`--dry-run`.
 
 ### The console
 
@@ -375,18 +381,18 @@ instead. Either way the token never appears in the output, including `--dry-run`
   1·deck   2·agents   3·chat   4·plan   5·memory   6·graph   7·files   8·fleet
 ```
 
-Everything the dashboard shows, on one screen, from the same snapshot — so a
-number here means what it means there. Panes for the deck (what you want to
-know before you know what you are looking for), agents, chat, plan, memory,
-the code graph, file locks and machines. A detail panel on the right carries
-whatever the cursor is on, in full. `a` attaches to the agent under the cursor
-— the real attach, the whole screen, and the console comes back when you
+Everything the dashboard shows, on one screen, from the same snapshot, so a
+number here means what it means there. There are panes for the deck (what you
+want to know before you know what you are looking for), agents, chat, plan,
+memory, the code graph, file locks and machines. A detail panel on the right
+carries whatever the cursor is on, in full. `a` attaches to the agent under the
+cursor: the real attach, the whole screen, and the console comes back when you
 detach.
 
 The graph pane draws the map in braille: subsystems placed on a ring, sized by
 how much is in them, with the heaviest dependencies between them and the
-cursor's own edges picked out. Only the big ones are labelled, because every
-label drawn is a label over something else.
+cursor's own edges picked out. Only the big ones are labelled, to keep the
+labels readable.
 
 ![The code graph in the console](images/console-graph.png)
 
@@ -399,10 +405,10 @@ shows, in the same terminal:
 
 ![The agents pane](images/console-agents.png)
 
-In the agents pane the list is sorted by whichever column you ask for — `,`
-and `.` walk the columns, `R` turns the order round — and the arrow in the
-header says which one and which way. The same pane is where seats are
-managed rather than only watched:
+In the agents pane the list is sorted by whichever column you ask for. `,` and
+`.` walk the columns, `R` turns the order round, and the arrow in the header
+says which one and which way. The same pane is where seats are managed rather
+than only watched:
 
 | key | what it does |
 |-----|--------------|
@@ -413,14 +419,20 @@ managed rather than only watched:
 | `e` | rename it |
 | `x` | remove it, seat and history |
 
-Each of those asks before it acts, and each is the same hub endpoint
-`nexmesh move-agent` and friends call — so an action taken here and the same
+Each of those asks before it acts, and each is the same hub endpoint that
+`nexmesh move-agent` and its friends call, so an action taken here and the same
 action taken from a script are the same action, including every refusal.
 
 The chat pane is a chat: `j`/`k` change channel, `i` starts typing, and while
-you are typing the arrows and `Tab` still work — the composer has a caret you
+you are typing the arrows and `Tab` still work. The composer has a caret you
 can move, `Ctrl-W` eats a word, and `PgUp` reads back through what was said.
+The wheel scrolls three lines at a time, in the chat and in every other pane.
 Messages wrap rather than being cut off at the edge of the pane.
+
+While the console is running the mouse belongs to it, which is the price of
+the wheel working at all: on the alternate screen the terminal has no
+scrollback to offer. Hold Shift to select text, as in any other full-screen
+program.
 
 A line that starts with `/` is a command rather than something to say; see
 [Commands in the chat](#commands-in-the-chat). `//like this` says a line that
@@ -428,15 +440,15 @@ begins with a slash.
 
 If the machine has a microphone and the fleet has a teammate advertising
 `transcribe`, `v` records until you press it again and puts the words in the
-composer — `Ctrl-V` does the same without leaving it. `V` reads new messages
+composer. `Ctrl-V` does the same without leaving it. `V` reads new messages
 aloud through a teammate advertising `tts`. Recording uses whatever is
 installed (`parecord`, `arecord`, `rec`, `ffmpeg`) and playing likewise
-(`paplay`, `aplay`, `play`, `ffplay`, `mpg123`); with neither, the key says so
+(`paplay`, `aplay`, `play`, `ffplay`, `mpg123`). With neither, the key says so
 instead of doing nothing.
 
 Inside an **attached terminal** the same things are reached through a mode,
-because every other key on that keyboard belongs to the agent — a CLI in
-there uses `Ctrl-A`, `Ctrl-R`, `Ctrl-W`, and a viewer that quietly ate three
+because every other key on that keyboard belongs to the agent. A CLI in there
+uses `Ctrl-A`, `Ctrl-R` and `Ctrl-W`, and a viewer that quietly ate three
 control characters would break somebody's editor.
 
 `Ctrl-\` turns **command mode** on and off. While it is on the bottom row
@@ -446,7 +458,7 @@ changes colour, nothing reaches the agent, and single letters do the work:
 |-----|---|
 | `d` | detach |
 | `v` | record a sentence; the fleet transcribes it into the prompt |
-| `r` | read the agent's last reply aloud — again walks further back, again while talking stops it |
+| `r` | read the agent's last reply aloud; again walks further back, and again while talking stops it |
 | `a` | read every new reply as it arrives |
 | `?` | list them |
 | `q`, Esc | leave command mode |
@@ -455,10 +467,9 @@ changes colour, nothing reaches the agent, and single letters do the work:
 printed since you last pressed Enter: that boundary is what makes "read the
 last one" and "read the one before it" mean something on a stream of bytes.
 
-`Ctrl-[` is deliberately not the mode key — it *is* Escape, and taking it
-would break every arrow key and every full-screen program inside the attach.
-It is refused if configured. Both keys can be changed in
-`~/.nexmesh/console.toml`:
+`Ctrl-[` is deliberately not the mode key. It *is* Escape, and taking it would
+break every arrow key and every full-screen program inside the attach. It is
+refused if configured. Both keys can be changed in `~/.nexmesh/console.toml`:
 
 ```toml
 command_key = "ctrl-g"
@@ -469,7 +480,7 @@ Command mode also carries the two things that move a FILE:
 
 | key | |
 |-----|---|
-| `Ctrl-Y` | send a file from this machine — the path is typed on the bar itself |
+| `Ctrl-Y` | send a file from this machine; the path is typed on the bar itself |
 | `Ctrl-P` | take a photo with this machine's camera and send that |
 
 Both land on **the machine the agent is running on**, in the workspace that
@@ -479,9 +490,13 @@ arrive where the agent can open it.
 
 The same two are buttons on the browser terminal, where they do exactly the
 same thing: the paperclip and the camera beside `keys` upload to the agent
-whose terminal is open, not to whichever machine happens to hold a copy of
-the workspace. And holding (or right-clicking) a line of the terminal reads
-that line aloud, or whatever is selected.
+whose terminal is open, not to whichever machine happens to hold a copy of the
+workspace. Holding a line of the terminal, or right-clicking it, reads that
+line aloud, or whatever is selected.
+
+A picture sent this way is shown in the chat line that announces it, and opens
+full size on a click. The hub stores no files, so it fetches the bytes back
+from the machine that holds them when the browser asks.
 
 From a script, or when you know the name:
 
@@ -490,20 +505,20 @@ nexmesh upload payments ./spec.pdf --to Max      # onto Max's machine
 nexmesh camera payments --to Max --seconds 8     # a clip from this webcam
 ```
 
-`nexmesh camera` needs `ffmpeg` and a `/dev/video*` here; without them it
-says so rather than offering a key that does nothing.
+`nexmesh camera` needs `ffmpeg` and a `/dev/video*` on this machine. Without
+them it says so rather than offering a key that does nothing.
 
 Anything being read aloud can be stopped: `V` again in the console, `Ctrl-_`
 again in an attached terminal, and the loudspeaker button in the browser
 becomes a stop while it is talking.
 
-In the memory pane, Enter opens the whole of the one under the cursor, because
-a memory is a paragraph and a table column is not where one gets read.
+In the memory pane, Enter opens the whole of the one under the cursor, since a
+memory is a paragraph and a table column is not where one gets read.
 
-Two themes, remembered in `~/.nexmesh/console.toml` and switched with `t`:
-`deck` is quiet and modern, and `lcars` is black, blocky, capitalised, and
-painted in the trans flag — which is both the point and, as it happens, very
-close to canon LCARS pastels.
+Two themes, remembered in `~/.nexmesh/console.toml` and switched with `t`.
+`deck` is quiet and modern. `lcars` is black, blocky, capitalised and painted
+in the trans flag, which is both the point and, as it happens, very close to
+canon LCARS pastels.
 
 From a script or a pipe there is no console: `nexmesh` prints help and exits
 non-zero. A program that clears your screen because it was called without
@@ -511,27 +526,27 @@ arguments is a program that ends up wrapped in `</dev/null` for ever.
 
 ### Commands in the chat
 
-The chat is where an operator already is — in the console, in the dashboard, on
-a phone — so a line beginning with `/` is read as an instruction instead of an
+The chat is where an operator already is: in the console, in the dashboard, on
+a phone. So a line beginning with `/` is read as an instruction instead of an
 utterance:
 
 ```
 /rename Dev the new dev
-/move Dev #payments          — the # is optional
-/remove Dev [force]          — force only if it still has a process
+/move Dev #payments          (the # is optional)
+/remove Dev [force]          (force only if it still has a process)
 /start Dev [interactive|headless]
 /new claude Dev [interactive|headless]
 /help
 ```
 
-An agent is named by its name, its role or its seat id. The hub parses these,
-not the front ends, so the console, the dashboard and the PWA all got them at
-once — and each one runs the endpoint the matching `nexmesh` subcommand runs.
-The outcome is posted into the channel as a record of what was done, pre-claimed
-so no agent is handed the operator's housekeeping as a message to act on. A
-mistyped command is refused with the shape it should have had, and nothing is
-said to the team. To say something that begins with a slash, double it:
-`//rename is a command`.
+An agent is named by its name, its role or its seat id. The hub parses these
+rather than the front ends, so the console, the dashboard and the PWA all got
+them at once, and each one runs the endpoint the matching `nexmesh` subcommand
+runs. The outcome is posted into the channel as a record of what was done,
+pre-claimed so no agent is handed the operator's housekeeping as a message to
+act on. A mistyped command is refused with the shape it should have had, and
+nothing is said to the team. To say something that begins with a slash, double
+it: `//rename is a command`.
 
 ### Watching the team
 
@@ -557,7 +572,7 @@ TIME               FROM    TO           MESSAGE
 
 That marker column is the useful part. Because delivery is acked separately
 from sending, the log distinguishes *sent* from *actually seen by the
-recipient's model* — so "why is this team stuck?" usually has a visible answer:
+recipient's model*, so "why is this team stuck?" usually has a visible answer:
 somebody is sitting on an unread message. `--follow` streams forward by message
 id, so it never repeats or skips one.
 
@@ -574,76 +589,87 @@ tool result. Always correct, but an agent deep in a long edit may not call a
 tool for minutes.
 
 **The driver fast path** writes into the CLI's own input stream, so a message
-is read at the next tool-call boundary instead — seconds, not minutes. For
-Claude Code that means `stream-json` on stdin, and the acknowledgement is not a
-guess: `--replay-user-messages` makes the CLI echo the message back, and only
-that echo marks it delivered. If the agent dies before echoing, the message
-returns to the queue for whoever fills the slot next.
+is read at the next tool-call boundary instead: seconds rather than minutes.
+For Claude Code that means `stream-json` on stdin, and the acknowledgement is
+not a guess. `--replay-user-messages` makes the CLI echo the message back, and
+only that echo marks it delivered. If the agent dies before echoing, the
+message returns to the queue for whoever fills the slot next.
 
 **A terminal is also an input stream.** An interactive seat has no stdin to
-frame a message into — it has a pty, and a pty is a keyboard. So the message is
+frame a message into. It has a pty, and a pty is a keyboard, so the message is
 *typed* at the CLI's own prompt, flattened onto one line because a TUI submits
 on the first newline. That is the only route an interactive seat has: without
 it a task sent to one waits for the agent to call a tool of its own accord,
 which for a CLI sitting at its prompt can be a very long time, or never. There
-is no echo to parse, so the write is the acknowledgement — which is all that
-pressing Enter is, too.
+is no echo to parse, so the write is the acknowledgement, which is all that
+pressing Enter is too.
 
-Two rules keep that honest, and both are worth stating plainly because the
+Two rules keep that honest, and both are worth stating plainly, because the
 failure modes are not subtle:
 
-- **Only a seat with a real driver is typed at.** An adopted tmux pane has a
-  pty as well, and whatever is sitting in it may be a shell prompt, where a
-  teammate's message plus the Enter after it would be *executed*. Adoption is
-  `mcp_only` and so is excluded: a driver that takes structured input is the
-  proof that the process on the other end is the CLI the node started.
+- **Only a prompt somebody vouches for is typed at.** A pty is not proof that
+  an agent is at the other end of it: a tmux pane has one too, and what is
+  sitting in it may be a shell, where a teammate's message and the Enter after
+  it would be *executed*. Two different things count as vouching. A structured
+  driver is one, because a CLI that takes framed input on stdin is the CLI the
+  node started. The CLI's own descriptor is the other: a `typed_delivery` mode
+  is the descriptor saying that this CLI's interactive mode is the agent's own
+  prompt. That claim is what lets hermes, qwen and gemini be reached at all,
+  since none of them has a driver. `tmux` does not make the claim, and an
+  adopted pane is typed at through the separate route below, which re-checks
+  what is in it before every write.
 - **Nothing is typed over a dialog.** A permission prompt does not take text;
   it swallows what is typed and reads the Enter as the answer, which on a real
   CLI means approving a tool call nobody looked at. When the bottom of the
   screen looks like a prompt awaiting a choice, the batch goes back in the
   queue and the next tick looks again. Only the bottom is examined, and a
-  prompt on the last line clears it outright — scrollback is append-only, so a
+  prompt on the last line clears it outright. Scrollback is append-only, so a
   rule that searched the whole tail would block delivery for the rest of the
   agent's life the first time anyone was asked anything.
 
 **A terminal you already had.** The route above belongs to seats nexmesh
 spawned, because those are the terminals a node owns. A CLI you started
-yourself has none — until you adopt the tmux pane it is sitting in, and then
-it does.
+yourself has none, until you adopt the tmux pane it is sitting in.
 
 Adoption gives the node a real pty onto an existing pane (`tmux new-session
 -t`, a second client, your own terminal untouched). What it cannot tell you is
-what is *in* the pane: a CLI, a shell, vim. So the pane alone earns nothing.
-What earns the keyboard is the pair of facts, neither sufficient alone:
+what is *in* the pane: a CLI, a shell, vim. The pane alone therefore earns
+nothing. What earns the keyboard is a pair of facts, neither sufficient alone:
 
 - a nexmesh shim registered over that node's socket, so an agent CLI
   demonstrably exists, and we know its process;
 - that process is a descendant of the pane the node's own tmux view is looking
   at, so we know *which* terminal it is sitting in.
 
-The CLI's identity is what gets recorded, not the shim's — the shim is the
+The CLI's identity is what gets recorded, not the shim's. The shim is the
 CLI's child, so the link outlives a shim that dies or loses its connection,
-which is exactly the case this exists for. And it is re-checked by the node,
-through `/proc`, before every single write: the same process by pid *and*
-start ticks, still inside the pane that view is looking at. A CLI that has
-exited and left a shell behind fails that check, and the message goes back in
-the queue rather than being executed by `sh`. An operator who switches window
-has moved the keyboard, and delivery waits.
+which is exactly the case this exists for. The node re-checks it through
+`/proc` before every single write: the same process by pid *and* start ticks,
+still inside the pane that view is looking at. A CLI that has exited and left a
+shell behind fails that check, and the message goes back in the queue rather
+than being executed by `sh`. An operator who switches window has moved the
+keyboard, and delivery waits.
 
-**Three steps, or one.** The three are: a tmux session in the right
-directory, `nexmesh adopt` so the node holds a view of that pane, and the CLI
-started inside it resuming the conversation that seat holds. `nexmesh seat
-<session> <name>` does all three, because the seat already knows which
-conversation is its own — that is what `cli_session` records — so the resume
-handle does not have to be hunted for in a list of twenty. It refuses while
-that conversation is still running somewhere else, since two CLIs on one
-conversation loses half of it, and it types into the pane only when the pane
-is at a shell prompt. Run it on the machine the seat belongs to: tmux is
-local, and so is the node that adopts it.
+**Three steps, or one.** The three are: a tmux session in the right directory,
+`nexmesh adopt` so the node holds a view of that pane, and the CLI started
+inside it resuming the conversation that seat holds. `nexmesh seat <session>
+<name>` does all three. The seat already knows which conversation is its own,
+which is what `cli_session` records, so the resume handle does not have to be
+hunted for in a list of twenty. It refuses while that conversation is still
+running somewhere else, since two CLIs on one conversation loses half of it,
+and it types into the pane only when the pane is at a shell prompt. Run it on
+the machine the seat belongs to: tmux is local, and so is the node that adopts
+it.
+
+The node also turns tmux's mouse on for the view it creates, so the wheel
+scrolls the pane's history. That history belongs to tmux rather than to the
+terminal you are attached from, and with the mouse off nothing receives the
+wheel at all. It is a session option set on the node's own view, so your own
+`tmux attach` keeps whatever you had.
 
 The link is recorded on the **seat**, not on the agent, because that is what
 it is about: whoever is in this seat is reachable by keyboard for as long as
-that terminal is adopted. Nothing cleans it up and nothing needs to — every
+that terminal is adopted. Nothing cleans it up and nothing needs to: every
 use joins the adopted agent, so the link dies with the adoption it depends on.
 
 Everything in that path was verified against claude 2.1.322 rather than
@@ -660,8 +686,8 @@ which becomes the `--resume` handle.
 
 **opencode is the best of the three to drive**, because it already has a
 client/server split. `opencode serve` exposes a documented API (OpenAPI at
-`/doc`) whose prompt endpoint takes `delivery: "steer" | "queue"` — mid-turn
-steering is a first-class operation there, not something bolted on. So that
+`/doc`) whose prompt endpoint takes `delivery: "steer" | "queue"`, so mid-turn
+steering is a first-class operation there rather than something bolted on. That
 driver holds no pty and parses no stdio protocol: it starts the server, reads
 the URL it prints, and makes HTTP calls. Verified against opencode 1.19.5 by
 reading `/doc` and calling a running server.
@@ -676,11 +702,11 @@ Two details that matter:
   the first line, or the first thing resembling a URL, starts the agent against
   nothing.
 
-It also gives something neither stdio-driven CLI can: because `opencode attach
+It also gives something neither stdio-driven CLI can. Because `opencode attach
 <url>` exists, a **headless** opencode agent can still be opened as a real TUI.
 Attach to one and the node starts a terminal client against its server just for
 that viewer; detach and the client goes away while the agent carries on. Best
-delivery and exact token accounting, *and* take-over on demand.
+delivery and exact token accounting, with take-over on demand.
 
 **Codex's `app-server`** is the other fast path, and it works differently
 enough to be worth describing. It is JSON-RPC over stdio with threads and
@@ -695,7 +721,7 @@ have been easy to get wrong:
   all token usage and turn state.
 - The server **asks the client questions and blocks until answered**. An
   unattended agent has nobody to ask, so command and file-change approvals are
-  accepted and anything needing a human's words is declined — leaving them
+  accepted and anything needing a human's words is declined. Leaving them
   unanswered wedges the turn.
 - The approval vocabularies **differ per method**: `execCommandApproval` wants
   `approved`, while `item/commandExecution/requestApproval` wants `accept` /
@@ -716,15 +742,15 @@ Two different things, often confused.
 
 **Pause** is reversible and leaves the agent alive. Work stops reaching it and
 it is told to stand by; messages queue and arrive when it resumes. A turn
-already in flight finishes — nothing here reaches into a model mid-thought — so
-pause means *take on nothing further*, not *stop this instant*. A paused agent
-is also not respawned if it dies: bringing back something you deliberately
-stopped would be the opposite of what you asked for.
+already in flight finishes, since nothing here reaches into a model
+mid-thought, so pause means *take on nothing further* rather than *stop this
+instant*. A paused agent is also not respawned if it dies: bringing back
+something you deliberately stopped would be the opposite of what you asked for.
 
 **Release** is the end of the review loop. Agents deliberately cannot
 disconnect on their own, which is what stops one wandering off before its work
-is reviewed; release lifts that hold. Its input is closed — which is how a
-stdio-driven CLI learns there is no more work and exits of its own accord — and
+is reviewed, and release lifts that hold. Its input is closed, which is how a
+stdio-driven CLI learns there is no more work and exits of its own accord, and
 it is terminated only if still there after a grace period. Killing it outright
 would lose whatever it was in the middle of writing.
 
@@ -744,19 +770,19 @@ From a CLI, the orchestrator offers `pause_agents`, `resume_agents` and
 A role is a **free-form string**. There is no fixed list, and nexmesh never
 decides who is more capable from it. What a role actually does:
 
-- **It is an address.** Everything that takes a teammate — `send_message`,
+- **It is an address.** Everything that takes a teammate (`send_message`,
   `nexmesh send --to`, `/move`, `pause --who`, the orchestrator's
-  `message_team` — accepts a name *or* a role, so `--to reviewer` reaches
+  `message_team`) accepts a name *or* a role, so `--to reviewer` reaches
   whoever holds that role without anybody knowing their name.
 - **One family is special: review.** A role containing `review`, `qa` or
-  `test` (case-insensitive) **approves its own work**: `signal_done` from that
-  seat goes straight to `approved`, because nobody reviews the reviewer. Every
+  `test` (case-insensitive) **approves its own work**. `signal_done` from that
+  seat goes straight to `approved`, since nobody reviews the reviewer. Every
   other role goes to `done_pending_review` and waits for a reviewer's
   `approve` or feedback.
 - **It goes into the agent's first prompt**, with its description, so the
   model is told what it is for in words rather than inferring it from a label.
 - **It is what you read** on the dashboard, in `nexmesh status` and in the
-  console — and it is the fallback name for a seat nobody named.
+  console, and it is the fallback name for a seat nobody named.
 
 The roles used throughout these docs are a convention, not an enum:
 `architect`, `engineer`, `code reviewer`, `qa`, `analyst`, `archivist`,
@@ -767,40 +793,45 @@ nexmesh add-agent payments --name Iris --role 'code reviewer' --cli opencode
 nexmesh set-role sl-1a2b3c4d 'qa'      # changes who approves whose work
 ```
 
-**Roles are not capabilities.** What a seat can *do* that others cannot —
-`ocr`, `transcribe`, `tts`, `strong`, `vision` — is a separate list, and the
+**Roles are not capabilities.** What a seat can *do* that others cannot
+(`ocr`, `transcribe`, `tts`, `strong`, `vision`) is a separate list, and the
 thing `ask_capability` routes on. A role says what somebody is for; a
 capability says what they can be asked for. See
 [Asking a teammate for something you cannot do](#asking-a-teammate-for-something-you-cannot-do).
 
 ### Giving the team a file to look at
 
-An agent reads files. A screenshot, a PDF, a recording has to *be* somewhere
-before anybody can be asked to look at it — so an upload goes into the
-session's workspace, on a machine that holds it, and the path is said in the
-chat:
+An agent reads files. A screenshot, a PDF or a recording has to *be* somewhere
+before anybody can be asked to look at it, so an upload goes into the session's
+workspace, on a machine that holds it, and the path is said in the chat:
 
 ```bash
 nexmesh upload payments ./screenshot.png
 nexmesh upload payments ./spec.pdf --say 'the API we have to match'
 ```
 
-In the dashboard and the installed app, the paperclip beside the chat does
-the same, and the camera button takes a photo or a clip and puts that there
-too — which is most of what a camera is for on a fleet: a screen, a
-whiteboard, a machine with a light on it.
+In the dashboard and the installed app, the paperclip beside the chat does the
+same, and the camera button takes a photo or a clip and puts that there too.
+That is most of what a camera is for on a fleet: a screen, a whiteboard, a
+machine with a light on it.
 
-The hub writes nothing itself: it picks the workspace and a connected machine
+The hub writes nothing itself. It picks the workspace and a connected machine
 that holds it and asks that **node**, which is the only component here with
-anybody's file system. The path is checked on both sides, and a name is a
-name — `../../etc/passwd` is a file called `.._.._etc_passwd` in `uploads/`.
-Up to 64MB in one go; something larger belongs in the workspace by other
-means, with a message to say where it is.
+anybody's file system. The path is checked on both sides, and a name is only a
+name: `../../etc/passwd` becomes a file called `.._.._etc_passwd` in
+`uploads/`. Up to 64MB in one go. Something larger belongs in the workspace by
+other means, with a message to say where it is.
 
-What an agent can do with it then depends on the agent: a model that reads
-images can look at a PNG, and one that cannot asks the capability bridge to
-OCR or transcribe it — which is the same `ask_capability` it uses for
-anything else it cannot do itself.
+A picture is also shown in the chat line that announced it, and opens full size
+on a click. The hub still holds no copy: it records which machine the file
+landed on and asks that machine for the bytes when a browser wants them. Only
+types a browser renders are served as themselves, so an uploaded `.html` or
+`.svg` downloads instead of running as a page on the hub's own origin.
+
+What an agent can do with a file depends on the agent. A model that reads
+images can look at a PNG; one that cannot asks the capability bridge to OCR or
+transcribe it, with the same `ask_capability` it uses for anything else it
+cannot do itself.
 
 ### Dividing a repository between agents
 
@@ -827,7 +858,7 @@ and the **longest** pattern wins, so a carve-out means the carve-out.
 What the agents then see:
 
 - `list_peers` says what each teammate owns, next to who they are;
-- `who_owns <path>` answers for one path — "Max owns this, through their zone
+- `who_owns <path>` answers for one path: "Max owns this, through their zone
   `verti/**`; send_message them rather than editing it";
 - `acquire_file` still gives a lock, and says whose area it is in, because a
   lock is not permission;
@@ -836,20 +867,20 @@ What the agents then see:
   wrong.
 
 Nothing is forbidden by force. An agent can still edit anywhere the file
-system lets it — the point is that it knows whose work it is about to touch,
-and that the operator can see who was told what.
+system lets it. The point is that it knows whose work it is about to touch, and
+that the operator can see who was told what.
 
 ### Delegating across teams
 
 An orchestrator that can see the whole fleet can hand work to an agent in
 **another** session with `delegate_task`: the task goes into that team's plan
 owned by that agent, and is sent to them as a message. A session-scoped
-orchestrator can do the same inside its own team and nowhere else — the hub
+orchestrator can do the same inside its own team and nowhere else: the hub
 refuses a cross-session path for a scoped token, so the limit is not a
 convention.
 
-The plan is also writable now, which is what makes a delegated task
-something you can watch rather than a sentence in a log:
+The plan is also writable, which is what makes a delegated task something you
+can watch rather than a sentence in a log:
 
 ```bash
 curl -XPOST .../v1/sessions/payments/plan -d '{"label":"rebuild ombia","owner":"Max"}'
@@ -859,7 +890,7 @@ curl -XPOST .../v1/sessions/payments/plan -d '{"label":"rebuild ombia","owner":"
 
 Agents differ. One seat is an expensive model that reasons well, another is
 cheap and fast, a third does OCR and nothing else. nexmesh does not try to be
-a scheduler — it never decides who is more capable — but it does carry the
+a scheduler and never decides who is more capable, but it does carry the
 facts that let a team work that way.
 
 **Which model is in a seat.** `slots.model` is what the seat was *asked* for
@@ -876,8 +907,8 @@ reports it from its own protocol, verified rather than assumed:
 | opencode | `ModelRef {providerID, id}` on `POST /api/session` | `Session.model` |
 | a plugin | the `model` field in its `hello` | the plugin's own `model` frame |
 
-**What a seat can do.** `capabilities` is a list of free-form labels —
-`strong`, `cheap`, `vision`, `ocr` — lower-cased and de-duplicated so that
+**What a seat can do.** `capabilities` is a list of free-form labels
+(`strong`, `cheap`, `vision`, `ocr`), lower-cased and de-duplicated so that
 addressing them is not a spelling lottery. A list rather than one tier,
 because capability is not a single axis. `list_peers` shows them and filters
 on them, and `send_message` resolves a label the way it resolves a name:
@@ -888,15 +919,15 @@ on them, and `send_message` resolves a label the way it resolves a name:
 ```
 
 Name and role win over a capability, and a label several teammates hold is
-**refused rather than guessed** — it tells you to use `list_peers` and choose.
+**refused rather than guessed**: it tells you to use `list_peers` and choose.
 Sending review feedback to the wrong agent is worse than a retry.
 
 **Handing work up.** `escalate {to, reason, task?}` is the mirror of
 `submit_feedback`: that one hands work back down for rework, this one hands it
 up to someone better equipped. With a mixed team the cheap seat reaching its
 limit is the normal case, not an error, and it needs a move that is neither
-"done" nor "failed". Both ends move — the escalator to `escalated`, the
-receiver to `working` — because leaving either alone is how a task is silently
+"done" nor "failed". Both ends move, the escalator to `escalated` and the
+receiver to `working`, because leaving either alone is how a task is silently
 dropped between two agents that each think the other has it. The reason and
 the task travel as a `handoff` message.
 
@@ -913,14 +944,14 @@ Pausing rather than killing, for three reasons: it is reversible by an
 operator who can look at what was bought, every agent already understands
 pause (it withholds work rather than yanking a process), and terminating
 agents mid-edit destroys work to save money, which is the wrong trade at
-almost any budget. The ceiling is per session, not per agent — with a mixed
+almost any budget. The ceiling is per session rather than per agent: with a mixed
 team the number worth capping is what the task cost, not what one seat cost.
 Cache reads are excluded, because charging for them would pause a session for
 being efficient.
 
 The crossing is stamped, so a session an operator deliberately resumes is not
 re-paused by the next token report. Changing the budget
-(`POST /v1/sessions/:id/budget`) re-arms the guard — otherwise raising a
+(`POST /v1/sessions/:id/budget`) re-arms the guard, since otherwise raising a
 budget would have no effect.
 
 **What this deliberately is not.** There is no automatic routing by ability,
@@ -934,12 +965,12 @@ other message here. Composing the team stays yours.
 
 A CLI is a descriptor in `clis/`, not Rust. Delivery has three tiers:
 
-- **`mcp_only`** — the universal floor. Any CLI that speaks MCP works with zero
+- **`mcp_only`**: the universal floor. Any CLI that speaks MCP works with zero
   bespoke code: messages ride in on the next tool result. This is what makes
   "and any other we can support" true rather than aspirational.
-- **built-in fast paths** — `stream_json` (Claude Code), `app_server` (Codex),
+- **built-in fast paths**: `stream_json` (Claude Code), `app_server` (Codex),
   `http_server` (opencode): mid-turn injection and exact token accounting.
-- **`plugin`** — an external helper binary, for a CLI with its own quirks. Same
+- **`plugin`**: an external helper binary, for a CLI with its own quirks. Same
   guarantees as a built-in driver, in any language, with no nexmesh release in
   between.
 
@@ -948,7 +979,7 @@ Shipped and verified against the real binaries: `claude`, `opencode`, `qwen`,
 the node down, and `cargo test` validates every shipped descriptor.
 
 > **opencode is a special case worth exploiting.** It already has a client/server
-> split of its own — `opencode serve --port N --hostname H` plus `opencode attach
+> split of its own: `opencode serve --port N --hostname H` plus `opencode attach
 > <url>`. For opencode, remote access needs no pty multiplexing from us at all,
 > which is what driver kind `http_server` does.
 
@@ -958,7 +989,7 @@ Most CLIs take a configuration file on the command line, which is how nexmesh
 hands one conversation its own MCP shim without touching your global config.
 Some do not. `clis/hermes.toml` is the worked example: the shim is registered
 once in the CLI's own config, and the **seat is decided by the environment the
-node sets** — which the shim reads for itself.
+node sets**, which the shim reads for itself.
 
 The trap, when you do it that way: if that global entry pins `NEXMESH_NAME`,
 `NEXMESH_SESSION` or `NEXMESH_CLI_SESSION` of its own, every conversation on
@@ -969,7 +1000,7 @@ Leave the environment out of the config file and let the node supply it.
 
 The built-in fast paths exist because particular CLIs speak particular
 protocols. Every further CLI with a shape of its own would otherwise mean
-another module in `nexmesh-node` — and a release of nexmesh before anyone
+another module in `nexmesh-node`, and a release of nexmesh before anyone
 could use it. A plugin moves that work outside:
 
 ```toml
@@ -986,7 +1017,7 @@ five:
 | node → plugin | |
 |---|---|
 | `hello` | protocol version, agent, slot, cwd, the **prompt**, and a `resume` handle when restarting |
-| `stdout` | a chunk of the CLI's output — not necessarily a whole line |
+| `stdout` | a chunk of the CLI's output, not necessarily a whole line |
 | `deliver` | teammate messages, both rendered and as envelopes |
 | `exit` | the CLI has gone |
 
@@ -1013,7 +1044,7 @@ delivered.
 
 **A plugin that dies is not an outage.** Injection then fails, the hub puts
 those messages back in its queue, and the agent collects them through MCP at
-its next tool call — the universal floor. Slower, never silent. The agent
+its next tool call, the universal floor. Slower, never silent. The agent
 itself keeps running: its stdin is tied to the lifetime of the CLI, not of the
 plugin.
 
@@ -1055,7 +1086,7 @@ curl -H "authorization: Bearer $TOKEN" \
 #### The MCP front door
 
 The HTTP API above asks a newcomer to implement a protocol that is ours alone.
-But every agent runtime worth integrating already speaks MCP — so that was the
+But every agent runtime worth integrating already speaks MCP, so that was the
 wrong way round. The hub therefore serves the *same* participant seat over MCP
 itself, at one endpoint:
 
@@ -1073,14 +1104,14 @@ same 30 tools and the same delivery. Verified against both `claude` and
 `opencode`, which each report the endpoint connected and negotiate MCP
 `2025-03-26`.
 
-The transport is **Streamable HTTP** — POST carries JSON-RPC and the reply
+The transport is **Streamable HTTP**: POST carries JSON-RPC and the reply
 comes straight back, with an `Mcp-Session-Id` minted by `initialize`. Three
 details are worth knowing, because each one is a decision rather than a
 default:
 
 - **An MCP client has no "join" call**, so `initialize` takes the seat, and
   per-client settings (`name`, `role`, `session`, `workspace`) ride on the URL
-  — the same place a hosted MCP server takes them. A client that sends no name
+  the same place a hosted MCP server takes them. A client that sends no name
   still has one: its own.
 - **`initialize` is not a one-off.** Clients reconnect, and `claude mcp list`
   sends one just to check the server is alive. So it reuses the seat this
@@ -1090,7 +1121,7 @@ default:
 - **The ack waits for proof.** The stdio shim acks as soon as it has written a
   tool result, because its stdout is a pipe on the same machine. Here the
   result crosses a network, so the session remembers what it handed over and
-  acks it when that client comes back — its return being the only evidence it
+  acks it when that client comes back, its return being the only evidence it
   arrived. A client that never returns has those messages reclaimed and
   redelivered. Later, or twice, but never silently lost.
 
@@ -1110,7 +1141,7 @@ Two independent axes, deliberately:
 
 - **Provenance.** `managed` = the hub asked a node to spawn it. `attached` = a
   human ran `claude` or `opencode` by hand, anywhere, and its `mcpd` registered
-  it into a slot. An attached agent is a full team member — it can message
+  it into a slot. An attached agent is a full team member: it can message
   peers, take locks and be reviewed.
 - **Mode.** `headless` gives the best injection and token accounting but is a
   protocol, not a terminal. `interactive` runs the CLI's TUI under a pty on the
@@ -1128,14 +1159,14 @@ A node checks each of its agents against `/proc` every heartbeat, and says
 which it still has as it connects. That inventory is what retires a seat: a
 node keeps its agent table in memory, so one that restarts knows nothing of
 the processes its predecessor spawned and will never mention them again. Told
-nothing, the hub kept them for ever — and a hub restart froze whatever status
+nothing, the hub kept them for ever, and a hub restart froze whatever status
 happened to be in the table, so a seat could report a live teammate hours
 after its process had died.
 
 So: an agent the node does not list has gone, and its seat is free. An agent
 nothing has confirmed for a whole lease is `disconnected` rather than
 `running`, whether the hub noticed the node leave or was itself restarted. A
-`disconnected` managed agent may still be alive — its node can adopt it back —
+`disconnected` managed agent may still be alive, since its node can adopt it back,
 but it is no longer something the fleet claims to be driving.
 
 The word is deliberate, and it used to be `lost`. What the hub knows when a
@@ -1148,7 +1179,7 @@ connected" and "no longer there" can be told apart without guessing.
 
 ### One bridge, several teams
 
-A capability bridge serves a capability, and OCR is OCR whoever is asking —
+A capability bridge serves a capability, and OCR is OCR whoever is asking,
 but `ask_capability` resolves providers **within the asking agent's own
 session**, so a bridge seated in one team is invisible to every other. Hence
 `--session` is a list, and `--session all` means every active session:
@@ -1162,12 +1193,12 @@ A CLI cannot do this and should not be able to: one conversation is one seat,
 enforced when it registers, because the seat's inbox, task state and lock
 domain all belong to one team. An external participant has no conversation
 and no process the hub can see, so nothing is ambiguous about it holding a
-seat in each of several teams — each seat has its own asks, and the service
+seat in each of several teams. Each seat has its own asks, and the service
 behind them is shared the way it already was.
 
 A participant token scoped to one session still cannot cross: it is seated
 where its token reaches and told so. A session named wrongly is reported
-rather than silently dropped, and the bridge joins the rest — being kept out
+rather than silently dropped, and the bridge joins the rest. Being kept out
 of four teams because one name was mistyped is not a useful failure. The list
 is resolved once, at startup; a session created later needs a restart, which
 is a second or two and keeps the bridge from re-seating itself on a timer.
@@ -1186,7 +1217,7 @@ CoderAI answered:
 ```
 
 It blocks until the holder answers, and the holder is whoever advertises that
-capability label — `pending_asks` to see what is waiting, `answer_ask` to
+capability label: `pending_asks` to see what is waiting, `answer_ask` to
 return it. An ask is a **row**, not an in-memory channel, so a holder
 restarted mid-flight leaves it visibly pending rather than leaving the asker
 waiting on something that no longer exists; a holder that exits fails its
@@ -1196,7 +1227,7 @@ one, and a capability nobody offers is refused with a pointer to `list_peers`
 rather than a silence.
 
 This knows nothing about any particular service. Whoever advertises a label
-can serve it — which is what lets a bridge to an external service be an
+can serve it, which is what lets a bridge to an external service be an
 ordinary participant that holds its own credentials.
 
 ### A bridge to senses the team does not have
@@ -1237,22 +1268,22 @@ chat and completion endpoints are absent from the manifest deliberately.
 Capabilities are a **TOML manifest**, for the same reason CLIs are: the
 service behind this one registers well over two hundred routes, and both its
 published capability document and its written documentation are out of date
-against its own code — the document omits whole subsystems that are serving.
+against its own code: the document omits whole subsystems that are serving.
 Hard-coding any of that would rot silently. A capability is a row saying where
 to call, how to find out whether it is installed, which models it offers,
 which request fields to pass through, and where the answer is.
 
 Three kinds of evidence, in order, because no single one covers everything:
 
-1. **Its own listing endpoint** — `/v1/ocr/engines` and friends. The strongest
+1. **Its own listing endpoint**, `/v1/ocr/engines` and friends. The strongest
    evidence, and where the real model list comes from.
-2. **The service's capability document** — a hint, not a source of truth,
+2. **The service's capability document**, a hint rather than a source of truth,
    since it is known to be incomplete.
 3. **The route itself.** A GET at a POST-only route is answered `405` by the
    framework serving it and `404` when nothing is registered, so the wrong
    method is a read-only existence check. This is what rescues embeddings,
    rerank and diarization, which have neither a listing endpoint nor a mention
-   in the document — without it they would be invisible despite working.
+   in the document. Without it they would be invisible despite working.
 
 Every "where is the answer" is a **list** of candidate paths, tried in order,
 because these response shapes are not reliably documented and a rename should
@@ -1269,7 +1300,7 @@ found into shared memory on joining, so a teammate can read what is on offer:
 ```
 
 `ask_capability` takes a `model`, validated against what the install actually
-has — asking for one it lacks is refused *with the real options*, rather than
+has. Asking for one it lacks is refused *with the real options* rather than
 passed down to become a confusing error from the service. A capability with no
 model list says "service default" instead of inventing one.
 
@@ -1278,7 +1309,7 @@ model list says "service default" instead of inventing one.
 base64 travels inline, because the service takes data URIs and bare base64
 natively and a scanned page is the common case. Two limits are deliberate
 rather than inherited: the hub accepts a 16MB body (the framework default of
-2MB silently made this impossible — an agent got a bare `413` long before the
+2MB silently made this impossible: an agent got a bare `413` long before the
 bridge could say anything useful), and the bridge refuses anything over 8MB
 inline **with advice**: upload it to the service's own content-addressed blob
 store and pass the reference. Produced files come back as references too; a
@@ -1292,7 +1323,7 @@ does not grow for no benefit.
 
 Every agent that joins a codebase starts by reading it, and a cheap seat
 spends its context doing badly what a parser does exactly. So the node parses
-the workspace — it has the files — and the hub keeps the result for the whole
+the workspace, which has the files, and the hub keeps the result for the whole
 team:
 
 ```
@@ -1309,7 +1340,7 @@ asking a question gets an answer rather than an instruction, and `rebuild`
 re-parses after large changes.
 
 Parsing is **tree-sitter**: deterministic, no model, no network, nothing
-leaving the machine. Languages are a table rather than code — Rust, Python,
+leaving the machine. Languages are a table rather than code: Rust, Python,
 JavaScript, TypeScript, Go, PHP and Bash today, and another is a row plus a
 grammar crate, the same reasoning as the CLI descriptors. Dependency and build
 directories are never walked, because burying a project's own code under
@@ -1323,7 +1354,7 @@ so a symbol that no longer exists is never offered as though it did.
 
 **A guess is never dressed as a fact.** `Defines` and `Imports` come straight
 off the syntax tree. `Calls` and `References` are resolved by name, which is
-a guess wherever a language lets two things share one — so they are labelled
+a guess wherever a language lets two things share one, so they are labelled
 that way all the way to the agent, and an ambiguous call produces *no* edge at
 all, because a wrong edge is worse than a missing one in something an agent
 reasons from. Imports that leave the workspace become module nodes, so "what
@@ -1333,13 +1364,13 @@ does this depend on" is answerable rather than silently pruned.
 
 Communities come from a native **Leiden** implementation. Louvain optimises
 the same quality function and is simpler, but it can return a community that
-is *internally disconnected* — a node acting as the only bridge gets moved out
+is *internally disconnected*. A node acting as the only bridge gets moved out
 and the orphaned remainder keeps the label. A "subsystem" whose members cannot
 reach each other would be actively misleading as agent context, so the
 refinement phase that prevents it is the whole reason for choosing Leiden, and
 a test asserts the property directly rather than trusting it.
 
-It is deliberately **deterministic** — the published algorithm randomises
+It is deliberately **deterministic**. The published algorithm randomises
 among well-connected candidates, and here the same codebase must yield the
 same subsystems on every machine, or two agents would be told different
 things.
@@ -1354,8 +1385,8 @@ real ones.
 query_code_graph {"what": "subsystems"}
 
 2 subsystem(s), largest first:
-- subsystem 0: 5 member(s) — Session, hash_token, make_session, sign_in (in src/auth.rs, src/store.rs)
-- subsystem 1: 3 member(s) — draw_page, header, layout (in src/render.rs)
+- subsystem 0: 5 member(s): Session, hash_token, make_session, sign_in (in src/auth.rs, src/store.rs)
+- subsystem 1: 3 member(s): draw_page, header, layout (in src/render.rs)
 ```
 
 That last one is what makes context budgeting possible: hand a cheap seat the
@@ -1368,7 +1399,7 @@ lookup only, last-writer-wins with no trace, and everything destroyed with the
 session that learned it. Useful, and too small to lean on. Three things fixed
 that.
 
-**Who may see it.** Four scopes, resolved nearest-first on a read — `agent`,
+**Who may see it.** Four scopes, resolved nearest-first on a read: `agent`,
 then any `group` the reader belongs to, then `session`, then `global`:
 
 ```
@@ -1382,7 +1413,7 @@ recall {"search": "which hashing did we pick?"}
 A nearer scope **shadows** a wider one for the same key, so a group can
 override a global default without editing it, and a cheap seat can be given a
 private scratchpad while still reading the team's conventions. Agent scope is
-private and group scope is members-only — and that is enforced by *building*
+private and group scope is members-only, and that is enforced by *building*
 the query from the reader's scopes rather than filtering afterwards, so a
 scope the reader cannot see is unreachable by any argument it passes.
 
@@ -1390,7 +1421,7 @@ scope the reader cannot see is unreachable by any argument it passes.
 `global` outlives every session, so it needs the `memory-writer` capability: a
 confused or experimental seat must not be able to leave something behind for
 every future team. Group membership is operator-driven
-(`POST /v1/sessions/:id/groups`), because membership *is* the access control —
+(`POST /v1/sessions/:id/groups`), since membership *is* the access control:
 an agent cannot put itself in a group.
 
 **How it is found.** FTS5 over keys and values, because an agent that must
@@ -1406,14 +1437,14 @@ memory_history {"key": "db"}
 - rev 1 by Scribe: sqlite with WAL
 ```
 
-Entries may carry a TTL, and `prune` reclaims them — a fact that was only true
+Entries may carry a TTL, and `prune` reclaims them. A fact that was only true
 for a while says so.
 
 #### Continuity across sessions
 
 `slots.resume_handle` is cascade-deleted with its session, so yesterday's
 conversation could never be picked up. Handles are now also kept against an
-**identity** — the CLI, the workspace and the name, which is what makes
+**identity**: the CLI, the workspace and the name, which is what makes
 tomorrow's agent the same agent — in `agent_continuity`.
 
 A seat also keeps its own rolling summary via `save_context`, and both are

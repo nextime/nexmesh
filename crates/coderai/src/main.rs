@@ -506,6 +506,31 @@ fn unb64(s: &str) -> Result<Vec<u8>> {
 /// Sentence ends first, then clauses, then whitespace, and a word longer than
 /// the whole budget is cut rather than dropped. Nothing is thrown away and
 /// nothing is reordered: this is the same text, read in instalments.
+/// Cut a piece in two at the best break near the middle.
+///
+/// Used only when the service has refused the piece, so the split has to
+/// make progress: a piece that cannot be made smaller comes back as one
+/// element and the caller reports the original failure rather than looping.
+pub fn halve(piece: &str) -> Vec<String> {
+    let piece = piece.trim();
+    let n = piece.chars().count();
+    if n < 24 {
+        return vec![piece.to_string()];
+    }
+    let mid = piece.char_indices().nth(n / 2).map(|(i, _)| i).unwrap_or(piece.len() / 2);
+    let at = piece[..mid]
+        .rfind(['.', '!', '?', '\n', ';', ':', ','])
+        .map(|i| i + 1)
+        .or_else(|| piece[..mid].rfind(char::is_whitespace))
+        .unwrap_or(mid);
+    let (a, b) = piece.split_at(at.max(1));
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() {
+        return vec![piece.to_string()];
+    }
+    vec![a.to_string(), b.to_string()]
+}
+
 pub fn chunk_text(text: &str, max: usize) -> Vec<String> {
     let max = max.max(40);
     let text = text.trim();
@@ -1010,12 +1035,36 @@ async fn handle(
                            "splitting a long request for a fixed-context model");
             let mut audio: Vec<Vec<u8>> = Vec::new();
             let mut text: Vec<String> = Vec::new();
-            for piece in pieces {
+            // A character count is a guess at a limit measured in phonemes.
+            // Dense text packs more of them into the same width, so a chunk
+            // that fits one paragraph overflows the next and the service
+            // answers 500 -- "index 510 is out of bounds for axis 0 with
+            // size 510" -- for the whole request. Rather than pick a smaller
+            // number and hope, a piece that is refused is cut in half and
+            // tried again. The guess only has to be close; this makes it
+            // right.
+            let mut queue: std::collections::VecDeque<String> = pieces.into_iter().collect();
+            while let Some(piece) = queue.pop_front() {
                 let mut part = body.clone();
-                part[field] = json!(piece);
-                let answer = match c.encoding.as_str() {
-                    "multipart" => svc.post_multipart(c, &part).await?,
-                    _ => svc.post_as(&c.endpoint, &part, c.binary).await?,
+                part[field] = json!(piece.clone());
+                let attempt = match c.encoding.as_str() {
+                    "multipart" => svc.post_multipart(c, &part).await,
+                    _ => svc.post_as(&c.endpoint, &part, c.binary).await,
+                };
+                let answer = match attempt {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let halves = halve(&piece);
+                        if halves.len() < 2 {
+                            return Err(e);
+                        }
+                        tracing::info!(label = %c.label, chars = piece.chars().count(),
+                            "a piece was refused; halving it and trying again");
+                        for (i, h) in halves.into_iter().enumerate() {
+                            queue.insert(i, h);
+                        }
+                        continue;
+                    }
                 };
                 if c.binary {
                     let found = answer
@@ -1113,6 +1162,32 @@ fn parse_pending(text: &str) -> Vec<(String, String, Value, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused piece has to come back smaller, or the retry is a loop.
+    #[test]
+    fn halving_makes_progress_and_knows_when_to_stop() {
+        let long = "One sentence here. Another sentence follows it, longer than the first.";
+        let halves = halve(long);
+        assert_eq!(halves.len(), 2, "{halves:?}");
+        assert!(halves[0].chars().count() < long.chars().count());
+        assert!(halves[1].chars().count() < long.chars().count());
+        assert!(halves[0].ends_with('.'), "split at the sentence: {:?}", halves[0]);
+        // Nothing left to cut: one element, so the caller reports the real
+        // failure instead of halving for ever.
+        assert_eq!(halve("tiny").len(), 1);
+        assert_eq!(halve("   ").len(), 1);
+    }
+
+    /// Joining the halves back up must lose no words, or a paragraph read
+    /// aloud quietly drops a clause in the middle.
+    #[test]
+    fn halving_keeps_every_word() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let halves = halve(text);
+        let rejoined = halves.join(" ");
+        assert_eq!(rejoined.split_whitespace().collect::<Vec<_>>(),
+                   text.split_whitespace().collect::<Vec<_>>());
+    }
 
     fn cap() -> Capability {
         let m = Manifest::parse(

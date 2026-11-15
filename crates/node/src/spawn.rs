@@ -307,6 +307,22 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     }
 }
 
+/// Does this CLI's own descriptor say this mode is an agent's prompt?
+///
+/// Read from the descriptor at the moment the agent comes up rather than
+/// threaded down through five spawn paths, and false whenever the CLI or the
+/// mode is not there -- a seat that cannot be looked up is not one to type
+/// at.
+fn typed_delivery(ctx: &Arc<NodeCtx>, cli_id: &str, mode: RunMode) -> bool {
+    let name = match mode {
+        RunMode::Headless => "headless",
+        RunMode::Interactive => "interactive",
+    };
+    ctx.descriptor(cli_id)
+        .and_then(|d| d.modes.get(name).map(|m| m.typed_delivery))
+        .unwrap_or(false)
+}
+
 /// Can this driver take a message mid-turn, or must it wait for a tool call?
 ///
 /// Getting this wrong is silent: the hub simply never pushes, and messages sit
@@ -398,6 +414,14 @@ async fn register_started(
         // The gate is the DRIVER, not the terminal: see `pushable`.
         push_capable: pushable(&driver, spec.mode, typable),
         io_kind: Some(io_kind),
+        // A CLI with no driver can still be typed at, if its descriptor says
+        // that its interactive mode is the agent's own prompt. Without this a
+        // seat the fleet itself put in a terminal has no route at all: the
+        // hub cannot push and nothing drives it, so a message waits for a
+        // tool call the CLI may never make. The claim is the descriptor's,
+        // never inferred -- `tmux` has an interactive mode too, and what is
+        // at that prompt is a shell.
+        typed_delivery: typable && typed_delivery(ctx, &spec.cli_id, spec.mode),
     })
     .await?;
 

@@ -28,6 +28,7 @@ struct SlotRow {
     /// CLI rather than spawned. For claude and codex this IS a resume
     /// handle.
     cli_session: Option<String>,
+    cli_session_own: bool,
 }
 
 fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
@@ -35,7 +36,7 @@ fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
     db.query_row(
         "SELECT s.session_id, se.name, s.cli_id, s.mode, s.placement, s.display_name,
                 s.role, s.role_description, s.workspace_id, s.resume_handle, s.tmux_target,
-                s.model, s.cli_session
+                s.model, s.cli_session, s.cli_session_own
          FROM slots s JOIN sessions se ON se.id = s.session_id WHERE s.id = ?",
         [slot_id],
         |r| {
@@ -53,6 +54,7 @@ fn read_slot(st: &AppState, slot_id: &str) -> Result<SlotRow> {
                 tmux_target: r.get(10)?,
                 model: r.get(11)?,
                 cli_session: r.get(12)?,
+                cli_session_own: r.get::<_, i64>(13)? != 0,
             })
         },
     )
@@ -167,7 +169,18 @@ pub async fn launch_slot(
         None
     } else {
         row.resume.clone().or_else(|| {
-            row.cli_session.clone().filter(|c| !c.trim().is_empty())
+            // Only the CLI's OWN conversation id can be handed back to it.
+            // `NEXMESH_CLI_SESSION` is a label an operator or a config file
+            // chose for a seat -- hermes has to be pinned that way, since it
+            // strips the environment of its MCP servers -- and passing a
+            // label to `--resume` asks for a conversation that never
+            // existed. The CLI then either dies at once (claude) or says so
+            // and starts a blank one wearing the right name (hermes), on
+            // every single start.
+            row.cli_session
+                .clone()
+                .filter(|c| !c.trim().is_empty())
+                .filter(|_| row.cli_session_own)
         })
     };
     let cli_for_identity = row.cli_id.clone().unwrap_or_default();
