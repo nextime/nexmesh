@@ -382,6 +382,10 @@ async fn handle(
             );
         }
 
+        NodeToHub::TerminalMouseSet { req_id, ok, detail } => {
+            st.complete_sync(req_id, serde_json::json!({ "ok": ok, "detail": detail }));
+        }
+
         NodeToHub::TicketStored { req_id } => {
             st.complete_sync(req_id, serde_json::json!({ "ok": true }));
         }

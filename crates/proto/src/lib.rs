@@ -410,6 +410,12 @@ pub enum NodeToHub {
         cli_session_is_own: bool,
     },
     /// What became of a `PutFile`.
+    /// Whether the wheel now goes to that tmux view.
+    TerminalMouseSet {
+        req_id: u64,
+        ok: bool,
+        detail: String,
+    },
     /// The bytes of a file this machine was asked for, base64.
     FileBytes {
         req_id: u64,
@@ -634,6 +640,18 @@ pub enum HubToNode {
         req_id: u64,
         root: String,
         rel: String,
+    },
+    /// Give the wheel to the tmux view this seat sits in, or take it back.
+    ///
+    /// Scrolling a pane's history is tmux's job and nobody else's: the
+    /// terminal the operator sits at has no scrollback for a full-screen
+    /// program, and the viewer in between has none either. But mouse mode
+    /// also takes dragging to select, so this is never on by default and
+    /// never set for longer than somebody asked for.
+    TerminalMouse {
+        req_id: u64,
+        slot_id: String,
+        on: bool,
     },
     AttachResize { attach_id: String, cols: u16, rows: u16 },
     AttachClose { attach_id: String },

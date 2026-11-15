@@ -1380,25 +1380,37 @@ impl StatusBar {
             } else {
                 format!("{}:{}", self.session, self.who)
             };
-            let full: Vec<String> =
-                self.menu.iter().map(|(k, what)| format!("{k} {what}")).collect();
-            let short: Vec<String> = self.menu.iter().map(|(k, _)| k.clone()).collect();
+            // A key with no label is not a key anybody can use. When the
+            // row runs out of width it drops whole ENTRIES, never the words
+            // that say what they do -- and says `? more`, so what was
+            // dropped is one keystroke away rather than guesswork.
             let marks: String = if self.marks.is_empty() {
                 String::new()
             } else {
                 format!("{sep}{}", self.marks.join(sep))
             };
-            for body in [full.join(sep), short.join(" ")] {
-                let line = format!(" COMMANDS ON{sep}{body}{marks}{sep}{id}");
-                if line.chars().count() <= w {
-                    return line;
+            let labelled: Vec<String> =
+                self.menu.iter().map(|(k, what)| format!("{k} {what}")).collect();
+            for keep in (0..=labelled.len()).rev() {
+                let mut shown: Vec<String> = labelled[..keep].to_vec();
+                if keep < labelled.len() {
+                    shown.push("? more".to_string());
                 }
-                let line = format!(" COMMANDS{sep}{body}");
-                if line.chars().count() <= w {
-                    return line;
+                let body = shown.join(sep);
+                // With the seat's name, then without it, then without the
+                // marks: the name is the first thing worth giving up here,
+                // because the row above has been saying it all along.
+                for line in [
+                    format!(" COMMANDS{sep}{body}{marks}{sep}{id}"),
+                    format!(" COMMANDS{sep}{body}{marks}"),
+                    format!(" COMMANDS{sep}{body}"),
+                ] {
+                    if line.chars().count() <= w {
+                        return line;
+                    }
                 }
             }
-            return format!(" COMMANDS{sep}{}", short.join(" ")).chars().take(w).collect();
+            return " COMMANDS \u{00b7} ? for the keys".chars().take(w).collect();
         }
         let id = if self.session.is_empty() {
             self.who.clone()
@@ -1596,9 +1608,18 @@ async fn attach(
     // terminal: the hub says so rather than refusing, and the bar says so
     // rather than pretending the pty is the agent's own.
     let via = r["via"].as_str().unwrap_or_default().to_string();
+    // Whose scrollback is it? A seat in an adopted tmux pane has its
+    // history inside tmux, and only tmux can scroll it; a seat on a plain
+    // pty has none at all, and the wheel is translated into the page keys
+    // a full-screen program uses. `Ctrl-F` does whichever applies.
+    let in_tmux = !via.is_empty() || r["io_kind"].as_str() == Some("tmux");
+    let seat_slot = r["slot_id"].as_str().unwrap_or_default().to_string();
     let vkeys = voice_keys();
     // Who has the mouse. The terminal, unless this machine's config says
     // otherwise: see `voice::mouse_to_viewer`.
+    // In a tmux pane the node has already given tmux the wheel, so the
+    // viewer starts in step with it: pressing Ctrl-F once gives the mouse
+    // back rather than appearing to do nothing.
     let mut mouse_ours = voice::mouse_to_viewer(&read_console_toml());
     let mut bar = StatusBar::new(
         name.to_string(),
@@ -1652,13 +1673,13 @@ async fn attach(
             b.menu.push((voice::key_name(vkeys.dictate), "say it".into()));
         }
         if a.can_speak() {
-            b.menu.push((voice::key_name(vkeys.read), "read".into()));
-            b.menu.push((voice::key_name(vkeys.aloud), "aloud".into()));
+            b.menu.push((voice::key_name(vkeys.read), "read it back".into()));
+            b.menu.push((voice::key_name(vkeys.aloud), "read everything".into()));
         }
         if a.can_hear() && voice::listen_cmd(&a).is_some() {
             b.menu.push((voice::key_name(vkeys.listen), "hands free".into()));
         }
-        b.menu.push((voice::key_name(vkeys.mouse), "wheel scrolls".into()));
+        b.menu.push((voice::key_name(vkeys.mouse), "plain mouse".into()));
         b.menu.push((voice::key_name(vkeys.link), "open a link".into()));
         b.menu.push((voice::key_name(vkeys.send), "send a file".into()));
         if camera::detect().ready() {
@@ -1831,6 +1852,13 @@ async fn attach(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("nexmesh-voice");
+
+    // Whatever was borrowed is given back on the way out, however this
+    // ends: a detach that leaves tmux holding the mouse is the bug this
+    // whole thing is about, one layer down.
+    let give_back = (in_tmux && !seat_slot.is_empty()).then(|| {
+        (c.clone(), base.to_string(), seat_slot.clone())
+    });
 
     let reason = loop {
         tokio::select! {
@@ -2070,6 +2098,25 @@ async fn attach(
                     // else -- text, Enter, arrows, every other control
                     // character -- still goes to the agent. So the mode can
                     // be left on while you carry on typing at the prompt.
+                    // `?` while the mode is on prints the whole list. The
+                    // row can only hold a few, so this is where the rest
+                    // live -- and it was promised in the documentation long
+                    // before it existed.
+                    if command && byte == b'?' {
+                        let mut out = tokio::io::stdout();
+                        let mut text = String::from("\r\n[nexmesh] in command mode:\r\n");
+                        for (k, what) in bar.as_ref().map(|b| b.menu.clone()).unwrap_or_default() {
+                            text.push_str(&format!("  {k:<10} {what}\r\n"));
+                        }
+                        text.push_str(&format!(
+                            "  {:<10} leave command mode\r\n  {:<10} detach\r\n",
+                            voice::key_name(vkeys.command),
+                            voice::key_name(vkeys.detach),
+                        ));
+                        let _ = out.write_all(text.as_bytes()).await;
+                        let _ = out.flush().await;
+                        continue;
+                    }
                     let Some(act) = (if command { vkeys.act(byte) } else { None }) else {
                         forward.push(byte);
                         continue;
@@ -2150,23 +2197,54 @@ async fn attach(
                             }
                         }
                         voice::Act::Mouse => {
-                            // Borrowing the mouse, or giving it back. Said
-                            // out loud both ways: a mode that silently eats
-                            // selection is the thing this exists to undo.
+                            // Hand the wheel to whatever actually holds the
+                            // scrollback, and say which that is. Giving it
+                            // back is the same key, because a mode you
+                            // cannot leave by the way you entered it is a
+                            // trap.
                             mouse_ours = !mouse_ours;
                             let mut out = tokio::io::stdout();
-                            let _ = out
-                                .write_all(if mouse_ours {
-                                    termmode::MOUSE_ON
-                                } else {
-                                    termmode::MOUSE_OFF
-                                })
+                            let said = if in_tmux && !seat_slot.is_empty() {
+                                // tmux owns the history: ask the node to let
+                                // tmux have the mouse for its own view.
+                                let r = post(
+                                    &c,
+                                    format!(
+                                        "{base}/v1/slots/{}/terminal-mouse",
+                                        tui::urlish(&seat_slot)
+                                    ),
+                                    json!({ "on": mouse_ours }),
+                                )
                                 .await;
-                            let said = if mouse_ours {
-                                "the wheel scrolls the agent now; selecting and clicking links \
-                                 are the terminal's again with Ctrl-F"
+                                match r.map(|v| v.get("error").and_then(|e| e.as_str())
+                                                 .map(|e| e.to_string())) {
+                                    Ok(None) if mouse_ours =>
+                                        "the wheel scrolls this pane now \u{2014} hold SHIFT to \
+                                         select or click a link, Ctrl-F to give it back".into(),
+                                    Ok(None) =>
+                                        "the mouse is yours again: select, copy and click as \
+                                         usual".to_string(),
+                                    Ok(Some(e)) => { mouse_ours = !mouse_ours; e }
+                                    Err(e) => { mouse_ours = !mouse_ours; format!("{e:#}") }
+                                }
                             } else {
-                                "the mouse is the terminal's: select, copy and click as usual"
+                                // A plain pty has no history to scroll, so
+                                // the wheel becomes the keys a full-screen
+                                // program scrolls with.
+                                let _ = out
+                                    .write_all(if mouse_ours {
+                                        termmode::MOUSE_ON
+                                    } else {
+                                        termmode::MOUSE_OFF
+                                    })
+                                    .await;
+                                if mouse_ours {
+                                    "the wheel pages the agent now \u{2014} hold SHIFT to select \
+                                     or click a link, Ctrl-F to give it back".to_string()
+                                } else {
+                                    "the mouse is yours again: select, copy and click as usual"
+                                        .to_string()
+                                }
                             };
                             let _ = out
                                 .write_all(format!("\r\n[nexmesh] {said}\r\n").as_bytes())
@@ -2389,6 +2467,15 @@ async fn attach(
 
     let _ = wire.tx.send(wire::Out::Close).await;
     reader.abort();
+    // Give the wheel back. A detach that leaves tmux holding the mouse is
+    // the same bug one layer down: somebody's pane, where selection has
+    // quietly stopped working and nothing said why.
+    if mouse_ours {
+        if let Some((cl, b, slot)) = give_back {
+            let _ = post(&cl, format!("{b}/v1/slots/{}/terminal-mouse", tui::urlish(&slot)),
+                         json!({ "on": false })).await;
+        }
+    }
     if let Some(b) = &bar {
         let mut out = tokio::io::stdout();
         let _ = out.write_all(&b.release()).await;
@@ -3298,6 +3385,31 @@ mod bar_tests {
         assert!(!bar(60).line().contains("on machine-b"), "then the machine: {}", bar(60).line());
         assert!(bar(80).line().contains("Ctrl-] detach"), "{}", bar(80).line());
         assert!(bar(80).line().contains("nexmesh:Nexmesh-dev"), "{}", bar(80).line());
+    }
+
+    /// A key with no label is useless, so the row drops whole entries and
+    /// points at `?` rather than listing bare chords nobody can read.
+    #[test]
+    fn a_narrow_row_drops_entries_not_their_words() {
+        let mut b = bar(58);
+        b.command = true;
+        b.menu.clear();
+        for (k, what) in [("Ctrl-G", "say it"), ("Ctrl-O", "read it back"),
+                          ("Ctrl-T", "read everything"), ("Ctrl-N", "hands free"),
+                          ("Ctrl-F", "plain mouse"), ("Ctrl-B", "open a link")] {
+            b.menu.push((k.into(), what.into()));
+        }
+        let line = b.line();
+        assert!(line.contains("Ctrl-G say it"), "{line}");
+        assert!(line.contains("? more"), "and a way to the rest: {line}");
+        assert!(line.chars().count() <= 58, "{} chars", line.chars().count());
+        // Never a chord without its words.
+        assert!(!line.contains("Ctrl-B  "), "a bare key with no label: {line}");
+        // Wide enough, and everything is there with its words.
+        b.cols = 160;
+        let wide = b.line();
+        assert!(wide.contains("Ctrl-B open a link"), "{wide}");
+        assert!(!wide.contains("? more"), "nothing was dropped: {wide}");
     }
 
     #[test]

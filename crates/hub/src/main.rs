@@ -706,6 +706,7 @@ async fn main() -> Result<()> {
         // A person at the dashboard using the fleet's own services --
         // transcription, speech -- rather than only agents being able to.
         .route("/v1/uploads/:id", get(api::upload_bytes))
+        .route("/v1/slots/:id/terminal-mouse", post(api::terminal_mouse))
         .route("/v1/operator/view", post(api::publish_view))
         .route("/v1/operator/views", get(api::list_views))
         .route("/v1/operator/view/:id", get(api::get_view))

@@ -69,17 +69,21 @@ pub fn repaint(view: &str) {
     // it is set on the session the NODE created, so it changes nothing about
     // what the operator sees in their own `tmux attach`.
     let _ = cmd().args(["set-option", "-t", view, "status", "off"]).output();
-    // The mouse is deliberately NOT taken here.
+    // And tmux takes the wheel, for this view only.
     //
-    // Turning tmux's own mouse mode on makes the wheel scroll the pane's
-    // history, which is the one thing an attach to an adopted terminal
-    // could not otherwise do -- but it also takes dragging to select and
-    // clicking a link, in a pane somebody is sitting in. Losing both to
-    // gain one is a bad trade, and the viewer offers the same scrolling
-    // behind `Ctrl-F` for anyone who wants it, without touching anybody's
-    // tmux. Turn it on yourself if you prefer it:
+    // A pane's history belongs to tmux: the terminal the operator sits at
+    // has no scrollback for a full-screen program, and the viewer in
+    // between has none either. With the mouse off, the wheel reaches
+    // nothing at all, which is simply a terminal you cannot scroll.
     //
-    //     tmux set-option -t <session> mouse on
+    // The cost is that dragging to select needs SHIFT held, as it does in
+    // every mouse-enabled TUI. That is a thing to know, not a thing to be
+    // stuck in; `Ctrl-F` in the viewer turns it off for anyone who would
+    // rather have the plain terminal back.
+    //
+    // Set on the session the NODE created, so the operator's own
+    // `tmux attach` keeps whatever they had.
+    let _ = cmd().args(["set-option", "-t", view, "mouse", "on"]).output();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((tty, session)) = line.split_once(' ') {
             if session == view {
@@ -152,4 +156,20 @@ pub fn pane_pid(view: &str) -> Option<i32> {
         return None;
     }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Hand the wheel to a tmux view, or take it back.
+///
+/// Per SESSION, and the session is the one the node created, so this never
+/// changes what somebody else's `tmux attach` does. Returns what to tell
+/// the person who asked, because "it did nothing" is not an answer.
+pub fn set_mouse(view: &str, on: bool) -> (bool, String) {
+    let out = cmd()
+        .args(["set-option", "-t", view, "mouse", if on { "on" } else { "off" }])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => (true, String::new()),
+        Ok(o) => (false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => (false, e.to_string()),
+    }
 }

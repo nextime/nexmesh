@@ -817,7 +817,7 @@ impl App {
 
 /// Percent-encode the few characters a session id or name can contain that a
 /// query string would otherwise read as structure.
-fn urlish(s: &str) -> String {
+pub fn urlish(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' => {

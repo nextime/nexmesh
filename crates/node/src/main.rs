@@ -710,6 +710,18 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             });
         }
 
+        HubToNode::TerminalMouse { req_id, slot_id, on } => {
+            // The node's own view of that pane, not the operator's session:
+            // mouse is a per-session option, so this changes what the FLEET
+            // sees and leaves anybody else's tmux alone.
+            let view = crate::spawn::tmux_view(&slot_id);
+            let (ok, detail) = crate::tmux::set_mouse(&view, on);
+            tracing::info!(%view, on, ok, "tmux mouse");
+            let _ = ctx
+                .send_hub(&NodeToHub::TerminalMouseSet { req_id, ok, detail })
+                .await;
+        }
+
         HubToNode::AttachResize { attach_id, cols, rows } => {
             attachsock::resize(&ctx, &attach_id, cols, rows);
         }

@@ -2060,6 +2060,65 @@ pub async fn get_view(
         .into_response())
 }
 
+#[derive(Deserialize)]
+pub struct MouseTo {
+    pub on: bool,
+}
+
+/// Give the wheel to the tmux view a seat sits in, or take it back.
+///
+/// Asked for by a viewer, for as long as somebody wants to scroll. Nothing
+/// here is on by default: tmux's mouse mode scrolls a pane's history, which
+/// is the one thing an attach cannot do for itself, and takes dragging to
+/// select, which is the one thing a person does most.
+pub async fn terminal_mouse(
+    State(st): State<AppState>,
+    Path(slot_ref): Path<String>,
+    Json(req): Json<MouseTo>,
+) -> ApiResult {
+    let found: Option<(String, Option<String>)> = {
+        let db = st.db.lock().unwrap();
+        db.query_row(
+            "SELECT s.id, (SELECT a.node_id FROM agents a
+                             WHERE a.slot_id = s.id AND a.exited_at_ms IS NULL
+                             ORDER BY (a.io_kind IS NOT NULL) DESC, a.started_at_ms DESC
+                             LIMIT 1)
+               FROM slots s WHERE s.id = ?",
+            [&slot_ref],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(bad)?
+    };
+    let Some((slot_id, node_id)) = found else {
+        return Err(bad("no such seat"));
+    };
+    let Some(node_id) = node_id.filter(|n| !n.is_empty()) else {
+        return Err(bad("that seat has no machine right now"));
+    };
+    if !st.node_is_connected(&node_id) {
+        return Err(bad("that machine is not connected"));
+    }
+    let (req_id, rx) = st.new_sync_request();
+    st.send_to_node(
+        &node_id,
+        &nexmesh_proto::HubToNode::TerminalMouse { req_id, slot_id, on: req.on },
+    )
+    .await
+    .map_err(bad)?;
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .map_err(|_| bad("that machine did not answer in time"))?
+        .map_err(|_| bad("that machine went away"))?;
+    if answer["ok"].as_bool() != Some(true) {
+        return Err(bad(format!(
+            "tmux refused: {}",
+            answer["detail"].as_str().unwrap_or("no reason given")
+        )));
+    }
+    Ok(Json(json!({ "ok": true, "on": req.on })))
+}
+
 /// Has it answered yet? The dashboard polls this.
 pub async fn operator_ask_result(
     State(st): State<AppState>,
