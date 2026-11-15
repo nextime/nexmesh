@@ -1808,43 +1808,68 @@ is as close to canon pastels as it is to the point. Both are CSS tokens on
 
 #### The room
 
-`/xr` is the same fleet as a place: the team standing in a room, the code
-graph as something with a far side. It is one file of WebGL2 and WebXR
-(`xr.js`), served by the hub like everything else, and it works on a flat
-screen as well as in a headset.
+`/xr` presents the same fleet as a place: the team as figures in a room, the
+code graph as a structure with a far side. It is one file of WebGL2 and WebXR
+(`xr.js`) served by the hub, with no 3D library and no external assets, and it
+works on a flat screen as well as in a headset.
 
-On a flat screen: drag to look, scroll to step back, click a teammate to open
-their terminal, **drag a screen to move it** — it turns to keep facing you —
-and `g`, `c`, `m`, `v` for the graph, the chat, the menu and speech, with
-`Escape` to clear the screens.
+**Flat-screen controls.** Drag to look, scroll to step back, click a teammate
+to open their terminal, drag a screen to move it, and scroll over a screen to
+resize it. Keys: `g` graph, `c` chat, `m` menu, `v` speak, `Escape` close the
+screens. While a terminal has the focus those shortcuts are suspended and the
+keys go to the agent instead.
 
-In a headset, the trigger presses whatever the ray is on and **squeeze takes
-hold of it**: a screen moves with your hand, a subsystem follows it, and empty
-space grabs the room and pulls it past you. The thumbsticks slide and
-snap-turn for anyone who prefers that.
+**Headset controls.** The trigger presses whatever the ray is on. Squeeze takes
+hold: one hand on a screen moves it, two hands on the same screen resize it, a
+subsystem follows the hand that holds it, and empty space moves the room past
+you. Thumbsticks slide and snap-turn.
 
-The menu rides on your **left wrist**, mounted the moment you enter and never
-closed by *close the screens*, because a menu you have to go and find is a
-menu nobody finds in a headset -- turn your wrist up to read it, point at it
-with the other hand to use it. Everything the flat views can do is on it,
-including **one line per team**: a fleet running four sessions at once is a
-crowd until you can ask for one of them, which is the dropdown the flat
-dashboard has. Picking a team rebuilds the room with that team alone; *every
-team* puts them all back.
+**The menu** is mounted on the left wrist, created when the session starts and
+not removed by *close the screens*. It carries everything the flat views do:
+the team, the code map, the chat, a teammate's screen, the keyboard, speech,
+and one line per team with the active one ticked — the equivalent of the
+dashboard's session dropdown. Selecting a team rebuilds the room with that team
+alone; *every team* restores all of them.
 
-Whatever is strapped to you is drawn where your body is rather than where the
-room is, so pulling the room past you leaves the menu exactly where your hand
-is.
+**The dashboard's tabs** are on the same menu and open as a screen in the room:
+the machines, the plan, what the team knows, and files with their locks and
+ownership zones. One panel, switched, as a tab is.
 
-Speech is the input a headset actually has: the trigger on empty space starts
-listening, and what you say is a command (`the code graph`, `the chat`), a
-name, or a sentence, which goes to whoever is selected or to the team.
+**Terminals are attached, not transcribed.** Opening a teammate's screen opens
+the same websocket the dashboard and `nexmesh attach` use, and the screen is
+drawn by the same VT emulator the dashboard uses (`term.js`), run headlessly:
+its DOM rendering is replaced, the screen it maintains is read out cell by cell
+and drawn as a panel texture, with the agent's own cursor. A full-screen agent
+interface therefore appears as the agent draws it. Where no attach is possible
+— an external participant, an exited agent, the demo fleet — the panel falls
+back to reading the transcript.
 
-The controls are tested in `tests/e2e_xrroom.py`, which drives the real page
-in headless chromium against the demo fleet — the menu's rows, filtering to
-one team, that closing the screens leaves the menu, and that a held screen
-moves by exactly what the hand moved. It skips itself where there is no
-chromium rather than failing.
+**Typing.** The keyboard in the room is a grid panel: point with one hand,
+press with the trigger. It sends to the focused screen, which is the one last
+opened or pressed, drawn with a brighter frame. `shift` and `ctrl` are one-shot
+modifiers, and `ctrl` produces a control code rather than a letter, so `Ctrl-C`
+reaches the process. Arrow keys, `PgUp`/`PgDn`, `Esc`, `Tab`, `Enter`,
+`Backspace`, `^C`, `^D` and `^L` are all on the layout. On a flat screen the
+real keyboard types into the focused screen, translated by `term.js` exactly as
+in the dashboard. A read-only agent — a headless process on a pipe — refuses
+input and says so.
+
+**Speech** remains available: the trigger on empty space starts listening, and
+an utterance is read as a command (`the code graph`, `the chat`, `the
+keyboard`, `the machines`), a teammate's name, or a message to the selected
+agent or the team.
+
+Panels on the wrist are drawn in viewer space rather than room space, so moving
+the room does not move them.
+
+**Tests.** `tests/e2e_xrroom.py` drives the page in headless chromium against
+the demo fleet and checks the menu, session filtering, panel movement and that
+closing the screens leaves the menu. `tests/e2e_xrtype.py` runs a real hub, a
+real node and a real interactive agent, presses keys on the keyboard grid the
+way a pointer does, and verifies the agent's reply arrives on the panel; it
+also covers the modifiers, both resize gestures and the four view screens. Both
+skip themselves where there is no chromium, which `run-all.sh` reports as a
+skip rather than a pass or a failure.
 
 #### Signing in
 

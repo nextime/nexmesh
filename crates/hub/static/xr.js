@@ -1924,6 +1924,12 @@ class Panel {
     // menu nobody finds. `roomSpace` is set while it is actually mounted.
     this.wrist = !!opts.wrist;
     this.roomSpace = false;
+    // A grid panel is a keyboard: rows of keys rather than one action per
+    // row, so a ray has to resolve a column as well as a row.
+    this.grid = opts.grid || null;
+    this.col = -1;
+    this.cursor = null;
+    this.live = null;
     this.geom();
   }
 
@@ -1953,8 +1959,8 @@ class Panel {
     g.addColorStop(1, `rgba(${rgb},0.10)`);
     x.fillStyle = g;
     x.fillRect(0, 0, c.width, 46);
-    x.strokeStyle = `rgba(${rgb},0.9)`;
-    x.lineWidth = 4;
+    x.strokeStyle = this.focused ? "rgba(235,245,255,0.95)" : `rgba(${rgb},0.9)`;
+    x.lineWidth = this.focused ? 7 : 4;
     x.strokeRect(2, 2, c.width - 4, c.height - 4);
     const font = `ui-monospace, "DejaVu Sans Mono", "Menlo", monospace`;
     x.textBaseline = "top";
@@ -1962,7 +1968,37 @@ class Panel {
     x.font = `700 28px ${font}`;
     x.fillText(this.title, 20, 9);
     x.font = `500 ${this.cell - 7}px ${font}`;
+    const chw = x.measureText("M").width || (this.cell * 0.6);
+    if (this.grid) {
+      const m = 14;
+      this.grid.forEach((keys, i) => {
+        const y = 62 + i * this.cell;
+        const kw = (c.width - m * 2) / keys.length;
+        keys.forEach((k, j) => {
+          const on = i === this.row && j === this.col;
+          const held = !!(k.held && k.held());
+          x.fillStyle = on ? `rgba(${rgb},0.75)`
+                           : held ? `rgba(${rgb},0.40)` : "rgba(255,255,255,0.06)";
+          x.fillRect(m + j * kw + 2, y - 3, kw - 4, this.cell - 5);
+          x.fillStyle = on ? "#ffffff" : "#d8e6f8";
+          const label = String(k.label);
+          const w = x.measureText(label).width;
+          x.fillText(label, m + j * kw + Math.max(3, (kw - w) / 2), y);
+        });
+      });
+      this.tex = this.r.texture(c, this.tex);
+      this.dirty = false;
+      return;
+    }
     const rows = this.buttons.length ? this.buttons.map((b) => b.label) : this.lines;
+    // Where the agent's own cursor is, drawn as the block a terminal draws.
+    if (this.cursor && !this.buttons.length) {
+      const [cx0, cy0] = this.cursor;
+      if (cy0 >= 0 && cy0 < this.rows) {
+        x.fillStyle = "rgba(220,235,255,0.55)";
+        x.fillRect(22 + cx0 * chw, 62 + cy0 * this.cell - 2, Math.max(chw, 6), this.cell - 5);
+      }
+    }
     rows.forEach((line, i) => {
       const y = 62 + i * this.cell;
       const s = String(line);
@@ -2180,6 +2216,115 @@ function demoChat() {
   ];
 }
 
+// ------------------------------------------------------------ a live screen --
+//
+// A terminal in the room, attached rather than transcribed. It is the same
+// websocket the dashboard and `nexmesh attach` use -- binary frames are
+// bytes, text frames are control JSON -- and the same VT emulator the
+// dashboard draws with (`term.js`), used headlessly: its DOM rendering is
+// replaced, the screen it keeps is read out cell by cell, and the panel
+// draws that as a texture. So a full-screen agent interface appears as the
+// agent draws it, and keys typed in here reach the real process.
+class LiveTerm {
+  constructor(app, panel, agentId, name) {
+    this.app = app;
+    this.panel = panel;
+    this.agent = agentId;
+    this.name = name;
+    this.readOnly = false;
+    this.state = "attaching";
+    this.needs = true;
+    this.painted = 0;
+    // term.js measures its own font against the DOM, so it needs a box with
+    // a layout. Off-screen is enough; invisible is not the same as absent.
+    this.host = document.createElement("div");
+    this.host.style.cssText =
+      "position:fixed;left:-20000px;top:0;width:1200px;height:600px;pointer-events:none";
+    document.body.appendChild(this.host);
+    this.t = new NexTerm(this.host);
+    this.t.render = () => { this.needs = true; };   // drawn as a texture instead
+    this.t.resize(panel.cols, panel.rows);
+    const base = location.protocol === "https:" ? "wss://" : "ws://";
+    const url = `${base}${location.host}/v1/attach/ws?agent=${encodeURIComponent(agentId)}`
+              + `&cols=${panel.cols}&rows=${panel.rows}&replay=262144`;
+    let ws = null;
+    try {
+      // A websocket cannot carry a header, so an operator token signs in
+      // through the subprotocol. A dashboard account's cookie rides along.
+      ws = token ? new WebSocket(url, ["nexmesh.token." + token]) : new WebSocket(url);
+    } catch (e) {
+      this.fail(String(e.message || e));
+      return;
+    }
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+    this.t.onInput((bytes) => { if (ws.readyState === 1) ws.send(bytes); });
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string") {
+        let v = {};
+        try { v = JSON.parse(ev.data); } catch (e) { return; }
+        if (v.t === "opened") {
+          this.readOnly = !!v.read_only;
+          this.t.readOnly = this.readOnly;
+          this.state = this.readOnly ? "watching" : "attached";
+          this.app.say(`${this.name}: ${this.state}`);
+        } else if (v.t === "closed" || v.t === "error") {
+          this.state = v.reason || v.message || "closed";
+        }
+        this.needs = true;
+        return;
+      }
+      this.t.write(new Uint8Array(ev.data));
+      this.needs = true;
+    };
+    ws.onclose = () => { this.state = "detached"; this.needs = true; };
+    ws.onerror = () => { this.fail("could not attach"); };
+  }
+
+  /// An attach that cannot be had falls back to the transcript, which still
+  /// says what the agent has been doing.
+  fail(why) {
+    this.state = why;
+    this.needs = true;
+    this.app.refreshTerminal().catch(() => {});
+  }
+
+  /// The screen, read out of the emulator and handed to the panel. Rate
+  /// limited: a busy agent writes far more often than a frame is drawn, and
+  /// nobody can read sixty screens a second.
+  tick() {
+    const now = performance.now();
+    if (!this.needs || now - this.painted < 60) return;
+    this.painted = now;
+    this.needs = false;
+    const t = this.t;
+    const lines = [];
+    for (let y = 0; y < t.rows; y++) {
+      const row = t.screen.lines[y] || [];
+      let line = "";
+      for (let x = 0; x < t.cols; x++) line += (row[x] && row[x].c) || " ";
+      lines.push(line.replace(/\s+$/, ""));
+    }
+    this.panel.lines = lines;
+    this.panel.cursor = this.readOnly ? null : [t.cx, t.cy];
+    this.panel.title = `${this.name} · ${this.state}`;
+    this.panel.dirty = true;
+  }
+
+  /// What the keyboard in the room sends, and what a real keyboard sends
+  /// when this screen has the focus.
+  type(bytes) {
+    if (this.readOnly) { this.app.say(`${this.name} is read-only`); return; }
+    this.t.send(bytes);
+  }
+
+  close() {
+    try { if (this.ws) { this.ws.onclose = null; this.ws.onerror = null; this.ws.close(); } }
+    catch (e) {}
+    try { this.host.remove(); } catch (e) {}
+  }
+}
+
 class App {
   constructor() {
     this.canvas = document.getElementById("gl");
@@ -2197,6 +2342,10 @@ class App {
     this.grab = new Map();
     this.panels = [];
     this.pointers = [];
+    // Which screen typing goes to, and the state of the keyboard in the
+    // room. Both modifiers are one-shot.
+    this.focus = null;
+    this.kb = { shift: false, ctrl: false };
     this.status = "";
     this.fixed = null;            // a clock held still, for filming
     this.me = [.16, .62, .86];    // the colour of your own sleeves
@@ -2240,6 +2389,17 @@ class App {
     }
   }
 
+  /// Closing a screen has to close its attach as well: a websocket left
+  /// open keeps a node streaming a terminal nobody is looking at.
+  closeScreens(keep) {
+    for (const q of this.panels) {
+      if (keep && keep(q)) continue;
+      if (q.live) { q.live.close(); q.live = null; }
+      if (q === this.focus) this.focus = null;
+    }
+    this.panels = keep ? this.panels.filter(keep) : [];
+  }
+
   say(text) {
     this.status = text;
     const el = document.getElementById("status");
@@ -2267,10 +2427,11 @@ class App {
 
   // A teammate's own screen, between you and them, facing you.
   //
-  // The transcript rather than a vt100: a headset has no keyboard, so what
-  // it needs is to SEE what the agent is doing, and what it sends is a
-  // sentence, which the voice already does and the hub types into the
-  // agent's real terminal.
+  // It is an attach, not a transcript: the real screen, with the agent's
+  // own cursor, and keys typed on the keyboard in the room reach the
+  // process. Where there is no attach to be had -- an external participant,
+  // an agent that has exited, the demo fleet -- it falls back to reading
+  // the transcript, which still shows what happened.
   openTerminal(o) {
     const a = o.data;
     const st = stateStyle(a);
@@ -2283,13 +2444,58 @@ class App {
     p.agent = a;
     p.opened = this.now();
     p.lines = [];
-    p.set([`connecting to ${a.name}…`]);
-    this.refreshTerminal().catch(() => {});
+    p.cursor = null;
+    if (p.live) { p.live.close(); p.live = null; }
+    // The agent that HAS the terminal: for a seat in an adopted tmux pane
+    // that is the pane's agent, not the seat's.
+    const who = a.attach_agent_id || a.agent_id;
+    if (!DEMO && who && typeof NexTerm === "function") {
+      p.set([`attaching to ${a.name}…`]);
+      p.live = new LiveTerm(this, p, who, a.name);
+    } else {
+      p.set([`connecting to ${a.name}…`]);
+      this.refreshTerminal().catch(() => {});
+    }
+    this.focusPanel(p);
+    // In a headset there is no other keyboard, so opening a screen puts one
+    // in the room with it rather than leaving it a menu row away.
+    if (this.xr) this.openKeys();
+  }
+
+  /// Which screen the keyboard types into. With one open it is that one;
+  /// with several, the one last opened or pressed.
+  focusPanel(p) {
+    for (const q of this.panels) {
+      if (q.focused && q !== p) { q.focused = false; q.dirty = true; }
+    }
+    if (!p) { this.focus = null; return; }
+    this.focus = p;
+    p.focused = true;
+    p.dirty = true;
+    // On a flat screen a real keyboard is the obvious way to type, so the
+    // emulator's own input is given the focus and term.js translates the
+    // keys exactly as it does in the dashboard.
+    if (!this.xr && p.live && p.live.t) p.live.t.focus();
+    const k = this.panels.find((q) => q.kind === "keys");
+    if (k) { k.title = `keyboard → ${p.agent ? p.agent.name : "a screen"}`; k.dirty = true; }
+  }
+
+  /// Send bytes to the focused screen.
+  typeInto(bytes) {
+    const p = this.focus && this.focus.live ? this.focus
+            : this.panels.find((q) => q.kind === "terminal" && q.live);
+    if (!p) { this.say("open a teammate's screen first"); return; }
+    if (p !== this.focus) this.focusPanel(p);
+    p.live.type(bytes);
   }
 
   async refreshTerminal() {
     const p = this.panels.find((x) => x.kind === "terminal");
     if (!p || !p.agent) return;
+    // A live attach draws this panel itself.
+    if (p.live && p.live.ws && p.live.ws.readyState <= 1 && p.live.state !== "could not attach") {
+      return;
+    }
     // The agent that HAS the terminal, which for a seat sitting in an
     // adopted tmux pane is the pane's agent and not the seat's. Reading the
     // seat's own transcript there returns nothing at all, which is a blank
@@ -2346,6 +2552,149 @@ class App {
     } catch (e) { p.set(["could not read the log"]); }
   }
 
+
+  // ------------------------------------------------------------ keyboard --
+  //
+  // A headset has no keyboard, and speech is not always the right way to
+  // answer an agent: a path, a flag, a Ctrl-C. So there is a keyboard in
+  // the room, pointed at with one hand and pressed with the trigger, and
+  // what it sends goes to whichever screen has the focus.
+  openKeys() {
+    const p = this.panel("keys", "keyboard", {
+      pos: [0, 1.12, -1.05], yaw: 0,
+      w: 1.45, cols: 58, rows: 5, accent: [.50, .80, .70],
+    });
+    p.grid = this.keyGrid();
+    p.geom();
+    p.dirty = true;
+    const f = this.focus && this.focus.kind === "terminal" ? this.focus
+            : this.panels.find((q) => q.kind === "terminal");
+    if (f) this.focusPanel(f);
+    else p.title = "keyboard \u2192 no screen open";
+    return p;
+  }
+
+  /// The layout. Rebuilt whenever a modifier changes, because a key whose
+  /// label does not say what it will send is worse than no label.
+  keyGrid() {
+    const kb = this.kb;
+    const SH = { "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^",
+                 "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+",
+                 "[": "{", "]": "}", "\\": "|", ";": ":", "'": "\"",
+                 ",": "<", ".": ">", "/": "?" };
+    const ch = (c) => ({
+      label: kb.shift ? (SH[c] || c.toUpperCase()) : c,
+      act: () => this.sendChar(c),
+    });
+    const key = (label, out) => ({ label, act: () => this.sendKey(out) });
+    const mod = (label, name) => ({
+      label, held: () => !!this.kb[name],
+      act: () => {
+        this.kb[name] = !this.kb[name];
+        const k = this.panels.find((q) => q.kind === "keys");
+        if (k) { k.grid = this.keyGrid(); k.dirty = true; }
+      },
+    });
+    const row = (str) => str.split("").map(ch);
+    return [
+      [key("esc", "\u001b"), ...row("1234567890-="), key("bksp", "\u007f")],
+      [key("tab", "\t"), ...row("qwertyuiop[]"), ch("\\")],
+      [mod("ctrl", "ctrl"), ...row("asdfghjkl;'"), key("enter", "\r")],
+      [mod("shift", "shift"), ...row("zxcvbnm,./"), key("\u2191", "\u001b[A"),
+       key("\u2193", "\u001b[B")],
+      [ch("`"), key("space", " "), key("\u2190", "\u001b[D"), key("\u2192", "\u001b[C"),
+       key("pgup", "\u001b[5~"), key("pgdn", "\u001b[6~"),
+       key("^C", "\u0003"), key("^D", "\u0004"), key("^L", "\u000c"),
+       { label: "close", act: () => { this.panels = this.panels.filter((q) => q.kind !== "keys"); } }],
+    ];
+  }
+
+  /// A printable key, with the modifiers applied. Both modifiers are
+  /// one-shot, as they are on every on-screen keyboard: press shift, press
+  /// a letter, and shift is spent.
+  sendChar(c) {
+    const kb = this.kb;
+    const SH = { "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^",
+                 "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+",
+                 "[": "{", "]": "}", "\\": "|", ";": ":", "'": "\"",
+                 ",": "<", ".": ">", "/": "?" };
+    let out = kb.shift ? (SH[c] || c.toUpperCase()) : c;
+    if (kb.ctrl) {
+      const code = out.toLowerCase().charCodeAt(0);
+      if (code >= 97 && code <= 122) out = String.fromCharCode(code - 96);
+      else if (out === "[") out = "\u001b";
+      else if (out === "\\") out = "\u001c";
+      else if (out === "]") out = "\u001d";
+    }
+    this.sendKey(out);
+  }
+
+  sendKey(out) {
+    this.typeInto(out);
+    if (this.kb.shift || this.kb.ctrl) {
+      this.kb.shift = false;
+      this.kb.ctrl = false;
+      const k = this.panels.find((q) => q.kind === "keys");
+      if (k) { k.grid = this.keyGrid(); k.dirty = true; }
+    }
+  }
+
+  // ---------------------------------------------------------- the tabs --
+  //
+  // Everything the flat dashboard keeps behind a tab, as a screen in the
+  // room: the machines, the plan, what the team knows, and what is locked.
+  // One panel, switched, because that is what a tab is.
+  openView(which) {
+    const d = (this.snap && this.snap.detail) || {};
+    const pad = (v, n) => String(v == null ? "" : v).slice(0, n).padEnd(n);
+    let title = which;
+    let lines = [];
+    if (which === "machines") {
+      title = "the machines";
+      for (const n of (this.snap && this.snap.nodes) || []) {
+        lines.push(`${pad(n.name, 14)} ${pad(n.status, 11)} ${pad(n.arch, 14)} ${n.clis || ""}`);
+      }
+      if (!lines.length) lines.push("no machines are enrolled");
+    } else if (which === "plan") {
+      title = "the plan";
+      const items = d.plan || [];
+      const done = items.filter((i) => i.status === "done").length;
+      lines.push(`${done} of ${items.length} done`);
+      lines.push("");
+      for (const i of items) {
+        lines.push(`${pad(i.ord, 3)} ${pad(i.status, 13)} ${pad(i.label, 46)} ${i.who || ""}`);
+      }
+      if (!items.length) lines.push("no plan has been set for this team");
+    } else if (which === "knowledge") {
+      title = "what the team knows";
+      for (const k of d.knowledge || []) {
+        lines.push(`${pad(k.scope, 8)} ${pad(k.category, 10)} ${pad(k.key, 22)} ${k.value || ""}`);
+      }
+      if (!lines.length) lines.push("nothing is remembered yet");
+    } else if (which === "files") {
+      title = "files and who owns what";
+      for (const l of d.locks || []) {
+        lines.push(`locked ${pad(l.path, 40)} ${pad(l.who, 14)} ${l.purpose || ""}`);
+      }
+      for (const z of d.zones || []) {
+        lines.push(`owns   ${pad(z.pattern, 40)} ${z.who || ""}`);
+      }
+      if (!lines.length) lines.push("nothing is locked, and no zones are set");
+    }
+    const p = this.panel("view", title, {
+      pos: [2.30, 1.86, -1.05], yaw: Math.atan2(-2.30, 1.05),
+      w: 1.60, cols: 78, rows: 20, accent: [.45, .60, .95],
+    });
+    p.buttons = [];
+    p.grid = null;
+    p.cursor = null;
+    p.view = which;
+    p.lines = lines.slice(0, p.rows);
+    p.dirty = true;
+    this.say(title);
+    return p;
+  }
+
   // Everything else the flat views can do, as a list you point at. In a
   // headset it rides on the left wrist, so there is always a way back to
   // the chat, to the code map, and to one team on its own.
@@ -2360,7 +2709,12 @@ class App {
       { label: "  " + (who ? who + "'s screen" : "a screen — point first"),
         act: () => (sel && sel.kind === "agent" ? this.openTerminal(sel)
                                                 : this.say("point at somebody first")) },
+      { label: "  the keyboard", act: () => this.openKeys() },
       { label: "  say something", act: () => this.listen() },
+      { label: "  the machines", act: () => this.openView("machines") },
+      { label: "  the plan", act: () => this.openView("plan") },
+      { label: "  what the team knows", act: () => this.openView("knowledge") },
+      { label: "  files and who owns what", act: () => this.openView("files") },
     ];
     // One line per team. This is the dropdown, in a place you can reach
     // without taking the headset off.
@@ -2380,7 +2734,7 @@ class App {
       buttons.push({ label: "  start " + who, act: () => this.agentAction("spawn") });
     }
     buttons.push({ label: "  close the screens",
-                   act: () => { this.panels = this.panels.filter((x) => x.wrist); } });
+                   act: () => this.closeScreens((x) => x.wrist) });
     const mounted = this.panels.find((x) => x.wrist && x.roomSpace);
     this.panel("menu", "nexmesh", {
       wrist: true,
@@ -2422,17 +2776,30 @@ class App {
       if (c && (!best || c.t < best.c.t)) best = { p, c };
     }
     for (const p of this.panels) {
-      const row = (best && best.p === p && p.buttons.length)
+      const n = p.grid ? p.grid.length : p.buttons.length;
+      const row = (best && best.p === p && n)
         ? Math.floor((best.c.v - p.rowTop) / p.rowH) : -1;
-      const ok = row >= 0 && row < p.buttons.length ? row : -1;
-      if (p.row !== ok) { p.row = ok; p.dirty = true; }
+      const ok = row >= 0 && row < n ? row : -1;
+      let col = -1;
+      if (ok >= 0 && p.grid) {
+        // The keys are drawn inside a margin, so the column is measured
+        // against the same margin: a key you press has to be the key you
+        // were pointing at, at both ends of the row.
+        const keys = p.grid[ok] || [];
+        const m = 14 / p.cw;
+        const u = (best.c.u - m) / Math.max(1 - m * 2, 1e-3);
+        col = Math.floor(u * keys.length);
+        col = col >= 0 && col < keys.length ? col : -1;
+      }
+      if (p.row !== ok || p.col !== col) { p.row = ok; p.col = col; p.dirty = true; }
     }
     if (!best) return null;
-    return { panel: best.p, row: best.p.row, t: best.c.t };
+    return { panel: best.p, row: best.p.row, col: best.p.col, t: best.c.t };
   }
 
   panelsInto(L) {
     for (const p of this.panels) {
+      if (p.live) p.live.tick();
       if (p.dirty || !p.tex) p.redraw();
       if (p.roomSpace) continue;        // drawn with your hands instead
       L.textured.push({ tex: p.tex, model: p.model(), alpha: 0.97, gain: 1.1 });
@@ -2473,15 +2840,27 @@ class App {
                     1 - ((e.clientY - rect.top) / rect.height) * 2];
     });
     c.addEventListener("wheel", (e) => {
-      this.cam.dist = clamp(this.cam.dist + Math.sign(e.deltaY) * 0.3, -3.6, 6);
+      // Over a screen the wheel resizes that screen; everywhere else it
+      // steps the camera back, as it always did.
+      const over = this.lastRay && this.lastRay.panelHit ? this.lastRay.panelHit.panel : null;
+      if (over) {
+        over.w = clamp(over.w * (e.deltaY > 0 ? 0.93 : 1.075), 0.25, 6.0);
+        over.geom();
+        over.dirty = true;
+      } else {
+        this.cam.dist = clamp(this.cam.dist + Math.sign(e.deltaY) * 0.3, -3.6, 6);
+      }
       e.preventDefault();
     }, { passive: false });
     window.addEventListener("keydown", (e) => {
+      // While a screen has the focus, the keys are the agent's: term.js is
+      // reading them from its own input, and `g` means g.
+      if (this.typingNow()) return;
       if (e.key === "g") this.setMode(this.scene.mode === "graph" ? "team" : "graph");
       if (e.key === "v") this.listen();
       if (e.key === "c") this.openChat();
       if (e.key === "m") this.openMenu();
-      if (e.key === "Escape") { this.panels = []; this.cam.focus = null; }
+      if (e.key === "Escape") { this.closeScreens(); this.cam.focus = null; }
     });
   }
 
@@ -2504,7 +2883,7 @@ class App {
     this.scene.mode = mode;
     this.scene.selected = null;
     this.scene.hovered = null;
-    this.panels = this.panels.filter((p) => p.kind !== "terminal");
+    this.closeScreens((p) => p.kind !== "terminal");
     this.r.focus = mode === "graph" ? [0, 0, this.scene.graphCentre[2]] : [0, 0, -2.2];
     this.say(mode === "graph" ? "the code graph" : "the team");
     const b = document.getElementById("modeBtn");
@@ -2529,13 +2908,37 @@ class App {
   // A press, wherever the ray is: a button, a teammate, a subsystem, or
   // nothing at all, which starts listening.
   press(ray) {
-    if (ray && ray.panelHit && ray.panelHit.row >= 0) {
-      const b = ray.panelHit.panel.buttons[ray.panelHit.row];
-      if (b && b.act) { b.act(); return; }
+    if (ray && ray.panelHit) {
+      const h = ray.panelHit, p = h.panel;
+      if (p.grid && h.row >= 0 && h.col >= 0) {
+        const k = (p.grid[h.row] || [])[h.col];
+        if (k && k.act) { k.act(); return; }
+      }
+      if (p.buttons.length && h.row >= 0) {
+        const b = p.buttons[h.row];
+        if (b && b.act) { b.act(); return; }
+      }
+      // Pressing a screen is how you choose which one the keyboard types
+      // into, when more than one is open.
+      if (p.kind === "terminal") this.focusPanel(p);
+      return;
     }
-    if (ray && ray.panelHit) return;
     if (ray && ray.hit) { this.select(ray.hit.object); return; }
-    if (this.xr) this.listen();
+    if (!this.xr) { this.blurTerminal(); return; }
+    this.listen();
+  }
+
+  /// Is a real keyboard currently typing into an agent?
+  typingNow() {
+    const a = document.activeElement;
+    return !!(a && a.classList && a.classList.contains("ntinput"));
+  }
+
+  /// Give the keys back to the page.
+  blurTerminal() {
+    if (!this.typingNow()) return;
+    try { document.activeElement.blur(); } catch (e) {}
+    if (this.focus) { this.focus.focused = false; this.focus.dirty = true; }
   }
 
   desktopCamera() {
@@ -2720,12 +3123,46 @@ class App {
           nodeAt: node ? node.pos.slice() : null,
           panelAt: panel ? panel.pos.slice() : null,
         });
+        // The second hand on a screen starts a resize, and the size to
+        // scale from is the size it is NOW -- measured when the hand closes,
+        // not on the first frame it moves, or the first movement is lost.
+        if (panel) {
+          const other = this.pointers.find((o) => o !== p && this.grab.get(o.src)
+                                            && this.grab.get(o.src).panel === panel);
+          if (other) {
+            const mine = this.grab.get(p.src), theirs = this.grab.get(other.src);
+            const span = V3.len(V3.sub(p.sOrigin, other.sOrigin));
+            mine.span = theirs.span = span;
+            mine.w0 = theirs.w0 = panel.w;
+          }
+        }
       } else if (!squeezing && held) {
         this.grab.delete(p.src);
       } else if (squeezing && held) {
         const d = V3.sub(p.sOrigin, held.at);
         if (held.panel) {
           const q = held.panel;
+          // Both hands on the same screen resizes it, the way both hands on
+          // anything else does. One hand still moves it.
+          const other = this.pointers.find((o) => o !== p && this.grab.get(o.src)
+                                            && this.grab.get(o.src).panel === q);
+          if (other) {
+            const o = this.grab.get(other.src);
+            const span = V3.len(V3.sub(p.sOrigin, other.sOrigin));
+            if (!held.span) {
+              // Both hands were already holding it before this ran: take
+              // the baseline now rather than scaling by a ratio of one.
+              held.span = span; held.w0 = q.w;
+              o.span = span; o.w0 = q.w;
+            }
+            if (held.span > 0.02) {
+              q.w = clamp(held.w0 * (span / held.span), 0.25, 6.0);
+              q.geom();
+              q.dirty = true;
+            }
+            continue;
+          }
+          held.span = 0;
           q.pos = V3.add(held.panelAt, d);
           // It turns to keep facing you as it goes, because a screen you
           // have pushed to one side edge-on is a screen you have lost.
@@ -2824,8 +3261,12 @@ App.prototype.heard = function (text) {
   if (/^(show |open |go to )?(the )?(team|agents|room)$/.test(low)) { this.setMode("team"); return; }
   if (/^(show |open )?(the )?chat$/.test(low)) { this.openChat(); return; }
   if (/^(show |open )?(the )?menu$/.test(low)) { this.openMenu(); return; }
+  if (/^(show |open )?(the )?(keyboard|keys)$/.test(low)) { this.openKeys(); return; }
+  if (/^(show |open )?(the )?(machines|plan|knowledge|files)$/.test(low)) {
+    this.openView(low.replace(/^(show |open )?(the )?/, "")); return;
+  }
   if (/^close( everything| the screens)?$/.test(low)) {
-    this.panels = this.panels.filter((q) => q.wrist); return;
+    this.closeScreens((q) => q.wrist); return;
   }
   const name = low.replace(/^(select|choose|pick|show|open|talk to|message|attach to)\s+/, "");
   const found = this.scene.active().find((o) => {

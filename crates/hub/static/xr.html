@@ -45,8 +45,9 @@
 
 <div class="hint">
   <strong>nexmesh</strong> · the fleet as a room.
-  Drag to look, scroll to step back, click a teammate to open their terminal,
-  drag a screen to move it. <a href="/">the flat dashboard</a>
+  Drag to look, click a teammate to open their terminal and type into it,
+  drag a screen to move it, scroll over it to resize.
+  <a href="/">the flat dashboard</a>
 </div>
 
 <div class="bar">
@@ -64,6 +65,9 @@
     document.body.classList.add("bare");
   }
 </script>
+<!-- The same VT emulator the dashboard draws terminals with. The room
+     uses it headlessly: it keeps the screen, the panel draws it. -->
+<script src="/term.js"></script>
 <script src="/xr.js"></script>
 </body>
 </html>

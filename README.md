@@ -229,12 +229,18 @@ so a glance across the room is a status report:
 
 ![A teammate, up close](docs/images/xr-figure.png)
 
-**Click a teammate and their terminal opens**, above them, facing you, filling
-as they work. The chat is another screen in the room, and the menu — switch
-view, open a terminal, pause or start a seat, speak, show one team on its own
-— rides on your left wrist in a headset, because a menu you have to go and
-find is a menu nobody finds. A ray lands on a button exactly as it lands on a
-person, and screens can be taken hold of and moved wherever you want them.
+**Click a teammate and their terminal opens**, above them, facing you. It is an
+attach rather than a transcript: the real screen, with the agent's own cursor,
+drawn by the same VT emulator the dashboard uses. **There is a keyboard in the
+room**, so a path, a flag or a Ctrl-C can be typed at an agent without taking
+the headset off; a flat screen types into the focused terminal directly.
+
+The chat is another screen, and the menu — the team, the code map, the chat, a
+terminal, the keyboard, speech, one line per team, and the dashboard's own tabs
+for the machines, the plan, what the team knows and what is locked — is mounted
+on your left wrist in a headset, so it is reachable from anywhere in the scene.
+A ray lands on a button exactly as it lands on a person. Screens can be moved
+with one hand and resized with two, or with the wheel on a flat screen.
 
 | | |
 |---|---|
