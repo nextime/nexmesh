@@ -311,26 +311,30 @@ With neither, the key says so rather than doing nothing.
 In an attached terminal the same two things are reached through a mode,
 because every other key on that keyboard belongs to the agent.
 .B Ctrl-\e\e
-turns COMMAND MODE on and off. While it is on the bottom row changes colour,
-nothing reaches the agent, and single letters do the work:
-.B d
-detaches,
-.B v
+turns COMMAND MODE on and off. While it is on the bottom row changes
+colour and three or four keys become nexmesh's \(em everything else, text
+and Enter and the line-editing keys included, still goes to the agent, so
+the mode can be left on while you type.
+.B Ctrl-G
 records a sentence for the fleet to transcribe into the prompt,
-.B r
+.B Ctrl-O
 reads the agent's last REPLY aloud \(em everything it printed since you last
 pressed Enter \(em and again walks further back through the conversation, or
 stops it if it is talking,
-.B a
+.B Ctrl-T
 reads every new reply as it arrives,
-.B ?
-lists them, and
-.B q
-or Escape leaves.
+.B Ctrl-Y
+sends a file from this machine \(em the path is typed on the bar itself \(em
+.B Ctrl-P
+takes a photo with this machine's camera and sends that,
+and the mode key again turns it off. A file sent either way lands on the
+machine the AGENT is running on, in the workspace that seat works in, and
+the message about it is addressed to that agent.
 .PP
-Only those two keys are taken. Everything else belongs to the agent, which
-is the point: a CLI inside an attach uses Ctrl-A, Ctrl-R and Ctrl-W, and a
-viewer that quietly eats three control characters breaks somebody's editor.
+Nothing at all is taken while the mode is OFF, and only those few while it
+is on. That is the point: a CLI inside an attach uses Ctrl-A, Ctrl-R and
+Ctrl-W, and a viewer that quietly eats them breaks somebody's editor. The
+defaults avoid every key a prompt is driven with.
 .PP
 .B Ctrl-[
 is deliberately NOT the mode key: it IS Escape, and binding it would break
@@ -340,8 +344,13 @@ refused if configured. Both keys can be changed in
 .PP
 .RS
 .nf
-command_key = "ctrl-g"
+command_key = "ctrl-\e\e"
 detach_key  = "ctrl-]"
+dictate_key = "ctrl-g"
+read_key    = "ctrl-o"
+aloud_key   = "ctrl-t"
+send_key    = "ctrl-y"
+photo_key   = "ctrl-p"
 .fi
 .RE
 .PP

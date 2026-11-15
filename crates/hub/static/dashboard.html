@@ -841,6 +841,11 @@
               title="Say it instead of typing it: the words are typed into this terminal">🎤</button>
       <button class="tiny" id="termSay" hidden onclick="termSpeak()"
               title="Read this screen aloud (or whatever is selected)">🔊</button>
+      <button class="tiny" onclick="pickFiles()"
+              title="Put a file in THIS agent's workspace, on its machine">📎</button>
+      ${navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+        ? `<button class="tiny" onclick="openCamera()"
+              title="Photo or clip, into this agent's workspace">📷</button>` : ""}
       <button class="tiny" onclick="termKeys()" title="Send a key a phone has no room for">keys</button>
       <button class="tiny" onclick="closeTerm()" title="Detach (the agent keeps working)">detach</button>
     </div>
@@ -2778,14 +2783,32 @@ async function askFleet(capability, request, waitMs) {
 // Which is also why there is no "attachment" here: there is nothing to
 // attach a file to that an agent would ever open.
 
-/// Which team the file belongs to: the channel being read, or the session on
-/// screen.
+/// Which team the file belongs to: the agent whose terminal is open, the
+/// channel being read, or the session on screen.
 function uploadSession() {
+  const who = uploadAgent();
+  if (who && who.session) return who.session;
   if (chatOpen && chatChan && chatChan !== "*") return chatChan;
   const sid = currentSession();
   if (sid && sid !== "*") return sid;
   const first = (snap && snap.sessions || [])[0];
   return first ? first.id : "";
+}
+
+/// The agent a file should go TO, when there is an obvious one.
+///
+/// An open terminal is the obvious one: a file sent while looking at an
+/// agent belongs on the machine THAT agent runs on, in the workspace it is
+/// working in -- not on whichever machine happens to hold a copy. This
+/// browser may be a phone on another continent; the file still has to land
+/// where the agent can open it.
+function uploadAgent() {
+  if ($("term") && !$("term").hidden && termAgent) {
+    const a = ((snap && snap.detail && snap.detail.agents) || [])
+      .find((x) => x.agent_id === termAgent || x.attach_agent_id === termAgent);
+    if (a) return { name: a.name, session: a.session };
+  }
+  return null;
 }
 
 /// Read a File as base64, without the data-URI prefix mattering: the hub
@@ -2814,8 +2837,12 @@ async function uploadFile(file, say) {
   try {
     const body = { name: file.name, data_base64: await asBase64(file) };
     if (say) body.say = say;
+    // To the agent being watched, when one is: that decides the machine.
+    const who = uploadAgent();
+    if (who && who.name) body.to = who.name;
     const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/upload`, body);
-    note(`${file.name} is in the workspace at ${r.path} on ${r.node}. The team has been told.`);
+    note(`${file.name} is at ${r.path} on ${r.node}`
+       + (body.to ? `, and ${body.to} has been told.` : ". The team has been told."));
   } catch (e) {
     note(e.message || "could not upload that");
   }

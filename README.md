@@ -163,9 +163,12 @@ nexmesh upload payments ./spec.pdf --say 'the API we have to match'
 ```
 
 In the browser and the installed app it is the paperclip beside the chat —
-and the camera button beside it, which takes a photo or a clip straight into
-the workspace. A model that cannot read a PDF asks the capability bridge to
-OCR it, which is the same `ask_capability` it uses for anything else.
+and beside an open terminal, where it lands on **that agent's** machine, in
+the workspace that seat works in. The camera button next to it does the same
+with a photo or a clip, from the phone in your hand or the webcam on the
+machine you are typing at; `nexmesh camera` is the same thing from a
+terminal. A model that cannot read a PDF asks the capability bridge to OCR
+it, which is the same `ask_capability` it uses for anything else.
 
 ### One repository, several agents, no collisions
 

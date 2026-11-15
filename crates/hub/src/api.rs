@@ -678,6 +678,12 @@ pub struct Upload {
     /// Which machine's copy to write to. Any that holds it, by default.
     #[serde(default)]
     pub node: Option<String>,
+    /// The agent this is FOR. When given, the file lands on the machine that
+    /// agent runs on, in the workspace that seat works in -- which is what
+    /// "send this to the thing I am attached to" means, from a console on
+    /// one machine or a browser on another.
+    #[serde(default)]
+    pub to: Option<String>,
     /// Directory inside the workspace. `uploads` unless said otherwise.
     #[serde(default)]
     pub dir: Option<String>,
@@ -722,15 +728,57 @@ pub async fn upload(
         return Err(bad("the directory must be inside the workspace"));
     }
 
+    // An agent named means its machine and its workspace: a file sent to
+    // something you are attached to belongs where that something can read
+    // it, not on whichever machine answered first.
+    let for_agent: Option<(String, String, String)> = match req.to.as_deref() {
+        None => None,
+        Some(who) => {
+            let db = st.db.lock().unwrap();
+            let sid = session_ref_to_id(&db, &session_ref);
+            let found = db
+                .query_row(
+                    "SELECT COALESCE(a.node_id,''), COALESCE(s.workspace_id, ''),
+                            COALESCE(s.display_name, s.role, s.id)
+                       FROM slots s
+                       JOIN agents a ON a.id = (
+                            SELECT id FROM agents WHERE slot_id = s.id
+                             ORDER BY (exited_at_ms IS NULL) DESC, started_at_ms DESC LIMIT 1)
+                      WHERE s.session_id = ?1
+                        AND (s.id = ?2 OR LOWER(COALESCE(s.display_name,'')) = LOWER(?2)
+                             OR LOWER(COALESCE(s.role,'')) = LOWER(?2))",
+                    params![sid, who],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(bad)?;
+            if found.is_none() {
+                return Err(bad(format!("no agent called '{who}' in that session")));
+            }
+            found
+        }
+    };
+
     let (session_id, workspace_id, ws_name) = {
         let db = st.db.lock().unwrap();
         let sid = session_ref_to_id(&db, &session_ref);
+        // The agent's own workspace, when one was named and it has one.
+        let want = match &for_agent {
+            Some((_, ws, _)) if !ws.is_empty() => Some(ws.clone()),
+            _ => req.workspace.clone(),
+        };
         let found: Option<(String, String)> = db
             .query_row(
                 "SELECT id, name FROM workspaces
                   WHERE session_id = ?1 AND (?2 IS NULL OR name = ?2 OR id = ?2)
                   ORDER BY (?2 IS NOT NULL) DESC LIMIT 1",
-                params![sid, req.workspace],
+                params![sid, want],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -746,17 +794,29 @@ pub async fn upload(
     // A machine that holds this workspace AND is connected. Asked for by
     // name when the caller said which; any that answers otherwise.
     let mounts = crate::sync::mounts(&st, &workspace_id);
+    // The agent's machine wins over anything else, because that is the
+    // machine that has to be able to open the file.
+    let want_node = for_agent
+        .as_ref()
+        .map(|(node, _, _)| node.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| req.node.clone());
     let pick = mounts
         .iter()
         .find(|(node_id, name, _)| {
             st.node_is_connected(node_id)
-                && req.node.as_deref().is_none_or(|want| want == name || want == node_id)
+                && want_node.as_deref().is_none_or(|want| want == name || want == node_id)
         })
         .cloned();
     let Some((node_id, node_name, root)) = pick else {
-        return Err(bad(format!(
-            "no connected machine holds workspace '{ws_name}' right now"
-        )));
+        return Err(bad(match (&for_agent, &want_node) {
+            (Some((_, _, who)), _) => format!(
+                "{who} is on a machine that is not connected, or one that does not hold \
+                 workspace '{ws_name}'"
+            ),
+            (_, Some(n)) => format!("{n} is not connected, or does not hold '{ws_name}'"),
+            _ => format!("no connected machine holds workspace '{ws_name}' right now"),
+        }));
     };
 
     let rel = if dir.is_empty() { safe.clone() } else { format!("{dir}/{safe}") };

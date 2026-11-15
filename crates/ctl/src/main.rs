@@ -10,6 +10,7 @@
 //! `nexmesh` -- the operator CLI. Runs on any machine and talks to the hub over
 //! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
+mod camera;
 mod install;
 mod replies;
 mod runcmd;
@@ -199,12 +200,45 @@ means, with `nexmesh send` to say where it is.")]
         /// Which machine's copy to write to. Any that holds it, by default.
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
+        /// The agent it is for. The file lands on THAT agent's machine, in
+        /// the workspace it is working in, and the message is addressed to
+        /// it -- which is what you want when you are attached to something
+        /// on another machine.
+        #[arg(long, value_name = "AGENT")]
+        to: Option<String>,
         /// Which workspace, when the session has more than one.
         #[arg(long, value_name = "NAME")]
         workspace: Option<String>,
         /// Directory inside the workspace. `uploads` by default.
         #[arg(long, value_name = "DIR")]
         dir: Option<String>,
+    },
+    /// Take a photo or a clip with this machine's camera, for an agent to look at.
+    #[command(after_help = "\
+EXAMPLES
+  nexmesh camera payments                         # a photo, into the workspace
+  nexmesh camera payments --to Max --say 'this screen'
+  nexmesh camera payments --seconds 8             # a clip instead
+
+\"Look at this\" is most of what a camera is for on a fleet: a screen, a
+whiteboard, a machine with a light on it. The picture is taken HERE, and
+lands on the machine the agent is running on, in its workspace.
+
+Needs ffmpeg and a /dev/video* on this machine. The dashboard and the
+installed app have the same thing as a button.")]
+    Camera {
+        /// Session, by name or id.
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// Record this many seconds instead of taking a still.
+        #[arg(long, value_name = "N")]
+        seconds: Option<u32>,
+        /// The agent it is for: it lands on that agent's machine.
+        #[arg(long, value_name = "AGENT")]
+        to: Option<String>,
+        /// A line for the team's chat.
+        #[arg(long, value_name = "TEXT")]
+        say: Option<String>,
     },
     /// Say which parts of the workspace a seat is responsible for.
     #[command(after_help = "\
@@ -869,6 +903,58 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
+/// `~/shot.png` is a path people type, and only a shell expands it.
+fn shellexpand(p: &str) -> String {
+    match (p.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => p.to_string(),
+    }
+}
+
+/// Put a file from this machine into the session's workspace, on the machine
+/// the agent is running on, and say so in the chat.
+///
+/// The same endpoint the dashboard's paperclip uses. Which machine it lands
+/// on is decided by WHO it is for: a file sent to something you are attached
+/// to belongs where that something can open it.
+async fn send_file(
+    base: &str,
+    c: &reqwest::Client,
+    session: &str,
+    path: &std::path::Path,
+    to: Option<&str>,
+    say: Option<&str>,
+) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        anyhow::bail!(
+            "{} is {:.1}MB, over the 64MB limit for one upload",
+            path.display(),
+            bytes.len() as f64 / 1_048_576.0
+        );
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "upload".into());
+    let mut body = json!({ "name": name, "data_base64": b64(&bytes) });
+    if let Some(t) = to {
+        body["to"] = json!(t);
+    }
+    if let Some(s) = say {
+        body["say"] = json!(s);
+    }
+    let v = post(c, format!("{base}/v1/sessions/{session}/upload"), body).await?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("{e}");
+    }
+    Ok(format!(
+        "{name} is at {} on {}",
+        v["path"].as_str().unwrap_or("?"),
+        v["node"].as_str().unwrap_or("?")
+    ))
+}
+
 /// "2m", "3h", "4d" -- how long ago something was, for a listing.
 fn ago(now: i64, then: i64) -> String {
     let d = ((now - then) / 1000).max(0);
@@ -1134,6 +1220,10 @@ struct StatusBar {
     command: bool,
     /// What those letters are, for the row to say.
     menu: Vec<(String, String)>,
+    /// A question being typed on the row itself: (what is being asked, what
+    /// has been typed). An attach has no other line to ask on, and the
+    /// agent must not be shown the question.
+    ask: Option<(String, String)>,
     cols: u16,
     rows: u16,
 }
@@ -1153,6 +1243,7 @@ impl StatusBar {
             marks: Vec::new(),
             command: false,
             menu: Vec::new(),
+            ask: None,
             cols,
             rows,
         })
@@ -1184,6 +1275,15 @@ impl StatusBar {
     fn line(&self) -> String {
         let w = self.cols as usize;
         let sep = "  \u{00b7}  ";
+        // A question owns the row while it is up.
+        if let Some((what, typed)) = &self.ask {
+            let line = format!(" {what}: {typed}\u{2588}{sep}Enter sends \u{b7} Esc cancels");
+            if line.chars().count() <= w {
+                return line;
+            }
+            let bare = format!(" {what}: {typed}\u{2588}");
+            return bare.chars().skip(bare.chars().count().saturating_sub(w)).collect();
+        }
         // In command mode the row IS the menu: what the letters do, and how
         // to get out. Nothing else on it matters while it is up.
         if self.command {
@@ -1201,16 +1301,16 @@ impl StatusBar {
                 format!("{sep}{}", self.marks.join(sep))
             };
             for body in [full.join(sep), short.join(" ")] {
-                let line = format!(" COMMAND{sep}{body}{marks}{sep}{id}");
+                let line = format!(" COMMANDS ON{sep}{body}{marks}{sep}{id}");
                 if line.chars().count() <= w {
                     return line;
                 }
-                let line = format!(" COMMAND{sep}{body}");
+                let line = format!(" COMMANDS{sep}{body}");
                 if line.chars().count() <= w {
                     return line;
                 }
             }
-            return format!(" COMMAND{sep}{}", short.join(" ")).chars().take(w).collect();
+            return format!(" COMMANDS{sep}{}", short.join(" ")).chars().take(w).collect();
         }
         let id = if self.session.is_empty() {
             self.who.clone()
@@ -1303,7 +1403,14 @@ impl StatusBar {
         // coloured while this row does. The difference has to be visible
         // from the corner of an eye, because the whole point of a mode is
         // knowing which one you are in without trying a key.
-        let colour = if self.command { "\x1b[45m\x1b[97m\x1b[1m" } else { "\x1b[40m\x1b[37m" };
+        let colour = if self.ask.is_some() {
+            // A question is a third state and looks like one.
+            "\x1b[44m\x1b[97m\x1b[1m"
+        } else if self.command {
+            "\x1b[45m\x1b[97m\x1b[1m"
+        } else {
+            "\x1b[40m\x1b[37m"
+        };
         format!("\x1b7\x1b[{};1H{}{}\x1b[0m\x1b8", self.rows, colour, line).into_bytes()
     }
 
@@ -1445,15 +1552,18 @@ async fn attach(
         let a = voice::detect();
         b.keys.push((voice::key_name(vkeys.command), "commands".into()));
         b.keys.push((voice::key_name(vkeys.detach), "detach".into()));
-        b.menu.push(("d".into(), "detach".into()));
         if a.can_hear() {
-            b.menu.push(("v".into(), "say it".into()));
+            b.menu.push((voice::key_name(vkeys.dictate), "say it".into()));
         }
         if a.can_speak() {
-            b.menu.push(("r".into(), "read".into()));
-            b.menu.push(("a".into(), "aloud".into()));
+            b.menu.push((voice::key_name(vkeys.read), "read".into()));
+            b.menu.push((voice::key_name(vkeys.aloud), "aloud".into()));
         }
-        b.menu.push((voice::key_name(vkeys.command), "back".into()));
+        b.menu.push((voice::key_name(vkeys.send), "send a file".into()));
+        if camera::detect().ready() {
+            b.menu.push((voice::key_name(vkeys.photo), "photo".into()));
+        }
+        b.menu.push((voice::key_name(vkeys.command), "off".into()));
         b.direct = wire.direct;
     }
 
@@ -1575,9 +1685,12 @@ async fn attach(
     let playing: voice::Playing = Default::default();
     // Reading every new reply out as it settles, rather than on request.
     let mut aloud = false;
-    // Command mode: one key in, one key out, and nothing reaches the agent
+    // Command mode: one key in, one key out, and three keys that are ours
     // while it is on.
     let mut command = false;
+    // A question being typed on the bar -- the path of a file to send. While
+    // it is up, keystrokes go into it rather than to the agent.
+    let mut asking: Option<String> = None;
     // Whether the last thing pressed was the read key, so pressing it again
     // means "the one before that" rather than "that one again".
     let mut spoke_once = false;
@@ -1624,6 +1737,18 @@ async fn attach(
             // prompt. Never submitted: Enter stays the operator's.
             Some(words) = said_rx.recv() => {
                 match words {
+                    // A sent file reports itself; it is not dictation, and
+                    // must not be typed into the agent's prompt.
+                    Ok(text) if text.starts_with('\u{0001}') => {
+                        if let Some(b) = &mut bar {
+                            b.set_mark("camera", false);
+                        }
+                        let mut out = tokio::io::stdout();
+                        let _ = out
+                            .write_all(format!("\r\n[nexmesh] {}\r\n", &text[1..]).as_bytes())
+                            .await;
+                        let _ = out.flush().await;
+                    }
                     Ok(text) if !text.trim().is_empty() => {
                         if wire.tx.send(wire::Out::Data(text.into_bytes())).await.is_err() {
                             break "connection lost".to_string();
@@ -1652,6 +1777,50 @@ async fn attach(
                 // a control character each.
                 let mut forward: Vec<u8> = Vec::with_capacity(n);
                 let mut leaving: Option<String> = None;
+                // A question on the bar owns the keyboard until it is
+                // answered or abandoned. Nothing typed into it reaches the
+                // agent -- a path typed at somebody's prompt would run.
+                if let Some(typed) = asking.as_mut() {
+                    let mut done: Option<Option<String>> = None;
+                    for &byte in &buf[..n] {
+                        match byte {
+                            b'\r' | b'\n' => {
+                                done = Some(Some(typed.clone()));
+                                break;
+                            }
+                            0x1b | 0x03 => {
+                                done = Some(None);
+                                break;
+                            }
+                            0x7f | 0x08 => {
+                                typed.pop();
+                            }
+                            b if b >= 0x20 => typed.push(b as char),
+                            _ => {}
+                        }
+                    }
+                    if let Some(b) = &mut bar {
+                        b.ask = asking.clone().map(|t| ("file to send".to_string(), t));
+                    }
+                    if let Some(answer) = done {
+                        asking = None;
+                        if let Some(b) = &mut bar {
+                            b.ask = None;
+                        }
+                        if let Some(path) = answer.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+                            let path = std::path::PathBuf::from(shellexpand(&path));
+                            let (bs, cl, tx, sess, who) = (
+                                base.to_string(), c.clone(), said_tx.clone(),
+                                session.to_string(), name.to_string(),
+                            );
+                            tokio::spawn(async move {
+                                let r = send_file(&bs, &cl, &sess, &path, Some(&who), None).await;
+                                let _ = tx.send(r.map(|said| format!("\u{0001}{said}"))).await;
+                            });
+                        }
+                    }
+                    continue;
+                }
                 for &byte in &buf[..n] {
                     if byte == vkeys.detach {
                         leaving = Some("detached".to_string());
@@ -1664,34 +1833,16 @@ async fn attach(
                         }
                         continue;
                     }
-                    if !command {
+                    // In command mode THREE keys are nexmesh's and everything
+                    // else -- text, Enter, arrows, every other control
+                    // character -- still goes to the agent. So the mode can
+                    // be left on while you carry on typing at the prompt.
+                    let Some(act) = (if command { vkeys.act(byte) } else { None }) else {
                         forward.push(byte);
                         continue;
-                    }
-                    // In command mode nothing reaches the agent: a letter
-                    // that means nothing here is a letter the operator meant
-                    // for a command, not for its prompt.
-                    match voice::command_for(byte) {
-                        Some(voice::Act::Leave) => {
-                            command = false;
-                            if let Some(b) = &mut bar {
-                                b.command = false;
-                            }
-                        }
-                        Some(voice::Act::Detach) => {
-                            leaving = Some("detached".to_string());
-                            break;
-                        }
-                        Some(voice::Act::Help) => {
-                            let mut out = tokio::io::stdout();
-                            let _ = out
-                                .write_all(
-                                    b"\r\n[nexmesh] d detach \xc2\xb7 v say it \xc2\xb7                                       r read a reply (again: further back) \xc2\xb7                                       a read new ones aloud \xc2\xb7 q leave command mode\r\n",
-                                )
-                                .await;
-                            let _ = out.flush().await;
-                        }
-                        Some(voice::Act::Dictate) => {
+                    };
+                    match act {
+                        voice::Act::Dictate => {
                             rec = match rec.take() {
                                 Some((child, path)) => {
                                     match voice::stop(child, &path) {
@@ -1735,7 +1886,7 @@ async fn attach(
                                 },
                             };
                         }
-                        Some(voice::Act::Read) => {
+                        voice::Act::Read => {
                             // Talking already? The same key is a stop.
                             if playing.lock().map(|p| p.is_some()).unwrap_or(false) {
                                 voice::hush(&playing);
@@ -1781,7 +1932,54 @@ async fn attach(
                                 }
                             }
                         }
-                        Some(voice::Act::Aloud) => {
+                        // A file from THIS machine to the one the agent is
+                        // on, in the workspace it is working in. The path is
+                        // typed on the bar: an attach has no other line to
+                        // ask on, and the agent must not see the question.
+                        voice::Act::Send => {
+                            if asking.is_none() {
+                                asking = Some(String::new());
+                                if let Some(b) = &mut bar {
+                                    b.ask = Some(("file to send".into(), String::new()));
+                                }
+                            }
+                        }
+                        // The camera on this machine, straight into the
+                        // agent's workspace.
+                        voice::Act::Photo => {
+                            let cam = camera::detect();
+                            if !cam.ready() {
+                                let mut out = tokio::io::stdout();
+                                let _ = out
+                                    .write_all(format!("\r\n[nexmesh] {}\r\n", cam.why_not()).as_bytes())
+                                    .await;
+                                let _ = out.flush().await;
+                            } else {
+                                if let Some(b) = &mut bar {
+                                    b.set_mark("camera", true);
+                                }
+                                let (bs, cl, tx, sess, who) = (
+                                    base.to_string(), c.clone(), said_tx.clone(),
+                                    session.to_string(), name.to_string(),
+                                );
+                                let dir = scratch.clone();
+                                tokio::spawn(async move {
+                                    let shot = camera::photo(&cam, &dir).await;
+                                    let r = match shot {
+                                        Ok(path) => {
+                                            let out = send_file(&bs, &cl, &sess, &path, Some(&who),
+                                                Some("A photo for you to look at, taken just now."))
+                                                .await;
+                                            let _ = std::fs::remove_file(&path);
+                                            out
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    let _ = tx.send(r.map(|said| format!("\u{0001}{said}"))).await;
+                                });
+                            }
+                        }
+                        voice::Act::Aloud => {
                             aloud = !aloud;
                             if !aloud {
                                 voice::hush(&playing);
@@ -1790,7 +1988,6 @@ async fn attach(
                                 b.set_mark("aloud", aloud);
                             }
                         }
-                        None => {}
                     }
                 }
                 if let Some(why) = leaving {
@@ -2052,7 +2249,40 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Upload { session, file, say, node, workspace, dir } => {
+        Cmd::Camera { session, seconds, to, say } => {
+            let cam = camera::detect();
+            if !cam.ready() {
+                anyhow::bail!("{}", cam.why_not());
+            }
+            let dir = std::env::temp_dir().join("nexmesh-camera");
+            let (path, what) = match seconds {
+                Some(n) => (camera::clip(&cam, &dir, n).await?, format!("{n}s clip")),
+                None => (camera::photo(&cam, &dir).await?, "photo".to_string()),
+            };
+            let bytes = std::fs::read(&path)?;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "capture".into());
+            println!("{what}: {} ({} bytes)", path.display(), bytes.len());
+            let mut body = json!({ "name": name, "data_base64": b64(&bytes) });
+            body["say"] = json!(say.unwrap_or_else(|| {
+                "A picture for the team to look at, taken just now.".to_string()
+            }));
+            if let Some(t) = to {
+                body["to"] = json!(t);
+            }
+            let v = post(&c, format!("{base}/v1/sessions/{session}/upload"), body).await?;
+            bail_on_error(&v)?;
+            let _ = std::fs::remove_file(&path);
+            println!(
+                "  it is at {} on {}",
+                v["path"].as_str().unwrap_or("?"),
+                v["node"].as_str().unwrap_or("?")
+            );
+        }
+
+        Cmd::Upload { session, file, say, node, workspace, dir, to } => {
             let bytes = std::fs::read(&file)
                 .with_context(|| format!("reading {file}"))?;
             // 64MB, the same limit the node enforces: said here, before the
@@ -2073,6 +2303,7 @@ async fn main() -> Result<()> {
             if let Some(n) = node { body["node"] = json!(n); }
             if let Some(w) = workspace { body["workspace"] = json!(w); }
             if let Some(d) = dir { body["dir"] = json!(d); }
+            if let Some(t) = to { body["to"] = json!(t); }
             let v = post(&c, format!("{base}/v1/sessions/{session}/upload"), body).await?;
             bail_on_error(&v)?;
             println!(
@@ -2673,11 +2904,10 @@ mod bar_tests {
             ("Ctrl-]".into(), "detach".into()),
         ];
         b.menu = vec![
-            ("d".into(), "detach".into()),
-            ("v".into(), "say it".into()),
-            ("r".into(), "read".into()),
-            ("a".into(), "aloud".into()),
-            ("Ctrl-\\".into(), "back".into()),
+            ("Ctrl-G".into(), "say it".into()),
+            ("Ctrl-O".into(), "read".into()),
+            ("Ctrl-T".into(), "aloud".into()),
+            ("Ctrl-\\".into(), "off".into()),
         ];
         b
     }
@@ -2752,10 +2982,10 @@ mod bar_shapes {
                 ("Ctrl-]".into(), "detach".into()),
             ];
             b.menu = vec![
-                ("d".into(), "detach".into()),
-                ("v".into(), "say it".into()),
-                ("r".into(), "read".into()),
-                ("a".into(), "aloud".into()),
+                ("Ctrl-G".into(), "say it".into()),
+                ("Ctrl-O".into(), "read".into()),
+                ("Ctrl-T".into(), "aloud".into()),
+                ("Ctrl-\\".into(), "off".into()),
             ];
             println!("{cols:>4} |{}|", b.line());
             b.command = true;

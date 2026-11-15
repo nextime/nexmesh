@@ -500,6 +500,89 @@ fn unb64(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Split text into pieces a fixed-context model will accept, at the places a
+/// reader would pause.
+///
+/// Sentence ends first, then clauses, then whitespace, and a word longer than
+/// the whole budget is cut rather than dropped. Nothing is thrown away and
+/// nothing is reordered: this is the same text, read in instalments.
+pub fn chunk_text(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(40);
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return if text.is_empty() { Vec::new() } else { vec![text.to_string()] };
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.chars().count() <= max {
+            out.push(rest.trim().to_string());
+            break;
+        }
+        // The byte index of the max'th character, so a multi-byte sentence
+        // is never cut through the middle of a letter.
+        let limit = rest
+            .char_indices()
+            .nth(max)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        let window = &rest[..limit];
+        let at = window
+            .rfind(['.', '!', '?', '\n'])
+            .map(|i| i + 1)
+            .or_else(|| window.rfind([';', ':', ',']).map(|i| i + 1))
+            .or_else(|| window.rfind(char::is_whitespace))
+            .unwrap_or(limit);
+        let (head, tail) = rest.split_at(at.max(1));
+        let head = head.trim();
+        if !head.is_empty() {
+            out.push(head.to_string());
+        }
+        rest = tail.trim_start();
+    }
+    out
+}
+
+/// Join several wav answers into one.
+///
+/// Each piece is a complete RIFF file; the result keeps the first one's
+/// header and appends everybody's samples, with the two length fields
+/// corrected. Anything that is not a wav is returned as the first piece
+/// alone rather than spliced into nonsense.
+fn join_wav(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if parts.len() == 1 {
+        return Some(parts[0].clone());
+    }
+    let data_of = |b: &[u8]| -> Option<(usize, usize)> {
+        if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+            return None;
+        }
+        let mut i = 12;
+        while i + 8 <= b.len() {
+            let id = &b[i..i + 4];
+            let len = u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
+            if id == b"data" {
+                let start = i + 8;
+                return Some((start, len.min(b.len().saturating_sub(start))));
+            }
+            i += 8 + len + (len % 2);
+        }
+        None
+    };
+    let (first_start, first_len) = data_of(parts.first()?)?;
+    let mut out = parts[0][..first_start + first_len].to_vec();
+    for p in &parts[1..] {
+        let (s, l) = data_of(p)?;
+        out.extend_from_slice(&p[s..s + l]);
+    }
+    // RIFF size (everything after the first 8 bytes) and the data chunk size.
+    let riff = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&riff.to_le_bytes());
+    let data_len = (out.len() - first_start) as u32;
+    out[first_start - 4..first_start].copy_from_slice(&data_len.to_le_bytes());
+    Some(out)
+}
+
 /// Turn the service's answer into something an agent can read.
 fn render_answer(c: &Capability, v: &Value) -> String {
     let text = manifest::extract_first(v, &c.text_at);
@@ -915,6 +998,58 @@ async fn handle(
         }
     }
     let body = build_request(c, request, model, max_inline)?;
+
+    // Too long for the model behind it? Say it in instalments and join the
+    // sound back together. A teammate asking for a paragraph to be read
+    // should not have to know this model's context is 510 phonemes.
+    if let (Some(field), Some(max)) = (&c.chunk_field, c.chunk_chars) {
+        let whole = body.get(field).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let pieces = chunk_text(&whole, max);
+        if pieces.len() > 1 {
+            tracing::info!(label = %c.label, pieces = pieces.len(),
+                           "splitting a long request for a fixed-context model");
+            let mut audio: Vec<Vec<u8>> = Vec::new();
+            let mut text: Vec<String> = Vec::new();
+            for piece in pieces {
+                let mut part = body.clone();
+                part[field] = json!(piece);
+                let answer = match c.encoding.as_str() {
+                    "multipart" => svc.post_multipart(c, &part).await?,
+                    _ => svc.post_as(&c.endpoint, &part, c.binary).await?,
+                };
+                if c.binary {
+                    let found = answer
+                        .get("audio_base64")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            manifest::extract_first(&answer, &c.audio_at)
+                                .into_iter()
+                                .find(|s| s.len() > 64)
+                        });
+                    match found {
+                        Some(b64) => audio.push(unb64(&b64)?),
+                        None => anyhow::bail!(
+                            "'{}' answered one piece with no sound in it",
+                            c.label
+                        ),
+                    }
+                } else {
+                    text.push(render_answer(c, &answer));
+                }
+            }
+            if c.binary {
+                let joined = join_wav(&audio)
+                    .context("the pieces came back in a format that cannot be joined")?;
+                return Ok(serde_json::to_string(&json!({
+                    "audio_base64": b64(&joined), "content_type": "audio/wav"
+                }))
+                .unwrap_or_default());
+            }
+            return Ok(text.join("\n"));
+        }
+    }
+
     let answer = match (c.method.to_uppercase().as_str(), c.encoding.as_str()) {
         ("GET", _) => svc.get(&c.endpoint).await?,
         (_, "multipart") => svc.post_multipart(c, &body).await?,
@@ -1052,6 +1187,63 @@ file_at = ["url"]
         assert!(t.contains("needs image \u{b7} also takes lang"), "{t}");
         assert!(t.contains("needs prompt \u{b7} also takes width"), "{t}");
         assert!(t.contains("timeout_seconds"), "slow work needs saying: {t}");
+    }
+
+    #[test]
+    fn long_text_is_split_where_a_reader_would_pause() {
+        let text = "First sentence here. Second one, with a clause; and a third part. \
+                    And a final sentence to finish it off.";
+        let pieces = chunk_text(text, 45);
+        assert!(pieces.len() > 1, "{pieces:?}");
+        for p in &pieces {
+            assert!(p.chars().count() <= 45, "{p}");
+        }
+        // Nothing is lost and nothing is reordered.
+        let back: String = pieces.join(" ");
+        for word in ["First", "clause;", "third", "finish"] {
+            assert!(back.contains(word), "{word} missing from {back}");
+        }
+        assert!(pieces[0].ends_with('.'), "it breaks at a sentence: {:?}", pieces[0]);
+
+        // Short enough already: one piece, unchanged.
+        assert_eq!(chunk_text("just this", 100), vec!["just this".to_string()]);
+        assert!(chunk_text("   ", 100).is_empty());
+        // A word longer than the whole budget is cut, not dropped.
+        let long = "x".repeat(300);
+        let pieces = chunk_text(&long, 50);
+        assert!(pieces.len() >= 6);
+        assert_eq!(pieces.concat().len(), 300);
+    }
+
+    #[test]
+    fn several_wavs_become_one() {
+        // A minimal RIFF: 44-byte header, then samples.
+        let wav = |samples: &[u8]| -> Vec<u8> {
+            let mut v = b"RIFF".to_vec();
+            v.extend_from_slice(&((36 + samples.len()) as u32).to_le_bytes());
+            v.extend_from_slice(b"WAVEfmt ");
+            v.extend_from_slice(&16u32.to_le_bytes());
+            v.extend_from_slice(&[1, 0, 1, 0]); // pcm, mono
+            v.extend_from_slice(&24000u32.to_le_bytes());
+            v.extend_from_slice(&48000u32.to_le_bytes());
+            v.extend_from_slice(&[2, 0, 16, 0]);
+            v.extend_from_slice(b"data");
+            v.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+            v.extend_from_slice(samples);
+            v
+        };
+        let a = wav(&[1, 2, 3, 4]);
+        let b = wav(&[5, 6, 7, 8]);
+        let joined = join_wav(&[a.clone(), b]).unwrap();
+        assert_eq!(&joined[..4], b"RIFF");
+        // Both halves of the sound, and the two length fields corrected.
+        assert_eq!(&joined[44..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(u32::from_le_bytes(joined[4..8].try_into().unwrap()) as usize, joined.len() - 8);
+        assert_eq!(u32::from_le_bytes(joined[40..44].try_into().unwrap()), 8);
+        // One piece is itself.
+        assert_eq!(join_wav(&[a.clone()]).unwrap(), a);
+        // Something that is not a wav is refused rather than spliced.
+        assert!(join_wav(&[a, b"not a wav at all".to_vec()]).is_none());
     }
 
     #[test]

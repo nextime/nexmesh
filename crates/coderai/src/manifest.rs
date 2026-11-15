@@ -117,6 +117,15 @@ pub struct Capability {
     /// no amount of guessing would have found.
     #[serde(default)]
     pub audio_at: Vec<String>,
+    /// Which field to SPLIT when it is too long for the model behind it,
+    /// and how long is too long. Speech models have a fixed context -- this
+    /// install's answers `index 510 is out of bounds for axis 0 with size
+    /// 510` to a paragraph -- and a teammate asking for a paragraph to be
+    /// read out should not have to know that.
+    #[serde(default)]
+    pub chunk_field: Option<String>,
+    #[serde(default)]
+    pub chunk_chars: Option<usize>,
 }
 
 fn json_encoding() -> String {

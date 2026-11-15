@@ -454,9 +454,33 @@ command_key = "ctrl-g"
 detach_key  = "ctrl-]"
 ```
 
-In the browser terminal the same two are buttons, and holding (or
-right-clicking) a line of the terminal reads that line, or whatever is
-selected.
+Command mode also carries the two things that move a FILE:
+
+| key | |
+|-----|---|
+| `Ctrl-Y` | send a file from this machine — the path is typed on the bar itself |
+| `Ctrl-P` | take a photo with this machine's camera and send that |
+
+Both land on **the machine the agent is running on**, in the workspace that
+seat is working in, and the message about it is addressed to that agent. You
+may be attached from a laptop on another continent; the file still has to
+arrive where the agent can open it.
+
+The same two are buttons on the browser terminal, where they do exactly the
+same thing: the paperclip and the camera beside `keys` upload to the agent
+whose terminal is open, not to whichever machine happens to hold a copy of
+the workspace. And holding (or right-clicking) a line of the terminal reads
+that line aloud, or whatever is selected.
+
+From a script, or when you know the name:
+
+```bash
+nexmesh upload payments ./spec.pdf --to Max      # onto Max's machine
+nexmesh camera payments --to Max --seconds 8     # a clip from this webcam
+```
+
+`nexmesh camera` needs `ffmpeg` and a `/dev/video*` here; without them it
+says so rather than offering a key that does nothing.
 
 Anything being read aloud can be stopped: `V` again in the console, `Ctrl-_`
 again in an attached terminal, and the loudspeaker button in the browser

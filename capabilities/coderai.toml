@@ -101,6 +101,13 @@ binary = true
 # Where the sound is when it comes back inside JSON: this install answers
 # {"audio": "<base64>"}, which is not in anybody's documentation.
 audio_at = ["audio", "audio_base64", "data.audio", "data.audio_base64", "audio_content"]
+# Kokoro's context is 510 phonemes, and it answers a paragraph with
+# "index 510 is out of bounds for axis 0 with size 510". So a long line is
+# said in instalments, split where a reader would pause, and the sound is
+# joined back together. 700 characters is comfortably inside it for both
+# languages this fleet is spoken to in.
+chunk_field = "input"
+chunk_chars = 700
 # A voice and a model are required, and "say this out loud" is a request
 # nobody wants to decorate. Kokoro is small, fast and intelligible; the
 # asker can still name any model or voice the install has.

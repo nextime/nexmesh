@@ -31,13 +31,12 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// The two keys an attach keeps for itself.
+/// The keys an attach may intercept, and when.
 ///
-/// Everything else goes to the agent, which is the point: a CLI inside an
-/// attach uses Ctrl-A, Ctrl-R, Ctrl-W and most of the rest, and a viewer
-/// that quietly eats three of them is a viewer that breaks somebody's
-/// editor. So there is a COMMAND MODE -- one key in, one key out -- and
-/// inside it plain letters do the work.
+/// Nothing is taken while command mode is OFF: every control character goes
+/// to the agent, so a CLI that wants Ctrl-A, Ctrl-R or Ctrl-W gets them.
+/// Turning the mode ON makes three of them nexmesh's -- and only three, so
+/// you can leave it on and carry on typing into the CLI underneath.
 ///
 /// `Ctrl-[` would have been the obvious partner for `Ctrl-]`, and is the one
 /// key that absolutely cannot be used: it IS Escape. Taking it would break
@@ -46,27 +45,75 @@ use std::process::{Child, Command, Stdio};
 /// shell would otherwise turn into SIGQUIT -- which an attach does not pass
 /// on anyway.
 ///
-/// Both are configurable, from `~/.nexmesh/console.toml`:
+/// The defaults avoid the line-editing keys on purpose: Ctrl-A, Ctrl-E,
+/// Ctrl-K, Ctrl-U, Ctrl-W and Ctrl-R are what a prompt is driven with, and a
+/// mode you cannot type in is a mode you turn off. All of them are
+/// configurable, from `~/.nexmesh/console.toml`:
 ///
 /// ```toml
 /// command_key = "ctrl-\\"   # into and out of command mode
 /// detach_key  = "ctrl-]"    # always, in either mode
+/// dictate_key = "ctrl-g"    # in command mode: say it instead of typing it
+/// read_key    = "ctrl-o"    # in command mode: read a reply back
+/// aloud_key   = "ctrl-t"    # in command mode: read every new one
+/// send_key    = "ctrl-y"    # in command mode: send a file from here
+/// photo_key   = "ctrl-p"    # in command mode: a photo from this camera
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keys {
     pub command: u8,
     pub detach: u8,
+    pub dictate: u8,
+    pub read: u8,
+    pub aloud: u8,
+    /// Send a file from HERE to the machine the agent is on.
+    pub send: u8,
+    /// Take a photo with this machine's camera and send that.
+    pub photo: u8,
 }
 
 impl Default for Keys {
     fn default() -> Self {
-        Keys { command: 0x1c, detach: 0x1d }
+        Keys {
+            command: 0x1c,
+            detach: 0x1d,
+            // Ctrl-G, Ctrl-O, Ctrl-T: a bell, a rarely-bound key, and
+            // transpose-characters. None of the three is how anybody edits a
+            // line, which is the point.
+            dictate: 0x07,
+            read: 0x0f,
+            aloud: 0x14,
+            // Ctrl-Y and Ctrl-P: yank and previous-history in readline, and
+            // neither is how a line gets written. Both are given back the
+            // moment command mode is off.
+            send: 0x19,
+            photo: 0x10,
+        }
     }
 }
 
-/// What a letter does once command mode is on. Letters, not control
-/// characters: nothing here is forwarded while the mode is on, so they cost
-/// the agent nothing.
+impl Keys {
+    /// What this key does while command mode is on, if anything. Anything
+    /// else -- including every other control character and all text -- goes
+    /// to the agent, so the mode can be left on while you type.
+    pub fn act(&self, b: u8) -> Option<Act> {
+        if b == self.dictate {
+            Some(Act::Dictate)
+        } else if b == self.read {
+            Some(Act::Read)
+        } else if b == self.aloud {
+            Some(Act::Aloud)
+        } else if b == self.send {
+            Some(Act::Send)
+        } else if b == self.photo {
+            Some(Act::Photo)
+        } else {
+            None
+        }
+    }
+}
+
+/// What a key does once command mode is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     /// Record, then transcribe into the agent's prompt.
@@ -75,26 +122,10 @@ pub enum Act {
     Read,
     /// Read every new reply as it arrives.
     Aloud,
-    /// Leave, as `d` rather than reaching for the other key.
-    Detach,
-    /// Say what the letters are.
-    Help,
-    /// Leave command mode.
-    Leave,
-}
-
-/// A key pressed while command mode is on.
-pub fn command_for(b: u8) -> Option<Act> {
-    match b {
-        b'v' | b'V' => Some(Act::Dictate),
-        b'r' | b'R' => Some(Act::Read),
-        b'a' | b'A' => Some(Act::Aloud),
-        b'd' | b'D' => Some(Act::Detach),
-        b'?' | b'h' => Some(Act::Help),
-        // Escape leaves, which is what Escape means everywhere else.
-        0x1b | b'q' => Some(Act::Leave),
-        _ => None,
-    }
+    /// Send a file from this machine to the agent's.
+    Send,
+    /// Take a photo here and send that.
+    Photo,
 }
 
 /// `ctrl-^`, `ctrl-g`, `^]`, `0x1e`, `30` -- whatever somebody writes down.
@@ -165,12 +196,30 @@ pub fn keys_from(toml_text: &str) -> Keys {
         match name.trim() {
             "command_key" => k.command = b,
             "detach_key" => k.detach = b,
+            "dictate_key" => k.dictate = b,
+            "read_key" => k.read = b,
+            "aloud_key" => k.aloud = b,
+            "send_key" => k.send = b,
+            "photo_key" => k.photo = b,
             _ => {}
         }
     }
-    // Two keys that are the same key is one key and a puzzle.
+    // Two of these being the same key is one key and a puzzle. The two that
+    // work in both modes win, since they are the way out of everything.
+    let d = Keys::default();
     if k.command == k.detach {
-        k.command = Keys::default().command;
+        k.command = d.command;
+    }
+    for (field, fallback) in [
+        (&mut k.dictate, d.dictate),
+        (&mut k.read, d.read),
+        (&mut k.aloud, d.aloud),
+        (&mut k.send, d.send),
+        (&mut k.photo, d.photo),
+    ] {
+        if *field == k.command || *field == k.detach {
+            *field = fallback;
+        }
     }
     k
 }
@@ -739,18 +788,29 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_letters_are_the_ones_the_row_advertises() {
-        assert_eq!(command_for(b'v'), Some(Act::Dictate));
-        assert_eq!(command_for(b'r'), Some(Act::Read));
-        assert_eq!(command_for(b'a'), Some(Act::Aloud));
-        assert_eq!(command_for(b'd'), Some(Act::Detach));
-        assert_eq!(command_for(b'?'), Some(Act::Help));
-        // Escape leaves, which is what Escape means everywhere else.
-        assert_eq!(command_for(0x1b), Some(Act::Leave));
-        assert_eq!(command_for(b'q'), Some(Act::Leave));
-        // Anything else does nothing AND is not forwarded: a letter pressed
-        // in command mode was meant for a command.
-        assert_eq!(command_for(b'z'), None);
+    fn command_mode_takes_three_keys_and_leaves_the_keyboard_alone() {
+        let k = Keys::default();
+        assert_eq!(k.act(k.dictate), Some(Act::Dictate));
+        assert_eq!(k.act(k.read), Some(Act::Read));
+        assert_eq!(k.act(k.aloud), Some(Act::Aloud));
+        // Everything else is the agent's, even in command mode: you can
+        // leave the mode on and carry on typing. That includes the letters
+        // and the line-editing keys a prompt is actually driven with.
+        assert_eq!(k.act(k.send), Some(Act::Send));
+        assert_eq!(k.act(k.photo), Some(Act::Photo));
+        for b in [b'v', b'r', b'a', b'd', b'q', b'?', 0x01, 0x05, 0x0b, 0x12, 0x17, b'\r'] {
+            assert_eq!(k.act(b), None, "0x{b:02x} must reach the agent");
+        }
+    }
+
+    #[test]
+    fn a_key_cannot_be_two_things_at_once() {
+        // Setting the dictate key to the detach key would make one of them
+        // unreachable, and which one would depend on the order of a match.
+        let k = keys_from("dictate_key = \"ctrl-]\"\nread_key = \"ctrl-\\\\\"\n");
+        assert_ne!(k.dictate, k.detach);
+        assert_ne!(k.read, k.command);
+        assert_eq!(k.dictate, Keys::default().dictate);
     }
 
     #[test]
