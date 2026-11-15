@@ -47,15 +47,19 @@ pub struct AgentIo {
     server: Mutex<Option<(String, Option<(String, Vec<String>)>)>>,
     ring: Mutex<VecDeque<u8>>,
     attaches: Mutex<HashSet<String>>,
-    /// Whether the CLI has turned BRACKETED PASTE on, and the tail of its
-    /// output, because the sequence that says so can be split across two
-    /// reads. It matters because a burst of bytes typed at a TUI is treated
-    /// as a paste by the TUI's own heuristics, and the Enter after it then
-    /// lands inside the paste instead of submitting it -- so a long message
-    /// sat in the composer, delivered and unsent. Wrapping the text in the
-    /// paste markers is what a real terminal does, and makes the Enter an
-    /// Enter again.
-    bracketed: std::sync::atomic::AtomicBool,
+    /// The terminal modes this CLI has asked for, and the tail of its output,
+    /// because a sequence can be split across two reads.
+    ///
+    /// Two things need them. Typing: a burst of bytes is a paste as far as a
+    /// TUI is concerned, and one that asked for BRACKETED PASTE (2004) wants
+    /// the markers, or the Enter after a long message is read as part of the
+    /// paste. Attaching: a CLI sets these ONCE, at startup, and a viewer that
+    /// arrives an hour later finds them long gone from the replay -- so the
+    /// program believes the terminal reports the mouse and is in the
+    /// alternate screen while the terminal in front of the operator is in
+    /// neither. That is a TUI whose scrolling has stopped working for no
+    /// visible reason.
+    modes: Mutex<std::collections::BTreeMap<u16, bool>>,
     mode_tail: Mutex<Vec<u8>>,
     /// Injections written to the CLI but not yet echoed back, oldest first.
     pending: Mutex<VecDeque<Injected>>,
@@ -89,7 +93,7 @@ impl AgentIo {
             server: Mutex::new(None),
             ring: Mutex::new(VecDeque::new()),
             attaches: Mutex::new(HashSet::new()),
-            bracketed: std::sync::atomic::AtomicBool::new(false),
+            modes: Mutex::new(Default::default()),
             mode_tail: Mutex::new(Vec::new()),
             pending: Mutex::new(VecDeque::new()),
         })
@@ -108,9 +112,7 @@ impl AgentIo {
             server: Mutex::new(self.server.lock().unwrap().clone()),
             ring: Mutex::new(self.ring.lock().unwrap().clone()),
             attaches: Mutex::new(self.attaches.lock().unwrap().clone()),
-            bracketed: std::sync::atomic::AtomicBool::new(
-                self.bracketed.load(std::sync::atomic::Ordering::Relaxed),
-            ),
+            modes: Mutex::new(self.modes.lock().unwrap().clone()),
             mode_tail: Mutex::new(Vec::new()),
             pending: Mutex::new(Default::default()),
         })
@@ -118,34 +120,90 @@ impl AgentIo {
 
     /// Has the CLI asked for bracketed paste?
     pub fn bracketed(&self) -> bool {
-        self.bracketed.load(std::sync::atomic::Ordering::Relaxed)
+        self.modes.lock().unwrap().get(&2004).copied().unwrap_or(false)
     }
 
-    /// Watch the CLI's own output for the bracketed-paste mode switch.
+    /// The DEC private modes worth remembering for a viewer.
     ///
-    /// A few bytes of the previous chunk are kept, because `\x1b[?2004h` is
-    /// seven bytes and a read can end in the middle of it -- which would
-    /// otherwise mean the mode was missed exactly once, at startup, which is
-    /// when every CLI sets it.
+    /// Not every mode: only the ones whose absence a person would notice.
+    /// 1049 is the alternate screen, without which a full-screen program's
+    /// drawing lands in the scrollback; 1 is application cursor keys, so the
+    /// arrows send what the program is listening for; 1000/1002/1003 and the
+    /// 1005/1006/1015 encodings are how it hears the mouse, which is how most
+    /// TUIs scroll; 2004 is bracketed paste; 1004 is focus; 7 is autowrap;
+    /// 25 is the cursor. 1007, alternate scroll, is deliberately NOT here:
+    /// an attach refuses that one.
+    const WORTH_KEEPING: &'static [u16] =
+        &[1, 7, 25, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1049, 2004];
+
+    /// Watch the CLI's own output for the modes it sets.
+    ///
+    /// A few bytes of the previous chunk are kept, because these sequences
+    /// run to a dozen bytes and a read can end in the middle of one -- which
+    /// would mean missing a mode exactly at startup, which is when every CLI
+    /// sets all of them.
     pub fn note_modes(&self, data: &[u8]) {
-        const ON: &[u8] = b"\x1b[?2004h";
-        const OFF: &[u8] = b"\x1b[?2004l";
         let mut tail = self.mode_tail.lock().unwrap();
         let mut buf = Vec::with_capacity(tail.len() + data.len());
         buf.extend_from_slice(&tail);
         buf.extend_from_slice(data);
-        let on = buf.windows(ON.len()).rposition(|w| w == ON);
-        let off = buf.windows(OFF.len()).rposition(|w| w == OFF);
-        match (on, off) {
-            (Some(a), Some(b)) => self
-                .bracketed
-                .store(a > b, std::sync::atomic::Ordering::Relaxed),
-            (Some(_), None) => self.bracketed.store(true, std::sync::atomic::Ordering::Relaxed),
-            (None, Some(_)) => self.bracketed.store(false, std::sync::atomic::Ordering::Relaxed),
-            (None, None) => {}
+        let mut modes = self.modes.lock().unwrap();
+        // `CSI ? <params> h|l`, where params may be several modes at once:
+        // `\x1b[?1000;1002;1006h` is one sequence setting three.
+        let mut i = 0usize;
+        while i + 3 < buf.len() {
+            if !(buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?') {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 3;
+            while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                j += 1;
+            }
+            if j >= buf.len() {
+                break;              // the sequence is still arriving
+            }
+            let enabling = match buf[j] {
+                b'h' => true,
+                b'l' => false,
+                _ => {
+                    i = j + 1;
+                    continue;
+                }
+            };
+            for part in buf[i + 3..j].split(|b| *b == b';') {
+                if let Ok(n) = std::str::from_utf8(part).unwrap_or("").parse::<u16>() {
+                    if Self::WORTH_KEEPING.contains(&n) {
+                        modes.insert(n, enabling);
+                    }
+                }
+            }
+            i = j + 1;
         }
-        let keep = buf.len().saturating_sub(ON.len() - 1);
+        let keep = buf.len().saturating_sub(24);
         *tail = buf[keep..].to_vec();
+    }
+
+    /// What to send a viewer before the replay, so the terminal it is looking
+    /// at is in the state the program believes it is in.
+    ///
+    /// The alternate screen goes first: everything else is about a screen,
+    /// and the order a real program sets them in is the order that works.
+    pub fn modes_preamble(&self) -> Vec<u8> {
+        let modes = self.modes.lock().unwrap();
+        let mut out = Vec::new();
+        let mut emit = |n: u16| {
+            out.extend_from_slice(format!("\x1b[?{n}h").as_bytes());
+        };
+        if modes.get(&1049).copied().unwrap_or(false) {
+            emit(1049);
+        }
+        for n in Self::WORTH_KEEPING.iter().filter(|n| **n != 1049) {
+            if modes.get(n).copied().unwrap_or(false) {
+                emit(*n);
+            }
+        }
+        out
     }
 
     /// Does this agent have a pty of its own?
@@ -607,6 +665,39 @@ mod mode_tests {
 
     fn io() -> Arc<AgentIo> {
         AgentIo::new(IoKind::Pty, None, None)
+    }
+
+    #[test]
+    fn several_modes_in_one_sequence_are_all_remembered() {
+        // What a TUI actually sends at startup, in one breath.
+        let io = io();
+        io.note_modes(b"\x1b[?1049h\x1b[?1000;1002;1003;1006h\x1b[?2004h\x1b[?25l");
+        let pre = String::from_utf8(io.modes_preamble()).unwrap();
+        for want in ["\x1b[?1049h", "\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h",
+                     "\x1b[?1006h", "\x1b[?2004h"] {
+            assert!(pre.contains(want), "preamble is missing {want:?}: {pre:?}");
+        }
+        assert!(!pre.contains("\x1b[?25h"), "a hidden cursor is not re-shown");
+        assert!(pre.starts_with("\x1b[?1049h"), "the alternate screen comes first: {pre:?}");
+    }
+
+    #[test]
+    fn a_mode_the_program_gave_back_is_not_re_asserted() {
+        let io = io();
+        io.note_modes(b"\x1b[?1000h\x1b[?1049h");
+        io.note_modes(b"\x1b[?1000l");
+        let pre = String::from_utf8(io.modes_preamble()).unwrap();
+        assert!(pre.contains("\x1b[?1049h"));
+        assert!(!pre.contains("\x1b[?1000h"), "it asked for the mouse and then gave it back");
+    }
+
+    #[test]
+    fn modes_nobody_needs_are_not_carried() {
+        // Alternate scroll is refused by an attach, so remembering it would
+        // only re-enable something the viewer then strips.
+        let io = io();
+        io.note_modes(b"\x1b[?1007h\x1b[?47h");
+        assert_eq!(io.modes_preamble(), Vec::<u8>::new());
     }
 
     #[test]

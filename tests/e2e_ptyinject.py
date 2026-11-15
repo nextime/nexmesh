@@ -134,6 +134,36 @@ def main():
     check("the hub stops holding it in flight once typed", bool(acked),
           str(q("SELECT inflight_at_ms,acked_at_ms FROM messages")))
 
+    print("\n=== a viewer arriving late is put into the program's modes ===")
+    # A CLI sets its terminal modes once, at startup. A viewer that attaches
+    # later finds them long gone from the replay, so the terminal in front of
+    # the operator is not in the alternate screen and does not report the
+    # mouse -- while the program believes it is and does. That is a TUI whose
+    # scrolling has stopped working for no visible reason.
+    import websocket
+    wsu = (f"ws://127.0.0.1:{PORT}/v1/attach/ws?agent={agent['id']}"
+           f"&cols=100&rows=30&replay=512")
+    # This hub needs no token: the suite runs it on loopback, unauthenticated.
+    sock = websocket.create_connection(wsu, timeout=20)
+    sock.settimeout(4)
+    first = b""
+    t0 = time.time()
+    while time.time() - t0 < 4 and len(first) < 4096:
+        try:
+            op, data = sock.recv_data()
+        except Exception:
+            break
+        if op == websocket.ABNF.OPCODE_BINARY:
+            first += data
+    sock.close()
+    head = first[:400]
+    check("the alternate screen is re-asserted before anything is replayed",
+          b"\x1b[?1049h" in head, repr(head[:120]))
+    check("so is mouse reporting, which is how a TUI scrolls",
+          b"\x1b[?1000h" in head and b"\x1b[?1006h" in head, repr(head[:160]))
+    check("and bracketed paste, so a paste is still a paste",
+          b"\x1b[?2004h" in head, repr(head[:160]))
+
     print("\n=== a long message is pasted the way a terminal pastes ===")
     # A burst of bytes is a PASTE as far as a TUI is concerned, and one that
     # has asked for bracketed paste expects to be told where the paste ends.

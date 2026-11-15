@@ -255,6 +255,109 @@ pub async fn interactive_tick(st: &AppState) {
     }
 }
 
+/// How long a message may go unacknowledged before its sender is told.
+///
+/// Long enough that a busy agent mid-turn is not reported as unreachable --
+/// delivery happens on a tool result, which can be minutes on a long turn --
+/// and short enough that nobody waits a whole afternoon on a seat that died
+/// the moment they wrote to it.
+const STALL_AFTER_MS: i64 = 180_000;
+
+/// Tell senders about messages that are not getting through.
+///
+/// A message addressed to a seat whose process has died, or whose machine has
+/// gone, waits for ever: the queue keeps it for whoever fills that seat next,
+/// which is right, but the SENDER is never told and goes on believing it was
+/// heard. An agent that asked a teammate for something and got silence cannot
+/// tell "working on it" from "that seat has been dead for an hour".
+///
+/// So each stalled message is reported once, to whoever sent it, with the
+/// reason -- which is a different sentence for a dead process, a disconnected
+/// machine and a seat that simply has not picked it up yet.
+pub async fn stalled_tick(st: &AppState) {
+    let now = crate::now_ms();
+    let stalled: Vec<(i64, String, Option<String>, String, String, Option<String>, Option<String>, i64)> = {
+        let db = st.db.lock().unwrap();
+        let Ok(mut stmt) = db.prepare(
+            "SELECT m.id, m.session_id, m.from_slot, m.to_slot,
+                    COALESCE(t.display_name, t.role, m.to_slot),
+                    -- The machine's NAME, not its id: 'machine-a' tells a
+                    -- reader where to look, 'n1' tells them nothing.
+                    (SELECT n.name FROM agents a LEFT JOIN nodes n ON n.id = a.node_id
+                      WHERE a.slot_id = m.to_slot
+                      ORDER BY a.started_at_ms DESC LIMIT 1),
+                    (SELECT n.status FROM agents a LEFT JOIN nodes n ON n.id = a.node_id
+                      WHERE a.slot_id = m.to_slot
+                      ORDER BY a.started_at_ms DESC LIMIT 1),
+                    (SELECT COUNT(*) FROM agents a WHERE a.slot_id = m.to_slot
+                      AND a.exited_at_ms IS NULL)
+               FROM messages m JOIN slots t ON t.id = m.to_slot
+              WHERE m.to_slot IS NOT NULL
+                AND m.acked_at_ms IS NULL
+                AND m.stalled_at_ms IS NULL
+                AND m.claimed_at_ms IS NULL
+                AND m.sent_at_ms < ?1
+              ORDER BY m.id ASC LIMIT 20",
+        ) else {
+            return;
+        };
+        stmt.query_map([now - STALL_AFTER_MS], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                r.get(7)?))
+        })
+        .and_then(|m| m.collect())
+        .unwrap_or_default()
+    };
+    if stalled.is_empty() {
+        return;
+    }
+    let db = st.db.lock().unwrap();
+    for (id, session, from_slot, _to_slot, to_name, node, node_status, live) in stalled {
+        let why = if live == 0 {
+            match node {
+                Some(n) if node_status.as_deref() != Some("online") => format!(
+                    "{to_name} has no process running, and its machine '{n}' is not connected"
+                ),
+                _ => format!("{to_name} has no process running"),
+            }
+        } else if node_status.as_deref() == Some("online") {
+            format!("{to_name} is running but has not picked it up")
+        } else {
+            let n = node.unwrap_or_else(|| "its machine".into());
+            format!("{to_name} is running on '{n}', which is not connected")
+        };
+        let body = format!(
+            "[undelivered] your message #{id} to {to_name} has not been delivered after              three minutes: {why}. It stays queued for whoever fills that seat, so it is              not lost -- but nothing has read it. Re-send it, address somebody else, or              raise it with notify_operator if it needs a person."
+        );
+        let told = match &from_slot {
+            // An agent sent it: tell them as a real message, since they may
+            // need to do something about it.
+            Some(slot) => db.execute(
+                "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
+                                       reply_to_slot, reply_to_session, claimed_at_ms,
+                                       claimed_by)
+                 VALUES (?1, NULL, ?2, 'system', ?3, ?4, NULL, NULL, NULL, NULL)",
+                rusqlite::params![session, slot, body, now],
+            ),
+            // The operator sent it: a line in the chat they are reading,
+            // pre-claimed so no agent is handed somebody else's postmark.
+            None => db.execute(
+                "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
+                                       claimed_at_ms, claimed_by)
+                 VALUES (?1, NULL, NULL, 'system', ?2, ?3, ?3, 'operator')",
+                rusqlite::params![session, body, now],
+            ),
+        };
+        if told.is_ok() {
+            let _ = db.execute(
+                "UPDATE messages SET stalled_at_ms = ? WHERE id = ?",
+                rusqlite::params![now, id],
+            );
+            tracing::info!(message = id, %to_name, "told the sender a message is not getting through");
+        }
+    }
+}
+
 /// Bring back managed agents that died with work still outstanding.
 pub async fn recovery_tick(st: &AppState) {
     // A slot needs recovery when its last managed agent has exited, the work
@@ -359,5 +462,142 @@ pub async fn recovery_tick(st: &AppState) {
             Err(e) => tracing::warn!(%slot_id, error = %e, "could not respawn yet"),
         }
         st.end_respawn(&slot_id);
+    }
+}
+
+#[cfg(test)]
+mod stalled_tests {
+    use crate::state::AppState;
+    use rusqlite::params;
+
+    /// A session, two seats, and one of them dead.
+    fn fleet(live_for_max: bool, node_online: bool) -> AppState {
+        let st = AppState::in_memory().unwrap();
+        let now = crate::now_ms();
+        {
+            let db = st.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO sessions (id, name, created_at_ms, last_active_ms)
+                 VALUES ('s1','T',?,?)",
+                params![now, now],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO nodes (id,name,os,arch,node_version,status,first_seen_ms,
+                                    last_seen_ms,lease_expires_ms)
+                 VALUES ('n1','machine-a','linux','x86_64','0.1.0',?,?,?,?)",
+                params![if node_online { "online" } else { "offline" }, now, now, now + 60000],
+            )
+            .unwrap();
+            for (id, name) in [("sl-eng", "Max"), ("sl-rev", "Iris")] {
+                db.execute(
+                    "INSERT INTO slots (id, session_id, cli_id, participant_kind, display_name,
+                                        role, created_at_ms)
+                     VALUES (?,'s1','claude','cli',?,'engineer',?)",
+                    params![id, name, now],
+                )
+                .unwrap();
+            }
+            // Max's agent: present, and alive or not.
+            db.execute(
+                "INSERT INTO agents (id, slot_id, node_id, provenance, status, started_at_ms,
+                                     exited_at_ms, last_seen_ms)
+                 VALUES ('a-eng','sl-eng','n1','managed','running',?,?,?)",
+                params![now, if live_for_max { None } else { Some(now) }, now],
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    fn insert(st: &AppState, from: Option<&str>, to: &str, body: &str, age_ms: i64) -> i64 {
+        let db = st.db.lock().unwrap();
+        let sent = crate::now_ms() - age_ms;
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', ?, ?, 'text', ?, ?)",
+            params![from, to, body, sent],
+        )
+        .unwrap();
+        db.last_insert_rowid()
+    }
+
+    fn reports(st: &AppState) -> Vec<(String, Option<String>)> {
+        let db = st.db.lock().unwrap();
+        let mut q = db
+            .prepare("SELECT body, to_slot FROM messages WHERE body LIKE '[undelivered]%'")
+            .unwrap();
+        let rows = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    #[tokio::test]
+    async fn a_message_to_a_dead_seat_is_reported_to_whoever_sent_it() {
+        let st = fleet(false, true);
+        insert(&st, Some("sl-rev"), "sl-eng", "can you take this?", 200_000);
+        super::stalled_tick(&st).await;
+        let got = reports(&st);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].0.contains("no process running"), "{}", got[0].0);
+        assert_eq!(got[0].1.as_deref(), Some("sl-rev"), "the SENDER is told, nobody else");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_machine_is_named_as_the_reason() {
+        let st = fleet(false, false);
+        insert(&st, Some("sl-rev"), "sl-eng", "still there?", 200_000);
+        super::stalled_tick(&st).await;
+        let got = reports(&st);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].0.contains("machine-a") && got[0].0.contains("not connected"),
+                "{}", got[0].0);
+    }
+
+    #[tokio::test]
+    async fn a_live_seat_that_is_merely_busy_is_reported_as_such() {
+        let st = fleet(true, true);
+        insert(&st, Some("sl-rev"), "sl-eng", "when you can", 200_000);
+        super::stalled_tick(&st).await;
+        let got = reports(&st);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].0.contains("has not picked it up"), "{}", got[0].0);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_message_is_left_alone() {
+        let st = fleet(false, true);
+        insert(&st, Some("sl-rev"), "sl-eng", "just sent", 1_000);
+        super::stalled_tick(&st).await;
+        assert!(reports(&st).is_empty(), "three minutes have not passed");
+    }
+
+    #[tokio::test]
+    async fn the_operator_is_told_in_the_chat_and_no_agent_is_handed_it() {
+        let st = fleet(false, true);
+        insert(&st, None, "sl-eng", "status please", 200_000);
+        super::stalled_tick(&st).await;
+        let got = reports(&st);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].1.is_none(), "it belongs in the chat, not in a seat's queue");
+        let pending = {
+            let db = st.db.lock().unwrap();
+            crate::tools::pending_for_slot(&db, "s1", "sl-rev").unwrap()
+        };
+        assert!(!pending.iter().any(|m| m.body.starts_with("[undelivered]")),
+                "somebody else's postmark was delivered to an agent");
+    }
+
+    #[tokio::test]
+    async fn it_is_reported_once_and_not_every_tick() {
+        let st = fleet(false, true);
+        insert(&st, Some("sl-rev"), "sl-eng", "hello?", 200_000);
+        super::stalled_tick(&st).await;
+        super::stalled_tick(&st).await;
+        super::stalled_tick(&st).await;
+        assert_eq!(reports(&st).len(), 1, "a postmark per tick is a flood, not a warning");
     }
 }

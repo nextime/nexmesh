@@ -624,6 +624,7 @@ async fn main() -> Result<()> {
                 delivery::typed_tick(&st).await;
                 delivery::interactive_tick(&st).await;
                 delivery::recovery_tick(&st).await;
+                delivery::stalled_tick(&st).await;
             }
         });
     }

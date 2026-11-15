@@ -2876,6 +2876,25 @@ async fn run_command(
                 format!("{name} is read in {voice}")
             })
         }
+        Cmd::Supervisor { who, on } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            {
+                let db = st.db.lock().unwrap();
+                db.execute(
+                    "UPDATE slots SET supervisor = ? WHERE id = ?",
+                    params![if *on { 1 } else { 0 }, slot],
+                )
+                .map_err(bad)?;
+            }
+            Ok(if *on {
+                format!(
+                    "{name} supervises the fleet: what agents raise to the supervisors \
+                     is delivered to it here, with a return address it can answer"
+                )
+            } else {
+                format!("{name} no longer supervises the fleet")
+            })
+        }
         Cmd::Move { who, session } => {
             let (slot, name) = seat_by_ref(st, session_id, who)?;
             let Json(v) = move_slot(

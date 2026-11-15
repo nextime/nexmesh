@@ -45,6 +45,10 @@ pub enum Cmd {
     /// Which voice reads this agent's words out. A seat, not a machine:
     /// whoever is listening hears the same team.
     Voice { who: String, voice: String },
+    /// Mark a seat as supervising the fleet: what agents raise to the
+    /// supervisors is delivered to it as an ordinary message, in its own
+    /// session, with a return address it can answer.
+    Supervisor { who: String, on: bool },
 }
 
 /// What the chat can be told to do, as the chat itself explains it.
@@ -58,6 +62,7 @@ pub fn help() -> String {
      \u{2022} /owns <agent> <pattern>...     \u{2014} which parts of the workspace are theirs\n\
      \u{2022} /owns <agent> +<pattern>       \u{2014} add one instead of replacing the list\n\
      \u{2022} /voice <agent> <voice|none>   \u{2014} which voice reads that agent aloud\n\
+     \u{2022} /supervisor <agent> [off]      \u{2014} this seat hears what agents raise to the supervisors\n\
      \u{2022} /help\n\
      An agent is named by its name, its role or its seat id. Say something \
      starting with a slash by doubling it: //like this."
@@ -93,6 +98,13 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
 
     match verb.as_str() {
         "help" | "?" | "commands" => Ok(Parsed::Do(Cmd::Help)),
+        "supervisor" | "supervise" => {
+            let who = one("an agent")?;
+            let off = args[1..]
+                .iter()
+                .any(|a| matches!(a.to_lowercase().as_str(), "off" | "no" | "none" | "clear"));
+            Ok(Parsed::Do(Cmd::Supervisor { who, on: !off }))
+        }
         "rename" | "name" => {
             let who = one("an agent and a new name")?;
             let name = args[1..].join(" ");

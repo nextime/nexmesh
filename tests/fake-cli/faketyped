@@ -27,10 +27,12 @@ def note(what):
         f.flush()
 
 print(f"FAKETYPED READY tty={sys.stdin.isatty()}", flush=True)
-# Ask for bracketed paste, as every real TUI does. The node watches for
-# this and wraps what it types, which is the difference between a long
-# message being submitted and sitting in the composer for ever.
-sys.stdout.write("\x1b[?2004h")
+# What a real TUI asks of its terminal, once, at startup: the alternate
+# screen, the mouse, and bracketed paste. A viewer attaching an hour later
+# never sees these go by -- they have rolled out of the replay -- so the
+# node has to remember them and re-assert them, or the operator's terminal
+# is not in the state this program believes it is in.
+sys.stdout.write("\x1b[?1049h\x1b[?1000;1002;1006h\x1b[?2004h")
 print("> ", end="", flush=True)
 for line in sys.stdin:
     line = line.strip()

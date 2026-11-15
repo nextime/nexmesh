@@ -201,12 +201,12 @@ pub fn render_pending(deliver: &[Envelope]) -> String {
             (Some(_), Some(n)) => n.clone(),
             (Some(_), None) => "a teammate".to_string(),
         };
-        body.push_str(&format!("- from {}: {}\n", who, m.body));
+        body.push_str(&format!("- #{} from {}: {}\n", m.id, who, m.body));
     }
     body.push_str("[END PENDING MESSAGES]\n");
     if from_operator {
         body.push_str(
-            "The operator is a person, reading this session's chat. Answer them with              `broadcast` -- that is what they see. A message addressed to a teammate              does not reach them, and `notify_operator` reaches their inbox rather than              the chat they asked in.\n",
+            "The operator is a person, reading this session's chat. Answer them with              `reply` and the message's own number -- reply(to: <#>, text: ...) -- which              puts your answer in the chat they are reading WITHOUT sending it to your              teammates. `broadcast` is for something the whole team needs; using it to              answer one person is how six agents come to read a note meant for one.\n",
         );
     }
     body.push_str("Respond to these before continuing.\n\n");

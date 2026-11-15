@@ -1741,6 +1741,59 @@ public address.
 Served by the hub itself, with no CDN and no external fonts: one page, inline.
 `agents`, `messages`, `plan`, `knowledge`, `graph`, `files` and `fleet`.
 
+#### Answering one person, and who hears it
+
+A message now carries a **return address**, and `reply` uses it. That exists
+because of a line this guide used to be proud of: delivery told an agent that
+the operator "is a person, reading this session's chat — answer them with
+`broadcast`, that is what they see". It was true and it was the wrong advice.
+Every exchange with one agent became a message to all of them, and a team of
+six read six copies of a note meant for one.
+
+`reply(to: <the message's number>, text: ...)` goes to exactly one place,
+whichever of three the sender was:
+
+| The sender | Where the answer goes |
+|---|---|
+| a teammate | addressed to that seat, like any other message |
+| the **operator** (no seat of their own) | into the session's chat, pre-claimed, so the person reading the chat sees it and no agent is handed it as work |
+| a seat in **another session**, via a forward from the operator channel | back into that session, addressed to the seat that raised it — the one sanctioned way a reply crosses a session |
+
+`broadcast` is still there, and its description now says what it is for: a
+decision the whole team needs. The pending-message block shows each message's
+number, which is what `reply` takes.
+
+#### Supervisors, and a channel you can hear
+
+`notify_operator` writes to the operator channel, which is read by the
+console, the dashboard and `nexmesh-orch`. No *seat* tool reads it — so a seat
+acting as orchestrator could shout into it and never hear a thing, and three
+agents on the fleet reported in turn that no orchestrator was reachable while
+their requests sat in the channel unread.
+
+`/supervisor <agent>` in the chat marks a seat as supervising the fleet. What
+agents raise to the supervisors is then delivered into that seat's session as
+an ordinary message, carrying the asker as its return address — so `reply`
+reaches back across the session boundary to the seat that asked, and nobody
+else. `/supervisor <agent> off` undoes it.
+
+#### A message nobody can take
+
+A message addressed to a seat whose process has died, or whose machine has
+gone, waits in the queue for whoever fills that seat next. That is right — it
+is not lost — but the **sender** used to be told nothing and went on believing
+it had been heard. An agent cannot tell "working on it" from "that seat has
+been dead for an hour".
+
+So after three minutes without an acknowledgement, the sender is told once,
+with the reason, which is a different sentence for each case: the seat has no
+process running; it has no process and its machine is not connected; it is
+running on a machine that is not connected; or it is running and simply has
+not picked it up. An agent gets that as a message it can act on; the operator
+gets it as a line in the chat. Three minutes because delivery happens on a
+tool result, and a long turn is minutes — a shorter grace would report every
+busy agent as unreachable.
+
 #### The chat, as a room, and a drawer on a phone
 
 The messages tab is a panel, which is the right shape for watching one team

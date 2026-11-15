@@ -79,7 +79,7 @@ pub fn render_injection_line(messages: &[Envelope]) -> String {
     }
     if from_operator {
         body.push_str(
-            " | the operator is a person reading this session's chat: answer with `broadcast`,              which is what they see",
+            " | the operator is a person reading this session's chat: answer with              `reply` and the message's own number, which reaches them there without              sending it to your teammates -- `broadcast` is for something the whole              team needs",
         );
     }
     body.push_str(" | respond to these before continuing.");

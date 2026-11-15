@@ -111,6 +111,21 @@ pub async fn open(
                     rows,
                 })
                 .await;
+            // The modes the program set at STARTUP, which a viewer arriving
+            // later never saw: they rolled out of the ring hours ago. Without
+            // them the terminal in front of the operator is not in the
+            // alternate screen and does not report the mouse, while the
+            // program believes it is and does -- which is a TUI whose
+            // scrolling has silently stopped working.
+            let preamble = io.modes_preamble();
+            if !preamble.is_empty() {
+                let _ = ctx
+                    .send_hub(&NodeToHub::AttachData {
+                        attach_id: attach_id.clone(),
+                        data: preamble,
+                    })
+                    .await;
+            }
             // Replay scrollback so the viewer does not start at a blank screen.
             let back = io.scrollback(replay_bytes.min(256 * 1024));
             if !back.is_empty() {

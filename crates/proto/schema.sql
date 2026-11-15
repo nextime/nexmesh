@@ -439,6 +439,11 @@ CREATE TABLE IF NOT EXISTS slots (
   -- For an ADOPTED slot: the tmux target (session, window or pane) whose
   -- terminal this slot mirrors.
   tmux_target       TEXT,
+  -- A seat that SUPERVISES the fleet. What agents raise to the supervisors is
+  -- delivered into this seat's session as an ordinary message, with a return
+  -- address it can answer: the operator channel has no read tool for seats,
+  -- and a channel you can only shout into is not a channel.
+  supervisor        INTEGER NOT NULL DEFAULT 0,
   created_at_ms     INTEGER NOT NULL
 );
 
@@ -538,7 +543,20 @@ CREATE TABLE IF NOT EXISTS messages (
   -- gone. A message stays UNCLAIMED until an agent explicitly claims it, or
   -- an operator clears it by hand.
   claimed_at_ms   INTEGER,
-  claimed_by      TEXT
+  claimed_by      TEXT,
+  -- WHO TO ANSWER, and where they are. A message arriving with no return
+  -- address leaves an agent one safe move -- broadcast -- which is how a note
+  -- meant for one teammate comes to be read by six. For an ordinary message
+  -- this is the sender; for one forwarded from the operator channel it is the
+  -- seat that raised it, in its own session, and answering it is the only
+  -- sanctioned way a reply crosses a session.
+  reply_to_slot    TEXT,
+  reply_to_session TEXT,
+  -- When the sender was told this message is not getting through. A message
+  -- to a seat whose process has died, or whose machine has gone, waits for
+  -- ever and silently: the sender believes it was heard. Reported once, which
+  -- is what this records.
+  stalled_at_ms    INTEGER
 );
 -- Who has had a given message, one row per SEAT.
 --

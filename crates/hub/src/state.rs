@@ -93,6 +93,22 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // Delivered is not read. See schema.sql.
         ("messages", "claimed_at_ms", "INTEGER"),
         ("messages", "claimed_by", "TEXT"),
+        // WHO TO ANSWER, and where they are. A message that arrives with no
+        // return address leaves an agent one safe move -- broadcast -- which
+        // is how a note meant for one teammate comes to be read by six. For
+        // an ordinary message this is the sender; for one forwarded from the
+        // operator channel it is the seat that raised it, in its own session,
+        // which is the only sanctioned way a reply crosses a session.
+        ("messages", "reply_to_slot", "TEXT"),
+        ("messages", "reply_to_session", "TEXT"),
+        // When the sender was told a message is not getting through.
+        ("messages", "stalled_at_ms", "INTEGER"),
+        // A seat that supervises the fleet: what agents raise to the
+        // supervisors is delivered into its session as an ordinary message,
+        // so a seat acting as orchestrator can hear what it supervises. The
+        // operator channel has no read tool for seats, and a channel you can
+        // only shout into is not a channel.
+        ("slots", "supervisor", "INTEGER NOT NULL DEFAULT 0"),
         // WHICH limit cut a scan short. "partial" on its own sends you
         // looking for the wrong fix -- a tree of data files that exhausts
         // the walk and one of source files that exhausts the clock want

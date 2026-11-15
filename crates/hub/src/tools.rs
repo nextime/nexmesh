@@ -293,9 +293,12 @@ impl<'a> Ctx<'a> {
     }
 
     fn insert_message(&self, to_slot: Option<&str>, kind: MessageKind, body: &str) -> Result<i64> {
+        // The return address is this seat: whoever reads this can answer it
+        // with `reply` instead of broadcasting at the whole team.
         self.db.execute(
-            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
+                                   reply_to_slot, reply_to_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?2, ?1)",
             params![
                 self.session_id,
                 self.slot_id,
@@ -306,6 +309,88 @@ impl<'a> Ctx<'a> {
             ],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// Answer one message, wherever its sender is.
+    ///
+    /// Three shapes, because a return address can be three things:
+    ///
+    ///   * a teammate in this session -- an ordinary addressed message;
+    ///   * the OPERATOR, who has no seat: the answer goes into the session's
+    ///     chat pre-claimed, so the person reading the chat sees it and no
+    ///     agent is handed it as work. That is the case that used to be
+    ///     answered with `broadcast`, which is why a note for one person was
+    ///     read by the whole team;
+    ///   * a seat in ANOTHER session, which is only possible for a message
+    ///     that was forwarded here from the operator channel. That forward is
+    ///     the one sanctioned way a reply crosses a session boundary.
+    fn reply_to_message(&self, id: i64, text: &str) -> Result<String> {
+        let found: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> =
+            self.db
+                .query_row(
+                    "SELECT session_id, to_slot, from_slot, reply_to_slot, reply_to_session
+                       FROM messages WHERE id = ?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+        let Some((session, to_slot, from_slot, reply_slot, reply_session)) = found else {
+            bail!("no message #{id}");
+        };
+        // You may answer what was sent to you or to your team, in your own
+        // session. Anything else is somebody else's conversation.
+        if session != self.session_id {
+            bail!("message #{id} is not in this session");
+        }
+        if let Some(to) = &to_slot {
+            if to != &self.slot_id {
+                bail!("message #{id} was not addressed to you");
+            }
+        }
+        let target_slot = reply_slot.or(from_slot);
+        let target_session = reply_session.unwrap_or_else(|| self.session_id.clone());
+        let now = now_ms();
+        match target_slot {
+            // The operator: no seat, so the answer is a chat line, claimed on
+            // arrival so no agent is handed it.
+            None => {
+                self.db.execute(
+                    "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                           sent_at_ms, claimed_at_ms, claimed_by,
+                                           reply_to_slot, reply_to_session)
+                     VALUES (?1, ?2, NULL, 'text', ?3, ?4, ?4, 'operator', ?2, ?1)",
+                    params![self.session_id, self.slot_id, text, now],
+                )?;
+                Ok("Answered the operator in this chat. Your teammates were not sent it.".into())
+            }
+            Some(slot) if target_session == self.session_id => {
+                self.db.execute(
+                    "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                           sent_at_ms, reply_to_slot, reply_to_session)
+                     VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?2, ?1)",
+                    params![self.session_id, self.slot_id, slot, text, now],
+                )?;
+                Ok(format!("Answered {}.", self.label_of(&slot)))
+            }
+            // Forwarded here from the operator channel: the answer goes back
+            // into the session it came from, addressed to the seat that asked.
+            Some(slot) => {
+                self.db.execute(
+                    "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                           sent_at_ms, reply_to_slot, reply_to_session)
+                     VALUES (?1, NULL, ?2, 'text', ?3, ?4, ?5, ?6)",
+                    params![
+                        target_session,
+                        slot,
+                        format!("[answer from {}] {text}", self.my_label()),
+                        now,
+                        self.slot_id,
+                        self.session_id
+                    ],
+                )?;
+                Ok("Answered the seat that raised it, in its own session.".into())
+            }
+        }
     }
 
     fn touch(&self) {
@@ -386,6 +471,13 @@ pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Res
          FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
          WHERE m.session_id = ?1
            AND m.from_slot IS NOT ?2
+           -- A PRE-CLAIMED message is a record, not a message: the console's
+           -- own housekeeping lines and the node's notes about what it did
+           -- while nobody was attached. The MCP floor has always skipped
+           -- them; the push and typed paths did not, so they were delivered
+           -- to agents -- and a seat that joined later was typed at with the
+           -- whole backlog of them at once.
+           AND m.claimed_at_ms IS NULL
            -- Addressed to me: the message's own state is the whole story.
            -- Addressed to the team: MY copy is, because one teammate acking
            -- must not take it from the rest.
@@ -535,6 +627,14 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "list_peers" => list_peers(ctx, args),
         "send_message" => send_message(ctx, args),
         "broadcast" => broadcast(ctx, args),
+        "reply" => {
+            let id = args
+                .get("to")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("reply needs 'to': the message's number"))?;
+            let text = arg_str(args, "text")?;
+            ctx.reply_to_message(id, &text)
+        }
         "check_messages" => check_messages(ctx),
         "claim_messages" => claim_messages_tool(ctx, args),
         "set_summary" => set_summary(ctx, args),
@@ -1008,6 +1108,39 @@ fn notify_operator(ctx: &Ctx, args: &Value) -> Result<String> {
         params![me, ctx.session_id, to_session, text, now],
     )?;
 
+    // And to any seat that SUPERVISES the fleet, in its own session, as an
+    // ordinary message it can read and answer.
+    //
+    // The operator channel has no read tool for seats: a seat acting as
+    // orchestrator could shout into it and never hear a thing, so a request
+    // raised to the supervisors sat there unseen while three agents reported
+    // that no orchestrator was reachable. The forward carries the asker as
+    // its return address, which is what lets `reply` cross back.
+    let supervisors: Vec<(String, String)> = {
+        let mut q = ctx.db.prepare(
+            "SELECT s.id, s.session_id FROM slots s
+              WHERE s.supervisor = 1 AND s.session_id <> ?1",
+        )?;
+        let rows = q
+            .query_map([&ctx.session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (slot, session) in supervisors {
+        let body = format!(
+            "[raised to the supervisors] {me}, in session '{}', says: {text}\n\n\
+             Answer it with reply(to: <this message's number>) -- that reaches {me} \
+             in its own session. Nobody else is listening to this one.",
+            ctx.session_id
+        );
+        ctx.db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
+                                   reply_to_slot, reply_to_session)
+             VALUES (?1, NULL, ?2, 'text', ?3, ?4, ?5, ?6)",
+            params![session, slot, body, now, ctx.slot_id, ctx.session_id],
+        )?;
+    }
+
     Ok(match to_session {
         Some(_) => format!(
             "Raised with this session's orchestrator ({why}). Watch for a reply with \
@@ -1373,6 +1506,151 @@ fn get_history(ctx: &Ctx, args: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Answering is `reply`, and it goes to ONE place.
+    ///
+    /// Before this, delivery told an agent to answer the operator with
+    /// `broadcast` -- "that is what they see" -- so every exchange with one
+    /// agent was read by the whole team. A message now carries its own return
+    /// address and `reply` uses it.
+    #[test]
+    fn replying_to_a_teammate_reaches_that_teammate_only() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message",
+                 &json!({"to": "Max", "text": "can you look at auth.rs?"})).unwrap();
+        let id: i64 = db
+            .query_row("SELECT id FROM messages WHERE body LIKE '%auth.rs%'", [], |r| r.get(0))
+            .unwrap();
+        let said = dispatch(&ctx(&db, "sl-eng"), "reply",
+                            &json!({"to": id, "text": "looking now"})).unwrap();
+        assert!(said.contains("Iris"), "{said}");
+        let (to, claimed): (Option<String>, Option<i64>) = db
+            .query_row("SELECT to_slot, claimed_at_ms FROM messages WHERE body = 'looking now'",
+                       [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(to.as_deref(), Some("sl-rev"), "a reply is addressed, not broadcast");
+        assert!(claimed.is_none(), "a teammate's reply is a real message for them");
+    }
+
+    #[test]
+    fn replying_to_the_operator_lands_in_the_chat_and_not_on_the_team() {
+        let db = fixture();
+        let now = now_ms();
+        // The operator has no seat: from_slot NULL is how they appear.
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', NULL, 'sl-eng', 'text', 'what is the status?', ?)",
+            params![now],
+        ).unwrap();
+        let id: i64 = db
+            .query_row("SELECT id FROM messages WHERE body = 'what is the status?'", [],
+                       |r| r.get(0)).unwrap();
+        let said = dispatch(&ctx(&db, "sl-eng"), "reply",
+                            &json!({"to": id, "text": "auth is done"})).unwrap();
+        assert!(said.contains("operator"), "{said}");
+        let (to, claimed, by): (Option<String>, Option<i64>, Option<String>) = db
+            .query_row("SELECT to_slot, claimed_at_ms, claimed_by FROM messages
+                         WHERE body = 'auth is done'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert!(to.is_none(), "it goes in the chat the operator is reading");
+        assert!(claimed.is_some() && by.as_deref() == Some("operator"),
+                "and pre-claimed, so no agent is handed it: {claimed:?} {by:?}");
+        // The proof of the complaint being fixed: it is not pending for a peer.
+        let peers = pending_for_slot(&db, "s1", "sl-rev").unwrap();
+        assert!(!peers.iter().any(|m| m.body == "auth is done"),
+                "a reply to the operator must not reach the rest of the team");
+    }
+
+    #[test]
+    fn you_cannot_answer_somebody_elses_message() {
+        let db = fixture();
+        dispatch(&ctx(&db, "sl-rev"), "send_message",
+                 &json!({"to": "Max", "text": "for Max alone"})).unwrap();
+        let id: i64 = db
+            .query_row("SELECT id FROM messages WHERE body = 'for Max alone'", [], |r| r.get(0))
+            .unwrap();
+        let err = dispatch(&ctx(&db, "sl-ext"), "reply",
+                           &json!({"to": id, "text": "me neither"})).unwrap_err();
+        assert!(err.to_string().contains("not addressed to you"), "{err}");
+    }
+
+    /// A seat marked as a supervisor hears what agents raise to the
+    /// supervisors, and can answer it across the session boundary -- the one
+    /// sanctioned way a reply crosses one.
+    #[test]
+    fn what_is_raised_to_the_supervisors_reaches_a_supervisor_seat_and_can_be_answered() {
+        let db = fixture();
+        let now = now_ms();
+        db.execute(
+            "INSERT INTO sessions (id, name, created_at_ms, last_active_ms)
+             VALUES ('s2','supervisors',?,?)",
+            params![now, now],
+        ).unwrap();
+        db.execute(
+            "INSERT INTO slots (id, session_id, cli_id, participant_kind, display_name,
+                                role, created_at_ms, supervisor)
+             VALUES ('sl-boss','s2','claude','cli','Orchestrator','orchestrator',?,1)",
+            params![now],
+        ).unwrap();
+
+        let said = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                            &json!({"text": "I need a credential only a person can issue"}))
+            .unwrap();
+        assert!(said.to_lowercase().contains("supervisor"), "{said}");
+
+        let waiting = pending_for_slot(&db, "s2", "sl-boss").unwrap();
+        let raised = waiting
+            .iter()
+            .find(|m| m.body.contains("only a person can issue"))
+            .expect("the supervisor seat was not told");
+        assert!(raised.body.contains("raised to the supervisors"), "{}", raised.body);
+        assert!(raised.body.contains("reply(to:"), "it must say how to answer: {}", raised.body);
+
+        // And the answer goes back into the asker's session, to the asker.
+        let out = dispatch(&ctx2(&db, "sl-boss", "s2"), "reply",
+                           &json!({"to": raised.id, "text": "minted, see your inbox"})).unwrap();
+        assert!(out.contains("its own session"), "{out}");
+        let back = pending_for_slot(&db, "s1", "sl-eng").unwrap();
+        assert!(back.iter().any(|m| m.body.contains("minted, see your inbox")),
+                "the seat that raised it was not answered: {:?}",
+                back.iter().map(|m| &m.body).collect::<Vec<_>>());
+        // ...and nobody else in that session was.
+        let others = pending_for_slot(&db, "s1", "sl-rev").unwrap();
+        assert!(!others.iter().any(|m| m.body.contains("minted")),
+                "the answer was sprayed at the team");
+    }
+
+    /// A record is not a message. The console's housekeeping lines and the
+    /// node's notes about what it did unattended are inserted pre-claimed,
+    /// and the MCP floor has always skipped them -- but the PUSH and TYPED
+    /// paths read a different query, which did not. The cost was a seat
+    /// joining later and being typed at with the whole backlog of them at
+    /// once, which killed it.
+    #[test]
+    fn a_pre_claimed_record_is_never_delivered_to_an_agent() {
+        let db = fixture();
+        let now = now_ms();
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                   sent_at_ms, claimed_at_ms, claimed_by)
+             VALUES ('s1', NULL, NULL, 'system', 'answered a prompt for you', ?, ?, 'node')",
+            params![now, now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', NULL, NULL, 'text', 'a real message', ?)",
+            params![now],
+        )
+        .unwrap();
+        let pending = pending_for_slot(&db, "s1", "sl-eng").unwrap();
+        let bodies: Vec<&str> = pending.iter().map(|e| e.body.as_str()).collect();
+        assert!(bodies.contains(&"a real message"), "{bodies:?}");
+        assert!(
+            !bodies.iter().any(|b| b.contains("answered a prompt")),
+            "a pre-claimed record was handed to an agent: {bodies:?}"
+        );
+    }
 
     /// A session with a shared-repo workspace and three slots: an engineer, a
     /// reviewer, and an EXTERNAL (non-CLI) participant standing in for a
