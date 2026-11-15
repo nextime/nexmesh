@@ -239,8 +239,10 @@ The chat is another screen, and the menu — the team, the code map, the chat, a
 terminal, the keyboard, speech, one line per team, and the dashboard's own tabs
 for the machines, the plan, what the team knows and what is locked — is mounted
 on your left wrist in a headset, so it is reachable from anywhere in the scene.
-A ray lands on a button exactly as it lands on a person. Screens can be moved
-with one hand and resized with two, or with the wheel on a flat screen.
+A ray lands on a button exactly as it lands on a person. Every screen has a
+close button that detaches it and a handle at each corner: dragging one is a
+window resize rather than a zoom, so the text stays the size it was and the
+terminal gains columns and rows, which the agent's process is told about.
 
 | | |
 |---|---|

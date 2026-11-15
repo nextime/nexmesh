@@ -1933,13 +1933,65 @@ class Panel {
     this.geom();
   }
 
+  /// The texture is sized by the character grid; the panel in the room is
+  /// sized in metres. Until a corner is dragged the second follows the
+  /// first, which is what an opened screen should look like. After that the
+  /// height is the operator's, and the grid follows the metres instead.
   geom() {
     this.cell = 30;
     this.cw = Math.round(this.cols * this.cell * 0.6 + 44);
     this.ch = this.rows * this.cell + 78;
-    this.h = this.w * this.ch / this.cw;
+    if (!this.freeH || !this.h) this.h = this.w * this.ch / this.cw;
+    // Metres per character, remembered so that dragging a corner makes the
+    // screen bigger rather than making the text bigger: a window resize,
+    // not a zoom.
+    this.cellM = this.w / Math.max(this.cols, 1);
+    this.lineM = this.h / Math.max(this.rows, 1);
     this.rowTop = 62 / this.ch;
     this.rowH = this.cell / this.ch;
+  }
+
+  /// What is under a point on the panel's face, in the texture's own pixels
+  /// so that a handle is the same size on a small panel as on a large one.
+  ///
+  /// The close button first; then an L of frame at each corner, which is
+  /// exactly the bracket that is drawn there -- a handle you cannot see is a
+  /// handle nobody finds, and one that is not where it is drawn is worse.
+  /// Everything else is body, and the body moves the panel.
+  zoneAt(u, v) {
+    const px = u * this.cw, py = v * this.ch;
+    if (!this.wrist && px > this.cw - 46 && py < 46) return "close";
+    const band = 34, along = 80;
+    const edge = px < band || px > this.cw - band || py < band || py > this.ch - band;
+    const inL = px < along, inR = px > this.cw - along;
+    const inT = py < along, inB = py > this.ch - along;
+    if (edge && (inL || inR) && (inT || inB)) {
+      return "corner:" + (inT ? "t" : "b") + (inL ? "l" : "r");
+    }
+    return "body";
+  }
+
+  /// A corner dragged to `w` by `h`: the grid is recomputed at the same
+  /// character size, so a wider screen holds more columns.
+  setSize(w, h) {
+    this.w = clamp(w, 0.22, 7.0);
+    this.h = clamp(h, 0.14, 5.0);
+    this.freeH = true;
+    const cols = Math.round(this.w / Math.max(this.cellM, 1e-4));
+    const rows = Math.round(this.h / Math.max(this.lineM, 1e-4));
+    const nc = clamp(cols, 20, 220), nr = clamp(rows, 4, 70);
+    const changed = nc !== this.cols || nr !== this.rows;
+    if (changed) {
+      this.cols = nc;
+      this.rows = nr;
+      this.cell = 30;
+      this.cw = Math.round(this.cols * this.cell * 0.6 + 44);
+      this.ch = this.rows * this.cell + 78;
+      this.rowTop = 62 / this.ch;
+      this.rowH = this.cell / this.ch;
+    }
+    this.dirty = true;
+    return changed;
   }
 
   set(lines) {
@@ -1962,6 +2014,32 @@ class Panel {
     x.strokeStyle = this.focused ? "rgba(235,245,255,0.95)" : `rgba(${rgb},0.9)`;
     x.lineWidth = this.focused ? 7 : 4;
     x.strokeRect(2, 2, c.width - 4, c.height - 4);
+    // The handles have to be visible to be grabbed: four corners you can
+    // take hold of, and a close button that detaches.
+    const hl = 54;
+    const lit = this.zone && this.zone.startsWith("corner") ? this.zone.slice(7) : null;
+    for (const [cx1, cy1, sx, sy, id] of [[9, 9, 1, 1, "tl"], [c.width - 9, 9, -1, 1, "tr"],
+                                          [9, c.height - 9, 1, -1, "bl"],
+                                          [c.width - 9, c.height - 9, -1, -1, "br"]]) {
+      x.strokeStyle = lit === id ? "rgba(255,255,255,0.98)" : `rgba(${rgb},0.80)`;
+      x.lineWidth = lit === id ? 11 : 8;
+      x.beginPath();
+      x.moveTo(cx1 + sx * hl, cy1);
+      x.lineTo(cx1, cy1);
+      x.lineTo(cx1, cy1 + sy * hl);
+      x.stroke();
+    }
+    if (!this.wrist) {
+      const on = this.zone === "close";
+      x.fillStyle = on ? "rgba(255,120,120,0.85)" : "rgba(255,255,255,0.10)";
+      x.fillRect(c.width - 44, 6, 38, 34);
+      x.strokeStyle = on ? "#ffffff" : "#cfe0f5";
+      x.lineWidth = 4;
+      x.beginPath();
+      x.moveTo(c.width - 35, 15); x.lineTo(c.width - 15, 33);
+      x.moveTo(c.width - 15, 15); x.lineTo(c.width - 35, 33);
+      x.stroke();
+    }
     const font = `ui-monospace, "DejaVu Sans Mono", "Menlo", monospace`;
     x.textBaseline = "top";
     x.fillStyle = "#f4f8ff";
@@ -1970,7 +2048,7 @@ class Panel {
     x.font = `500 ${this.cell - 7}px ${font}`;
     const chw = x.measureText("M").width || (this.cell * 0.6);
     if (this.grid) {
-      const m = 14;
+      const m = 22;        // clear of the frame, which is a resize handle
       this.grid.forEach((keys, i) => {
         const y = 62 + i * this.cell;
         const kw = (c.width - m * 2) / keys.length;
@@ -2311,6 +2389,28 @@ class LiveTerm {
     this.panel.dirty = true;
   }
 
+  /// A resized window is a resized terminal: the emulator's grid and the
+  /// process's own idea of its screen both have to change, or a program
+  /// draws boxes that do not close. The hub carries the same `resize` the
+  /// dashboard sends, and it is rate limited because a drag is continuous
+  /// and a full-screen program repaints on every one of them.
+  resize(cols, rows) {
+    if (cols === this.t.cols && rows === this.t.rows) return;
+    this.t.resize(cols, rows);
+    this.needs = true;
+    const now = performance.now();
+    this.want = [cols, rows];
+    if (now - (this.told || 0) < 200) return;
+    this.told = now;
+    this.tell();
+  }
+
+  tell() {
+    if (!this.want || !this.ws || this.ws.readyState !== 1) return;
+    const [cols, rows] = this.want;
+    try { this.ws.send(JSON.stringify({ t: "resize", cols, rows })); } catch (e) {}
+  }
+
   /// What the keyboard in the room sends, and what a real keyboard sends
   /// when this screen has the focus.
   type(bytes) {
@@ -2418,7 +2518,12 @@ class App {
       this.panels.push(p);
     } else {
       p.title = title;
+      // A screen the operator has sized by its corners keeps that size when
+      // it is reused for another agent: having it snap back would undo the
+      // one thing they did by hand.
+      const kept = p.freeH ? { w: p.w, h: p.h, cols: p.cols, rows: p.rows } : null;
       Object.assign(p, opts || {});
+      if (kept) Object.assign(p, kept);
       p.geom();
       p.dirty = true;
     }
@@ -2460,6 +2565,28 @@ class App {
     // In a headset there is no other keyboard, so opening a screen puts one
     // in the room with it rather than leaving it a menu row away.
     if (this.xr) this.openKeys();
+  }
+
+  /// The close button on a screen: it detaches, which is the thing it
+  /// looks like it does. The wrist menu has no close button, because
+  /// closing the only way back would be a trap.
+  closePanel(p) {
+    if (!p || p.wrist) return;
+    const name = p.live ? p.live.name : p.kind;
+    if (p.live) { p.live.close(); p.live = null; }
+    this.panels = this.panels.filter((q) => q !== p);
+    if (this.focus === p) {
+      this.focus = null;
+      const next = this.panels.find((q) => q.kind === "terminal" && q.live);
+      if (next) this.focusPanel(next);
+    }
+    this.say(p.kind === "terminal" ? `detached from ${name}` : `closed the ${p.kind}`);
+  }
+
+  /// A corner dragged: the panel is resized, and anything live inside it is
+  /// told about it.
+  sizePanel(p, w, h) {
+    if (p.setSize(w, h) && p.live) p.live.resize(p.cols, p.rows);
   }
 
   /// Which screen the keyboard types into. With one open it is that one;
@@ -2786,15 +2913,22 @@ class App {
         // against the same margin: a key you press has to be the key you
         // were pointing at, at both ends of the row.
         const keys = p.grid[ok] || [];
-        const m = 14 / p.cw;
+        const m = 22 / p.cw;
         const u = (best.c.u - m) / Math.max(1 - m * 2, 1e-3);
         col = Math.floor(u * keys.length);
         col = col >= 0 && col < keys.length ? col : -1;
       }
-      if (p.row !== ok || p.col !== col) { p.row = ok; p.col = col; p.dirty = true; }
+      const zone = best && best.p === p ? p.zoneAt(best.c.u, best.c.v) : null;
+      if (p.row !== ok || p.col !== col || p.zone !== zone) {
+        p.row = ok; p.col = col; p.zone = zone; p.dirty = true;
+      }
     }
     if (!best) return null;
-    return { panel: best.p, row: best.p.row, col: best.p.col, t: best.c.t };
+    // A corner or the close button is not a row: a key under your thumb at
+    // the edge of the keyboard must not fire when you meant to take hold.
+    const zone = best.p.zone || "body";
+    if (zone !== "body") { best.p.row = -1; best.p.col = -1; }
+    return { panel: best.p, row: best.p.row, col: best.p.col, zone, t: best.c.t };
   }
 
   panelsInto(L) {
@@ -2814,20 +2948,34 @@ class App {
     let down = false, lx = 0, ly = 0, sx = 0, sy = 0;
     c.addEventListener("pointerdown", (e) => {
       down = true; lx = sx = e.clientX; ly = sy = e.clientY;
-      // Dragging a screen moves the screen; dragging anywhere else turns
-      // the room. Same hand, same gesture, in a headset and here.
-      this.dragPanel = this.lastRay && this.lastRay.panelHit
-        ? this.lastRay.panelHit.panel : null;
-      c.setPointerCapture(e.pointerId);
+      // A corner resizes the screen, the body moves it, and anywhere else
+      // turns the room. The same three gestures the headset has.
+      const h = this.lastRay && this.lastRay.panelHit;
+      this.dragPanel = h ? h.panel : null;
+      const zone = h ? (h.zone || "body") : null;
+      this.dragHeld = zone && zone.startsWith("corner")
+        ? { panel: this.dragPanel, corner: zone.slice(7), panelAt: this.dragPanel.pos.slice(),
+            w0: this.dragPanel.w, h0: this.dragPanel.h, acc: [0, 0, 0] }
+        : null;
+      try { c.setPointerCapture(e.pointerId); } catch (err) {}
     });
     c.addEventListener("pointerup", (e) => {
       down = false;
+      // The process is told the final size on release: a drag sends a few
+      // on the way, and the last word has to be the size it ended at.
+      if (this.dragHeld && this.dragHeld.panel.live) this.dragHeld.panel.live.tell();
       this.dragPanel = null;
+      this.dragHeld = null;
       try { c.releasePointerCapture(e.pointerId); } catch (err) {}
       if (Math.abs(e.clientX - sx) < 4 && Math.abs(e.clientY - sy) < 4) this.press(this.lastRay);
     });
     c.addEventListener("pointermove", (e) => {
-      if (down && this.dragPanel) {
+      if (down && this.dragHeld) {
+        const d = this.worldDelta(this.dragHeld.panel, e.clientX - lx, e.clientY - ly);
+        this.dragHeld.acc = V3.add(this.dragHeld.acc, d);
+        this.dragCorner(this.dragHeld, this.dragHeld.acc);
+        lx = e.clientX; ly = e.clientY;
+      } else if (down && this.dragPanel) {
         this.movePanel(this.dragPanel, e.clientX - lx, e.clientY - ly);
         lx = e.clientX; ly = e.clientY;
       } else if (down) {
@@ -2840,16 +2988,7 @@ class App {
                     1 - ((e.clientY - rect.top) / rect.height) * 2];
     });
     c.addEventListener("wheel", (e) => {
-      // Over a screen the wheel resizes that screen; everywhere else it
-      // steps the camera back, as it always did.
-      const over = this.lastRay && this.lastRay.panelHit ? this.lastRay.panelHit.panel : null;
-      if (over) {
-        over.w = clamp(over.w * (e.deltaY > 0 ? 0.93 : 1.075), 0.25, 6.0);
-        over.geom();
-        over.dirty = true;
-      } else {
-        this.cam.dist = clamp(this.cam.dist + Math.sign(e.deltaY) * 0.3, -3.6, 6);
-      }
+      this.cam.dist = clamp(this.cam.dist + Math.sign(e.deltaY) * 0.3, -3.6, 6);
       e.preventDefault();
     }, { passive: false });
     window.addEventListener("keydown", (e) => {
@@ -2869,13 +3008,21 @@ class App {
   // hand, far ones drift, exactly as a thing at that distance should.
   movePanel(q, dx, dy) {
     const cam = this.desktopCamera();
+    q.pos = V3.add(q.pos, this.worldDelta(q, dx, dy));
+    q.yaw = Math.atan2(cam.eye[0] - q.pos[0], cam.eye[2] - q.pos[2]);
+  }
+
+  /// So many pixels of mouse, as a distance in the room at the depth the
+  /// panel is at: near screens follow the hand, far ones drift, which is
+  /// what things at those distances should do.
+  worldDelta(q, dx, dy) {
+    const cam = this.desktopCamera();
     const vd = V3.norm(V3.sub(q.pos, cam.eye));
     const right = V3.norm(V3.cross(vd, [0, 1, 0]));
     const up = V3.norm(V3.cross(right, vd));
     const depth = Math.max(0.5, V3.len(V3.sub(q.pos, cam.eye)));
     const k = 2 * Math.tan(cam.fov / 2) * depth / Math.max(this.canvas.clientHeight, 1);
-    q.pos = V3.add(q.pos, V3.add(V3.mul(right, dx * k), V3.mul(up, -dy * k)));
-    q.yaw = Math.atan2(cam.eye[0] - q.pos[0], cam.eye[2] - q.pos[2]);
+    return V3.add(V3.mul(right, dx * k), V3.mul(up, -dy * k));
   }
 
   setMode(mode) {
@@ -2910,6 +3057,8 @@ class App {
   press(ray) {
     if (ray && ray.panelHit) {
       const h = ray.panelHit, p = h.panel;
+      if (h.zone === "close") { this.closePanel(p); return; }
+      if (h.zone && h.zone.startsWith("corner")) return;   // that is a handle
       if (p.grid && h.row >= 0 && h.col >= 0) {
         const k = (p.grid[h.row] || [])[h.col];
         if (k && k.act) { k.act(); return; }
@@ -3118,51 +3267,28 @@ class App {
       if (squeezing && !held) {
         const panel = p.panelHit && !p.panelHit.panel.roomSpace ? p.panelHit.panel : null;
         const node = !panel && this.scene.mode === "graph" && p.hit ? p.hit.object : null;
+        // A corner is a handle: squeezing one resizes the screen, squeezing
+        // anywhere else on it moves the screen.
+        const zone = panel ? (p.panelHit.zone || "body") : null;
+        const corner = zone && zone.startsWith("corner") ? zone.slice(7) : null;
         this.grab.set(p.src, {
-          at: p.sOrigin, node, panel,
+          at: p.sOrigin, node, panel, corner,
           nodeAt: node ? node.pos.slice() : null,
           panelAt: panel ? panel.pos.slice() : null,
+          w0: panel ? panel.w : 0, h0: panel ? panel.h : 0,
         });
-        // The second hand on a screen starts a resize, and the size to
-        // scale from is the size it is NOW -- measured when the hand closes,
-        // not on the first frame it moves, or the first movement is lost.
-        if (panel) {
-          const other = this.pointers.find((o) => o !== p && this.grab.get(o.src)
-                                            && this.grab.get(o.src).panel === panel);
-          if (other) {
-            const mine = this.grab.get(p.src), theirs = this.grab.get(other.src);
-            const span = V3.len(V3.sub(p.sOrigin, other.sOrigin));
-            mine.span = theirs.span = span;
-            mine.w0 = theirs.w0 = panel.w;
-          }
-        }
       } else if (!squeezing && held) {
+        if (held.panel && held.corner && held.panel.live) held.panel.live.tell();
         this.grab.delete(p.src);
       } else if (squeezing && held) {
         const d = V3.sub(p.sOrigin, held.at);
-        if (held.panel) {
+        if (held.panel && held.corner) {
+          // The corner follows the hand and the opposite corner stays put,
+          // which is how a window behaves and the only way a resize feels
+          // like one.
+          this.dragCorner(held, d);
+        } else if (held.panel) {
           const q = held.panel;
-          // Both hands on the same screen resizes it, the way both hands on
-          // anything else does. One hand still moves it.
-          const other = this.pointers.find((o) => o !== p && this.grab.get(o.src)
-                                            && this.grab.get(o.src).panel === q);
-          if (other) {
-            const o = this.grab.get(other.src);
-            const span = V3.len(V3.sub(p.sOrigin, other.sOrigin));
-            if (!held.span) {
-              // Both hands were already holding it before this ran: take
-              // the baseline now rather than scaling by a ratio of one.
-              held.span = span; held.w0 = q.w;
-              o.span = span; o.w0 = q.w;
-            }
-            if (held.span > 0.02) {
-              q.w = clamp(held.w0 * (span / held.span), 0.25, 6.0);
-              q.geom();
-              q.dirty = true;
-            }
-            continue;
-          }
-          held.span = 0;
           q.pos = V3.add(held.panelAt, d);
           // It turns to keep facing you as it goes, because a screen you
           // have pushed to one side edge-on is a screen you have lost.
@@ -3178,6 +3304,22 @@ class App {
         }
       }
     }
+  }
+
+  /// A corner drag, given the hand's movement in the room: `d` is resolved
+  /// in the panel's own axes, so dragging sideways changes the width and
+  /// dragging up changes the height however the panel is turned.
+  dragCorner(held, d) {
+    const q = held.panel;
+    const right = M4.dir(RY(q.yaw), [1, 0, 0]);
+    const sx = held.corner[1] === "r" ? 1 : -1;
+    const sy = held.corner[0] === "t" ? 1 : -1;
+    const du = V3.dot(d, right) * sx;
+    const dv = d[1] * sy;
+    this.sizePanel(q, held.w0 + du, held.h0 + dv);
+    q.pos = V3.add(held.panelAt,
+                   V3.add(V3.mul(right, sx * (q.w - held.w0) / 2),
+                          [0, sy * (q.h - held.h0) / 2, 0]));
   }
 
   // A thumbstick, for anyone who prefers one: push to slide, flick to turn

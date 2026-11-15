@@ -1814,15 +1814,24 @@ code graph as a structure with a far side. It is one file of WebGL2 and WebXR
 works on a flat screen as well as in a headset.
 
 **Flat-screen controls.** Drag to look, scroll to step back, click a teammate
-to open their terminal, drag a screen to move it, and scroll over a screen to
+to open their terminal, drag a screen to move it, drag one of its corners to
 resize it. Keys: `g` graph, `c` chat, `m` menu, `v` speak, `Escape` close the
 screens. While a terminal has the focus those shortcuts are suspended and the
 keys go to the agent instead.
 
 **Headset controls.** The trigger presses whatever the ray is on. Squeeze takes
-hold: one hand on a screen moves it, two hands on the same screen resize it, a
+hold: a corner of a screen resizes it, anywhere else on the screen moves it, a
 subsystem follows the hand that holds it, and empty space moves the room past
 you. Thumbsticks slide and snap-turn.
+
+**Window chrome.** Every screen except the wrist menu carries a close button in
+its title bar and a bracket at each corner, drawn where the handle actually is.
+Closing a terminal detaches it: the panel goes and so does the websocket.
+Resizing is a window resize, not a zoom — the character size stays fixed, the
+grid grows, the emulator is reflowed and the process is sent the same `resize`
+the dashboard sends, rate limited during the drag and flushed on release. The
+corner under the hand moves and the opposite corner stays where it is. A screen
+sized by hand keeps that size when it is reused for another agent.
 
 **The menu** is mounted on the left wrist, created when the session starts and
 not removed by *close the screens*. It carries everything the flat views do:
@@ -1845,7 +1854,8 @@ interface therefore appears as the agent draws it. Where no attach is possible
 back to reading the transcript.
 
 **Typing.** The keyboard in the room is a grid panel: point with one hand,
-press with the trigger. It sends to the focused screen, which is the one last
+press with the trigger. Its keys clear the frame, so a key press is never a
+resize. It sends to the focused screen, which is the one last
 opened or pressed, drawn with a brighter frame. `shift` and `ctrl` are one-shot
 modifiers, and `ctrl` produces a control code rather than a letter, so `Ctrl-C`
 reaches the process. Arrow keys, `PgUp`/`PgDn`, `Esc`, `Tab`, `Enter`,
@@ -1866,8 +1876,11 @@ the room does not move them.
 the demo fleet and checks the menu, session filtering, panel movement and that
 closing the screens leaves the menu. `tests/e2e_xrtype.py` runs a real hub, a
 real node and a real interactive agent, presses keys on the keyboard grid the
-way a pointer does, and verifies the agent's reply arrives on the panel; it
-also covers the modifiers, both resize gestures and the four view screens. Both
+way a pointer does, and verifies the agent's reply arrives on the panel. It
+also covers the modifiers, the zones a pointer resolves, a corner drag in a
+headset and with the mouse — including that the grid and the process were
+resized and that the opposite corner did not drift — the close button closing
+the attach, and the four view screens. Both
 skip themselves where there is no chromium, which `run-all.sh` reports as a
 skip rather than a pass or a failure.
 

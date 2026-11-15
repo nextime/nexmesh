@@ -250,44 +250,94 @@ def main():
           sent["out"][1] == "\u0003" and sent["ctrlAfter"] is False, repr(sent["out"][1:2]))
     check("the next key is plain again", sent["out"][2] == "a", str(sent["out"]))
 
-    # Resizing: the wheel on a flat screen, and two hands in a headset.
-    sized = json.loads(cdp.js("""(() => {
+    # Resizing: a corner in each hand, and a corner under the mouse. A
+    # terminal resized this way is a WINDOW resize -- the character grid
+    # changes and the process is told -- not a magnified picture.
+    zones = json.loads(cdp.js("""(() => {
+      const p = %s.panels.find((q) => q.kind === 'terminal');
+      return JSON.stringify({
+        close: p.zoneAt(1 - 10 / p.cw, 10 / p.ch),
+        br: p.zoneAt(1 - 10 / p.cw, 1 - 10 / p.ch),
+        bl: p.zoneAt(10 / p.cw, 1 - 10 / p.ch),
+        tl: p.zoneAt(10 / p.cw, 10 / p.ch),
+        middle: p.zoneAt(0.5, 0.5),
+        titlebar: p.zoneAt(0.5, 12 / p.ch),
+      });
+    })()""" % APP))
+    check("the close button is in the corner where it is drawn",
+          zones["close"] == "close", str(zones))
+    check("each corner is a resize handle",
+          [zones["br"], zones["bl"], zones["tl"]] == ["corner:br", "corner:bl", "corner:tl"],
+          str(zones))
+    check("the middle of a screen is not a handle",
+          zones["middle"] == "body" and zones["titlebar"] == "body", str(zones))
+
+    pulled = json.loads(cdp.js("""(() => {
       const a = %s;
       const p = a.panels.find((q) => q.kind === 'terminal');
-      const w0 = p.w, h0 = p.h;
-      a.lastRay = { panelHit: { panel: p, row: -1 }, hit: null };
-      a.canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -120, cancelable: true }));
-      const bigger = p.w > w0 && p.h > h0;
-      const camBefore = a.cam.dist;
-      a.lastRay = { panelHit: null, hit: null };
-      a.canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -120, cancelable: true }));
-      const moved = a.cam.dist !== camBefore && Math.abs(p.w - a.panels.find(
-        (q) => q.kind === 'terminal').w) < 1e-9;
-      // Two hands on the same screen, as the headset reports them.
-      const w1 = p.w;
+      const before = { w: p.w, h: p.h, cols: p.cols, rows: p.rows,
+                       tcols: p.live.t.cols, trows: p.live.t.rows };
+      // Where the corner that must NOT move is, in the room.
+      const corner = () => {
+        const r = M4.dir(RY(p.yaw), [1, 0, 0]);
+        return V3.add(p.pos, V3.add(V3.mul(r, -p.w / 2), [0, p.h / 2, 0]));
+      };
+      const fixedBefore = corner();
       a.grab.clear();
-      a.pointers = [
-        { src: 'L', handed: 'left', squeeze: 1, sOrigin: [-0.2, 1.4, -1],
-          origin: [-0.2, 1.4, -1], panelHit: { panel: p, row: -1 }, hit: null },
-        { src: 'R', handed: 'right', squeeze: 1, sOrigin: [0.2, 1.4, -1],
-          origin: [0.2, 1.4, -1], panelHit: { panel: p, row: -1 }, hit: null },
-      ];
+      a.pointers = [{ src: 'R', handed: 'right', squeeze: 1, sOrigin: [0, 1.4, -1],
+                      origin: [0, 1.4, -1], hit: null,
+                      panelHit: { panel: p, row: -1, zone: 'corner:br' } }];
+      a.applyGrab();                                  // take the corner
+      a.pointers[0].sOrigin = [0.5, 1.0, -1];         // out and down
       a.applyGrab();
-      a.pointers[0].sOrigin = [-0.4, 1.4, -1];
-      a.pointers[1].sOrigin = [0.4, 1.4, -1];
+      const after = { w: p.w, h: p.h, cols: p.cols, rows: p.rows,
+                      tcols: p.live.t.cols, trows: p.live.t.rows };
+      const fixedAfter = corner();
+      a.pointers[0].squeeze = 0;
       a.applyGrab();
-      const pulled = p.w;
-      a.pointers.forEach((x) => { x.squeeze = 0; });
-      a.applyGrab();
-      return JSON.stringify({ bigger, wheelElsewhereMovedCamera: moved,
-                              w1, pulled, grabsLeft: a.grab.size });
+      return JSON.stringify({ before, after, want: p.live.want || null,
+                              drift: V3.len(V3.sub(fixedAfter, fixedBefore)),
+                              grabs: a.grab.size });
     })()""" % APP))
-    check("the wheel over a screen makes it bigger", sized["bigger"] is True, str(sized))
-    check("the wheel elsewhere still moves the camera",
-          sized["wheelElsewhereMovedCamera"] is True, str(sized))
-    check("hands pulled apart made the screen bigger",
-          sized["pulled"] > sized["w1"] * 1.5, f"{sized['w1']} -> {sized['pulled']}")
-    check("letting go released both hands", sized["grabsLeft"] == 0, str(sized))
+    check("dragging a corner made the screen wider and taller",
+          pulled["after"]["w"] > pulled["before"]["w"] + 0.3
+          and pulled["after"]["h"] > pulled["before"]["h"] + 0.2, str(pulled))
+    check("it resized the character grid rather than magnifying the text",
+          pulled["after"]["cols"] > pulled["before"]["cols"]
+          and pulled["after"]["rows"] > pulled["before"]["rows"], str(pulled))
+    check("the emulator took the new grid",
+          pulled["after"]["tcols"] == pulled["after"]["cols"]
+          and pulled["after"]["trows"] == pulled["after"]["rows"], str(pulled["after"]))
+    check("the process was told the new size",
+          pulled["want"] == [pulled["after"]["cols"], pulled["after"]["rows"]],
+          str(pulled["want"]))
+    check("the opposite corner stayed where it was",
+          pulled["drift"] < 0.02, f"it moved {pulled['drift']:.3f}m")
+    check("letting go of the corner released it", pulled["grabs"] == 0)
+
+    mouse = json.loads(cdp.js("""(() => {
+      const a = %s;
+      const p = a.panels.find((q) => q.kind === 'terminal');
+      const w0 = p.w, cols0 = p.cols, dist0 = a.cam.dist;
+      a.lastRay = { panelHit: { panel: p, row: -1, zone: 'corner:br' }, hit: null };
+      const ev = (t, x, y) => a.canvas.dispatchEvent(
+        new PointerEvent(t, { clientX: x, clientY: y, pointerId: 1, bubbles: true }));
+      ev('pointerdown', 600, 400);
+      ev('pointermove', 760, 520);
+      ev('pointerup', 760, 520);
+      const dragged = { w: p.w, cols: p.cols };
+      // And the wheel is the camera again, wherever it is pointed.
+      a.lastRay = { panelHit: { panel: p, row: -1, zone: 'body' }, hit: null };
+      a.canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -120, cancelable: true }));
+      return JSON.stringify({ w0, cols0, dragged, wNow: p.w,
+                              camMoved: a.cam.dist !== dist0 });
+    })()""" % APP))
+    check("the mouse on a corner resizes it too",
+          mouse["dragged"]["w"] > mouse["w0"] and mouse["dragged"]["cols"] > mouse["cols0"],
+          str(mouse))
+    check("the wheel over a screen no longer resizes it",
+          abs(mouse["wNow"] - mouse["dragged"]["w"]) < 1e-9, str(mouse))
+    check("the wheel still moves the camera", mouse["camMoved"] is True, str(mouse))
 
     # The tabs: the dashboard's own views, as screens in the room.
     views = json.loads(cdp.js("""(() => {
@@ -304,6 +354,20 @@ def main():
     for v in ("plan", "knowledge", "files"):
         check(f"the {v} view says something rather than nothing",
               len(views[v]["lines"]) > 4, str(views[v]))
+
+    # The close button detaches: the panel goes, and so does the websocket.
+    closed = json.loads(cdp.js("""(() => {
+      const a = %s;
+      const p = a.panels.find((q) => q.kind === 'terminal');
+      const ws = p.live.ws;
+      a.press({ panelHit: { panel: p, row: -1, col: -1, zone: 'close' }, hit: null });
+      return JSON.stringify({ gone: !a.panels.some((q) => q === p),
+                              said: a.status, ws: ws.readyState, focus: !!a.focus });
+    })()""" % APP))
+    check("the close button removed the screen", closed["gone"] is True, str(closed))
+    check("and said it detached", "detached" in (closed["said"] or ""), str(closed["said"]))
+    check("the attach was closed with it", closed["ws"] >= 2, f"readyState {closed['ws']}")
+    check("nothing is left holding the keyboard's focus", closed["focus"] is False, str(closed))
 
     errs = json.loads(cdp.js("JSON.stringify(window.__errs || [])"))
     check("the page reported no errors", not errs, str(errs[:3]))
