@@ -48,17 +48,46 @@ pub fn render_injection(messages: &[Envelope]) -> String {
 
 /// How a batch reads when it has to be TYPED at a terminal.
 ///
-/// A TUI submits on the first newline, so the rendering above would arrive as
-/// one message followed by several stray empty submits. The same wording goes
-/// onto a single line instead, with no newline in it until the Enter that
-/// sends it. Each body is collapsed the same way, because a teammate who
-/// writes a paragraph should not be able to submit on your behalf.
-pub fn render_injection_line(messages: &[Envelope]) -> String {
+/// `newlines_safe` says whether the CLI has asked for bracketed paste (DEC
+/// 2004). It decides the whole shape of this, because it decides what a
+/// newline MEANS on the way in:
+///
+///   - With the markers, a newline inside the paste is a newline in the
+///     composer. The bodies go in the way they were written -- a numbered
+///     list, a diff, an indented code block all survive the trip -- and only
+///     the Enter after the closing marker submits.
+///   - Without them a TUI submits on the first newline, so the batch would
+///     arrive as a fragment followed by a handful of stray empty submits.
+///     Everything is flattened onto one line instead: lossy on purpose,
+///     because a teammate who writes a paragraph must not be able to submit
+///     on your behalf.
+///
+/// The flattening used to be unconditional. It was written before bracketed
+/// paste was, and left behind: every list, every snippet and every indent an
+/// agent was sent arrived as one run-on line at a CLI that would have taken
+/// the real thing.
+pub fn render_injection_line(messages: &[Envelope], newlines_safe: bool) -> String {
     let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut body = String::from("[PENDING MESSAGES] ");
+    // A body that keeps its newlines is indented under its own bullet. The
+    // indent is uniform, so it shifts a code block without reflowing it,
+    // and it is what makes the end of one message distinguishable from the
+    // start of the next once several arrive together.
+    let shaped = |s: &str| {
+        if !newlines_safe {
+            return flat(s);
+        }
+        s.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\n  ")
+    };
+    let mut body = String::from(if newlines_safe {
+        "[PENDING MESSAGES]\n"
+    } else {
+        "[PENDING MESSAGES] "
+    });
     let mut from_operator = false;
     for (i, m) in messages.iter().enumerate() {
-        if i > 0 {
+        if newlines_safe {
+            body.push_str("- ");
+        } else if i > 0 {
             body.push_str(" | ");
         }
         // A message with no sending slot is from the person running the
@@ -75,14 +104,24 @@ pub fn render_injection_line(messages: &[Envelope]) -> String {
             (Some(_), Some(n)) => n.clone(),
             (Some(_), None) => "a teammate".to_string(),
         };
-        body.push_str(&format!("from {}: {}", who, flat(&m.body)));
+        body.push_str(&format!("from {}: {}", who, shaped(&m.body)));
+        if newlines_safe {
+            body.push('\n');
+        }
     }
     if from_operator {
+        body.push_str(if newlines_safe { "" } else { " | " });
         body.push_str(
-            " | the operator is a person reading this session's chat: answer with              `reply` and the message's own number, which reaches them there without              sending it to your teammates -- `broadcast` is for something the whole              team needs",
+            "the operator is a person reading this session's chat: answer with \
+             `reply` and the message's own number, which reaches them there without \
+             sending it to your teammates -- `broadcast` is for something the whole \
+             team needs",
         );
+        if newlines_safe {
+            body.push('\n');
+        }
     }
-    body.push_str(" | respond to these before continuing.");
+    body.push_str(if newlines_safe { "respond to these before continuing." } else { " | respond to these before continuing." });
     body
 }
 
@@ -235,8 +274,9 @@ pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<
         // waits for a human to press Enter. With them, the Enter is an
         // Enter. Verified against codex 0.169 at 1151 bytes, which is an
         // ordinary length for a teammate's message.
-        let line = render_injection_line(messages);
-        let typed = if io.bracketed() {
+        let bracketed = io.bracketed();
+        let line = render_injection_line(messages, bracketed);
+        let typed = if bracketed {
             format!("\x1b[200~{line}\x1b[201~")
         } else {
             line
@@ -422,13 +462,51 @@ mod tests {
         let line = render_injection_line(&[
             env(1, "orchestrator", "ship it\nthen tell me"),
             env(2, "Max", "and\t rebase  first"),
-        ]);
+        ], false);
         assert!(!line.contains('\n'), "{line}");
         assert!(!line.contains('\r'), "{line}");
         assert!(line.starts_with("[PENDING MESSAGES] "));
         assert!(line.contains("from orchestrator: ship it then tell me"));
         assert!(line.contains("from Max: and rebase first"));
         assert!(line.ends_with("respond to these before continuing."));
+    }
+
+    #[test]
+    fn a_bracketed_batch_keeps_the_shape_it_was_written_in() {
+        // Inside the paste markers a newline is a newline, so there is
+        // nothing to protect against -- and a teammate who sends a numbered
+        // list or an indented block meant it. Flattening this was silently
+        // destroying every formatted message the fleet sent.
+        let line = render_injection_line(
+            &[env(1, "Max", "do these in order:\n  1. rebase\n  2. run the tests")],
+            true,
+        );
+        assert!(line.contains("do these in order:\n    1. rebase\n    2. run the tests"),
+                "{line:?}");
+        // The body is indented under its own bullet, so two of them are
+        // still tellable apart.
+        assert!(line.contains("- from Max: do these in order:"), "{line:?}");
+    }
+
+    #[test]
+    fn an_indented_block_keeps_its_relative_indent() {
+        // A uniform shift is not a reflow: code sent to a CLI has to come
+        // out of this with its own structure intact.
+        let line = render_injection_line(&[env(1, "Max", "fn a() {\n    b();\n}")], true);
+        assert!(line.contains("- from Max: fn a() {\n      b();\n  }"), "{line:?}");
+    }
+
+    #[test]
+    fn the_note_to_the_operator_is_not_padded_with_source_whitespace() {
+        // It used to carry runs of fourteen spaces from the way the literal
+        // was wrapped in this file, and an agent read them verbatim.
+        let mut e = env(1, "x", "hi");
+        e.from_slot = None;
+        e.from_name = None;
+        for safe in [true, false] {
+            let line = render_injection_line(&[e.clone()], safe);
+            assert!(!line.contains("  `reply`"), "{line:?}");
+        }
     }
 
     #[test]
@@ -439,7 +517,7 @@ mod tests {
         let mut e = env(1, "orchestrator", "are you connected?");
         e.from_slot = None;
         e.from_name = None;
-        let line = render_injection_line(&[e]);
+        let line = render_injection_line(&[e], false);
         assert!(line.contains("from the OPERATOR: are you connected?"), "{line}");
         assert!(line.contains("broadcast"), "{line}");
         assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
@@ -447,7 +525,7 @@ mod tests {
 
     #[test]
     fn a_teammates_line_says_nothing_about_the_operator() {
-        let line = render_injection_line(&[env(1, "Max", "rebase first")]);
+        let line = render_injection_line(&[env(1, "Max", "rebase first")], false);
         assert!(!line.contains("OPERATOR"), "{line}");
     }
 

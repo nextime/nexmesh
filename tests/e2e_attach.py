@@ -13,6 +13,17 @@ import urllib.request, urllib.error
 # shim here the same identity and make them all claim a single seat -- which
 # looks like a bug in the hub and is not. The tests choose their own.
 import os as _os
+
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
     _os.environ.pop(_v, None)
@@ -51,6 +62,19 @@ def http(m, p, b=None):
     try:
         with urllib.request.urlopen(r, timeout=20) as x: return x.status, json.loads(x.read() or b"{}")
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b"{}")
+
+def until(fn, seconds=30.0, step=0.5):
+    """Wait for something to become true rather than reading once."""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            if fn():
+                return True
+        except Exception:
+            pass
+        time.sleep(step)
+    return False
+
 
 class Term:
     """A local pty running the real attach client."""
@@ -172,12 +196,24 @@ def main():
     check("the remaining viewer still works",
           t.expect("you said: still here?"), t.buf[-300:])
 
-    print("\n=== attaching to something that has no terminal ===")
+    print("\n=== attaching to a seat with nothing in it STARTS it ===")
+    # This used to fail with advice: "put something in the seat with nexmesh
+    # spawn ...", which is an instruction to type the obvious next command.
+    # It came up every time a node restarted, and it led somewhere bad -- a
+    # seat that was already coming back got spawned a second time, and
+    # because a conversation is resumed by id, two CLIs appended to one
+    # transcript.
     s, j = http("POST", f"/v1/sessions/{sid}/slots", {"cli_id": "faketui",
         "mode": "interactive", "display_name": "Ghost", "placement": {"node": "machine-b"}})
     t3 = Term([f"{BIN}/nexmesh", "--hub", HUB, "attach", sid, "Ghost"])
-    check("attaching to a never-spawned agent fails cleanly",
-          t3.expect("no agent matching") or t3.expect("Error"), t3.buf[-300:])
+    check("it says it is starting one", t3.expect("has no process; starting one"),
+          t3.buf[-400:])
+    check("and then attaches to what it started", t3.expect("attached to Ghost", 40),
+          t3.buf[-400:])
+    check("the seat really has a process now",
+          until(lambda: any(a["name"] == "Ghost" and a.get("pid")
+                            for a in http("GET", f"/v1/sessions/{sid}/status")[1]["agents"])),
+          "")
 
     print("\n=== agent exit closes the viewers ===")
     t.send("quit\n")

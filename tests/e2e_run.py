@@ -25,7 +25,12 @@ SCR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCR)
 BIN = f"{ROOT}/target/debug"
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
-           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           # This seat's OWN identity: inherited when the suite is run
+           # from inside a managed seat, and then every test's shim
+           # registers as an agent the test's node has never heard of.
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
     os.environ.pop(_v, None)
 
 # The fake interactive CLI: a real pty, a prompt, and a shim that registers.
@@ -150,8 +155,11 @@ def main():
     print("\n=== 2. a dry run says what it would do, and does nothing ===")
     rc, out = ctl("run", "faketui", "--dry-run", cwd=UNOWNED)
     check("dry run succeeds", rc == 0, out)
-    check("it would create the team this directory needs",
-          "create scratch" in out and UNOWNED in out, out)
+    check("it would put it in the default team, not one per directory",
+          "create default" in out, out)
+    check("and say which directory it will work in", UNOWNED in out, out)
+    check("and that the seat and workspace are its own",
+          "new;" in out and "its own mount" in out, out)
     check("and name the seat after the CLI and the machine",
           f"Faketui-{NODE}" in out, out)
     s, j = http("GET", "/v1/sessions")
@@ -162,21 +170,25 @@ def main():
     check("run succeeds", rc == 0, out)
     s, j = http("GET", "/v1/sessions")
     names = [x["name"] for x in j.get("sessions", [])]
-    check("a session named after the directory exists", "scratch" in names, str(names))
+    # A team per DIRECTORY left one-agent teams nobody asked for, and
+    # `nexmesh sessions` filled up with them. One default team instead.
+    check("the run landed in the default team", "default" in names, str(names))
+    check("and did NOT invent one named after the directory",
+          "scratch" not in names, str(names))
     s, j = http("GET", f"/v1/session-for?node={NODE}&path={UNOWNED}")
-    check("and it owns the directory now", j.get("session") == "scratch", str(j))
-    row = wait_for_seat("scratch", f"Faketui-{NODE}", "running")
+    check("and it owns the directory now", j.get("session") == "default", str(j))
+    row = wait_for_seat("default", f"Faketui-{NODE}", "running")
     check("the CLI is running in it", row.get("status") == "running", str(row)[:300])
     check("on a terminal the node owns, which is what makes it attachable",
           row.get("io_kind") in ("pty", "tmux"), str(row)[:300])
     check("working where we were standing", row.get("cwd") == UNOWNED, str(row)[:300])
 
     print("\n=== 4. that terminal really can be attached to ===")
-    s, j = http("GET", f"/v1/sessions/scratch/resolve/Faketui-{NODE}")
+    s, j = http("GET", f"/v1/sessions/default/resolve/Faketui-{NODE}")
     check("the hub resolves it to a live terminal",
           s == 200 and j.get("exited") is False and j.get("io_kind") is not None,
           str(j)[:300])
-    rc, out = ctl("attach", "scratch", f"Faketui-{NODE}", timeout=25)
+    rc, out = ctl("attach", "default", f"Faketui-{NODE}", timeout=25)
     # Not a terminal here, so the viewer refuses for THAT reason -- never for
     # want of something to attach to.
     check("attach finds a terminal rather than refusing the seat",
@@ -185,27 +197,38 @@ def main():
     print("\n=== 5. a seat somebody is sitting in is not taken from under them ===")
     rc, out = ctl("run", "faketui", "--no-attach", cwd=UNOWNED)
     check("a second run succeeds", rc == 0, out)
-    rows = [a["name"] for a in seats("scratch") if a.get("participant_kind") != "terminal"]
+    rows = [a["name"] for a in seats("default") if a.get("participant_kind") != "terminal"]
     check("it took a seat of its own beside the first",
           f"Faketui-{NODE}" in rows and f"Faketui-{NODE}-2" in rows, str(rows))
 
     print("\n=== 6. an empty seat of the same name is taken back ===")
-    row = wait_for_seat("scratch", f"Faketui-{NODE}-2", "running")
+    row = wait_for_seat("default", f"Faketui-{NODE}-2", "running")
     pid = row.get("pid")
     check("the second one has a process", bool(pid), str(row)[:200])
     os.kill(pid, signal.SIGTERM)
     gone = False
     for _ in range(80):
-        r = wait_for_seat("scratch", f"Faketui-{NODE}-2", timeout=1)
+        r = wait_for_seat("default", f"Faketui-{NODE}-2", timeout=1)
         if r.get("exited") is True or r.get("agent_status") in ("exited", "disconnected"):
             gone = True
             break
-    check("and it can be made empty", gone, str(wait_for_seat('scratch', f'Faketui-{NODE}-2', timeout=1))[:200])
+    check("and it can be made empty", gone, str(wait_for_seat('default', f'Faketui-{NODE}-2', timeout=1))[:200])
+    # WITHOUT --reuse a run is a NEW agent, even onto an empty seat of that
+    # name: a second person running it in a directory should not inherit the
+    # first one's conversation.
     rc, out = ctl("run", "faketui", "--name", f"Faketui-{NODE}-2", "--no-attach", cwd=UNOWNED)
-    check("run takes that seat back rather than making a third",
+    check("by default it starts another agent rather than taking the seat back",
+          rc == 0 and "taking the seat it left" not in out, out)
+    rows = [a["name"] for a in seats("default")]
+    check("so a third seat appears", f"Faketui-{NODE}-3" in rows, str(rows))
+    # And --reuse is how you ask for the old behaviour: that seat, and the
+    # conversation it was last on.
+    rc, out = ctl("run", "faketui", "--reuse", "--name", f"Faketui-{NODE}-2",
+                  "--no-attach", cwd=UNOWNED)
+    check("--reuse takes that seat back instead",
           rc == 0 and "taking the seat it left" in out, out)
-    rows = [a["name"] for a in seats("scratch")]
-    check("so there is no third seat", f"Faketui-{NODE}-3" not in rows, str(rows))
+    rows = [a["name"] for a in seats("default")]
+    check("and makes no fourth seat", f"Faketui-{NODE}-4" not in rows, str(rows))
 
     print("\n=== 7. in a directory a session owns: it joins that session ===")
     s, j = http("POST", "/v1/sessions", {
@@ -221,7 +244,7 @@ def main():
           row.get("status") == "running", str(row)[:300])
     s, j = http("GET", "/v1/sessions")
     check("and no second session was invented",
-          sorted(x["name"] for x in j["sessions"]) == ["payments", "scratch"],
+          sorted(x["name"] for x in j["sessions"]) == ["default", "payments"],
           str([x["name"] for x in j["sessions"]]))
 
     print("\n=== 8. a CLI the machine does not have leaves nothing behind ===")

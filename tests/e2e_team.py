@@ -20,7 +20,12 @@ WS_DIR = f"{_T}/workspace"
 # very often run FROM inside such a CLI, which would hand every shim the same
 # identity and make them all share one seat. The tests choose their own.
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
-           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           # This seat's OWN identity: inherited when the suite is run
+           # from inside a managed seat, and then every test's shim
+           # registers as an agent the test's node has never heard of.
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
     os.environ.pop(_v, None)
 
 procs = []
@@ -81,6 +86,21 @@ class Mcpd:
         r = self.call("tools/call", {"name": name, "arguments": args or {}})
         if "error" in r: return f"RPC-ERROR: {r['error']['message']}"
         return r["result"]["content"][0]["text"]
+
+def until(fn, seconds=20.0, step=0.25):
+    """Wait for something to become true. The hub learns of a hand-run CLI's
+    exit through its node, so "it is gone" is not true the instant the
+    process is."""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            if fn():
+                return True
+        except Exception:
+            pass
+        time.sleep(step)
+    return False
+
 
 def wait_http(timeout=20):
     for _ in range(int(timeout * 5)):
@@ -238,9 +258,9 @@ def main():
                 {"patterns": ["verti/**", "ombia"]})
     check("a seat can be given zones after it exists",
           s == 200 and set(j.get("owns", [])) == {"verti/**", "ombia"}, str(j)[:200])
-    s, j = http("POST", f"/v1/slots/{slots['Max']}/owns", {"patterns": ["digesta"], "add": True})
+    s, j = http("POST", f"/v1/slots/{slots['Max']}/owns", {"patterns": ["team"], "add": True})
     check("and a zone can be added without repeating the others",
-          set(j.get("owns", [])) == {"verti/**", "ombia", "digesta"}, str(j)[:200])
+          set(j.get("owns", [])) == {"verti/**", "ombia", "team"}, str(j)[:200])
 
     t = max_.tool("who_owns", {"path": "verti/src/main.rs"})
     check("an agent is told it owns its own area", "You own" in t, t)
@@ -366,15 +386,18 @@ def main():
     s, j = http("GET", f"/v1/sessions/{sid}/status")
     check("session survives an agent dying", s == 200, str(s))
 
-    print("\n=== an attached agent that comes back reuses its seat ===")
+    print("\n=== a hand-run CLI holds a seat while it runs, and leaves none behind ===")
     # Run by hand, so run repeatedly: restarted, or probed by its own
-    # tooling. A fresh seat each time fills a session with teammates that
-    # never answer.
+    # tooling. A fresh seat PER RUN would fill a session with teammates that
+    # never answer -- and so does a seat left behind by every run that ends.
+    # So the seat is the running CLI's, and goes when the CLI does.
     before = len(http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", []))
     env = dict(os.environ, NEXMESH_SOCK=SOCK, NEXMESH_CLI="handmade",
                NEXMESH_NAME="Handmade", NEXMESH_ROLE="tester",
                NEXMESH_SESSION=sid)
-    def probe():
+    def probe(hold=False):
+        """Register a hand-run shim. With `hold`, leave it running and
+        return it, so the seat can be looked at while its CLI is alive."""
         p = subprocess.Popen([f"{BIN}/nexmesh-mcpd"], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              text=True, env=env, bufsize=1)
@@ -384,19 +407,33 @@ def main():
                                              "clientInfo": {"name": "probe", "version": "1"}}}) + "\n")
         p.stdin.flush()
         p.stdout.readline()
+        if hold:
+            return p
         p.stdin.close(); p.wait(timeout=20)
-    probe()
-    after_first = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
-    check("the first run takes a seat", len(after_first) == before + 1,
-          f"{before} -> {len(after_first)}")
-    # Its process is gone now, so the next run is the same agent returning.
-    probe(); probe()
+        return None
+
+    live = probe(hold=True)
     seats = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
-    check("running it again reuses that seat rather than taking more",
-          len(seats) == before + 1, f"expected {before + 1}, got {len(seats)}")
+    check("it takes a seat while it is running", len(seats) == before + 1,
+          f"{before} -> {len(seats)}")
     check("and there is exactly one of it",
           sum(1 for a in seats if a.get("name") == "Handmade") == 1,
           str([a.get("name") for a in seats]))
+    # The operator closes the terminal. Nothing is coming back to this seat:
+    # the fleet never started it and cannot restart it.
+    live.stdin.close(); live.wait(timeout=20)
+    gone = until(lambda: all(a.get("name") != "Handmade"
+                             for a in http("GET", f"/v1/sessions/{sid}/status")[1]
+                                 .get("agents", [])), 20)
+    check("and when it exits its seat goes with it", gone,
+          str([a.get("name") for a in
+               http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])]))
+    # Repeatedly, without piling up: three runs, no residue.
+    probe(); probe(); probe()
+    after = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
+    check("running it again and again leaves nothing behind",
+          len(after) == before, f"expected {before}, got {len(after)}: " +
+          str([a.get("name") for a in after]))
 
     print("\n=== a seat follows the CLI's conversation, not the directory ===")
     # claude and opencode both keep several conversations per project, and
@@ -476,10 +513,11 @@ def main():
                                   "params": {"protocolVersion": "2024-11-05",
                                              "capabilities": {},
                                              "clientInfo": {"name": "Window", "version": "1"}}}) + "\n")
-        p.stdin.flush(); p.stdout.readline(); p.stdin.close(); p.wait(timeout=20)
+        p.stdin.flush(); p.stdout.readline()
         moved = http("GET", f"/v1/sessions/{other}/status")[1].get("agents", [])
         check("the identity takes a seat in the session it moved to",
               any(a.get("name") == "Window" for a in moved), str(moved))
+        p.stdin.close(); p.wait(timeout=20)
         left = http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", [])
         stale = [a for a in left
                  if a.get("name") == "Window" and a.get("state") not in (None, "exited")

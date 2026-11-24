@@ -135,6 +135,100 @@ pub fn modes() -> Vec<Choice> {
     ]
 }
 
+/// What a seat tells its agent, as one file an operator edits.
+///
+/// A system prompt is markdown and runs to pages, so the console does not
+/// try to be a text editor: it writes this, opens $EDITOR on it, and reads
+/// it back. One pass edits both halves and the mode, which is also how they
+/// are usually thought about -- "what this seat is" is one decision.
+///
+/// Markers rather than markdown headings, because the prompt itself is
+/// markdown and will contain headings of its own.
+pub const SYSTEM_MARK: &str = "--8<-- system prompt";
+pub const INSTRUCTION_MARK: &str = "--8<-- instruction on arrival";
+
+/// Render the file the operator sees.
+pub fn prompt_file(name: &str, system: &str, mode: &str, instruction: &str) -> String {
+    let replace = mode == "replace";
+    format!(
+        "# What {name} tells its agent. Edit under the two markers, save, quit.\n\
+         #\n\
+         # The SYSTEM PROMPT is who the agent in this seat is. Every agent that\n\
+         # ever fills the seat gets it, including a respawn nobody watched.\n\
+         # The INSTRUCTION is what to do on arrival, said to each new occupant\n\
+         # as the first thing it hears.\n\
+         #\n\
+         # Empty a section to clear it. Lines starting with # up here are notes\n\
+         # and are not sent; inside a section nothing is stripped.\n\
+         #\n\
+         # Mode is on the marker line below: `append` adds to the CLI's own\n\
+         # system prompt, `replace` uses this instead of it.\n\
+         \n\
+         {SYSTEM_MARK}: {}\n\
+         \n\
+         {}\n\
+         \n\
+         {INSTRUCTION_MARK}\n\
+         \n\
+         {}\n",
+        if replace { "replace" } else { "append" },
+        system.trim_end(),
+        instruction.trim_end(),
+    )
+}
+
+/// Read it back: the system prompt, the mode, and the instruction.
+///
+/// A file with no markers at all is a refusal, not an empty prompt: an
+/// operator who deleted the whole thing, or an editor that wrote nothing,
+/// should not silently clear both halves of a seat's prompt.
+pub fn parse_prompt_file(text: &str) -> anyhow::Result<(String, String, String)> {
+    let mut mode = "append".to_string();
+    let mut system = String::new();
+    let mut instruction = String::new();
+    // 0 = the notes above the first marker, 1 = system prompt, 2 = instruction.
+    let mut at = 0u8;
+    let mut seen = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix(SYSTEM_MARK) {
+            at = 1;
+            seen = true;
+            if let Some(m) = rest.trim().strip_prefix(':') {
+                let m = m.trim();
+                if m == "replace" {
+                    mode = "replace".into();
+                }
+            }
+            continue;
+        }
+        if t.starts_with(INSTRUCTION_MARK) {
+            at = 2;
+            seen = true;
+            continue;
+        }
+        match at {
+            1 => {
+                system.push_str(line);
+                system.push('\n');
+            }
+            2 => {
+                instruction.push_str(line);
+                instruction.push('\n');
+            }
+            // Above the first marker: notes, dropped.
+            _ => {}
+        }
+    }
+    if !seen {
+        anyhow::bail!(
+            "the file came back with neither marker in it, so nothing was changed. \
+             Leave the `{SYSTEM_MARK}` and `{INSTRUCTION_MARK}` lines where they are."
+        );
+    }
+    Ok((system.trim().to_string(), mode, instruction.trim().to_string()))
+}
+
 /// What came back, said in one line for the status row.
 pub type Said = String;
 
@@ -297,6 +391,49 @@ mod tests {
         assert_eq!(d.rows(), 0);
         assert!(d.chosen().is_none());
         assert_eq!(d.typed(), "");
+    }
+
+    #[test]
+    fn a_prompt_file_round_trips_markdown_headings_and_all() {
+        // The prompt IS markdown, so a `#` heading inside it must survive --
+        // which is why the file uses markers rather than headings.
+        let sys = "# You are the reviewer\n\n- read the diff\n- say what is wrong";
+        let instr = "## today\nStart with crates/node.";
+        let f = prompt_file("alice", sys, "replace", instr);
+        let (got_sys, mode, got_instr) = parse_prompt_file(&f).unwrap();
+        assert_eq!(got_sys, sys);
+        assert_eq!(got_instr, instr);
+        assert_eq!(mode, "replace");
+    }
+
+    #[test]
+    fn the_notes_at_the_top_are_not_part_of_the_prompt() {
+        let f = prompt_file("dev", "be brief", "append", "");
+        assert!(f.contains("# What dev tells its agent"), "the notes should be there");
+        let (sys, mode, instr) = parse_prompt_file(&f).unwrap();
+        assert_eq!(sys, "be brief");
+        assert_eq!(mode, "append");
+        assert!(instr.is_empty());
+    }
+
+    #[test]
+    fn emptying_a_section_clears_it_but_an_empty_file_changes_nothing() {
+        // Deleting the text under a marker means "stop saying that".
+        let (sys, _, instr) = parse_prompt_file(&prompt_file("dev", "", "append", "")).unwrap();
+        assert!(sys.is_empty() && instr.is_empty());
+        // Deleting the whole file is a mistake, or an editor that wrote
+        // nothing, and must not clear both halves of a seat's prompt.
+        assert!(parse_prompt_file("").is_err());
+        assert!(parse_prompt_file("i deleted everything\n").is_err());
+    }
+
+    #[test]
+    fn an_unknown_mode_on_the_marker_line_falls_back_to_appending() {
+        // Appending leaves the CLI's own prompt in place, so a typo costs a
+        // prompt that does slightly less rather than one that threw the
+        // CLI's away.
+        let f = prompt_file("dev", "x", "append", "").replace(": append", ": REPLACE-ish");
+        assert_eq!(parse_prompt_file(&f).unwrap().1, "append");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install nexmesh on this machine.
 #
-#   curl -fsSL https://raw.githubusercontent.com/nextime/nexmesh/main/packaging/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/dev/nexmesh/main/packaging/install.sh | sh
 #   sh packaging/install.sh --role node --hub wss://hub.example.net/v1/node/ws
 #
 # What it does, in order, and nothing else:
@@ -18,7 +18,7 @@
 # version to match, no runtime to install, nothing to compile unless you ask.
 set -eu
 
-REPO="${NEXMESH_REPO:-nextime/nexmesh}"
+REPO="${NEXMESH_REPO:-dev/nexmesh}"
 VERSION="${NEXMESH_VERSION:-latest}"
 PREFIX="${PREFIX:-/usr/local}"
 ROLE=""

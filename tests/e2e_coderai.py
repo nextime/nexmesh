@@ -14,6 +14,17 @@ exactly the way the real one is.
 import base64, json, os, signal, sqlite3, subprocess, sys, tempfile, time
 import urllib.request, urllib.error
 
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
+
 SCR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCR); BIN = f"{ROOT}/target/debug"
 PORT = 17955; SVC = 17956; HUB = f"http://127.0.0.1:{PORT}"
@@ -137,6 +148,21 @@ def main():
     print("\n=== a teammate can see what is on offer ===")
     j = tool("list_peers", {"capability": "ocr"})
     check("list_peers finds it by capability", "CoderAI" in j.get("text", ""), str(j))
+
+    print("\n=== and it says which machine it is on ===")
+    # A bridge has no node row and no process the hub can see, so the fleet
+    # could only say it was not a machine -- and a service running on a known
+    # host was then filed under "participants with no machine", which is true
+    # of what the hub knew and wrong about the world. It has a machine; it is
+    # just not an agent CLI on a node.
+    myhost = open("/proc/sys/kernel/hostname").read().strip()
+    host = None
+    for a in http("GET", f"/v1/sessions/{sid}/status")[1].get("agents", []):
+        if a.get("name") == "CoderAI":
+            host = a.get("host")
+    check("the bridge is placed on the machine it runs on, with no flag passed",
+          host == myhost, f"wanted {myhost}, status says {host}")
+
     j = tool("recall", {"search": "coderai-capabilities"})
     check("and it wrote what it offers into shared memory",
           "ocr" in j.get("text", "") and "ask_capability" in j.get("text", ""), str(j)[:400])

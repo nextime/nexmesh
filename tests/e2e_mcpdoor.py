@@ -18,6 +18,17 @@ import urllib.request, urllib.error
 # shim here the same identity and make them all claim a single seat -- which
 # looks like a bug in the hub and is not. The tests choose their own.
 import os as _os
+
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
     _os.environ.pop(_v, None)

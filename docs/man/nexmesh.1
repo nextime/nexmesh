@@ -120,6 +120,59 @@ The hub writes nothing itself: it asks the node, which is the only component
 with anybody's file system. Up to 64MB in one go. In the dashboard and the
 installed app the same thing is the paperclip beside the chat, and the camera
 button puts a photo or a clip there too.
+.SH TEAMMATES THAT ARE NOT CLIS
+A seat is usually an agent CLI running on a machine the fleet has enrolled.
+Some are not: a capability bridge, a bot, a service that joins over HTTP and
+answers what it is asked. Those have no node row and no process the hub can
+see, so the fleet used to be able to say only that they were not machines
+\(em and a service running on a known host then appeared under "participants
+with no machine", which reads as nowhere.
+.PP
+They say where they run when they join, and the dashboard and
+.B nexmesh status
+show it. It is a claim, like the rest of what a participant says about
+itself: nothing verifies it. One that says nothing still reads as
+.BR external ,
+rather than being given a machine it never named.
+.SH WHAT A FLEET REMEMBERS
+Everything an agent remembers has a scope, and it decides who is affected
+when the agent turns out to be wrong. Shown in the memory pane and in the
+dashboard, labelled, so a fleet-wide convention and one seat's working note
+are not read with the same weight.
+.TP
+.B agent
+One seat's own. Working notes, what it has tried, where it had got to.
+Private between agents \(em the operator sees it, because they see everything
+else about that seat \(em and the right place for anything provisional. It
+survives the process, which is what a respawned seat is glad of.
+.TP
+.B group
+A named subset of a team, for when three seats are on one thing and the rest
+of the room does not need it.
+.TP
+.B session
+That team. The default, and where most of it belongs: decisions about the
+work in hand, what the code turned out to do. It goes when the team does,
+which is right for something that was only ever true of this piece of work.
+.TP
+.B global
+The whole fleet, for ever, across every team that will ever run on it. For
+what is true of the MACHINES and the TOOLS rather than of a job: which host
+has the GPU, that a service is managed by sysvinit, that a repository's tests
+need a flag to run at all. Writing it needs the
+.B memory\-writer
+capability, deliberately: a global note is read by teams nobody has thought
+of yet.
+.PP
+A nearer scope shadows a wider one for the same key, so a team can override a
+fleet\-wide default by writing its own without touching it.
+.PP
+The code graph is scoped too, for a different reason: it is parsed from the
+files in one directory on one machine. An agent asks it of its own workspace
+by default \(em the only scope that parses on demand \(em of every workspace
+its team has parsed, or of every parsed workspace on the fleet, which is how
+"where does this live at all" is answerable when each seat has a checkout of
+its own.
 .SH ROLES
 A role is a free-form string; there is no fixed list, and nothing decides
 from it who is more capable. What it does:
@@ -271,7 +324,11 @@ moves it to another session,
 .B e
 renames it and
 .B x
-removes it. Each asks first, and each calls the same endpoint the matching
+removes it,
+.B E
+opens what the seat tells its agent in
+.BR $EDITOR .
+Each asks first, and each calls the same endpoint the matching
 subcommand does. In the memory pane
 .B Enter
 opens the whole of one.
@@ -526,6 +583,66 @@ requests and the tokens scoped to it. Refuses while anybody is still sitting
 in it unless
 .B \-\-force
 is given.
+.TP
+.BI seat\-prompt " SESSION SEAT " [ \-\-system " FILE" ] [ \-\-instructions " FILE" ] \
+[ \-\-append | \-\-replace ] [ \-\-clear\-system ] [ \-\-clear\-instructions ]
+What a seat tells its agent, over and above whatever its CLI says by itself.
+Two separate things.
+.RS
+.PP
+A
+.B system prompt
+is who the agent in this seat is. It is handed to the CLI as a system prompt
+and it lasts: every agent that ever fills the seat gets it, including a
+respawn at 4am that nobody watched.
+.B \-\-append
+(the default) adds it to the CLI's own system prompt;
+.B \-\-replace
+is used instead of it, which throws away what that CLI tells the model about
+its own tools \(em right for a seat not meant to behave like that CLI, a trap
+otherwise. A CLI that takes no such argument says so in the team's chat
+rather than starting without one.
+.PP
+An
+.B instruction
+is what to do on arrival. It is sent to each new occupant as a message, so it
+reaches a seat however that seat can be reached, and the agent already
+sitting there does not get it again.
+.PP
+Both are markdown, read from a file or piped in with
+.BR \- ,
+because a prompt worth having is longer than a shell line. With neither
+given, it prints what is set. Neither reaches the agent sitting there now:
+the system prompt applies to the next process started in the seat, the
+instruction to the next occupant.
+.PP
+.EX
+nexmesh seat-prompt team alice
+nexmesh seat-prompt team alice --system role.md --replace
+cat role.md | nexmesh seat-prompt team alice --system -
+nexmesh seat-prompt team alice --clear-instructions
+.EE
+.RE
+.TP
+.BI cancel " SESSION " [ \-\-id " N" ] [ \-\-unseen ]
+Withdraw a message nobody has seen, so it is never delivered.
+.RS
+.PP
+A message waits until it is delivered, and nothing expires it. Addressed to a
+seat that has gone, or sent in error, it sits there: the sender believes it
+was heard, and the next process to take that seat is handed something stale
+the moment it starts.
+.PP
+Not the same as clearing unclaimed, which marks what a person has dealt with
+and still delivers the message. A message an agent has ALREADY seen cannot be
+unsent and is refused, because the log is read later to work out what an
+agent knew when it acted.
+.PP
+.EX
+nexmesh cancel team --id 4821
+nexmesh cancel team --unseen
+.EE
+.RE
 .SS Driving
 .TP
 .BI send " SESSION TEXT " [ \-\-to " WHO" ]
@@ -546,6 +663,55 @@ to release the team.
 .BI budget " SESSION " [ \-\-tokens " N" ]
 Set, raise or clear a session's token ceiling. Changing it re\-arms the
 guard, so a session paused on budget can be given more and resumed.
+.TP
+.BI team\-rules " SESSION " [ \-\-from " FILE" ] [ \-\-clear ]
+Read or set the standing rules everybody in a team is told, over and above
+their own brief \(em the conventions, what not to touch, how this team works.
+.RS
+.PP
+Every seat started from then on gets them near the top of its first prompt,
+and everybody already running is told in the chat. Only the operator and a
+seat holding orchestrator authority may write them. 8 KiB limit: rules nobody
+can hold in their head are rules nobody follows.
+.RE
+.TP
+.BI seat\-prompt " SESSION AGENT " [ \-\-skill " NAME" ] [ \-\-no\-skill " NAME" ]
+Select or deselect one of the template's skills for that seat, leaving the
+rest of its selection alone. Repeatable. With no flags at all,
+.B seat\-prompt
+prints what the seat is built from and what it carries.
+.TP
+.BI roles " " [ ROLE ] [ \-\-skills " A,B" ]
+The ready\-made role briefs this fleet has, or one of them in full. Apply one
+with
+.BR "seat\-prompt \-\-template" .
+.TP
+.BI compact\-at " SESSION AGENT PCT"
+Compact that seat by itself once its context passes that percentage of its
+model's window.
+.I PCT
+may be
+.BR off ,
+or
+.B default
+to follow the team and then the fleet. OFF for every seat until set. Say
+.B session
+instead of a seat for everybody who has not set their own.
+.TP
+.BI loop\-guard " SESSION AGENT REPEATS"
+Stop that seat if it repeats the same turn that many times in a row: it is
+interrupted, paused and reported to you, with its conversation intact.
+Different arguments are different work and are never counted. Minimum 2; OFF
+until set.
+.TP
+.BI flood " SESSION AGENT " [ \-\-per\-min " N" ] [ \-\-per\-pair " N" ] [ \-\-off ]
+Refuse messages from a seat that is flooding the team:
+.B \-\-per\-min
+for one seat sending too much to anybody, and
+.B \-\-per\-pair
+for two seats talking only to each other in ten minutes. The refusal goes to
+the agent and says what to do instead; its work is not stopped, only its
+messages. OFF until set.
 .TP
 .BI sync " SESSION " \-\-op " publish|refresh|status"
 Publish, pull, or report on a shared workspace, on every machine at once.

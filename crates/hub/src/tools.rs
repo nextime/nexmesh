@@ -17,6 +17,14 @@ pub struct Ctx<'a> {
     pub db: &'a Connection,
     pub session_id: String,
     pub slot_id: String,
+    /// The FLEET-WIDE flood limits: messages a seat may send a minute, and
+    /// messages one pair may exchange in ten. The bottom of the usual three
+    /// levels -- the seat's own, then its team's, then this -- and the only
+    /// one that is not in the database, because it belongs to the hub's
+    /// deployment rather than to anything in it.
+    ///
+    /// `(0, 0)` is off, which is what a `Default` and every test gets.
+    pub flood: (i64, i64),
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String> {
@@ -147,6 +155,46 @@ impl<'a> Ctx<'a> {
         self.label_of(&self.slot_id)
     }
 
+    /// What this seat may do to the fleet. Read fresh on every call, never
+    /// cached and never taken from anything the caller sent.
+    fn authority(&self) -> nexmesh_proto::authority::Authority {
+        crate::fleet::authority_of(self.db, &self.slot_id)
+    }
+
+    /// WHO THIS SEAT MAY SEE AND ADDRESS, as one SQL predicate.
+    ///
+    /// Every peer query uses this, so what is LISTED and what can be
+    /// ADDRESSED cannot drift apart. They had: `list_peers` carried its own
+    /// copy of the predicate without the terminal exclusion, so an adopted
+    /// terminal was offered as a teammate and then refused as a target --
+    /// "no teammate matching 'term-Orchestrator'" for a name the same tool
+    /// had just printed.
+    ///
+    /// A SUPERORCHESTRATOR'S ROOM IS THE FLEET. Its authority already
+    /// reaches every team -- it may move, rename, remove and elect seats
+    /// anywhere, and `list_seats` shows it all of them -- but its messaging
+    /// stayed session-scoped, so it could reorganise a team it was unable to
+    /// say one word to. The reach of the two has to be the same reach.
+    ///
+    /// An ordinary seat, and an orchestrator, see exactly what they always
+    /// did: their own team, the teams they are a guest in, and those teams'
+    /// guests.
+    ///
+    /// `me` is the placeholder holding this seat's slot id in the caller's
+    /// query, because the two call sites number their parameters differently.
+    fn peer_scope(&self, me: &str) -> String {
+        use nexmesh_proto::authority::Authority;
+        let room = if self.authority() == Authority::Super {
+            "1 = 1".to_string()
+        } else {
+            crate::guests::shares_room("s", me)
+        };
+        // An adopted terminal is a window onto a seat, not a teammate. It
+        // holds no model, answers nothing and acks nothing, and whatever is
+        // IN it has a seat of its own that this query already returns.
+        format!("({room}) AND COALESCE(s.cli_id,'') <> 'tmux' AND s.tmux_target IS NULL")
+    }
+
     fn label_of(&self, slot_id: &str) -> String {
         self.db
             .query_row(
@@ -166,19 +214,19 @@ impl<'a> Ctx<'a> {
             .flatten()
     }
 
-    /// Every teammate in this session but me, with what they answer to.
+    /// Everyone this seat may address but me, with what they answer to.
     fn peers(&self) -> Result<Vec<Peer>> {
-        let mut stmt = self.db.prepare(
-            // An adopted terminal is a window onto a seat, not a teammate.
-            // It holds no model, answers nothing, and acks nothing -- and it
-            // was being listed as a peer, so an agent looking for somebody
-            // to hand work to found `term-Max` sitting there as if it could
-            // take it. Whatever is IN that terminal has a seat of its own,
-            // and that seat is listed.
-            "SELECT id, LOWER(COALESCE(display_name, '')), LOWER(COALESCE(role, '')), capabilities
-             FROM slots WHERE session_id = ? AND id != ?
-               AND COALESCE(cli_id,'') <> 'tmux' AND tmux_target IS NULL",
-        )?;
+        let mut stmt = self.db.prepare(&format!(
+            // Anyone I share a room with: my own team, plus any team I am a
+            // guest in, plus the guests of those teams. Both directions
+            // matter -- a room must see its guests, and a guest must see the
+            // rooms it answers in, or it can be asked for something and have
+            // no way to reply. For a superorchestrator, the fleet.
+            "SELECT s.id, LOWER(COALESCE(s.display_name, '')),
+                    LOWER(COALESCE(s.role, '')), s.capabilities
+                 FROM slots s WHERE {scope} AND s.id != ?2",
+            scope = self.peer_scope("?2"),
+        ))?;
         let rows = stmt
             .query_map(params![self.session_id, self.slot_id], |r| {
                 let caps: String = r.get(3)?;
@@ -233,7 +281,26 @@ impl<'a> Ctx<'a> {
             .collect();
         match partial.len() {
             1 => Ok(partial[0].id.clone()),
-            0 => bail!("no teammate matching '{needle}'"),
+            // The guidance is the SAME whether or not a seat by this name
+            // exists in another session -- deliberately. A bare "no teammate
+            // matching X" reads as a typo and teaches nothing, so it is worth
+            // saying why a send can fail and how cross-session reaching
+            // actually works: two engineer seats that must collaborate hit
+            // exactly this, with the name right and the room not shared. But
+            // the message must NOT confirm whether X exists elsewhere, or it
+            // becomes an oracle a plain seat could sweep to enumerate other
+            // teams -- which `list_peers` refuses to reveal for the same
+            // reason. So it names the mechanism, not the seat: the operator
+            // or an orchestrator who runs the invite already knows where the
+            // seat lives.
+            0 => bail!(
+                "no teammate matching '{needle}' in a room you share. You can only message \
+                 seats in your own team or a team you are a guest in. If '{needle}' is a \
+                 seat in another session, it has to share a room with you first -- ask the \
+                 operator or an orchestrator to invite it into yours (guesting), after which \
+                 send_message reaches it with you as the sender -- or raise the request with \
+                 notify_operator."
+            ),
             k => bail!("'{needle}' is ambiguous ({k} matches); use a unique name"),
         }
     }
@@ -293,19 +360,88 @@ impl<'a> Ctx<'a> {
     }
 
     fn insert_message(&self, to_slot: Option<&str>, kind: MessageKind, body: &str) -> Result<i64> {
-        // The return address is this seat: whoever reads this can answer it
-        // with `reply` instead of broadcasting at the whole team.
+        // FLOOD PROTECTION, on the one funnel every agent-sent message goes
+        // through: `send_message`, `broadcast` and `reply` all arrive here,
+        // so there is no way round it and no second place to remember.
+        //
+        // The message is REFUSED rather than dropped, and the refusal says
+        // what to do instead. A message silently swallowed teaches an agent
+        // nothing and it sends another; an error it can read is the only
+        // thing that stops the loop at the end that is looping.
+        if let Some(trip) = crate::watchdog::flood_check(
+            self.db,
+            &self.slot_id,
+            to_slot,
+            self.flood.0,
+            self.flood.1,
+        )? {
+            let other = trip
+                .other
+                .as_deref()
+                .map(|o| self.label_of(o))
+                .unwrap_or_else(|| "that teammate".to_string());
+            crate::watchdog::note_flood(
+                self.db,
+                &self.session_id,
+                &self.slot_id,
+                &trip,
+                &self.my_label(),
+            );
+            bail!("{}", trip.explain(&other));
+        }
+        // A message belongs in the ROOM it is addressed into, which is not
+        // always the sender's own. A guest seat -- a service answering in
+        // several teams -- has one home session, and a message it sends to
+        // somebody in another of its rooms has to land in THAT room, or the
+        // recipient's team never sees it and the sender's team sees a note
+        // about work it has nothing to do with.
+        //
+        // The return address stays this seat in ITS session, so `reply`
+        // still comes back here wherever "here" is.
+        let room = match to_slot {
+            Some(t) => self
+                .db
+                .query_row("SELECT session_id FROM slots WHERE id = ?", [t], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?
+                .filter(|home| {
+                    // Only when BOTH of us answer there. Otherwise it is
+                    // this room: a seat must not be able to post into a team
+                    // it has nothing to do with by addressing a guest of it.
+                    //
+                    // Unless it is a SUPERORCHESTRATOR, whose room is the
+                    // fleet. The message has to land in the RECIPIENT'S
+                    // room or it is never delivered at all: every delivery
+                    // query -- `pending_for_slot`, `unclaimed_for_slot` --
+                    // asks for messages in the rooms the RECIPIENT answers
+                    // in, and the sender's room is not one of them. Written
+                    // into the sender's own session it would sit there
+                    // forever, reported as sent and read by nobody.
+                    //
+                    // `reaches` is false for an orchestrator here (its reach
+                    // is its own session, which this arm has already
+                    // excluded), so this widens exactly one level and
+                    // nothing else.
+                    home != &self.session_id
+                        && (crate::guests::serves(self.db, &self.slot_id, home)
+                            || self.authority().reaches(&self.session_id, home))
+                })
+                .unwrap_or_else(|| self.session_id.clone()),
+            None => self.session_id.clone(),
+        };
         self.db.execute(
             "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms,
                                    reply_to_slot, reply_to_session)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?2, ?1)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?2, ?7)",
             params![
-                self.session_id,
+                room,
                 self.slot_id,
                 to_slot,
                 serde_json::to_value(kind)?.as_str().unwrap_or("text"),
                 body,
-                now_ms()
+                now_ms(),
+                self.session_id,
             ],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -372,17 +508,38 @@ impl<'a> Ctx<'a> {
                 )?;
                 Ok(format!("Answered {}.", self.label_of(&slot)))
             }
-            // Forwarded here from the operator channel: the answer goes back
-            // into the session it came from, addressed to the seat that asked.
+            // The answer crosses a team boundary: back into the session it
+            // came from, addressed to the seat that asked. Two things arrive
+            // this way -- an answer to something the operator channel
+            // forwarded here, and an answer to a superorchestrator that
+            // addressed this seat from another team.
+            //
+            // FROM_SLOT IS THIS SEAT, not NULL. It was NULL, and a NULL
+            // sender is what the whole stack reads as THE OPERATOR: the
+            // recipient was told a person was talking to it when a peer was,
+            // and the handshake text tells an agent to treat an operator
+            // message as the person running the fleet. The one thing the
+            // recipient cannot work out for itself is which TEAM answered --
+            // a seat in another room is not in its roster -- so that is what
+            // the prefix says, instead of repeating a name now attributed
+            // properly.
             Some(slot) => {
+                let team: String = self
+                    .db
+                    .query_row(
+                        "SELECT COALESCE(name, id) FROM sessions WHERE id = ?",
+                        [&self.session_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| self.session_id.clone());
                 self.db.execute(
                     "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
                                            sent_at_ms, reply_to_slot, reply_to_session)
-                     VALUES (?1, NULL, ?2, 'text', ?3, ?4, ?5, ?6)",
+                     VALUES (?1, ?5, ?2, 'text', ?3, ?4, ?5, ?6)",
                     params![
                         target_session,
                         slot,
-                        format!("[answer from {}] {text}", self.my_label()),
+                        format!("[answering from the {team} team] {text}"),
                         now,
                         self.slot_id,
                         self.session_id
@@ -426,8 +583,12 @@ pub fn unclaimed_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> R
                 COALESCE(s.display_name, s.role, 'orchestrator'),
                 m.to_slot, m.kind, m.body, m.sent_at_ms
          FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
-         WHERE m.session_id = ?1
-           AND (m.to_slot = ?2 OR m.to_slot IS NULL)
+         -- Every team this seat answers in: see `pending_for_slot`, which
+         -- explains why a BROADCAST is only taken from its own team.
+         WHERE (m.session_id = ?1
+                OR m.session_id IN (SELECT g.session_id FROM slot_sessions g
+                                     WHERE g.slot_id = ?2))
+           AND (m.to_slot = ?2 OR (m.to_slot IS NULL AND m.session_id = ?1))
            AND m.from_slot IS NOT ?2
            AND m.claimed_at_ms IS NULL
          ORDER BY m.id ASC LIMIT 50",
@@ -469,7 +630,18 @@ pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Res
                 COALESCE(s.display_name, s.role, 'orchestrator'),
                 m.to_slot, m.kind, m.body, m.sent_at_ms
          FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
-         WHERE m.session_id = ?1
+         -- THE ONE GATE. Every route that hands a message to an agent comes
+         -- through here -- the push tick, the typed tick, the interactive
+         -- tick, a shim asking, and the participant endpoint -- so a message
+         -- the operator withdrew is excluded once, here, rather than in five
+         -- queries of which one would eventually be missed.
+         WHERE m.cancelled_at_ms IS NULL
+         -- Every team this seat answers in, not just the one it lives in. A
+         -- service seat -- a capability bridge, a reviewer -- is a guest in
+         -- other rooms, and a message sent to it THERE has to arrive.
+           AND (m.session_id = ?1
+                OR m.session_id IN (SELECT g.session_id FROM slot_sessions g
+                                     WHERE g.slot_id = ?2))
            AND m.from_slot IS NOT ?2
            -- A RECORD is not a message: the console's own housekeeping
            -- lines, the node's notes about what it did while nobody was
@@ -485,8 +657,18 @@ pub fn pending_for_slot(db: &Connection, session_id: &str, slot_id: &str) -> Res
            -- Addressed to me: the message's own state is the whole story.
            -- Addressed to the team: MY copy is, because one teammate acking
            -- must not take it from the rest.
+           --
+           -- A BROADCAST is only taken from this seat's OWN team (?1). A
+           -- service seat visiting several teams -- which is what a
+           -- capability bridge or a shared reviewer is -- would otherwise
+           -- receive every one of those teams' announcements, and a bridge
+           -- invited into seven rooms is then reading seven rooms' traffic
+           -- to do a job it is asked for by name. In a room it visits it
+           -- answers what it is ASKED; its own team is where it hears
+           -- announcements. Address it directly if a visited team needs it
+           -- to know something.
            AND ((m.to_slot = ?2 AND m.acked_at_ms IS NULL AND m.inflight_at_ms IS NULL)
-                OR (m.to_slot IS NULL AND NOT EXISTS (
+                OR (m.to_slot IS NULL AND m.session_id = ?1 AND NOT EXISTS (
                       SELECT 1 FROM message_recipients r
                        WHERE r.message_id = m.id AND r.slot_id = ?2
                          AND (r.acked_at_ms IS NOT NULL OR r.inflight_at_ms IS NOT NULL))))
@@ -627,6 +809,46 @@ pub fn reclaim_stale_inflight(db: &Connection, older_than_ms: i64) -> Result<usi
 
 pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
     ctx.touch();
+    // WHAT THIS SEAT MAY CALL, checked from the seat itself on every call.
+    //
+    // The tool list a seat is advertised already follows its authority, but
+    // an advertisement is not an authorisation: a model that has seen a tool
+    // once will call it again from memory after being demoted, and a model
+    // told in a prompt not to do something routes around that the moment it
+    // believes it is helping. For an OBSERVER -- a seat that exists to be
+    // read and must not be able to steer the team -- that is the difference
+    // between a restriction and a request.
+    //
+    // One indexed lookup per call, on the same slot row the rest of this
+    // module already reads.
+    let level = ctx.authority();
+    if !nexmesh_proto::tools::allowed_for(level, tool) && nexmesh_proto::tools::is_known_tool(tool)
+    {
+        if level.is_read_only() {
+            bail!(
+                "'{tool}' is not something this seat can do. It OBSERVES: it reads the \
+                 team's state and memory, answers whoever asks it, and can ask a \
+                 teammate for its progress with `ask_progress` -- it cannot send a \
+                 message of its own, change anything, or touch a seat. That is the \
+                 point of the seat, not a misconfiguration; the operator can change \
+                 its authority if it was meant to take part."
+            );
+        }
+        // A tool that exists only for an observer, called by a seat that is
+        // not one. Harmless if it ran -- `ask_progress` is a restricted
+        // `send_message`, which this seat already has -- but a gate with a
+        // hole in it is one somebody will add a tool behind.
+        if !nexmesh_proto::tools::needs_authority(tool) {
+            bail!(
+                "'{tool}' is an OBSERVER's tool: the restricted substitute for \
+                 `send_message` given to a seat that may only watch. This seat has \
+                 `send_message` itself."
+            );
+        }
+        // Otherwise it is a fleet tool, and that arm's own message is better
+        // than this one -- it says where authority comes from and who can
+        // grant it -- so leave it to answer, below.
+    }
     match tool {
         "list_peers" => list_peers(ctx, args),
         "send_message" => send_message(ctx, args),
@@ -661,12 +883,154 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         "forget" => forget_memory(ctx, args),
         "memory_history" => memory_history(ctx, args),
         "save_context" => save_context(ctx, args),
+        "fold_context" => fold_context(ctx, args),
+        "unfold_context" => unfold_context(ctx, args),
+        "search_context" => search_context(ctx, args),
+        "context_map" => context_map(ctx),
         "pending_asks" => pending_asks(ctx),
         "answer_ask" => answer_ask(ctx, args),
         "get_history" => get_history(ctx, args),
+        "team_rules" => team_rules(ctx),
+        "ask_progress" => ask_progress(ctx, args),
+
+        // The fleet tools. Authority is checked HERE, from the calling slot,
+        // and not inferred from anything the caller sent: these are only
+        // advertised to a seat that holds it (see
+        // `proto::tools::team_tools_for`), but a model that has seen a tool
+        // once will call it again from memory after being demoted, and an
+        // advertisement is not an authorisation.
+        name if nexmesh_proto::tools::needs_authority(name) => {
+            let caller = crate::fleet::authority_of(ctx.db, &ctx.slot_id);
+            if !caller.is_orchestrating() {
+                bail!(
+                    "'{name}' is an orchestrator's tool, and this seat is a plain agent. \
+                     Authority lives on the seat in the hub: the operator grants it from \
+                     the dashboard, or an orchestrator of this session can with `elect`."
+                );
+            }
+            let db = ctx.db;
+            let (slot, sess) = (ctx.slot_id.as_str(), ctx.session_id.as_str());
+            match name {
+                "elect" => crate::fleet::elect(
+                    db, slot, sess, &arg_str(args, "agent")?, &arg_str(args, "authority")?),
+                "list_seats" => crate::fleet::list_seats(db, slot, sess),
+                "invite_agent" => crate::fleet::invite_agent(
+                    db, slot, sess, &arg_str(args, "agent")?, &arg_str(args, "session")?,
+                    args.get("leave").and_then(|v| v.as_bool()).unwrap_or(false)),
+                "add_agent" => crate::fleet::add_agent(db, slot, sess, args),
+                "remove_agent" => crate::fleet::remove_agent(
+                    db, slot, sess, &arg_str(args, "agent")?),
+                "rename_agent" => crate::fleet::rename_agent(
+                    db, slot, sess, &arg_str(args, "agent")?, &arg_str(args, "name")?),
+                "move_agent" => crate::fleet::move_agent(
+                    db, slot, sess, &arg_str(args, "agent")?, &arg_str(args, "session")?),
+                "set_team_rules" => set_team_rules(ctx, args),
+                // `needs_authority` said yes and this match did not: a tool
+                // was added to the orchestrator surface without being wired
+                // up here.
+                _ => bail!("'{name}' is not implemented on this hub"),
+            }
+        }
         other => bail!("unknown tool '{other}'"),
     }
 }
+
+/// The team's standing rules, as they stand.
+fn team_rules(ctx: &Ctx) -> Result<String> {
+    let text: Option<String> = ctx
+        .db
+        .query_row(
+            "SELECT instructions FROM sessions WHERE id = ?",
+            [&ctx.session_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok("This team has no standing rules set. Work to your own brief.".into()),
+        Some(t) => Ok(format!(
+            "THIS TEAM'S RULES, set for everybody working here. They outrank your own \
+             preferences about how to work.\n\n{t}"
+        )),
+    }
+}
+
+/// Replace the team's standing rules.
+///
+/// Reachable only from a seat holding orchestrator or superorchestrator
+/// authority -- `needs_authority` puts it behind the same gate as the rest of
+/// the fleet tools. Rules an ordinary agent can rewrite are not rules, and an
+/// agent that has misread them would be the first to edit them.
+///
+/// Everybody already running is TOLD, in the chat. Without that, a team
+/// carries on to the old rules with nothing to distinguish the agents that
+/// know from the agents that do not -- and the rules only reach a seat's
+/// prompt when its next process starts, which may be days.
+fn set_team_rules(ctx: &Ctx, args: &Value) -> Result<String> {
+    let text = arg_str(args, "text").unwrap_or_default();
+    let text = text.trim();
+    if text.len() > MAX_TEAM_RULES {
+        bail!(
+            "that is {} KiB of rules; the limit is {} KiB. Rules nobody can hold in \
+             their head are rules nobody follows -- put the detail in \
+             `store_knowledge` and keep these short.",
+            text.len() / 1024,
+            MAX_TEAM_RULES / 1024
+        );
+    }
+    let me = ctx.my_label();
+    let before: Option<String> = ctx
+        .db
+        .query_row(
+            "SELECT instructions FROM sessions WHERE id = ?",
+            [&ctx.session_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if before.as_deref().map(str::trim).unwrap_or("") == text {
+        return Ok("Those are already this team's rules; nothing changed.".into());
+    }
+    ctx.db.execute(
+        "UPDATE sessions SET instructions = ? WHERE id = ?",
+        params![if text.is_empty() { None } else { Some(text) }, ctx.session_id],
+    )?;
+    ctx.db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+        params![
+            now_ms(),
+            me,
+            "team_rules_set",
+            serde_json::json!({ "session": ctx.session_id, "bytes": text.len() })
+                .to_string()
+        ],
+    )?;
+    let said = if text.is_empty() {
+        format!("{me} has cleared this team's standing rules.")
+    } else {
+        format!(
+            "{me} has changed this team's standing rules. They apply to everybody here \
+             from now on -- call `team_rules` to read them.\n\n{text}"
+        )
+    };
+    ctx.db.execute(
+        "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+         VALUES (?, NULL, NULL, 'system', ?, ?)",
+        params![ctx.session_id, said, now_ms()],
+    )?;
+    Ok(if text.is_empty() {
+        "Cleared. Everybody here has been told.".to_string()
+    } else {
+        format!(
+            "Set, {} characters. Everybody here has been told, and every seat started \
+             from now on gets them in its first prompt.",
+            text.len()
+        )
+    })
+}
+
+/// Rules longer than this are not rules. See `set_team_rules`.
+const MAX_TEAM_RULES: usize = 8 * 1024;
 
 struct PeerRow {
     name: String,
@@ -683,24 +1047,38 @@ struct PeerRow {
     slot: String,
     /// The parts of the workspace this teammate is responsible for.
     zones: Vec<String>,
+    /// Whose team this one actually lives in, when that is not the same as
+    /// the caller's. A service seat visiting several teams is addressable
+    /// here but does not belong to this room, and that changes what it is
+    /// reasonable to ask of it.
+    elsewhere: Option<String>,
 }
 
 fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
     let role_filter = opt_str(args, "role");
     let cap_filter = opt_str(args, "capability").map(|c| c.trim().to_lowercase());
-    let mut stmt = ctx.db.prepare(
+    let mut stmt = ctx.db.prepare(&format!(
+        // Everyone I share a room with -- THE SAME PREDICATE `resolve_peer`
+        // uses, from `peer_scope`, so what is LISTED and what can be
+        // ADDRESSED cannot drift apart. It used to be a second copy of it
+        // here, which drifted. A service seat visiting this team appears
+        // here; so does a team this seat is visiting.
         "SELECT COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
                 s.task_state, s.summary, s.participant_kind,
                 COALESCE(n.name, CASE WHEN a.provenance = 'external' THEN 'external' ELSE '-' END),
-                COALESCE(a.status, 'disconnected'), s.capabilities, a.model, s.model, s.id
+                COALESCE(a.status, 'disconnected'), s.capabilities, a.model, s.model, s.id,
+                s.session_id <> (SELECT session_id FROM slots WHERE id = ?1),
+                COALESCE(se.name, s.session_id)
          FROM slots s
          LEFT JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
          LEFT JOIN nodes n ON n.id = a.node_id
-         WHERE s.session_id = ? AND s.id != ?
+         LEFT JOIN sessions se ON se.id = s.session_id
+         WHERE {scope} AND s.id != ?1
          ORDER BY 1",
-    )?;
+        scope = ctx.peer_scope("?1"),
+    ))?;
     let rows: Vec<PeerRow> = stmt
-        .query_map(params![ctx.session_id, ctx.slot_id], |r| {
+        .query_map(params![ctx.slot_id], |r| {
             let caps: String = r.get(7)?;
             let reported: Option<String> = r.get(8)?;
             let requested: Option<String> = r.get(9)?;
@@ -716,6 +1094,7 @@ fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
                 model: reported.or(requested),
                 slot: r.get(10)?,
                 zones: Vec::new(),
+                elsewhere: if r.get::<_, bool>(11)? { r.get(12)? } else { None },
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -772,6 +1151,24 @@ fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
         }
         if !p.capabilities.is_empty() {
             out.push_str(&format!(" can={}", p.capabilities.join(",")));
+        }
+        // A seat whose home is another team. Said out loud, because it is
+        // addressable like a teammate and is not one: what it is reasonable
+        // to ask of it -- and what it already knows from its other rooms --
+        // is different.
+        //
+        // Two different things end up here and must not read the same. A
+        // seat INVITED into this room is a service visiting it. A
+        // superorchestrator sees every team whether or not anyone invited
+        // anyone, and calling those "visiting from" told it twelve seats
+        // were guests of its room when none of them were -- so it would
+        // address another team's engineer as if that team had lent it out.
+        if let Some(home) = &p.elsewhere {
+            if crate::guests::serves(ctx.db, &p.slot, &ctx.session_id) {
+                out.push_str(&format!(" [a service, visiting from {home}]"));
+            } else {
+                out.push_str(&format!(" [on the {home} team; you reach it as a superorchestrator]"));
+            }
         }
         out.push('\n');
         // What this teammate is responsible for. Without it, a team that
@@ -833,6 +1230,56 @@ fn send_message(ctx: &Ctx, args: &Value) -> Result<String> {
     let target = ctx.resolve_peer(&to)?;
     ctx.insert_message(Some(&target), MessageKind::Text, &text)?;
     Ok(format!("Sent to {}.", ctx.label_of(&target)))
+}
+
+/// An observer's one way of putting something in front of a teammate.
+///
+/// THE QUESTION IS FIXED. An observer with a free-text message is
+/// `send_message` with extra steps, and watching a team turns into steering
+/// it one helpful suggestion at a time. So the caller chooses WHICH of three
+/// questions to ask and contributes no words of its own; the text below is
+/// the hub's, and it says plainly that a short answer is the right answer.
+///
+/// Available to anybody in principle -- nothing breaks if an orchestrator
+/// calls it -- but only advertised to an observer, which has no other way to
+/// ask. See `proto::tools::observer_tools`.
+fn ask_progress(ctx: &Ctx, args: &Value) -> Result<String> {
+    let to = arg_str(args, "agent")?;
+    let want = args
+        .get("want")
+        .and_then(|v| v.as_str())
+        .unwrap_or("progress")
+        .trim()
+        .to_lowercase();
+    let question = match want.as_str() {
+        "tests" | "test" | "test_results" | "build" => {
+            "what the last build or test run did: what you ran, and what it said. \
+             The result, not an explanation of it"
+        }
+        "eta" | "when" | "estimate" => {
+            "when you expect this to be done, and what would change that"
+        }
+        "progress" | "status" | "" => {
+            "what state the work is in: what is finished, what you are on now, and \
+             anything you are blocked on"
+        }
+        other => bail!(
+            "'{other}' is not something to ask for. It is 'progress', 'tests' or 'eta'."
+        ),
+    };
+    let target = ctx.resolve_peer(&to)?;
+    let me = ctx.my_label();
+    let text = format!(
+        "{me} is watching this team on somebody's behalf and asks for {question}. \
+         Answer it with `reply` in a line or two and carry on -- it cannot give you \
+         instructions and nothing it says changes your work."
+    );
+    ctx.insert_message(Some(&target), MessageKind::Text, &text)?;
+    Ok(format!(
+        "Asked {} for {}. The answer will arrive as an ordinary message.",
+        ctx.label_of(&target),
+        if want.is_empty() { "progress" } else { want.as_str() }
+    ))
 }
 
 fn broadcast(ctx: &Ctx, args: &Value) -> Result<String> {
@@ -1120,16 +1567,23 @@ fn notify_operator(ctx: &Ctx, args: &Value) -> Result<String> {
     // raised to the supervisors sat there unseen while three agents reported
     // that no orchestrator was reachable. The forward carries the asker as
     // its return address, which is what lets `reply` cross back.
+    // supervisor = 1 is an OPT-IN flag a seat sets with `/supervisor`, and a
+    // fleet can easily have none -- which is exactly how a superorchestrator
+    // existed, saw the whole fleet, and still never received a single raised
+    // ask: the forward looked only for the opt-in flag it had never set. A
+    // seat with super authority supervises the fleet by definition, so it
+    // hears these whether or not anyone flagged it.
     let supervisors: Vec<(String, String)> = {
         let mut q = ctx.db.prepare(
             "SELECT s.id, s.session_id FROM slots s
-              WHERE s.supervisor = 1 AND s.session_id <> ?1",
+              WHERE (s.supervisor = 1 OR s.authority = 'super') AND s.session_id <> ?1",
         )?;
         let rows = q
             .query_map([&ctx.session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
+    let reached = supervisors.len();
     for (slot, session) in supervisors {
         let body = format!(
             "[raised to the supervisors] {me}, in session '{}', says: {text}\n\n\
@@ -1145,14 +1599,26 @@ fn notify_operator(ctx: &Ctx, args: &Value) -> Result<String> {
         )?;
     }
 
-    Ok(match to_session {
-        Some(_) => format!(
+    // Tell the caller what actually happened, including the case the old
+    // text papered over: a raise that reached nobody who can read it. The
+    // operator_messages row is always written for the dashboard, so it is
+    // never lost -- but "watch for a reply" is a promise only someone
+    // listening can keep, and a seat left watching a channel no one is on
+    // is the stall this path was meant to end.
+    Ok(match (to_session, reached) {
+        (Some(_), _) => format!(
             "Raised with this session's orchestrator ({why}). Watch for a reply with \
              check_messages, and carry on with anything that does not depend on it."
         ),
-        None => format!(
-            "Raised with the supervisors who can see the whole fleet ({why}). Watch for a \
-             reply with check_messages, and carry on with anything that does not depend on it."
+        (None, 0) => format!(
+            "Logged for the operator to read on the dashboard ({why}). No supervisor seat \
+             is currently listening, so do not wait on a reply here -- carry on, and raise \
+             it again or ask the operator directly if it blocks you."
+        ),
+        (None, n) => format!(
+            "Raised with {n} supervisor seat(s) who can see the whole fleet ({why}). Watch \
+             for a reply with check_messages, and carry on with anything that does not \
+             depend on it."
         ),
     })
 }
@@ -1321,7 +1787,10 @@ fn view_file_locks(ctx: &Ctx) -> Result<String> {
 /// Kept because agents, prompts and descriptors all name them, and a tool
 /// that disappears is a broken team rather than a migration.
 fn store_knowledge(ctx: &Ctx, args: &Value) -> Result<String> {
-    let scope = crate::memory::Scope::Session(ctx.session_id.to_string());
+    // Session unless told otherwise, which is what it has always meant --
+    // but a fact about the fleet rather than this team, or a note only this
+    // seat should keep, no longer needs a different tool to say so.
+    let scope = scope_of(ctx, args)?;
     crate::memory::store(
         ctx.db,
         &ctx.slot_id,
@@ -1334,14 +1803,18 @@ fn store_knowledge(ctx: &Ctx, args: &Value) -> Result<String> {
 }
 
 fn query_knowledge(ctx: &Ctx, args: &Value) -> Result<String> {
+    // Everything this seat can see unless a scope is named. It used to read
+    // the session and nothing else, so an agent that called it on arrival --
+    // which the skill tells it to -- never saw a fleet-wide convention or its
+    // own notes from its last run, and had no way to know they were there.
     render_entries(ctx, crate::memory::recall(
         ctx.db,
         &ctx.slot_id,
         &ctx.session_id,
         opt_str(args, "key").as_deref(),
-        None,
+        opt_str(args, "search").as_deref(),
         opt_str(args, "category").as_deref(),
-        Some("session"),
+        opt_str(args, "scope").as_deref(),
         100,
     )?)
 }
@@ -1466,6 +1939,223 @@ fn save_context(ctx: &Ctx, args: &Value) -> Result<String> {
     }
 }
 
+// -------------------------------------------------------------- folds ----
+//
+// What a stretch of context established, kept after the context is gone. See
+// `folds.rs` for the shape of it; these four are the agent's side.
+
+fn fold_context(ctx: &Ctx, args: &Value) -> Result<String> {
+    // A fold defaults to the seat's OWN scope rather than the team's. Most
+    // of what an agent folds is its own working context, and a team whose
+    // every seat folded into the session memory would bury what the team
+    // actually needs to know under everybody's housekeeping.
+    let scope = crate::memory::Scope::parse(
+        opt_str(args, "scope").as_deref().or(Some("agent")),
+        opt_str(args, "group").as_deref(),
+        &ctx.slot_id,
+        &ctx.session_id,
+    )?;
+    crate::memory::may_write(ctx.db, &ctx.slot_id, &scope)?;
+    let covers: Vec<String> = args
+        .get("covers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let detail = opt_str(args, "detail").unwrap_or_default();
+    let agent_id: Option<String> = ctx
+        .db
+        .query_row(
+            "SELECT id FROM agents WHERE slot_id = ? AND exited_at_ms IS NULL
+              ORDER BY started_at_ms DESC LIMIT 1",
+            [&ctx.slot_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let f = crate::folds::fold(
+        ctx.db,
+        &scope,
+        &ctx.slot_id,
+        agent_id.as_deref(),
+        &arg_str(args, "topic")?,
+        &arg_str(args, "summary")?,
+        &detail,
+        &covers,
+        args.get("tokens_before").and_then(|v| v.as_i64()),
+    )?;
+    let mut said = format!("Folded as {} (tier {}, {} memory). ", f.id, f.tier, f.scope);
+    if f.tokens_before > f.tokens_after && f.tokens_after > 0 {
+        said.push_str(&format!(
+            "About {} tokens of detail now cost you {} to carry. ",
+            f.tokens_before, f.tokens_after
+        ));
+    } else if f.tokens_after >= f.tokens_before && f.covers.is_empty() {
+        // Said plainly, because an agent folding small stretches is spending
+        // context rather than saving it, and nothing else would tell it.
+        said.push_str(&format!(
+            "Note that this fold costs about {} tokens to carry and put away about {}:              folding a stretch this small gains nothing. Fold at the end of a piece of              work, not after every step. ",
+            f.tokens_after, f.tokens_before
+        ));
+    }
+    if !covers.is_empty() {
+        said.push_str(&format!("{} earlier fold(s) now sit underneath it. ", covers.len()));
+    }
+    said.push_str(
+        "You can let that detail go: `unfold_context` with that id gives it back in full, \
+         and `search_context` finds it by its words.",
+    );
+    Ok(said)
+}
+
+fn unfold_context(ctx: &Ctx, args: &Value) -> Result<String> {
+    let id = arg_str(args, "id")?;
+    let allowed = crate::memory::readable(ctx.db, &ctx.slot_id, &ctx.session_id)?;
+    let Some(f) = crate::folds::get(ctx.db, &id)? else {
+        bail!("there is no fold '{id}'; `search_context` or `context_map` lists what there is");
+    };
+    // Checked against the readable list, the same way the memory store does
+    // it: a scope that is not in that list cannot be reached by passing an id.
+    let may = allowed.iter().any(|sc| sc.name() == f.scope && sc.reference() == f.scope_ref);
+    if !may {
+        bail!(
+            "'{id}' is in another seat's private context. Only what you can see is \
+             yours to unfold."
+        );
+    }
+    crate::folds::note_unfolded(ctx.db, &id)?;
+    let mut out = format!("{} -- {}\n{}\n", f.id, f.topic, f.summary);
+    let kids = crate::folds::children(ctx.db, &id)?;
+    if !kids.is_empty() {
+        out.push_str(&format!(
+            "\nThis fold covers {} earlier fold(s). Unfold one of these to go further down:\n",
+            kids.len()
+        ));
+        for k in &kids {
+            out.push_str(&format!("- {} (tier {}) {}: {}\n", k.id, k.tier, k.topic, k.summary));
+        }
+    }
+    if !f.detail.trim().is_empty() {
+        out.push_str("\nThe detail, as it was handed over:\n");
+        out.push_str(&f.detail);
+        out.push('\n');
+    } else if kids.is_empty() {
+        out.push_str("\nThis fold kept no detail beyond its summary.\n");
+    }
+    Ok(out)
+}
+
+fn search_context(ctx: &Ctx, args: &Value) -> Result<String> {
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10).clamp(1, 50);
+    let scopes = match opt_str(args, "scope") {
+        Some(_) => vec![scope_of(ctx, args)?],
+        None => crate::memory::readable(ctx.db, &ctx.slot_id, &ctx.session_id)?,
+    };
+    let query = arg_str(args, "search")?;
+    let hits = crate::folds::search(ctx.db, &scopes, &query, limit)?;
+    if hits.is_empty() {
+        return Ok(format!(
+            "Nothing folded mentions '{query}'. It may never have been folded, in which \
+             case it is still in your own context or in the files."
+        ));
+    }
+    let mut out = format!("{} fold(s) mention '{query}':\n", hits.len());
+    for f in &hits {
+        out.push_str(&format!(
+            "- {} (tier {}, {}) {}: {}\n",
+            f.id, f.tier, f.scope, f.topic, f.summary
+        ));
+    }
+    out.push_str("`unfold_context` with an id gives back the detail underneath it.\n");
+    Ok(out)
+}
+
+fn context_map(ctx: &Ctx) -> Result<String> {
+    let mut out = String::new();
+    // How full it is, as the hub last measured it -- read off the CLI's own
+    // conversation where the CLI reports one, never estimated here.
+    let row: Option<(Option<i64>, Option<i64>, Option<String>)> = ctx
+        .db
+        .query_row(
+            "SELECT context_used_tokens, context_limit_tokens, context_source
+               FROM agents WHERE slot_id = ? AND exited_at_ms IS NULL
+              ORDER BY started_at_ms DESC LIMIT 1",
+            [&ctx.slot_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    match row {
+        Some((Some(used), Some(limit), source)) if limit > 0 => {
+            out.push_str(&format!(
+                "Your context: {used} of {limit} tokens, {}% full (read from {}).\n",
+                used.saturating_mul(100) / limit,
+                source.unwrap_or_else(|| "your CLI".into())
+            ));
+        }
+        _ => out.push_str(
+            "How full your context is cannot be read for this CLI, so nothing here is \
+             measured against a window. Fold by the rule instead: whatever the step you \
+             are on no longer needs.\n",
+        ),
+    }
+
+    let scopes = crate::memory::readable(ctx.db, &ctx.slot_id, &ctx.session_id)?;
+    let mut any = false;
+    for sc in &scopes {
+        let shape = crate::folds::shape(ctx.db, sc)?;
+        if shape.count() == 0 {
+            continue;
+        }
+        any = true;
+        out.push_str(&format!(
+            "\n{} memory: {} fold(s), carrying about {} tokens of summary over about {} \
+             tokens of detail.\n",
+            sc.name(),
+            shape.count(),
+            shape.carried(),
+            shape.folded()
+        ));
+        for (tier, n, carried, folded) in &shape.tiers {
+            out.push_str(&format!(
+                "  tier {tier}: {n} fold(s), {carried} carried, {folded} folded\n"
+            ));
+        }
+    }
+    if !any {
+        out.push_str(
+            "\nNothing has been folded yet. `fold_context` is how a stretch of work stops \
+             costing you context without being lost.\n",
+        );
+    } else {
+        let recent = crate::folds::visible(ctx.db, &scopes, 12)?;
+        out.push_str("\nMost recent, newest first:\n");
+        let now = nexmesh_proto::now_ms();
+        for f in &recent {
+            let mins = (now - f.created_at_ms) / 60_000;
+            let when = if mins < 1 {
+                "just now".to_string()
+            } else if mins < 90 {
+                format!("{mins}m ago")
+            } else {
+                format!("{}h ago", mins / 60)
+            };
+            out.push_str(&format!(
+                "- {} (tier {}, {}, {when}) {}\n", f.id, f.tier, f.scope, f.topic
+            ));
+        }
+        out.push_str(
+            "\nWhen one scope carries many tier-1 folds, fold them into one with `covers`: \
+             that is what keeps a long job down to a handful of summaries.\n",
+        );
+    }
+    out.push_str(&format!("\n{}\n", crate::folds::DOCTRINE));
+    Ok(out)
+}
+
 fn memory_history(ctx: &Ctx, args: &Value) -> Result<String> {
     let scope = scope_of(ctx, args)?;
     let key = arg_str(args, "key")?;
@@ -1485,13 +2175,32 @@ fn memory_history(ctx: &Ctx, args: &Value) -> Result<String> {
 
 fn get_history(ctx: &Ctx, args: &Value) -> Result<String> {
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(30).clamp(1, 200);
+    // WHAT THIS SEAT COULD HAVE SEEN, not everything in the room.
+    //
+    // This used to return every message in the session, so any agent that
+    // called it read the whole room: two other seats' private exchange, the
+    // operator's replies to somebody else, and every `record` line -- the
+    // console's housekeeping, the node's notes about what it did while
+    // nobody was attached, what the operator decided on an approval. None
+    // of that was ever delivered to this agent, and history is not a way
+    // around that.
+    //
+    // Three things qualify: addressed to me, addressed to the whole team,
+    // or sent by me. The same test `pending_for_slot` applies at delivery,
+    // so what an agent can read later matches what it could be handed at
+    // the time.
     let mut stmt = ctx.db.prepare(
         "SELECT COALESCE(s.display_name, s.role, 'orchestrator'), m.kind, m.body
          FROM messages m LEFT JOIN slots s ON s.id = m.from_slot
-         WHERE m.session_id = ? ORDER BY m.id DESC LIMIT ?",
+         WHERE (m.session_id = ?1
+                OR m.session_id IN (SELECT g.session_id FROM slot_sessions g
+                                     WHERE g.slot_id = ?2))
+           AND m.record = 0
+           AND (m.to_slot = ?2 OR m.to_slot IS NULL OR m.from_slot = ?2)
+         ORDER BY m.id DESC LIMIT ?3",
     )?;
     let mut rows: Vec<(String, String, String)> = stmt
-        .query_map(params![ctx.session_id, limit], |r| {
+        .query_map(params![ctx.session_id, ctx.slot_id, limit], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -1538,6 +2247,49 @@ mod tests {
             pending_for_slot(&db, "s1", "sl-rev").unwrap().iter().any(|m| m.id == id),
             "one seat claiming a team message took it from the rest"
         );
+    }
+
+    /// History is what THIS SEAT could have seen, not the whole room.
+    ///
+    /// `get_history` used to return every message in the session, so any
+    /// agent that called it read two other seats' private exchange, the
+    /// operator's replies to somebody else, and every `record` line -- the
+    /// console's housekeeping, the node's notes about what it did unattended,
+    /// what the operator decided on an approval. None of that was ever
+    /// delivered to it, and history must not be a way around delivery.
+    #[test]
+    fn history_shows_only_what_this_seat_could_have_seen() {
+        let db = fixture();
+        let now = now_ms();
+        let say = |from: Option<&str>, to: Option<&str>, body: &str, record: i64| {
+            db.execute(
+                "INSERT INTO messages (session_id, from_slot, to_slot, kind, body,
+                                       sent_at_ms, record)
+                 VALUES ('s1', ?1, ?2, 'text', ?3, ?4, ?5)",
+                params![from, to, body, now, record],
+            )
+            .unwrap();
+        };
+        say(None, None, "everyone hear this", 0);              // team
+        say(None, Some("sl-eng"), "for the engineer", 0);      // to me
+        say(Some("sl-eng"), Some("sl-rev"), "from me to them", 0); // by me
+        say(Some("sl-rev"), Some("sl-oth"), "between two others", 0);
+        say(None, Some("sl-rev"), "for the reviewer alone", 0);
+        say(None, None, "console housekeeping", 1);            // a record
+
+        let ctx = Ctx { db: &db, session_id: "s1".into(), slot_id: "sl-eng".into(),
+                        flood: (0, 0) };
+        let out = get_history(&ctx, &json!({})).unwrap();
+
+        assert!(out.contains("everyone hear this"), "{out}");
+        assert!(out.contains("for the engineer"), "{out}");
+        assert!(out.contains("from me to them"), "{out}");
+        // The three it was never handed.
+        assert!(!out.contains("between two others"), "it read another pair's exchange:\n{out}");
+        assert!(!out.contains("for the reviewer alone"),
+                "it read a message addressed to somebody else:\n{out}");
+        assert!(!out.contains("console housekeeping"),
+                "it read the operator's own housekeeping:\n{out}");
     }
 
     /// Answering is `reply`, and it goes to ONE place.
@@ -1653,6 +2405,62 @@ mod tests {
                 "the answer was sprayed at the team");
     }
 
+    /// THE TRAP THAT LET ASKS SIT FOR HOURS.
+    ///
+    /// `supervisor = 1` is opt-in, set with `/supervisor`. A fleet with a
+    /// superorchestrator but nobody flagged -- which is the ordinary case --
+    /// forwarded every raised ask to no one, while telling the caller to
+    /// watch for a reply. A seat that supervises the fleet by authority must
+    /// receive these whether or not anyone flagged it, and the caller must
+    /// be told the truth about who heard it.
+    #[test]
+    fn a_super_authority_seat_hears_raised_asks_without_the_opt_in_flag() {
+        let db = fixture();
+        let now = now_ms();
+        db.execute(
+            "INSERT INTO sessions (id, name, created_at_ms, last_active_ms)
+             VALUES ('s2','fleet',?,?)",
+            params![now, now],
+        ).unwrap();
+        // authority = super, supervisor = 0: exactly the live fleet's shape.
+        db.execute(
+            "INSERT INTO slots (id, session_id, cli_id, participant_kind, display_name,
+                                role, created_at_ms, supervisor, authority)
+             VALUES ('sl-super','s2','claude','cli','Super','orchestrator',?,0,'super')",
+            params![now],
+        ).unwrap();
+
+        let said = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                            &json!({"text": "fleet-wide thing only a super can settle"}))
+            .unwrap();
+        // The receipt names a real recipient count, not a hopeful "watch".
+        assert!(said.contains("1 supervisor seat") && said.contains("see the whole fleet"),
+                "receipt should say it reached the super: {said}");
+
+        let waiting = pending_for_slot(&db, "s2", "sl-super").unwrap();
+        assert!(waiting.iter().any(|m| m.body.contains("only a super can settle")),
+                "the super seat never received the raised ask");
+    }
+
+    /// And when there is genuinely nobody to hear it, say so plainly rather
+    /// than leave the caller watching a channel no one is on. The dashboard
+    /// row is still written; the lie "watch for a reply" is what's removed.
+    #[test]
+    fn a_raise_with_no_listener_is_honest_about_it() {
+        let db = fixture();
+        // fixture() has no super and no supervisor seat, and sl-eng's session
+        // has no orchestrator token, so this escalates to the supervisors and
+        // finds none.
+        let said = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
+                            &json!({"text": "anybody out there", "escalate": true}))
+            .unwrap();
+        assert!(said.to_lowercase().contains("no supervisor seat")
+                    || said.contains("dashboard"),
+                "a raise nobody can answer must not promise a reply: {said}");
+        assert!(!said.contains("Watch for a reply"),
+                "it still told the caller to wait: {said}");
+    }
+
     /// A record is not a message. The console's housekeeping lines and the
     /// node's notes about what it did unattended are inserted pre-claimed,
     /// and the MCP floor has always skipped them -- but the PUSH and TYPED
@@ -1734,16 +2542,156 @@ mod tests {
     }
 
     fn ctx<'a>(db: &'a Connection, slot: &str) -> Ctx<'a> {
-        Ctx { db, session_id: "s1".into(), slot_id: slot.into() }
+        Ctx { db, session_id: "s1".into(), slot_id: slot.into(), flood: (0, 0) }
     }
 
     /// A seat in some other session, for the cases that are about two teams.
     fn ctx2<'a>(db: &'a Connection, slot: &str, session: &str) -> Ctx<'a> {
-        Ctx { db, session_id: session.into(), slot_id: slot.into() }
+        Ctx { db, session_id: session.into(), slot_id: slot.into(), flood: (0, 0) }
     }
 
     fn state(db: &Connection, slot: &str) -> String {
         db.query_row("SELECT task_state FROM slots WHERE id = ?", [slot], |r| r.get(0)).unwrap()
+    }
+
+    // ------------------------------------------------------------ folds ----
+
+    #[test]
+    fn folding_takes_the_detail_out_of_context_and_hands_it_back_on_request() {
+        // The whole bargain: the agent stops carrying the raw material and
+        // loses nothing by it.
+        let db = fixture();
+        let c = ctx(&db, "sl-eng");
+        let out = dispatch(&c, "fold_context", &json!({
+            "topic": "the tenant migration",
+            "summary": "tenant_id was added in migrations/0041.sql:12; the backfill runs in \
+                        batches of 5000 and is idempotent",
+            "detail": format!("psql output, batch after batch:\n{}\n                               migrations/0041.sql:12 added tenant_id",
+                              "BEGIN; UPDATE claims SET tenant_id = ... ; COMMIT;\n"
+                                  .repeat(400)),
+        })).unwrap();
+        assert!(out.contains("Folded as fd-"), "{out}");
+        let id = out.split("Folded as ").nth(1).unwrap()
+                    .split_whitespace().next().unwrap().to_string();
+        // It says what it bought, so an agent can tell whether folding is
+        // worth doing again.
+        assert!(out.contains("tokens of detail now cost you"), "{out}");
+        let back = dispatch(&c, "unfold_context", &json!({ "id": id })).unwrap();
+        assert!(back.contains("psql output, batch after batch"), "{back}");
+        assert_eq!(back.matches("BEGIN; UPDATE claims").count(), 400,
+                   "every line of it comes back, not a sample");
+        assert!(back.contains("migrations/0041.sql:12"), "{back}");
+    }
+
+    #[test]
+    fn a_fold_is_private_to_the_seat_unless_it_says_otherwise() {
+        // An agent folding its own working context must not fill the team's
+        // memory with its housekeeping -- and a teammate must not be able to
+        // read it back by guessing an id.
+        let db = fixture();
+        let out = dispatch(&ctx(&db, "sl-eng"), "fold_context", &json!({
+            "topic": "my own reading", "summary": "what I found", "detail": "the long version",
+        })).unwrap();
+        assert!(out.contains("agent memory"), "{out}");
+        let id = out.split("Folded as ").nth(1).unwrap()
+                    .split_whitespace().next().unwrap().to_string();
+        let e = dispatch(&ctx(&db, "sl-rev"), "unfold_context", &json!({ "id": id }))
+            .unwrap_err().to_string();
+        assert!(e.contains("another seat's private context"), "{e}");
+        // ...and the team scope is there when it IS for the team.
+        let team = dispatch(&ctx(&db, "sl-eng"), "fold_context", &json!({
+            "topic": "the api we settled on", "summary": "POST /v1/claims takes a batch",
+            "scope": "session",
+        })).unwrap();
+        assert!(team.contains("session memory"), "{team}");
+        let tid = team.split("Folded as ").nth(1).unwrap()
+                      .split_whitespace().next().unwrap().to_string();
+        assert!(dispatch(&ctx(&db, "sl-rev"), "unfold_context", &json!({ "id": tid }))
+                .unwrap().contains("POST /v1/claims"));
+    }
+
+    #[test]
+    fn what_was_folded_is_found_by_its_words_not_by_remembering_an_id() {
+        // A fold nobody can find again is a deletion with extra steps.
+        let db = fixture();
+        let c = ctx(&db, "sl-eng");
+        dispatch(&c, "fold_context", &json!({
+            "topic": "the migration", "summary": "done in batches",
+            "detail": "the column is tenant_id and the index is idx_claims_tenant",
+        })).unwrap();
+        let hit = dispatch(&c, "search_context", &json!({ "search": "idx_claims_tenant" }))
+            .unwrap();
+        assert!(hit.contains("the migration"), "{hit}");
+        assert!(hit.contains("unfold_context"), "it has to say how to get the detail: {hit}");
+        let miss = dispatch(&c, "search_context", &json!({ "search": "kubernetes" })).unwrap();
+        assert!(miss.contains("Nothing folded mentions"), "{miss}");
+    }
+
+    #[test]
+    fn folds_fold_into_folds_so_a_long_job_stays_a_handful_of_summaries() {
+        let db = fixture();
+        let c = ctx(&db, "sl-eng");
+        let mut ids = Vec::new();
+        for n in ["monday", "tuesday", "wednesday"] {
+            let out = dispatch(&c, "fold_context", &json!({
+                "topic": n, "summary": format!("what {n} established"),
+                "detail": "x".repeat(2000),
+            })).unwrap();
+            ids.push(out.split("Folded as ").nth(1).unwrap()
+                        .split_whitespace().next().unwrap().to_string());
+        }
+        let top = dispatch(&c, "fold_context", &json!({
+            "topic": "the week", "summary": "the three days in one line",
+            "covers": ids.clone(),
+        })).unwrap();
+        assert!(top.contains("tier 2"), "{top}");
+        assert!(top.contains("3 earlier fold(s) now sit underneath it"), "{top}");
+        // The map shows the parent, and the way down is in the unfold.
+        let map = dispatch(&c, "context_map", &json!({})).unwrap();
+        assert!(map.contains("tier 2:"), "{map}");
+        let tid = top.split("Folded as ").nth(1).unwrap()
+                     .split_whitespace().next().unwrap().to_string();
+        let down = dispatch(&c, "unfold_context", &json!({ "id": tid })).unwrap();
+        assert!(down.contains("covers 3 earlier fold(s)"), "{down}");
+        assert!(down.contains("monday") && down.contains("wednesday"), "{down}");
+    }
+
+    #[test]
+    fn the_map_says_how_full_it_is_and_what_to_do_about_it() {
+        let db = fixture();
+        db.execute(
+            "UPDATE agents SET context_used_tokens = 150000, context_limit_tokens = 200000,
+                               context_source = 'its conversation file' WHERE id = 'a-eng'",
+            [],
+        ).unwrap();
+        let c = ctx(&db, "sl-eng");
+        let map = dispatch(&c, "context_map", &json!({})).unwrap();
+        assert!(map.contains("150000 of 200000"), "{map}");
+        assert!(map.contains("75% full"), "{map}");
+        assert!(map.contains("Nothing has been folded yet"), "{map}");
+        // The rule travels with the map: an agent reading this has to know
+        // what to keep, not just that it is full.
+        assert!(map.contains("no longer needs it"), "{map}");
+        assert!(map.contains("line numbers"), "{map}");
+    }
+
+    #[test]
+    fn a_cli_whose_window_cannot_be_read_is_told_the_rule_instead_of_a_number() {
+        // Only claude reports usage today. A seat on any other CLI must still
+        // get something it can act on rather than a blank.
+        let db = fixture();
+        let map = dispatch(&ctx(&db, "sl-rev"), "context_map", &json!({})).unwrap();
+        assert!(map.contains("cannot be read for this CLI"), "{map}");
+        assert!(map.contains("Fold by the rule instead"), "{map}");
+    }
+
+    #[test]
+    fn an_unknown_fold_says_so_rather_than_answering_nothing() {
+        let db = fixture();
+        let e = dispatch(&ctx(&db, "sl-eng"), "unfold_context", &json!({ "id": "fd-nope" }))
+            .unwrap_err().to_string();
+        assert!(e.contains("no fold 'fd-nope'"), "{e}");
+        assert!(e.contains("search_context"), "it should say how to find the real one: {e}");
     }
 
     #[test]
@@ -2131,7 +3079,10 @@ mod tests {
         let db = fixture();
         let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
                            &json!({"text": "nobody is driving this team"})).unwrap();
-        assert!(out.contains("supervisors"), "{out}");
+        // It escalates to the supervisor layer (None target), and this
+        // fixture has nobody flagged or super, so the receipt is honest
+        // about that rather than promising a reply that cannot come.
+        assert!(out.to_lowercase().contains("no supervisor seat"), "{out}");
         assert!(out.contains("no orchestrator of its own"), "{out}");
         assert_eq!(note_target(&db).0, None, "None is the supers' address");
     }
@@ -2145,7 +3096,7 @@ mod tests {
         give_session_an_orchestrator(&db, "asleep", now_ms() - ORCHESTRATOR_SILENT_MS - 1);
         let out = dispatch(&ctx(&db, "sl-eng"), "notify_operator",
                            &json!({"text": "still blocked"})).unwrap();
-        assert!(out.contains("supervisors"), "{out}");
+        assert!(out.to_lowercase().contains("no supervisor seat"), "{out}");
         assert!(out.contains("not been heard from"), "{out}");
         assert_eq!(note_target(&db).0, None);
     }
@@ -2419,5 +3370,236 @@ mod tests {
         let err = dispatch(&ctx(&db, "sl-eng"), "update_plan",
             &json!({"item": "nonexistent", "status": "done"})).unwrap_err();
         assert!(err.to_string().contains("no plan item"), "{err}");
+    }
+}
+
+/// A SUPERORCHESTRATOR'S REACH OVER THE CHAT.
+///
+/// The authority model gave it the fleet for every management tool and left
+/// its messaging in its own session, so the one seat on the fleet that could
+/// move another team's agents could not say a word to them. These are about
+/// the two reaches being one reach.
+#[cfg(test)]
+mod super_reach_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Two teams, and a seat in each. `s1` holds the super.
+    fn two_teams() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(nexmesh_proto::SCHEMA_SQL).unwrap();
+        let now = now_ms();
+        for (id, name) in [("s1", "orchestrator"), ("s2", "team")] {
+            db.execute(
+                "INSERT INTO sessions (id, name, created_at_ms, last_active_ms) VALUES (?,?,?,?)",
+                params![id, name, now, now],
+            )
+            .unwrap();
+        }
+        for (id, sess, name, auth, cli, tmux) in [
+            ("sl-boss", "s1", "Orchestrator", "super", Some("claude"), None),
+            ("sl-plain", "s1", "Plain", "agent", Some("claude"), None),
+            // The adopted terminal that sits in the same room.
+            ("sl-term", "s1", "term-Orchestrator", "agent", Some("tmux"), Some("nexmesh-orch")),
+            ("sl-far", "s2", "alice", "agent", Some("codex"), None),
+        ] {
+            db.execute(
+                "INSERT INTO slots (id, session_id, cli_id, participant_kind, display_name,
+                                    role, authority, tmux_target, capabilities, created_at_ms)
+                 VALUES (?,?,?, 'cli', ?, 'engineer', ?, ?, '[]', ?)",
+                params![id, sess, cli, name, auth, tmux, now],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn c<'a>(db: &'a Connection, slot: &str, session: &str) -> Ctx<'a> {
+        Ctx { db, session_id: session.into(), slot_id: slot.into(), flood: (0, 0) }
+    }
+
+    #[test]
+    fn a_super_can_address_a_seat_on_another_team() {
+        let db = two_teams();
+        let out = dispatch(
+            &c(&db, "sl-boss", "s1"),
+            "send_message",
+            &json!({"to": "alice", "text": "status?"}),
+        )
+        .unwrap();
+        assert!(out.contains("alice"), "{out}");
+    }
+
+    /// The half that was easy to miss: resolving the name is not delivering
+    /// the message. Written into the SENDER'S room it would be reported sent
+    /// and read by nobody, because every delivery query asks for the rooms
+    /// the RECIPIENT answers in.
+    #[test]
+    fn and_it_actually_arrives_in_the_other_team() {
+        let db = two_teams();
+        dispatch(
+            &c(&db, "sl-boss", "s1"),
+            "send_message",
+            &json!({"to": "alice", "text": "status?"}),
+        )
+        .unwrap();
+        let got = pending_for_slot(&db, "s2", "sl-far").unwrap();
+        assert_eq!(got.len(), 1, "the far seat must be handed it: {got:?}");
+        assert_eq!(got[0].body, "status?");
+        // And it is NOT sitting in the sender's own room instead.
+        let room: String =
+            db.query_row("SELECT session_id FROM messages WHERE id = ?", [got[0].id], |r| r.get(0))
+                .unwrap();
+        assert_eq!(room, "s2", "the message belongs in the recipient's room");
+    }
+
+    /// The answer has to find its way back across the same boundary.
+    #[test]
+    fn the_far_seat_can_reply_back_across_the_boundary() {
+        let db = two_teams();
+        dispatch(&c(&db, "sl-boss", "s1"), "send_message",
+                 &json!({"to": "alice", "text": "status?"})).unwrap();
+        let got = pending_for_slot(&db, "s2", "sl-far").unwrap();
+        dispatch(&c(&db, "sl-far", "s2"), "reply",
+                 &json!({"to": got[0].id, "text": "two files left"})).unwrap();
+        let back = pending_for_slot(&db, "s1", "sl-boss").unwrap();
+        assert_eq!(back.len(), 1, "the super must get its answer: {back:?}");
+        assert!(back[0].body.contains("two files left"), "{:?}", back[0].body);
+    }
+
+    /// A NULL sender is what the whole stack reads as the operator, and the
+    /// handshake text tells an agent that an operator message is the person
+    /// running the fleet. A teammate's answer arriving that way tells the
+    /// recipient a person is talking to it.
+    #[test]
+    fn a_cross_team_answer_is_attributed_to_the_seat_that_sent_it() {
+        let db = two_teams();
+        dispatch(&c(&db, "sl-boss", "s1"), "send_message",
+                 &json!({"to": "alice", "text": "status?"})).unwrap();
+        let got = pending_for_slot(&db, "s2", "sl-far").unwrap();
+        dispatch(&c(&db, "sl-far", "s2"), "reply",
+                 &json!({"to": got[0].id, "text": "two files left"})).unwrap();
+        let back = pending_for_slot(&db, "s1", "sl-boss").unwrap();
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert_eq!(
+            back[0].from_slot.as_deref(),
+            Some("sl-far"),
+            "a peer's answer must not arrive as the operator's"
+        );
+        assert_eq!(back[0].from_name.as_deref(), Some("alice"), "{:?}", back[0].from_name);
+        // And it says which team, which is the one thing the recipient
+        // cannot look up: a seat in another room is not in its roster.
+        assert!(back[0].body.contains("team"), "{}", back[0].body);
+    }
+
+    #[test]
+    fn a_super_sees_the_whole_fleet_in_list_peers() {
+        let db = two_teams();
+        let out = dispatch(&c(&db, "sl-boss", "s1"), "list_peers", &json!({})).unwrap();
+        assert!(out.contains("alice"), "another team's seat must be listed: {out}");
+        assert!(out.contains("Plain"), "{out}");
+    }
+
+    /// Fleet reach is not an invitation. Both read as "elsewhere", and
+    /// calling them the same thing told a super that every seat on the fleet
+    /// was a guest of its own room.
+    #[test]
+    fn a_seat_reached_by_authority_is_not_described_as_a_guest() {
+        let db = two_teams();
+        let out = dispatch(&c(&db, "sl-boss", "s1"), "list_peers", &json!({})).unwrap();
+        let line = out.lines().find(|l| l.contains("alice")).unwrap_or_default();
+        assert!(line.contains("on the team team"), "{line}");
+        assert!(!line.contains("visiting"), "nobody invited it: {line}");
+
+        // A seat genuinely invited into this room still reads as a visitor.
+        db.execute(
+            "INSERT INTO slot_sessions (slot_id, session_id, added_at_ms) VALUES ('sl-far','s1',1)",
+            [],
+        )
+        .unwrap();
+        let out = dispatch(&c(&db, "sl-boss", "s1"), "list_peers", &json!({})).unwrap();
+        let line = out.lines().find(|l| l.contains("alice")).unwrap_or_default();
+        assert!(line.contains("visiting from team"), "{line}");
+    }
+
+    /// Nothing else widens. A plain seat and an orchestrator see what they
+    /// always saw, or this fix has quietly opened every team to everyone.
+    #[test]
+    fn a_plain_seat_still_sees_only_its_own_team() {
+        let db = two_teams();
+        let out = dispatch(&c(&db, "sl-plain", "s1"), "list_peers", &json!({})).unwrap();
+        assert!(!out.contains("alice"), "another team must stay invisible: {out}");
+        let err = dispatch(&c(&db, "sl-plain", "s1"), "send_message",
+                           &json!({"to": "alice", "text": "x"})).unwrap_err().to_string();
+        assert!(err.contains("no teammate matching"), "{err}");
+    }
+
+    /// The legible error must TEACH without becoming an oracle. A plain seat
+    /// addressing 'alice' (a real seat in another team) and one addressing
+    /// a name that exists nowhere must get the SAME message bar the needle --
+    /// otherwise the difference is a yes/no probe a plain seat could sweep to
+    /// map a team `list_peers` is built to hide. Both must still name the
+    /// guest mechanism, so the one case this exists for -- two seats that
+    /// should collaborate -- is told how.
+    #[test]
+    fn the_cross_session_hint_teaches_without_confirming_existence() {
+        let db = two_teams();
+        let real = dispatch(&c(&db, "sl-plain", "s1"), "send_message",
+                            &json!({"to": "alice", "text": "x"})).unwrap_err().to_string();
+        let ghost = dispatch(&c(&db, "sl-plain", "s1"), "send_message",
+                             &json!({"to": "no-such-seat", "text": "x"})).unwrap_err().to_string();
+        assert_eq!(
+            real.replace("alice", "NEEDLE"),
+            ghost.replace("no-such-seat", "NEEDLE"),
+            "a real cross-session name and a nonexistent one must read identically, \
+             or the error is an enumeration oracle"
+        );
+        assert!(real.contains("guesting") && real.contains("notify_operator"),
+                "it must still point to the way across sessions: {real}");
+    }
+
+    #[test]
+    fn an_orchestrator_reaches_its_own_team_and_no_further() {
+        let db = two_teams();
+        db.execute("UPDATE slots SET authority = 'orchestrator' WHERE id = 'sl-plain'", [])
+            .unwrap();
+        let err = dispatch(&c(&db, "sl-plain", "s1"), "send_message",
+                           &json!({"to": "alice", "text": "x"})).unwrap_err().to_string();
+        assert!(err.contains("no teammate matching"), "an orchestrator runs ONE team: {err}");
+        // Its own team is unchanged.
+        dispatch(&c(&db, "sl-plain", "s1"), "send_message",
+                 &json!({"to": "Orchestrator", "text": "x"})).unwrap();
+    }
+
+    /// What is LISTED must be what can be ADDRESSED. `list_peers` carried its
+    /// own copy of the room predicate, without the terminal exclusion, so it
+    /// offered a name that `send_message` then refused.
+    #[test]
+    fn an_adopted_terminal_is_neither_listed_nor_addressable() {
+        let db = two_teams();
+        for slot in ["sl-boss", "sl-plain"] {
+            let out = dispatch(&c(&db, slot, "s1"), "list_peers", &json!({})).unwrap();
+            assert!(
+                !out.contains("term-Orchestrator"),
+                "a terminal is a window onto a seat, not a teammate ({slot}): {out}"
+            );
+            let err = dispatch(&c(&db, slot, "s1"), "send_message",
+                               &json!({"to": "term-Orchestrator", "text": "x"}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no teammate matching"), "{err}");
+        }
+    }
+
+    /// A broadcast stays in the room it was spoken in, super or not. Fleet
+    /// authority is for addressing a named seat; announcing to every agent
+    /// on every team is the operator's call, and a budget.
+    #[test]
+    fn a_broadcast_does_not_follow_the_wider_reach() {
+        let db = two_teams();
+        dispatch(&c(&db, "sl-boss", "s1"), "broadcast", &json!({"text": "heads up"})).unwrap();
+        assert!(pending_for_slot(&db, "s2", "sl-far").unwrap().is_empty(),
+                "another team must not hear this team's announcements");
+        assert_eq!(pending_for_slot(&db, "s1", "sl-plain").unwrap().len(), 1);
     }
 }

@@ -50,6 +50,45 @@ pub fn cmd() -> Command {
 /// this module: `refresh-client` writes nothing into the pane and sends no
 /// keys. It asks tmux to repaint the client the NODE owns, which is the
 /// screen the viewer is waiting for.
+/// TAKE TMUX'S OWN KEYS AWAY FROM THIS VIEW.
+///
+/// A seat held in tmux is reached through a second, grouped client that the
+/// node attaches -- and that client had tmux's whole keyboard. `Ctrl-B %`
+/// split the pane and gave whoever was attached a SHELL on that machine,
+/// `Ctrl-B c` opened a window with another, and `Ctrl-B :` was a tmux
+/// command prompt. An attach is a way into one agent; it is not a way onto
+/// the host it runs on, and nothing about pressing "attach" says otherwise.
+///
+/// `prefix` is a SESSION option, so this takes the keys away from the view
+/// the node created and changes nothing about the operator's own
+/// `tmux attach -t nexmesh-cli-<slot>`, which is their way in when they do
+/// want a terminal on that machine. That is deliberate: the lock is on the
+/// door nexmesh opens, not on tmux.
+///
+/// Not airtight on its own -- tmux's right-click menu offers to split a pane
+/// too, and key bindings are per-SERVER rather than per-session, so they
+/// cannot be unbound here without touching the operator's own tmux. The
+/// viewer drops button-3 reports before they reach tmux for that half.
+pub fn lock_view(view: &str) {
+    for args in [
+        // No prefix at all: `Ctrl-B` goes to the CLI like any other key,
+        // which is also what a CLI using Ctrl-B for anything would want.
+        ["set-option", "-t", view, "prefix", "None"],
+        ["set-option", "-t", view, "prefix2", "None"],
+        // Nothing to click on, either: tmux's status line carries menus of
+        // its own, and the viewer draws its own row anyway.
+        ["set-option", "-t", view, "status", "off"],
+    ] {
+        let out = cmd().args(args).output();
+        if let Ok(o) = out {
+            if !o.status.success() {
+                tracing::debug!(%view, stderr = %String::from_utf8_lossy(&o.stderr),
+                    "could not lock a tmux view down");
+            }
+        }
+    }
+}
+
 pub fn repaint(view: &str) {
     // Our client is the one attached to the session the node created for
     // this view. tmux addresses clients by their tty, not by session.
@@ -69,6 +108,11 @@ pub fn repaint(view: &str) {
     // it is set on the session the NODE created, so it changes nothing about
     // what the operator sees in their own `tmux attach`.
     let _ = cmd().args(["set-option", "-t", view, "status", "off"]).output();
+    // And tmux's own keys, which are not the operator's way onto this
+    // machine. Done here as well as at the start, because `repaint` is what
+    // runs when a viewer arrives -- including at a view the node adopted
+    // before this existed.
+    lock_view(view);
     // And tmux takes the wheel, for this view only.
     //
     // A pane's history belongs to tmux: the terminal the operator sits at
@@ -112,6 +156,39 @@ pub fn repaint(view: &str) {
 /// Only ever OUR name: `nexmesh-<slot>` is created by this code and by
 /// nothing else, and only when nothing is attached to it, which is what
 /// makes it a corpse rather than somebody's window.
+/// Does one of OUR view sessions still have a client on it?
+///
+/// A view session is created only by a node, so a client on one is a node's
+/// grouped client -- normally this node's own, from an earlier start of the
+/// same seat. That makes it the answer to "am I already watching this
+/// seat", which is a different question from "is there a leftover to clear".
+pub fn view_has_client(view: &str) -> bool {
+    let exact = format!("={view}");
+    cmd()
+        .args(["list-clients", "-t", &exact, "-F", "#{client_tty}"])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Kill a view session even though something is still on it.
+///
+/// Only for a view whose agent this node no longer has: the client is then
+/// an orphan from a start that went wrong, and leaving it there makes the
+/// seat unstartable for ever, because every later start collides with the
+/// name. Never used on a view whose agent is still ours.
+pub fn force_clear_view(view: &str) -> bool {
+    let exact = format!("={view}");
+    let killed = cmd()
+        .args(["kill-session", "-t", &exact])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    tracing::warn!(%view, killed,
+        "cleared a view session that still had a client but no agent of ours behind it");
+    killed
+}
+
 pub fn clear_stale_view(view: &str) -> bool {
     // `=name` is tmux's exact match; without it a prefix match could resolve
     // to a different session entirely.
@@ -172,4 +249,141 @@ pub fn set_mouse(view: &str, on: bool) -> (bool, String) {
         Ok(o) => (false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => (false, e.to_string()),
     }
+}
+
+/// The tmux session that HOLDS a supervised CLI.
+///
+/// Distinct from `nexmesh-<slot>`, which is the node's own grouped client
+/// (see `spawn::tmux_view`): one is the CLI's home and outlives the node,
+/// the other is a window onto it that comes and goes with the node.
+/// State a view's size to tmux, instead of relying on the client noticing.
+///
+/// A pty resize reaches a tmux client only as SIGWINCH, and a signal that
+/// arrives before the client has a handler for it is simply gone -- the
+/// default disposition of SIGWINCH is to ignore it. tmux then keeps the size
+/// it read when it started, sizes the window to that, and the CLI draws rows
+/// the viewer cannot show. Nothing recovers it, because a TUI repaints only
+/// the cells it believes changed.
+///
+/// `resize-window` puts the window into MANUAL sizing, which is the right
+/// state here: the node owns this view -- it created it, it turns the status
+/// line off, it owns the mouse -- and the size it computes from the viewers
+/// is the size that is wanted. Automatic sizing is what was getting it
+/// wrong.
+pub fn resize_window(view: &str, cols: u16, rows: u16) -> bool {
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+    cmd()
+        .args([
+            "resize-window",
+            "-t",
+            view,
+            "-x",
+            &cols.to_string(),
+            "-y",
+            &rows.to_string(),
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn held_session(slot_id: &str) -> String {
+    format!("nexmesh-cli-{slot_id}")
+}
+
+/// Is that session there?
+pub fn has_session(name: &str) -> bool {
+    cmd()
+        .args(["has-session", "-t", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Put a CLI in a tmux session of its own, detached, and leave it there.
+///
+/// The point is that the tmux SERVER owns the pty, not the node. The node
+/// then attaches a grouped client under its own pty and everything
+/// downstream is the ordinary terminal path; when the node goes away the
+/// client dies and the CLI does not notice.
+///
+/// Environment goes through `env` rather than tmux's own `-e`, which not
+/// every tmux in the field has, and `remain-on-exit` is left off on purpose:
+/// a CLI that exits should take its seat down, not leave a dead pane that
+/// looks like a running agent.
+pub fn hold(
+    name: &str,
+    cwd: &str,
+    bin: &str,
+    args: &[String],
+    env: &[(String, String)],
+    env_unset: &[String],
+) -> Result<(), String> {
+    let mut c = cmd();
+    // A size that is replaced the moment a client attaches, but a detached
+    // session with no size at all makes some CLIs lay out for 80x24 and keep
+    // it. Large enough not to wrap the first screen it draws.
+    c.args(["new-session", "-d", "-s", name, "-c", cwd, "-x", "200", "-y", "50", "--"]);
+    // `env` carries the environment INTO the session, because the tmux
+    // server the session is created on has its own, inherited from whenever
+    // it started -- not ours.
+    c.arg("env");
+    for k in env_unset {
+        c.args(["-u", k]);
+    }
+    for (k, v) in env {
+        c.arg(format!("{k}={v}"));
+    }
+    c.arg(bin);
+    c.args(args);
+    let out = c.output().map_err(|e| format!("running tmux: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "tmux would not hold it: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    lock_held(name);
+    Ok(())
+}
+
+/// WHEN THE CLI EXITS, SO DOES ITS SEAT.
+///
+/// `remain-on-exit` keeps a dead pane on screen with "Pane is dead" in it.
+/// tmux's own default is off, but it is an option an operator may have
+/// turned on in their own config -- and with it on, a CLI that crashed left
+/// a session that still existed, a node client still attached to it, and
+/// therefore a seat the hub believed was running. The viewer sat looking at
+/// a dead screen with no way to tell.
+///
+/// Set on the session's WINDOWS, with `-w`, which is the scope the option
+/// actually lives in. Without that flag tmux takes the command, exits 0 and
+/// stores nothing -- a silent no-op that read as a success on a fleet whose
+/// global value happened to be off already, and would have left a dead pane
+/// standing on any host where it was not. `-w` against a session target
+/// sets it for every window in that session, so this is the seat's own
+/// behaviour and not a change to anybody's tmux.
+///
+/// Called when a seat is first held AND every time one is re-attached,
+/// because `hold` runs only on the session that does not exist yet: a seat
+/// held before this node started -- the whole point of holding one -- would
+/// otherwise never be told, and a fleet upgraded in place would carry the
+/// old behaviour until every seat happened to be respawned.
+///
+/// The held session's PREFIX is deliberately left alone: it is the
+/// operator's own way in, and the lock in `lock_view` is on the door
+/// nexmesh opens.
+pub fn lock_held(name: &str) {
+    let _ = cmd().args(["set-option", "-w", "-t", name, "remain-on-exit", "off"]).output();
+    // Nothing in here is anybody's shell, and a pane that exits must not be
+    // replaced by one. A session option, so no `-w`.
+    let _ = cmd().args(["set-option", "-t", name, "destroy-unattached", "off"]).output();
+}
+
+/// Stop holding it: used when a seat is genuinely being ended rather than
+/// paused, and to clear a session whose CLI has already gone.
+pub fn release(name: &str) {
+    let _ = cmd().args(["kill-session", "-t", name]).output();
 }

@@ -2275,7 +2275,7 @@ function demoSnapshot() {
   });
   return {
     orchestrators: [
-      { name: "nextime", session: null, last_used_ms: Date.now() - 20000 },
+      { name: "dev", session: null, last_used_ms: Date.now() - 20000 },
     ],
     detail: {
     agents: [
@@ -2996,6 +2996,9 @@ class App {
     if (who) {
       buttons.push({ label: "  pause " + who, act: () => this.agentAction("pause") });
       buttons.push({ label: "  start " + who, act: () => this.agentAction("spawn") });
+      buttons.push({ label: "  what " + who + " tells its agent",
+                     act: () => this.openSeatPrompt(
+                       (this.scene.selected || {}).data || {}) });
     }
     buttons.push({ label: "  close the screens",
                    act: () => this.closeScreens((x) => x.kind === "menu") });
@@ -3534,6 +3537,14 @@ App.prototype.listen = async function () {
 // What a spoken sentence does: a command, a name, or something to say.
 App.prototype.heard = function (text) {
   const said = text.trim();
+  // A sentence spoken for a seat's prompt is not a command and not chat.
+  if (this.dictateInto) {
+    const { slot, name, field } = this.dictateInto;
+    this.dictateInto = null;
+    if (said) { this.setSeatPrompt(slot, name, { [field]: said }); }
+    else { this.say("nothing heard; nothing changed"); }
+    return;
+  }
   const low = said.toLowerCase().replace(/[.,!?]+$/, "");
   if (/^(show |open |go to )?(the )?(code )?(graph|map)$/.test(low)) { this.setMode("graph"); return; }
   if (/^(show |open |go to )?(the )?(team|agents|room)$/.test(low)) { this.setMode("team"); return; }
@@ -3569,6 +3580,130 @@ App.prototype.sendSaid = async function (said) {
 };
 
 // --------------------------------------------------------------- session --
+
+
+// ------------------------------------------------ what a seat tells its agent
+//
+// A system prompt is markdown and runs to pages, and a headset has no
+// keyboard worth typing pages on. So in here it is READ in full and changed
+// by the means a headset actually has: the microphone for the words, a press
+// for the mode, a press to clear. Writing it out is the dashboard's job, and
+// `nexmesh seat-prompt` takes a file -- this is for saying "and you are the
+// one who reviews the diffs" to a seat while standing in the room with it.
+App.prototype.openSeatPrompt = async function (data) {
+  const slot = data && data.slot_id;
+  const name = (data && data.name) || "that seat";
+  if (!slot || DEMO) { this.say(`what ${name} tells its agent: not on a demo fleet`); return; }
+  let d;
+  try {
+    d = await api(`/v1/slots/${encodeURIComponent(slot)}/prompt`);
+    if (d && d.error) throw new Error(d.error);
+  } catch (e) {
+    this.say(`could not read what ${name} tells its agent: ${e.message || e}`);
+    return;
+  }
+  const mode = d.system_prompt_mode === "replace" ? "replace" : "append";
+  const cols = 78;
+  // Wrapped to the panel, because a prompt that runs off the right edge of a
+  // screen in a headset cannot be scrolled sideways to read.
+  const wrap = (text, lead) => {
+    const out = [];
+    for (const para of String(text).split("\n")) {
+      if (!para.trim()) { out.push(lead); continue; }
+      let line = lead;
+      for (const word of para.split(/\s+/)) {
+        if (line.length + word.length + 1 > cols - 2) { out.push(line); line = lead; }
+        line += (line === lead ? "" : " ") + word;
+      }
+      out.push(line);
+    }
+    return out;
+  };
+  const rows = [];
+  const dead = () => {};
+  const say = (label) => rows.push({ label, act: dead });
+  say(`  system prompt · ${mode === "replace"
+        ? "INSTEAD of the CLI's own" : "added to the CLI's own"}`);
+  if (d.system_prompt) {
+    for (const l of wrap(d.system_prompt, "    ").slice(0, 8)) say(l);
+  } else {
+    say("    (none — this seat adds nothing to what its CLI says)");
+  }
+  say(`  said to each new agent that takes the seat`);
+  if (d.instructions) {
+    for (const l of wrap(d.instructions, "    ").slice(0, 5)) say(l);
+  } else {
+    say("    (none — nothing is said on arrival)");
+  }
+  say("");
+  rows.push({
+    label: "  ▸ say the system prompt (replaces what is there)",
+    act: () => this.dictatePrompt(slot, name, "system_prompt"),
+  });
+  rows.push({
+    label: mode === "replace"
+      ? "  ▸ go back to ADDING it to the CLI's own prompt"
+      : "  ▸ use it INSTEAD of the CLI's own prompt",
+    act: () => this.setSeatPrompt(slot, name,
+      { system_prompt_mode: mode === "replace" ? "append" : "replace" }),
+  });
+  if (d.system_prompt) {
+    rows.push({
+      label: "  ▸ clear the system prompt",
+      act: () => this.setSeatPrompt(slot, name, { system_prompt: "" }),
+    });
+  }
+  rows.push({
+    label: "  ▸ say what a new agent should do on arrival",
+    act: () => this.dictatePrompt(slot, name, "instructions"),
+  });
+  if (d.instructions) {
+    rows.push({
+      label: "  ▸ clear what is said on arrival",
+      act: () => this.setSeatPrompt(slot, name, { instructions: "" }),
+    });
+  }
+  say("  neither reaches the agent sitting there now: the prompt applies to the");
+  say("  next process, the instruction to the next occupant");
+  const at = this.panels.find((x) => x.kind === "seatprompt");
+  const p = this.panel("seatprompt", `what ${name} tells its agent`, {
+    pos: at ? at.pos : [-2.30, 1.86, -1.05],
+    yaw: at ? at.yaw : Math.atan2(2.30, 1.05),
+    w: 1.60, cols, rows: rows.length, accent: [.95, .66, .72],
+  });
+  p.grid = null;
+  p.cursor = null;
+  p.lines = [];
+  p.buttons = rows;
+  p.geom();
+  p.dirty = true;
+};
+
+/// Say it, and it becomes the seat's prompt. The words go nowhere else: a
+/// sentence spoken while this is waiting must not also land in the chat.
+App.prototype.dictatePrompt = function (slot, name, field) {
+  this.dictateInto = { slot, name, field };
+  this.say(field === "instructions"
+    ? `say what a new agent in ${name} should do first`
+    : `say who the agent in ${name} is`);
+  this.listen();
+};
+
+App.prototype.setSeatPrompt = async function (slot, name, body) {
+  try {
+    const r = await api(`/v1/slots/${encodeURIComponent(slot)}/prompt`, body);
+    if (r && r.error) throw new Error(r.error);
+    const when = (r.takes_effect || []).join("; ");
+    this.say(when ? `${name}: ${when}` : `${name} is unchanged`);
+  } catch (e) {
+    this.say(`could not change that: ${e.message || e}`);
+    return;
+  }
+  // Read it back rather than patching the panel: what the hub stored is what
+  // the seat will say, and trimming or a refused mode would differ.
+  const sel = this.scene.selected;
+  if (sel && sel.data && sel.data.slot_id === slot) this.openSeatPrompt(sel.data);
+};
 
 App.prototype.enterXR = async function () {
   if (!navigator.xr) { this.say("this browser has no WebXR"); return; }
@@ -3735,6 +3870,23 @@ window.addEventListener("load", async () => {
   } else {
     b.disabled = true;
     b.textContent = "no WebXR here";
+  }
+  // Launched as an installed app rather than opened in a browser tab.
+  //
+  // In a headset there is no mouse to press "enter the headset" with, and
+  // Meta's own WebXR PWA documentation says the app icon tap IS the user
+  // activation that `requestSession` requires -- so an immersive app may ask
+  // for the session as it loads. `?immersive=1` is what the room's manifest
+  // starts at; the display-mode test covers an install that kept a bare
+  // path. Guarded both ways: a device with no headset says so and keeps the
+  // button, which is what happens when the same app is installed on a phone.
+  const installedApp = (() => {
+    try {
+      return window.matchMedia("(display-mode: standalone)").matches;
+    } catch (e) { return false; }
+  })();
+  if (navigator.xr && (params.get("immersive") === "1" || installedApp)) {
+    app.enterXR().catch((e) => app.say(String((e && e.message) || e)));
   }
   if (!DEMO) setInterval(() => app.load().catch(() => {}), 4000);
   if (params.get("tour") === "1") app.tour();

@@ -1,0 +1,116 @@
+# Cursor CLI. NOT INSTALLED on any machine here, so unlike the descriptors
+# beside it this one is built from Cursor's own published documentation
+# (cursor.com/docs/cli: overview, reference/parameters, reference/
+# slash-commands, mcp, reference/permissions, reference/authentication) and
+# from the install script at cursor.com/install, read but not run. Every
+# flag below is quoted from those pages. Nothing here has been seen to work
+# against a real binary, and that is the difference between this file and
+# clis/claude.toml.
+#
+# What the documentation does NOT say is recorded as absences further down,
+# rather than guessed at: where it stores conversations, how big its context
+# window is, which key interrupts a turn.
+[cli]
+id = "cursor"
+display_name = "Cursor CLI"
+# `cursor-agent` and not `agent`, for two reasons. It is the name of the
+# real executable inside
+# ~/.local/share/cursor-agent/versions/<version>/, and the installer makes
+# BOTH names in ~/.local/bin as symlinks to it ("primary: agent, legacy:
+# cursor-agent"), so this name is present in every install while being
+# specific enough not to match some unrelated `agent` that happens to be on
+# a PATH.
+command = "cursor-agent"
+version_args = ["--version"]
+# The installer symlinks into ~/.local/bin and writes nothing to any shell
+# profile, so a service's PATH will not have it.
+extra_paths = ["~/.local/bin"]
+model_args = ["--model", "{model}"]
+
+[mcp]
+# `.cursor/mcp.json` in the project, which the CLI reads ahead of the global
+# one. A relative path keeps us out of the user's own ~/.cursor/mcp.json.
+# `type = "stdio"` is required by the documented schema, unlike every other
+# CLI here; environment goes under `env`.
+style = "json_file"
+path = ".cursor/mcp.json"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { type = "stdio", command = "{mcpd}", args = [] }
+
+[modes.headless]
+# The prompt is positional and comes last: `agent -p "fix the tests"`.
+#
+# --force ("allow commands unless explicitly denied") is what makes print
+# mode able to do anything at all: without it the docs say print mode runs
+# only allowlisted actions and REJECTS whatever would need approval.
+# --approve-mcps is needed for the shim to be usable, since Cursor asks
+# before using an MCP server's tools. --trust answers the workspace trust
+# question, which the docs say is a headless-mode flag only.
+args = ["-p", "--force", "--approve-mcps", "--trust", "{prompt}"]
+attachable = false
+
+[modes.interactive]
+# Same unattended posture, minus --trust, which the documentation describes
+# as headless-only. If an interactive seat turns out to stop on a trust
+# question, this is the line to add it to.
+args = ["--force", "--approve-mcps"]
+# `--resume [chatId]`. Dormant for now: Cursor publishes no chat id to its
+# MCP children and takes no caller-chosen id at launch, so the hub has no
+# handle to give back. `agent create-chat` prints one, which is the shape a
+# future driver would use.
+resume_args = ["--resume", "{resume}"]
+# NOT resume_latest_args. `--continue` is documented as an alias for
+# `--resume=-1`, "the previous session" -- which is the previous session of
+# the USER, not of this seat, because there is no way to give a Cursor seat
+# a store of its own: the documentation does not say where chats are kept,
+# and CURSOR_CONFIG_DIR is documented as moving configuration only. Handing
+# a seat somebody else's conversation is worse than starting a fresh one.
+#
+# Cursor's compaction command is `/summarize` ("Summarize the conversation
+# to reduce context"), with `/compress` as its alias. It is NOT `/compact`,
+# which does not exist here -- and `/clear` next door starts a new chat.
+compact_command = "/summarize"
+# No interrupt_keys: the published keyboard reference does not say which key
+# stops a running turn. A seat of it is paused without one rather than
+# having something plausible typed at it, because the keys next to the right
+# one quit the CLI.
+attachable = true
+# Typing a line at this prompt is a message to the agent, not a command
+# to a shell -- so a seat the fleet put in a terminal can be reached by
+# keyboard even with no driver to push to. `tmux` does not say this: what
+# is at ITS prompt is a shell.
+typed_delivery = true
+
+[driver]
+# `--output-format stream-json` with `--stream-partial-output` is documented
+# for print mode, which is the shape a driver would be written against. It
+# is not written against it yet, and claiming a driver that does not exist
+# would leave a seat with no delivery at all, so this stays at the floor.
+kind = "mcp_only"
+
+[user_install]
+# `agent mcp` has login, list, list-tools, enable and disable -- and no
+# `add`, so the documented file is written here instead. `agent mcp enable`
+# would still be needed to approve a server added this way for interactive
+# use; --approve-mcps covers the seats nexmesh spawns itself.
+style = "json_file"
+path = "~/.cursor/mcp.json"
+pointer = "/mcpServers/{name}"
+env_key = "env"
+entry = { type = "stdio", command = "{command}", args = [] }
+
+# No [skill] section: Cursor has no skills directory. It reads rules from
+# `.cursor/rules`, and AGENTS.md and CLAUDE.md at the project root, none of
+# which is a per-skill folder. It gets the same ground rules through the MCP
+# `instructions` field, which the hub sends every client at initialize (see
+# proto::tools::team_instructions).
+
+# No [session_store]: there would be nothing to point it at. See the note on
+# resume_latest_args above.
+
+# No [context] section: the documentation does not say where a chat is kept
+# on disk or how large the window is, so there is nothing to measure and no
+# number to measure it against. A seat of it is never compacted
+# automatically, which is the right default for a CLI nobody here has run.
+# `/compact <agent>` works, because the command above is documented.

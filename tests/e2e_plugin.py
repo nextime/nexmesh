@@ -15,6 +15,17 @@ import urllib.request, urllib.error
 # shim here the same identity and make them all claim a single seat -- which
 # looks like a bug in the hub and is not. The tests choose their own.
 import os as _os
+
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
     _os.environ.pop(_v, None)
@@ -160,8 +171,14 @@ def main():
     http("POST", f"/v1/slots/{dslot}/spawn")
     dagent = until(lambda: (q("SELECT id FROM agents WHERE slot_id=? AND exited_at_ms IS NULL", (dslot,)) or [None])[0])
     check("the agent starts even though its plugin prints junk", dagent is not None, nodelog()[-500:])
-    check("the junk line was reported, not obeyed",
-          "unparseable plugin frame" in nodelog(), nodelog()[-600:])
+    # WAITED FOR, not read once. The agent starting and the node logging
+    # what its plugin said are different events, and under a loaded machine
+    # -- the whole suite running -- the log had not been written yet when
+    # this looked. It failed in the full run and passed when the suite was
+    # run on its own, which is the signature of a missing wait rather than a
+    # broken product.
+    junk = until(lambda: "unparseable plugin frame" in nodelog(), seconds=30)
+    check("the junk line was reported, not obeyed", bool(junk), nodelog()[-600:])
     dtr = until(lambda: "survive a bad plugin" in transcript(sid, "Dora") and transcript(sid, "Dora"))
     check("the prompt it did send still got through", bool(dtr), transcript(sid, "Dora")[-300:])
 

@@ -15,7 +15,7 @@ mod draw;
 mod map;
 mod theme;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
@@ -232,6 +232,10 @@ pub struct App {
     /// Set when the camera should take the screen: the session a picture is
     /// for, and the agent it is for when the cursor was on one.
     camera_for: Option<(String, Option<String>)>,
+    /// A seat whose prompt the operator asked to edit: slot and name. Like
+    /// the camera, it takes the whole terminal, so the loop handles it rather
+    /// than the key.
+    prompt_for: Option<(String, String)>,
     /// A question waiting for an answer: where to move a seat, what to call
     /// it, whether to really remove it. One at a time, deliberately.
     dialog: Option<act::Dialog>,
@@ -862,6 +866,7 @@ pub async fn run(
         zoom: false,
         zoom_text: None,
         camera_for: None,
+        prompt_for: None,
         audio: voice::detect(),
         recording: None,
         speaking: false,
@@ -901,7 +906,9 @@ pub async fn run(
                 .identity
                 .as_ref()
                 .map(|(c, k)| (c.as_str(), k.as_str()));
-            let r = crate::attach(
+            // The waiting wrapper, so an attach from the console rides out a
+            // node restart instead of dropping back to the list.
+            let r = crate::attach_until_ended(
                 // The node keeps 256 KiB of scrollback per agent; ask for
                 // all of it, so attaching from the console shows what has
                 // been happening rather than the last few lines of it.
@@ -927,6 +934,41 @@ pub async fn run(
                     reason.lines().next().unwrap_or("detached")
                 )),
                 Err(e) => app.notice(trim_err(&e.to_string())),
+            }
+            app.fetch().await;
+        }
+
+        // Editing a seat's prompt takes the whole screen too, for the same
+        // reason the camera does: $EDITOR owns the terminal while it runs.
+        // Read and write around it, so a hub that refuses says so on the
+        // console rather than after a blank editor session.
+        if let Some((slot, name)) = app.prompt_for.take() {
+            match prompt_to_edit(&app.base, &app.client, &slot, &name, &app.scratch()).await {
+                Err(e) => app.notice(trim_err(&format!("{e:#}"))),
+                Ok(path) => {
+                    if let Err(e) = leave() {
+                        break Err(e);
+                    }
+                    let ran = crate::editor::edit(&path);
+                    if let Err(e) = enter() {
+                        break Err(e);
+                    }
+                    if let Err(e) = term.clear() {
+                        break Err(e.into());
+                    }
+                    match ran {
+                        Err(e) => app.notice(trim_err(&format!("{e:#}"))),
+                        Ok(()) => match save_edited_prompt(
+                            &app.base, &app.client, &slot, &name, &path,
+                        )
+                        .await
+                        {
+                            Ok(said) => app.notice(said),
+                            Err(e) => app.notice(trim_err(&format!("{e:#}"))),
+                        },
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
             }
             app.fetch().await;
         }
@@ -1009,6 +1051,85 @@ pub async fn run(
 
     let _ = leave();
     result
+}
+
+/// Fetch what a seat tells its agent and lay it out as a file to edit.
+///
+/// Done before the screen is given up: a hub that refuses, or a seat that is
+/// gone, should say so on the console rather than after an editor session
+/// the operator then loses.
+async fn prompt_to_edit(
+    base: &str,
+    client: &reqwest::Client,
+    slot: &str,
+    name: &str,
+    scratch: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let v = crate::get(client, format!("{base}/v1/slots/{slot}/prompt")).await?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("{e}");
+    }
+    let text = act::prompt_file(
+        name,
+        v["system_prompt"].as_str().unwrap_or(""),
+        v["system_prompt_mode"].as_str().unwrap_or("append"),
+        v["instructions"].as_str().unwrap_or(""),
+    );
+    std::fs::create_dir_all(scratch)
+        .with_context(|| format!("making {}", scratch.display()))?;
+    // Named after the seat, with `.md` so the editor knows it is markdown.
+    let path = scratch.join(format!("{slot}-prompt.md"));
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Read the edited file back and send it.
+///
+/// A file that comes back byte for byte is not sent at all: opening the
+/// editor to look at a prompt should not count as changing it, and a POST
+/// that changes nothing still reports "takes effect on the next agent",
+/// which would be a lie about a seat nobody touched.
+async fn save_edited_prompt(
+    base: &str,
+    client: &reqwest::Client,
+    slot: &str,
+    name: &str,
+    path: &std::path::Path,
+) -> Result<String> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let (system, mode, instruction) = act::parse_prompt_file(&text)?;
+    let now = crate::get(client, format!("{base}/v1/slots/{slot}/prompt")).await?;
+    let same = now["system_prompt"].as_str().unwrap_or("") == system
+        && now["system_prompt_mode"].as_str().unwrap_or("append") == mode
+        && now["instructions"].as_str().unwrap_or("") == instruction;
+    if same {
+        return Ok(format!("{name}: unchanged"));
+    }
+    let v = crate::post(
+        client,
+        format!("{base}/v1/slots/{slot}/prompt"),
+        serde_json::json!({
+            "system_prompt": system,
+            "system_prompt_mode": mode,
+            "instructions": instruction,
+        }),
+    )
+    .await?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("{e}");
+    }
+    // What took effect WHEN, in the one line the status row has: neither
+    // half reaches the agent sitting there now.
+    let mut parts = Vec::new();
+    match v["system_prompt"].as_str() {
+        Some(_) => parts.push(format!("system prompt ({mode}) on the next start")),
+        None => parts.push("no system prompt".to_string()),
+    }
+    match v["instructions"].as_str() {
+        Some(_) => parts.push("instruction to the next occupant".to_string()),
+        None => parts.push("nothing said on arrival".to_string()),
+    }
+    Ok(format!("{name}: {}", parts.join("; ")))
 }
 
 fn enter() -> Result<()> {
@@ -1415,6 +1536,14 @@ async fn handle(app: &mut App, ev: Event) -> Result<()> {
                 }
             }
         }
+        // What this seat tells its agent. A system prompt is markdown and
+        // runs to pages, so the console does not pretend to be a text
+        // editor: it hands the whole thing to $EDITOR, like `git commit`.
+        KeyCode::Char('E') if app.pane == Pane::Agents => {
+            if let Some((slot, name, _, _)) = app.seat_under_cursor() {
+                app.prompt_for = Some((slot, name));
+            }
+        }
         KeyCode::Char('R') if app.pane == Pane::Agents => {
             app.sort_rev = !app.sort_rev;
             app.say_sort();
@@ -1628,6 +1757,7 @@ mod tests {
             zoom: false,
             zoom_text: None,
             camera_for: None,
+            prompt_for: None,
             audio: voice::Audio::default(),
             recording: None,
             speaking: false,

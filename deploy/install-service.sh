@@ -106,6 +106,10 @@ if [ ! -f "$ENVFILE" ]; then
             hub) cat > "$ENVFILE" <<'ENV'
 # nexmesh hub. 0600 -- it names the database and may hold TLS paths.
 NEXMESH_DB=/var/lib/nexmesh/hub.db
+# The editable skills and role templates this fleet can change from the
+# dashboard. Seeded with the built-ins at install; edits here win over them,
+# and removing the directory reverts to the compiled-in defaults.
+NEXMESH_PROMPTS_DIR=/var/lib/nexmesh/prompts
 # Never 0.0.0.0 on a machine with a public address: this API starts
 # processes. One listen for the loopback (nginx), one for the LAN.
 NEXMESH_HUB_ARGS=--listen 127.0.0.1:7870
@@ -140,6 +144,22 @@ ENV
     fi
 else
     echo "  keeping $ENVFILE as it is"
+fi
+
+# Make the editable prompts store for a hub -- the DIRECTORY only, not its
+# contents. The built-in skills and templates are served from the binary and
+# ship with it, so they are never copied in: that way a binary upgrade that
+# improves a built-in reaches the fleet, where a seeded copy would have
+# shadowed it forever. A file appears here only when the operator edits one
+# (through the dashboard), which is exactly the thing that SHOULD shadow the
+# built-in. The hub defaults to this path when it exists, so creating it is
+# all the configuration an install needs.
+#
+# (`nexmesh-hub seed-prompts <dir>` still exists to fork the built-ins into
+# files on purpose -- but those forks then stop tracking upgrades, so it is
+# not run automatically.)
+if [ "$WHAT" = hub ]; then
+    run mkdir -p /var/lib/nexmesh/prompts/skills /var/lib/nexmesh/prompts/roles
 fi
 
 case "$INIT" in

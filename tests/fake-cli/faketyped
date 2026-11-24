@@ -8,6 +8,12 @@ than merely that the node wrote one.
 Typing `dialog` makes it put a permission prompt on the screen for a few
 seconds. Nothing must be typed at it while that is up: the text would be
 swallowed and the Enter after it would answer the question.
+
+Typing `chain` makes it put one up, ANSWER IT ITSELF a moment later -- which
+is what happens when the operator answers in the agent's own terminal instead
+of in the dashboard -- and then stop on a different question straight away.
+Nothing in the hub is involved in that first answer, which is the point: a
+card for a question nobody can answer any more has to go of its own accord.
 """
 import os, sys, time
 
@@ -20,6 +26,9 @@ HOLD = float(os.environ.get("FAKETYPED_DIALOG_SECONDS", "7"))
 # is what a real permission prompt does and what the prompt-answering test
 # needs in order to see the keystroke.
 WAIT_FOR_ANSWER = os.environ.get("FAKETYPED_DIALOG_WAIT") == "1"
+# How long the first of a chained pair of dialogs stays up before this program
+# answers it itself, standing in for a person at its keyboard.
+CHAIN = float(os.environ.get("FAKETYPED_CHAIN_SECONDS", "8"))
 
 def note(what):
     with open(LOG, "a") as f:
@@ -29,6 +38,13 @@ def note(what):
 # What nexmesh actually passed us. A test reads this to prove that a first
 # spawn NAMES the conversation and a second RESUMES it.
 note("argv: " + " ".join(sys.argv[1:]))
+# What terminal nexmesh says this pty is. A TUI decides here whether it has
+# colour, a mouse and an alternate screen, so a wrong answer is invisible
+# until somebody attaches and finds everything monochrome.
+note("TERM=" + os.environ.get("TERM", "<unset>"))
+# Where nexmesh told this seat to keep its own data, if anywhere. A store per
+# seat is what makes "continue the last conversation" mean this seat's.
+note("STORE=" + os.environ.get("FAKE_STORE_HOME", "<unset>"))
 print(f"FAKETYPED READY tty={sys.stdin.isatty()}", flush=True)
 # What a real TUI asks of its terminal, once, at startup: the alternate
 # screen, the mouse, and bracketed paste. A viewer attaching an hour later
@@ -37,18 +53,82 @@ print(f"FAKETYPED READY tty={sys.stdin.isatty()}", flush=True)
 # is not in the state this program believes it is in.
 sys.stdout.write("\x1b[?1049h\x1b[?1000;1002;1006h\x1b[?2004h")
 print("> ", end="", flush=True)
-for line in sys.stdin:
+# A program that asked for bracketed paste (mode 2004, set above) has to
+# honour it: everything between the markers is ONE input, newlines included,
+# and only the Enter after the closing marker submits. Reading the pasted
+# text line by line instead -- which is what this did -- means a pasted list
+# arrives as one input followed by several stray submits, and the line after
+# a permission dialog gets eaten as the answer to it. That is exactly the
+# failure the markers exist to prevent, so the fake has to model it.
+def inputs():
+    buf = None
+    for raw in sys.stdin:
+        if buf is None and "\x1b[200~" in raw:
+            buf = raw.split("\x1b[200~", 1)[1]
+            if "\x1b[201~" in buf:
+                whole, rest = buf.split("\x1b[201~", 1)
+                note(f"bracketed paste of {len(whole)} chars")
+                buf = None
+                yield whole
+                if rest.strip():
+                    yield rest
+            continue
+        if buf is not None:
+            if "\x1b[201~" in raw:
+                head, rest = raw.split("\x1b[201~", 1)
+                whole = buf + head
+                note(f"bracketed paste of {len(whole)} chars")
+                buf = None
+                yield whole
+                if rest.strip():
+                    yield rest
+            else:
+                buf += raw
+            continue
+        yield raw
+
+
+# ONE iterator over stdin, shared by the main loop and the dialog branch.
+# Two `for line in sys.stdin` / `next(sys.stdin)` consumers race over Python's
+# own buffer, and the answer to a dialog is then read by whichever got there
+# first -- which is a test that fails for a reason that is not the product.
+GEN = inputs()
+
+for line in GEN:
     line = line.strip()
     if not line:
         continue
-    # A bracketed paste arrives with its markers, which a terminal program
-    # strips. Note that it WAS bracketed, so a test can tell.
-    if "\x1b[200~" in line:
-        note(f"bracketed paste of {len(line) - 14} chars")
-        line = line.replace("\x1b[200~", "").replace("\x1b[201~", "").strip()
     note(line)
     if line in ("quit", "exit"):
         print("\nbye", flush=True); break
+    if "chain" in line:
+        print("\n\x1b[36m╭─────────────────────────────╮\x1b[0m", flush=True)
+        print("\x1b[1m│ Do you want to make this edit?\x1b[0m", flush=True)
+        print("\x1b[32m│ \x1b[0m\x1b[7m❯ 1. Yes\x1b[0m", flush=True)
+        print("│   2. No", flush=True)
+        print("\x1b[36m╰─────────────────────────────╯\x1b[0m", flush=True)
+        sys.stdout.flush()
+        # Long enough for the node to read the screen, report it, and for the
+        # test to see the card.
+        time.sleep(CHAIN)
+        note("the first dialog was answered at the terminal")
+        print("\n\x1b[2mEdit applied.\x1b[0m", flush=True)
+        # And immediately a DIFFERENT question, so the screen never passes
+        # through a moment with nothing on it to answer.
+        print("\n\x1b[36m╭─────────────────────────────╮\x1b[0m", flush=True)
+        print("\x1b[1m│ Do you want to run the tests?\x1b[0m", flush=True)
+        print("\x1b[32m│ \x1b[0m\x1b[7m❯ 1. Run them\x1b[0m", flush=True)
+        print("│   2. Not now", flush=True)
+        print("\x1b[36m╰─────────────────────────────╯\x1b[0m", flush=True)
+        sys.stdout.flush()
+        try:
+            choice = next(GEN).strip()
+        except StopIteration:
+            break
+        note(f"second dialog answered with {choice!r}")
+        print("\n\x1b[2mTests started.\x1b[0m", flush=True)
+        print("> ", end="", flush=True)
+        continue
     if "dialog" in line:
         # What a permission prompt looks like, escapes and box and all.
         print("\n\x1b[36m╭─────────────────────────────╮\x1b[0m", flush=True)
@@ -62,7 +142,7 @@ for line in sys.stdin:
             # so a test can prove WHO answered it and WITH WHAT. The pty is
             # in canonical mode here, so the choice arrives as a line.
             try:
-                choice = next(sys.stdin).strip()
+                choice = next(GEN).strip()
             except StopIteration:
                 break
             note(f"dialog answered with {choice!r}")

@@ -1,0 +1,35 @@
+# Test-only descriptor: an interactive agent that writes a conversation file
+# the way claude does, so the fleet can measure how full it is.
+#
+# `session_path` and `[cli.env]` are rewritten by the test, which bakes a
+# temporary directory into them: a suite must not read or write the real
+# ~/.claude of whoever is running it.
+[cli]
+id = "fakectx"
+display_name = "Fake context-writing TUI"
+command = "fakectx"
+version_args = ["--version"]
+extra_paths = ["tests/fake-cli"]
+
+[modes.interactive]
+args = []
+attachable = true
+typed_delivery = true
+session_id_args = ["--session-id", "{session_uuid}"]
+resume_args = ["--resume", "{resume}"]
+session_path = "/tmp/{cwd_slug}/{id}.jsonl"
+compact_command = "/squash-now"
+# Escape, as in claude: an interrupt has to land while the CLI is busy.
+interrupt_keys = "\u001b"
+
+[context]
+source = "claude_transcript"
+limit_tokens = 200000
+
+[context.models]
+# A second window, to prove the limit follows the model rather than the CLI.
+"fake-big" = 1000000
+
+[driver]
+kind = "stream_json"
+replay_user_messages = true

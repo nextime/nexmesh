@@ -474,9 +474,14 @@ pub fn stop(mut child: Child, path: &Path) -> Result<Vec<u8>> {
     }
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let _ = std::fs::remove_file(path);
-    // A wav header alone is 44 bytes; anything near that is a key pressed
-    // twice, not a sentence.
-    if bytes.len() < 1024 {
+    // A wav header alone is 44 bytes, and 16 kHz mono is 32,000 bytes a
+    // second, so this floor is about four tenths of a second. Not a size
+    // check for its own sake: a transcriber handed a fraction of a second of
+    // room noise does not answer "nothing", it answers with a short polite
+    // sentence -- "Thank you." is the one Whisper reaches for -- and that
+    // sentence then gets typed into an agent's prompt as though somebody
+    // had said it.
+    if bytes.len() < 13_000 {
         anyhow::bail!("that was too short to hear");
     }
     Ok(bytes)
@@ -673,6 +678,33 @@ async fn ask(
 /// a speech service asked to read `\x1b[1;32m` reads it out. Only the parts a
 /// person would see survive: CSI and OSC sequences go, as do the control
 /// characters, and a run of blanks becomes one space.
+/// The same, but one string per LINE.
+///
+/// `plain` flattens a screen into one line, which is right for a prompt
+/// fingerprint and wrong for deciding what an agent SAID: what is a reply
+/// and what is the box drawn round the prompt is a judgement about the shape
+/// of the screen, and a screen with no line breaks left in it has no shape.
+pub fn plain_lines(bytes: &[u8]) -> Vec<String> {
+    // Split first, strip second: a line break can only be recognised while
+    // the control characters are still there.
+    let mut out: Vec<String> = Vec::new();
+    for chunk in bytes.split(|b| *b == b'\n') {
+        // A carriage return means the terminal went back to the start of the
+        // line and drew over it. What a person SEES is the last thing drawn,
+        // which is the part after the final CR -- not the half-written line
+        // under it, and not both of them concatenated.
+        let last = chunk
+            .rsplit(|b| *b == b'\r')
+            .find(|part| !plain(part).trim().is_empty())
+            .unwrap_or(&[]);
+        let text = plain(last);
+        if !text.trim().is_empty() {
+            out.push(text.trim().to_string());
+        }
+    }
+    out
+}
+
 pub fn plain(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;

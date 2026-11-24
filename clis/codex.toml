@@ -37,6 +37,29 @@ attachable = false
 # on, which is codex's own documented unattended mode: failures go back to
 # the model instead of to a human who is not there.
 args = ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+# `codex resume <id>` continues a thread. It is a SUBCOMMAND, so it lands
+# after the options above -- verified that clap accepts
+# `codex --ask-for-approval never --sandbox workspace-write resume ...`.
+#
+# This only fires when the hub HAS a handle for the seat, and for an
+# interactive codex seat it currently never does: codex exports no session
+# id to its MCP children (checked against the real process environment on
+# 0.169), takes no session name at launch, and records its threads in a
+# store shared by every seat this user runs -- where two seats spawned
+# together were 610ms apart with the same cwd, so neither time nor
+# directory can tell them apart. Resuming the WRONG conversation is worse
+# than starting a fresh one, so nothing guesses. The driven app-server mode
+# learns its own thread id over the protocol and does resume.
+resume_args = ["resume", "{resume}"]
+# With a store of this seat's own (see the session_store section below), "the
+# last one" is unambiguously the conversation THIS seat was on, so there is no
+# id to learn or record. `resume --last` is codex's own way of saying it.
+resume_latest_args = ["resume", "--last"]
+# No compact_command: this CLI's compaction command was not verified here --
+# neither its --help nor its package names one, and the commands next to it
+# (/clear, /new) are destructive, so guessing in that neighbourhood is not
+# worth it. `/compact <agent>` reports that rather than typing a guess. Add
+# the real command here and it works immediately.
 attachable = true
 # Typing a line at this prompt is a message to the agent, not a command
 # to a shell -- so a seat the fleet put in a terminal can be reached by
@@ -53,3 +76,30 @@ path = "~/.codex/config.toml"
 key = "mcp_servers.{name}"
 env_key = "env"
 entry = { command = "{command}", args = [] }
+
+# No [skill] section: this CLI has no skills directory to write one into. It
+# gets the same ground rules through the MCP `instructions` field, which the
+# hub sends every client at initialize (see proto::tools::team_instructions).
+
+[session_store]
+# A data directory per SEAT, so a codex seat can be resumed at all.
+#
+# codex 0.169 exports no conversation id to its MCP children (checked against
+# the real process environment, not the docs), takes no conversation name at
+# launch, and records every seat's threads in one state_*.sqlite with no
+# column naming the process that owns them. Two seats spawned together are
+# milliseconds apart with the same cwd, so nothing outside codex can tell
+# which thread belongs to which seat -- and resuming the WRONG conversation
+# is worse than starting a fresh one.
+#
+# Given its own CODEX_HOME, "the last thread" is this seat's last thread.
+#
+# Everything in `share` is symlinked out of the real ~/.codex, so the login,
+# the configuration, the installed packages, plugins and skills are not
+# duplicated and cannot drift. Only the threads are per seat, which is the
+# point. An entry that does not exist on a given version is skipped.
+env = "CODEX_HOME"
+root = "~/.codex"
+share = ["auth.json", "auth.json.lock", "auth.lock", "config.toml",
+         "packages", "plugins", "skills", "models_cache.json",
+         "installation_id", "version.json", "shell_snapshots"]

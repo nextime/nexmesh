@@ -21,8 +21,16 @@ import urllib.request, urllib.error
 # report the same conversation and collapse into one seat. Which is correct
 # behaviour by the hub and nonsense in a demonstration; the suites drop these
 # for the same reason.
+# And this seat's OWN nexmesh identity, for a sharper version of the same
+# reason: run from inside a nexmesh seat, every shim below inherited the
+# agent id and socket of the CLI running this script, registered against a
+# node that has never heard of it, and died on its first message -- which
+# reads as a broken demo rather than as a borrowed identity.
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
-           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION", "NEXMESH_CLI",
+           "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK", "NEXMESH_HUB",
+           "NEXMESH_TOKEN"):
     os.environ.pop(_v, None)
 
 SCR = os.path.dirname(os.path.abspath(__file__))

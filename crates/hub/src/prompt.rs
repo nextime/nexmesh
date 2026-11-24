@@ -12,9 +12,30 @@ pub struct AgentBrief<'a> {
     pub workspace_path: &'a str,
     pub shared_workspace: bool,
     pub task: &'a str,
+    /// The TEAM'S standing rules, if it has any: what is true of the work
+    /// rather than of this seat. Set by the operator or by an orchestrating
+    /// seat, and the same for everybody in the session.
+    pub team_rules: &'a str,
 }
 
 pub fn first_prompt(b: &AgentBrief) -> String {
+    // THE TEAM'S RULES GO NEAR THE TOP, before the protocol.
+    //
+    // They are the most specific thing this agent is told -- somebody wrote
+    // them for this work, today -- and the protocol below is the same for
+    // every seat on the fleet. Buried under two pages of generic
+    // instructions, a rule that matters reads as a footnote.
+    let rules = if b.team_rules.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "THIS TEAM'S RULES\nSet for everybody working on \"{}\". They are not \
+             advice, and they outrank your own preferences about how to work; where they \
+             contradict the general guidance below, follow these.\n\n{}\n\n",
+            b.session_name,
+            b.team_rules.trim()
+        )
+    };
     let coordination = if b.shared_workspace {
         "Your workspace is SHARED with teammates on other machines. Before editing any \
          file outside your ownership zone, call `acquire_file`; release it when done. \
@@ -34,6 +55,7 @@ pub fn first_prompt(b: &AgentBrief) -> String {
 YOUR TASK
 {task}
 
+{rules}
 YOU ARE NOT ALONE. You are one agent on a team spread across machines. You are \
 running on the machine \"{node}\", in {cwd}.
 
@@ -109,6 +131,7 @@ FINISHING
         session = b.session_name,
         role_desc = b.role_description,
         task = b.task,
+        rules = rules,
         node = b.node_name,
         cwd = b.workspace_path,
         coordination = coordination,
@@ -129,7 +152,40 @@ mod tests {
             workspace_path: "/srv/app",
             shared_workspace: shared,
             task: "Build the login flow.",
+            team_rules: "",
         }
+    }
+
+    #[test]
+    fn a_team_with_no_rules_is_told_nothing_about_rules() {
+        let p = first_prompt(&brief(true));
+        assert!(!p.contains("THIS TEAM'S RULES"));
+    }
+
+    #[test]
+    fn the_teams_rules_come_before_the_general_guidance() {
+        // They are the specific thing somebody wrote for this work; what
+        // follows is the same for every seat on the fleet. Below two pages
+        // of generic instruction, a rule that matters reads as a footnote.
+        let mut b = brief(true);
+        b.team_rules = "Never deploy on a Friday.";
+        let p = first_prompt(&b);
+        assert!(p.contains("THIS TEAM'S RULES"));
+        assert!(p.contains("Never deploy on a Friday."));
+        assert!(
+            p.find("Never deploy on a Friday.").unwrap()
+                < p.find("HOW TO WORK WITH THE TEAM").unwrap()
+        );
+    }
+
+    #[test]
+    fn the_rules_say_they_outrank_the_general_guidance() {
+        // Otherwise an agent reading a contradiction picks whichever it read
+        // last, which is the generic half.
+        let mut b = brief(false);
+        b.team_rules = "Ask before touching the database.";
+        let p = first_prompt(&b);
+        assert!(p.contains("outrank"));
     }
 
     #[test]

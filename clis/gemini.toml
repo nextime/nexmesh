@@ -1,4 +1,9 @@
-# Gemini CLI. Not installed on machine-b.
+# Gemini CLI. Not installed on any machine here, so what is declared below
+# comes from Google's own published documentation for it -- the slash command
+# reference, the keyboard reference, the session-management page and the flag
+# table -- and not from anything run against the binary. Where that
+# documentation does not answer a question, the answer is left out and the
+# question written down, rather than filled in with something plausible.
 [cli]
 id = "gemini"
 display_name = "Gemini CLI"
@@ -21,7 +26,45 @@ args = ["--yolo", "--prompt", "{prompt}"]
 attachable = false
 
 [modes.interactive]
-args = []
+# An interactive seat has nobody at its keyboard, and Gemini CLI asks before
+# running a tool unless told otherwise -- which on this fleet means the
+# shim's own `claim_messages` raises a question the moment a teammate writes
+# to the seat. That question then blocks it: the message is typed into the
+# composer behind it and the Enter answers the question instead of
+# submitting, so from the outside the agent looks like it is ignoring you.
+#
+# `--yolo` is its documented auto-approve switch and the same one the
+# headless mode above already uses. Its own documentation now calls the flag
+# deprecated in favour of `--approval-mode=yolo`; the deprecated spelling is
+# the one that works on every version in the wild, so it is what is written
+# here, and the day it is removed this is a one-line edit.
+args = ["--yolo"]
+# `--resume` takes a session UUID (also "latest", or an index). Dormant for
+# now: Gemini CLI publishes no session id to its MCP children and takes no
+# caller-chosen id at launch, so the hub has no handle to hand back.
+#
+# Deliberately NOT resume_latest_args = ["--resume", "latest"]: sessions are
+# stored per PROJECT, under ~/.gemini/tmp/<project hash>/chats, and
+# GEMINI_CLI_HOME is documented as moving configuration without saying that
+# it moves those, so two seats in one directory cannot be given stores of
+# their own with any confidence. "The latest" would then be whichever seat
+# spoke last, and resuming the wrong conversation is worse than starting a
+# fresh one.
+resume_args = ["--resume", "{resume}"]
+# Its documented compaction command, verbatim: "Replace the entire chat
+# context with a summary." It is NOT `/compact`, which does not exist here,
+# and `/clear` next door wipes the conversation instead of summarising it.
+#
+# Note that Gemini CLI also compacts ITSELF, at the fraction of the window
+# given by `model.compressionThreshold` in its settings (0.5 by default), so
+# a seat of it may compact before any threshold nexmesh is holding.
+compact_command = "/compress"
+# No interrupt_keys. Its keyboard reference binds Ctrl+C to "Cancel the
+# current request or quit the CLI when input is empty" -- the same key for
+# both, with which one you get depending on a state nexmesh cannot see from
+# outside. Esc is documented only as dismissing dialogs, not as stopping a
+# turn. So a looping seat of this CLI is paused without an interrupt rather
+# than having the quit key typed at it.
 attachable = true
 # Typing a line at this prompt is a message to the agent, not a command
 # to a shell -- so a seat the fleet put in a terminal can be reached by
@@ -36,3 +79,14 @@ kind = "mcp_only"
 style = "command"
 argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
 env_flag = "-e"
+
+# No [context] section: Gemini CLI records token usage inside its session
+# history, but its documentation names no file that holds the current
+# occupancy, and this CLI is not installed on any machine here to check
+# against. So a seat of it is measured by nothing and compacted
+# automatically by nothing -- `/compact <agent>` still works, because the
+# command above is documented.
+
+# No [skill] section: this CLI has no skills directory to write one into. It
+# gets the same ground rules through the MCP `instructions` field, which the
+# hub sends every client at initialize (see proto::tools::team_instructions).

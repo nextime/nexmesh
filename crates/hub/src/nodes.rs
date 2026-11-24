@@ -241,11 +241,53 @@ async fn handle(
         } => {
             let db = st.db.lock().unwrap();
             let now = now_ms();
+            // THE SAME PROCESS, UNDER A NEW AGENT ID.
+            //
+            // tmux supervision made that ordinary: the CLI outlives the node,
+            // and after a node restart the node adopts the pane and registers
+            // it as a fresh agent -- same machine, same pid, same start
+            // ticks. `agents_identity` is UNIQUE on exactly that triple and
+            // `ON CONFLICT(id)` below does not cover it, so the whole insert
+            // failed, the frame was rejected with "UNIQUE constraint failed",
+            // and the hub went on believing the seat was empty. `attach`
+            // starts a seat with no process, so it started it again, and
+            // again: four rounds on the live fleet with the CLI sitting right
+            // there, and the only way out was killing a tmux session by hand.
+            //
+            // The triple is what says "this is the same process", so an older
+            // row carrying it describes THIS process under an id nothing will
+            // ever update again. Its bookkeeping ends here: the pid moves to
+            // the row that is actually tracking the process, and the old row
+            // keeps its times and its token counts as history.
+            let superseded: Vec<String> = db
+                .prepare(
+                    "SELECT id FROM agents
+                      WHERE node_id = ?1 AND pid = ?2 AND proc_start_ticks = ?3 AND id <> ?4",
+                )
+                .and_then(|mut q| {
+                    q.query_map(params![node_id, id.pid, id.start_ticks, agent_id], |r| r.get(0))
+                        .and_then(|m| m.collect())
+                })
+                .unwrap_or_default();
+            for old in &superseded {
+                // pid cleared, not just the status: the unique index is
+                // partial (WHERE pid IS NOT NULL), so leaving the pid there
+                // would keep the conflict and the insert would fail again.
+                db.execute(
+                    "UPDATE agents SET pid = NULL, status = 'exited',
+                                       exited_at_ms = COALESCE(exited_at_ms, ?2)
+                      WHERE id = ?1",
+                    params![old, now],
+                )?;
+                tracing::info!(old = %old, new = %agent_id, pid = id.pid, node = %node_id,
+                    "the same process has re-registered under a new agent id; \
+                     the earlier row is now history");
+            }
             db.execute(
                 "INSERT INTO agents (id, slot_id, node_id, pid, proc_start_ticks, provenance,
                                      status, cwd, started_at_ms, last_seen_ms, push_capable,
-                                     io_kind, typed_delivery)
-                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9,?10,?11)
+                                     io_kind, typed_delivery, resumed)
+                 VALUES (?1,?2,?3,?4,?5,?6,'running',?7,?8,?8,?9,?10,?11,?12)
                  ON CONFLICT(id) DO UPDATE SET status = 'running', last_seen_ms = ?8,
                                                -- Up again is not exited.
                                                exited_at_ms = NULL,
@@ -254,7 +296,12 @@ async fn handle(
                 params![
                     agent_id, slot_id, node_id, id.pid, id.start_ticks,
                     serde_json::to_value(provenance)?.as_str().unwrap_or("managed"),
-                    cwd, now, push_capable as i64, io_kind, typed_delivery as i64
+                    cwd, now, push_capable as i64, io_kind, typed_delivery as i64,
+                    // Did the hub hand this start a conversation to resume?
+                    // A start that dies seconds after being given one died
+                    // on OUR argument, and recovery treats that differently
+                    // from a seat exiting on its own account.
+                    i64::from(resume_handle.is_some())
                 ],
             )?;
             db.execute("UPDATE slots SET status = 'connected' WHERE id = ?", [&slot_id])?;
@@ -264,6 +311,24 @@ async fn handle(
             tracing::info!(node = %node_name, %agent_id, %slot_id, pid = id.pid, "agent up");
         }
 
+        // An agent is stopped at a permission prompt with nobody attached.
+        // The node did NOT answer it: it read the menu and is waiting.
+        NodeToHub::ApprovalAsked { agent_id, kind, question, options, fingerprint } => {
+            // `asked` returns a decision only when a standing auto-approval
+            // covers this seat, in which case the wait is invisible. The
+            // reply goes back on this node's own connection, since only this
+            // node can type at that terminal.
+            if let Some(decided) = crate::approvals::asked(
+                st, &agent_id, &kind, &question, &options, &fingerprint)
+            {
+                if let Ok(s) = serde_json::to_string(&decided) {
+                    let _ = tx.send(s).await;
+                }
+            }
+        }
+        NodeToHub::ApprovalWithdrawn { agent_id, fingerprint } => {
+            crate::approvals::withdrawn(st, &agent_id, &fingerprint);
+        }
         NodeToHub::Noted { agent_id, text } => {
             // Pre-claimed, like the console's own housekeeping lines: this is
             // a record for whoever reads the room later, never a message an
@@ -297,6 +362,9 @@ async fn handle(
                 "UPDATE agents SET status = 'exited', exited_at_ms = ? WHERE id = ?",
                 params![now_ms(), agent_id],
             )?;
+            // Whatever it was stopped on cannot be answered now: there is no
+            // terminal left to type the keystroke at.
+            crate::approvals::retire_gone(&db);
             // Anything handed to it but never acked must go back in the queue.
             db.execute(
                 "UPDATE messages SET inflight_agent = NULL, inflight_at_ms = NULL
@@ -317,6 +385,16 @@ async fn handle(
                     Err(e) => tracing::error!(error = %e, "releasing capability requests"),
                     _ => {}
                 }
+                // A seat a hand-run CLI took by itself has nothing to come
+                // back to it: the operator closed a terminal. Left behind it
+                // is a teammate in the roster that is not there. Only a seat
+                // carrying nothing goes -- see `retire_if_throwaway`, which
+                // keeps every seat an operator configured, because a hand-run
+                // conversation returns to its own seat.
+                if let Err(e) = crate::seat::retire_if_throwaway(&db, &slot) {
+                    tracing::error!(error = %e, slot = %slot,
+                        "could not decide whether to retire this seat; leaving it");
+                }
             }
             tracing::info!(node = %node_name, %agent_id, ?code, ?signal, "agent exited");
         }
@@ -327,6 +405,38 @@ async fn handle(
                 "UPDATE slots SET resume_handle = ? WHERE id = ?",
                 params![handle, slot_id],
             )?;
+            // BOUND TO THE PLACE IT EXISTS IN.
+            //
+            // A conversation is a local file on one machine, in one
+            // directory, belonging to one CLI. Recorded per place, so a seat
+            // that moves to another machine is not offered a conversation
+            // that cannot be there -- and a seat that moves BACK finds the
+            // one it left. The key is the seat, so renaming it or moving it
+            // between teams changes nothing.
+            let place: Option<(String, String, String)> = db
+                .query_row(
+                    "SELECT a.node_id, COALESCE(a.cwd, ''), COALESCE(s.cli_id, '')
+                       FROM agents a JOIN slots s ON s.id = a.slot_id
+                      WHERE a.id = ?",
+                    [&agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .unwrap_or(None);
+            if let Some((node, cwd, cli)) = place {
+                db.execute(
+                    "INSERT INTO slot_conversations
+                        (slot_id, node_id, cwd, cli_id, handle, updated_at_ms)
+                     VALUES (?,?,?,?,?,?)
+                     ON CONFLICT(slot_id, node_id, cwd, cli_id) DO UPDATE SET
+                        handle = excluded.handle,
+                        updated_at_ms = excluded.updated_at_ms",
+                    params![slot_id, node, cwd, cli, handle, crate::now_ms()],
+                )
+                .ok();
+                tracing::info!(%slot_id, %node, %cwd, %cli, %handle,
+                               "bound this seat's conversation to where it lives");
+            }
             // And durably, against the identity rather than the slot, so the
             // conversation can be picked up in a later session.
             let who: Option<(Option<String>, Option<String>, Option<String>)> = db
@@ -367,6 +477,17 @@ async fn handle(
                         "could not store a late code graph"),
                 }
             }
+        }
+
+        NodeToHub::TreeFingerprintResult {
+            req_id: _,
+            workspace_id,
+            fingerprint,
+            files,
+            partial,
+        } => {
+            let db = st.db.lock().unwrap();
+            crate::graph::fingerprint_arrived(&db, &workspace_id, &fingerprint, files, partial);
         }
 
         NodeToHub::AgentModel { agent_id, model } => {
@@ -435,6 +556,54 @@ async fn handle(
             st.complete_sync(req_id, v);
         }
 
+        // HOW FULL this agent's context is -- not what it has spent. See
+        // `agents.context_used_tokens` for why those are different numbers.
+        NodeToHub::ContextUsage { agent_id, used, limit, source } => {
+            let next = {
+                let db = st.db.lock().unwrap();
+                crate::watchdog::record_context(
+                    &db,
+                    st.fleet_compact_at_pct(),
+                    &agent_id,
+                    used,
+                    limit,
+                    &source,
+                )?
+            };
+            // Outside the lock, like a budget: asking a seat to compact
+            // talks to a node, and holding the database while waiting on a
+            // socket stops the whole fleet.
+            match next {
+                // A fold comes FIRST, and the compaction follows on a later
+                // reading if the seat does nothing about it: what the agent
+                // writes down survives the compaction, and what the
+                // compaction leaves behind is a summary of a summary.
+                crate::watchdog::Next::Fold(n) => crate::watchdog::nudge(st, n).await,
+                crate::watchdog::Next::Compact(full) => {
+                    crate::watchdog::compact(st, full).await
+                }
+                crate::watchdog::Next::Nothing => {}
+            }
+        }
+
+        // The same turn, over and over. The node reports the cycle; whether
+        // that many repeats is a loop is this fleet's setting.
+        NodeToHub::LoopSuspected { agent_id, period, repeats } => {
+            let looping = {
+                let db = st.db.lock().unwrap();
+                crate::watchdog::record_loop(
+                    &db,
+                    st.fleet_loop_repeats(),
+                    &agent_id,
+                    period,
+                    repeats,
+                )?
+            };
+            if let Some(it) = looping {
+                crate::watchdog::halt(st, it).await;
+            }
+        }
+
         NodeToHub::TokenUsage { agent_id, input, output, cache_read } => {
             let over = {
                 let db = st.db.lock().unwrap();
@@ -483,9 +652,18 @@ async fn handle(
             let granted = join(st, node_id, session_hint, cli_id, role, name, cwd, pid,
                                cli_session, cli_session_is_own);
             let frame = match granted {
-                Ok((slot_id, session_id, agent_id, display_name, role)) => HubToNode::JoinGranted {
-                    req_id, slot_id, session_id, agent_id, display_name, role,
-                },
+                Ok((slot_id, session_id, agent_id, display_name, role)) => {
+                    // The seat's authority decides the tool list its shim
+                    // advertises, and only the hub knows it.
+                    let authority = {
+                        let db = st.db.lock().unwrap();
+                        crate::fleet::authority_of(&db, &slot_id).as_str().to_string()
+                    };
+                    HubToNode::JoinGranted {
+                        req_id, slot_id, session_id, agent_id, display_name, role,
+                        authority: Some(authority),
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(node = %node_name, error = %e, "join denied");
                     HubToNode::JoinDenied { req_id, reason: e.to_string() }
@@ -670,6 +848,7 @@ async fn code_graph_tool(
     ws_id: &str,
     node_id: &str,
     path: &str,
+    session_id: &str,
     args: &serde_json::Value,
 ) -> Result<String> {
     let what = args
@@ -680,6 +859,31 @@ async fn code_graph_tool(
     let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+    let scope = crate::graph::GraphScope::parse(args.get("scope").and_then(|v| v.as_str()))?;
+
+    // A WIDER question answers from what has already been parsed, and never
+    // parses on behalf of somebody else's workspace: that is minutes of
+    // another machine's time, and the agent asking it is not the one who
+    // decided to run an agent there.
+    if scope != crate::graph::GraphScope::Workspace {
+        if rebuild {
+            anyhow::bail!(
+                "rebuild parses one workspace on one machine, so ask it of your own: \
+                 drop the scope. A wider question answers from the workspaces already \
+                 parsed."
+            );
+        }
+        let db = st.db.lock().unwrap();
+        let places = crate::graph::parsed_in_scope(&db, scope, session_id, ws_id)?;
+        if places.is_empty() {
+            return Ok(format!(
+                "No workspace {} has been parsed yet. Ask about your own workspace first \
+                 (drop the scope), which parses it.",
+                if scope == crate::graph::GraphScope::Global { "on the fleet" } else { "in this team" }
+            ));
+        }
+        return crate::graph::query_across(&db, &places, &what, &target, &to);
+    }
 
     // Built on first use rather than requiring anyone to remember: an agent
     // asking a question should get an answer, not an instruction.
@@ -707,14 +911,38 @@ async fn workspace_tool(
     // The code graph needs a directory, not a git remote, so it is answered
     // for any workspace -- including a node-local one.
     if tool == "query_code_graph" {
-        let Some((ws_id, node_id, path)) = crate::sync::workspace_host(st, &slot_id) else {
-            return Ok((
-                "You have no workspace on a connected machine, so there are no files to parse."
-                    .into(),
-                vec![],
-            ));
+        let session_id: String = {
+            let db = st.db.lock().unwrap();
+            db.query_row("SELECT session_id FROM slots WHERE id = ?", [&slot_id], |r| r.get(0))
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
         };
-        return code_graph_tool(st, &ws_id, &node_id, &path, args).await.map(|t| (t, vec![]));
+        let Some((ws_id, node_id, path)) = crate::sync::workspace_host(st, &slot_id) else {
+            // A seat with no workspace of its own can still ask a WIDER
+            // question: the fleet's parsed workspaces are there whether this
+            // seat has files or not, and refusing left an agent on a machine
+            // with nothing checked out unable to ask where anything is.
+            let wider = crate::graph::GraphScope::parse(
+                args.get("scope").and_then(|v| v.as_str()),
+            )?;
+            if wider == crate::graph::GraphScope::Workspace {
+                return Ok((
+                    "You have no workspace on a connected machine, so there are no files to \
+                     parse. Ask with scope 'session' or 'global' to search the workspaces \
+                     this fleet has already parsed."
+                        .into(),
+                    vec![],
+                ));
+            }
+            return code_graph_tool(st, "", "", "", &session_id, args)
+                .await
+                .map(|t| (t, vec![]));
+        };
+        return code_graph_tool(st, &ws_id, &node_id, &path, &session_id, args)
+            .await
+            .map(|t| (t, vec![]));
     }
 
     let Some((ws_id, node_id, path)) = crate::sync::slot_workspace(st, &slot_id) else {
@@ -822,7 +1050,12 @@ pub fn run_tool(
         .optional()?
         .ok_or_else(|| anyhow::anyhow!("unknown agent '{agent_id}'"))?;
 
-    let ctx = tools::Ctx { db: &db, session_id: session_id.clone(), slot_id: slot_id.clone() };
+    let ctx = tools::Ctx {
+        db: &db,
+        session_id: session_id.clone(),
+        slot_id: slot_id.clone(),
+        flood: (st.fleet_msg_rate(), st.fleet_msg_pair()),
+    };
     let text = tools::dispatch(&ctx, tool, args)?;
 
     // `check_messages` already acked what it showed; don't hand it out twice.
@@ -1415,5 +1648,113 @@ mod tests {
     fn a_cwd_outside_every_mount_matches_nothing() {
         assert_eq!(workspace_for_cwd(&mounts(), "/home/alice"), None);
         assert_eq!(workspace_for_cwd(&[], "/srv/app"), None);
+    }
+}
+
+/// A process that comes back under a new agent id.
+#[cfg(test)]
+mod reregister_tests {
+    use super::*;
+    use crate::state::AppState;
+
+    fn fleet() -> AppState {
+        let st = AppState::in_memory().unwrap();
+        {
+            let db = st.db.lock().unwrap();
+            db.execute_batch(
+                "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1);
+                 INSERT INTO nodes (id,name,os,arch,node_version,labels,status,
+                                    first_seen_ms,last_seen_ms,lease_expires_ms)
+                   VALUES ('n1','machine-b','linux','x86_64','0','[]','online',1,1,9999999999999);
+                 INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                   VALUES ('sl-1','s1','Dev','claude',1);",
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    fn up(agent: &str) -> proto::NodeToHub {
+        proto::NodeToHub::AgentUp {
+            agent_id: agent.to_string(),
+            slot_id: "sl-1".to_string(),
+            proc: proto::ProcIdentity {
+                node_id: "machine-b".to_string(),
+                pid: 4242,
+                start_ticks: 777,
+            },
+            provenance: proto::Provenance::Managed,
+            cwd: "/tmp".to_string(),
+            resume_handle: None,
+            push_capable: false,
+            io_kind: Some("tmux".to_string()),
+            typed_delivery: true,
+        }
+    }
+
+    /// A CLI held in tmux outlives its node. The node restarts, adopts the
+    /// pane, and registers it as a FRESH agent -- same machine, same pid,
+    /// same start ticks. `agents_identity` is UNIQUE on that triple, so the
+    /// insert failed, the frame was rejected, and the hub went on believing
+    /// the seat was empty. attach then started it again, four times over,
+    /// with the CLI sitting right there.
+    #[tokio::test]
+    async fn the_same_process_may_re_register_under_a_new_id() {
+        let st = fleet();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        handle(&st, "n1", "machine-b", up("ag-first"), &tx)
+            .await
+            .expect("first registration");
+        // The node restarts and adopts the same pane.
+        handle(&st, "n1", "machine-b", up("ag-second"), &tx)
+            .await
+            .expect("a reattached process must be allowed to register again");
+
+        let db = st.db.lock().unwrap();
+        // THE SYMPTOM THAT MATTERED: the seat has a live process the hub
+        // knows about, so attach has something to open.
+        let live: Vec<(String, Option<i64>)> = db
+            .prepare("SELECT id, pid FROM agents WHERE slot_id='sl-1' AND exited_at_ms IS NULL")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(live.len(), 1, "exactly one live agent per process: {live:?}");
+        assert_eq!(live[0].0, "ag-second", "the new id is the live one");
+        assert_eq!(live[0].1, Some(4242), "and it carries the pid");
+
+        // The earlier row is history, not a second live agent -- and it has
+        // given up the pid, because the unique index is partial on pid and
+        // would otherwise still conflict.
+        let (status, pid): (String, Option<i64>) = db
+            .query_row("SELECT status, pid FROM agents WHERE id='ag-first'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "exited");
+        assert_eq!(pid, None);
+    }
+
+    /// And the ordinary case is untouched: the same agent id coming up again
+    /// is an update, not a supersede, and must not retire itself.
+    #[tokio::test]
+    async fn the_same_agent_coming_up_again_is_still_just_an_update() {
+        let st = fleet();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        handle(&st, "n1", "machine-b", up("ag-one"), &tx).await.unwrap();
+        handle(&st, "n1", "machine-b", up("ag-one"), &tx).await.unwrap();
+        let db = st.db.lock().unwrap();
+        let n: i64 = db
+            .query_row("SELECT COUNT(*) FROM agents WHERE slot_id='sl-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let (status, pid): (String, Option<i64>) = db
+            .query_row("SELECT status, pid FROM agents WHERE id='ag-one'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(pid, Some(4242), "it must not retire its own pid");
     }
 }

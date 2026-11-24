@@ -53,6 +53,10 @@ struct Args {
     /// The nexmesh hub.
     #[arg(long, env = "NEXMESH_HUB_HTTP", default_value = "http://127.0.0.1:7870")]
     hub: String,
+    /// What to call the machine this bridge runs on. Defaults to the
+    /// hostname, and is only ever a claim -- nothing verifies it.
+    #[arg(long)]
+    host: Option<String>,
     /// A participant token, scoped to the session this should join.
     #[arg(long, env = "NEXMESH_PARTICIPANT_TOKEN")]
     token: String,
@@ -804,6 +808,11 @@ async fn main() -> Result<()> {
         "role": args.role,
         "kind_hint": format!("{} bridge {VERSION}", m.service.name),
         "capabilities": available.iter().map(|a| a.label.clone()).collect::<Vec<_>>(),
+        // WHERE THIS RUNS. A bridge has no node row and no process the hub
+        // can see, so without this the fleet can only say it is not a
+        // machine -- and a service on a known host then appears under
+        // "participants with no machine", which reads as nowhere.
+        "host": args.host.clone().unwrap_or_else(default_host),
     });
     // One session is sent the way it always was, so an older hub still
     // understands this bridge. Several -- or `all` -- go as a list, which is
@@ -915,7 +924,7 @@ async fn main() -> Result<()> {
             .await;
     }
 
-    serve(&hubs, &svc, &m, &available, args.max_inline_bytes, &usage).await
+    serve(&hubs, &svc, &m, &available, args.max_inline_bytes, &args.name).await
 }
 
 /// Answer requests until stopped, for every seat this bridge holds.
@@ -930,15 +939,28 @@ async fn serve(
     m: &Manifest,
     available: &[Available],
     max_inline: usize,
-    usage: &str,
+    name: &str,
 ) -> Result<()> {
     let mut idle = 0u32;
     // Who has been told how to ask, and when. Told once and then left alone
     // for a while: an agent that keeps talking to the bridge in prose should
     // get the instructions, not a conversation with a wall.
     let mut told: BTreeMap<String, std::time::Instant> = BTreeMap::new();
+    // A TERSE nudge, not the catalogue. A sentence addressed to a bridge gets
+    // one line that says what it is and how to ask -- re-dumping the whole
+    // ~2KB capability sheet into a shared room every time somebody speaks to
+    // it in prose (four verbatim copies in one thread, on the live fleet)
+    // buries real conversation in boilerplate. The full sheet, with every
+    // request shape, is stored once in team memory at startup; this points
+    // there rather than repeating it.
+    let nudge = format!(
+        "{name} is a bridge to {svc}, not an agent -- it has no language model, so it          cannot act on a message written as a sentence. Ask it with the ask_capability          tool: ask_capability(capability=\"...\", request={{...}}). Its {n} capabilities          and their request fields are listed in team memory -- recall \"{svc}-capabilities\".",
+        name = name,
+        svc = m.service.name,
+        n = available.len(),
+    );
     loop {
-        answer_prose(hubs, usage, &mut told).await;
+        answer_prose(hubs, &nudge, &mut told).await;
         let mut asks: Vec<(String, String, Value, Option<String>, &Hub)> = Vec::new();
         for hub in hubs {
             let waiting = hub.tool("pending_asks", json!({})).await;
@@ -1507,5 +1529,34 @@ required = ["audio_base64"]
     #[test]
     fn a_line_that_is_not_an_ask_is_ignored() {
         assert!(parse_pending("- not-an-ask [ocr]\n  {}").is_empty());
+    }
+}
+
+/// What to call this machine when nobody said.
+///
+/// `hostname` is what an operator recognises, and it is what the fleet's
+/// nodes are named after, so a bridge beside one of them lines up with it.
+/// Falling back to the empty string rather than inventing a name: the hub
+/// treats a blank as "did not say", which is honest, where a guess like
+/// "unknown" would look like an answer.
+fn default_host() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.trim().is_empty()))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn it_names_this_machine_or_says_nothing() {
+        let h = default_host();
+        // Either a real name, or empty -- never a word that looks like one.
+        assert!(h.is_empty() || !h.contains(char::is_whitespace), "{h:?}");
+        assert_ne!(h, "unknown", "a guess must not look like an answer");
     }
 }

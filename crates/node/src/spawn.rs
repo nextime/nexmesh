@@ -45,6 +45,259 @@ fn expand(p: &str) -> String {
 }
 
 /// The environment an mcpd inherits so it can identify itself to the node.
+/// Record that a directory is trusted, where this CLI looks for that.
+///
+/// claude asks "do you trust the files in this folder?" as a modal question
+/// and will not start until it is answered. No automation can answer it, so
+/// the seat is stuck and looks, from the outside, like a CLI that refuses to
+/// run -- which is exactly how it was reported.
+///
+/// The operator chose the directory when they made the seat; running an
+/// agent there IS the decision. This records it where the CLI looks for it.
+///
+/// Returns `Some(path)` when it had to change something, so the caller can
+/// say so: marking a directory trusted on somebody's behalf is not a thing
+/// to do silently.
+fn ensure_trusted(
+    trust: &nexmesh_proto::cli_descriptor::TrustPath,
+    cwd: &str,
+) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let file = if let Some(rest) = trust.file.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        trust.file.clone()
+    };
+    // JSON pointer escaping: `~` then `/`, in that order, per RFC 6901.
+    let escaped = cwd.replace('~', "~0").replace('/', "~1");
+    let pointer = trust.pointer.replace("{cwd}", &escaped);
+
+    let text = std::fs::read_to_string(&file).ok()?;
+    let mut root: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // Already true? Then nothing to do and nothing to announce.
+    if root.pointer(&pointer).and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    // Walk the pointer, creating objects as needed.
+    let mut cur = &mut root;
+    let parts: Vec<String> = pointer
+        .trim_start_matches('/')
+        .split('/')
+        .map(|p| p.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    let (last, lead) = parts.split_last()?;
+    for p in lead {
+        if !cur.is_object() {
+            *cur = serde_json::json!({});
+        }
+        cur = cur
+            .as_object_mut()?
+            .entry(p.clone())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    if !cur.is_object() {
+        *cur = serde_json::json!({});
+    }
+    cur.as_object_mut()?.insert(last.clone(), serde_json::Value::Bool(true));
+
+    // Written through a temporary file and renamed: this is somebody's live
+    // CLI config, and a half-written one would lock them out of their own
+    // tool.
+    let tmp = format!("{file}.nexmesh-tmp");
+    let pretty = serde_json::to_string_pretty(&root).ok()?;
+    std::fs::write(&tmp, pretty).ok()?;
+    std::fs::rename(&tmp, &file).ok()?;
+    Some(file)
+}
+
+/// What this spawn should say about conversations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumePlan {
+    /// Continue this conversation, by id.
+    Resume(String),
+    /// Start a NEW conversation and NAME it, so there is something to resume
+    /// next time.
+    NameFresh,
+    /// Continue whatever this seat was last on, out of its own store.
+    ContinueLatest,
+    /// Say nothing: this CLI manages its own conversations.
+    Nothing,
+}
+
+/// Decide it in one place, so the decision can be tested rather than believed.
+///
+/// The rule that matters most: a resume that cannot be honoured becomes a
+/// NEW NAMED conversation, never nothing. A seat whose conversation has gone
+/// -- the start that named it died before the CLI wrote it, the file belongs
+/// to another directory, the seat has moved machines -- must still come up,
+/// and come up with a conversation of its own so the next restart has
+/// something to continue. Leaving it with no session argument is how a seat
+/// ends up unopenable with nothing the operator can do about it.
+pub(crate) fn resume_plan(
+    mode: &nexmesh_proto::cli_descriptor::ModeSpec,
+    // Every conversation this seat might be resuming, best first. The node
+    // is the only component that can see the files, so choosing between
+    // them is its job, not the hub's.
+    candidates: &[String],
+    // Asks whether a conversation is really there. `Some(false)`: checked,
+    // and it is not. `None`: this CLI does not say where conversations
+    // live, so nothing is checkable and nothing is refused.
+    exists: impl Fn(&str) -> Option<bool>,
+    // Does this seat's own store already hold a conversation?
+    store_has_prior: bool,
+) -> ResumePlan {
+    // A handle is only worth anything if the CLI takes one at all. Holding
+    // one for a CLI with no `resume_args` is not a reason to skip naming a
+    // fresh conversation -- which is what the old chain did, leaving such a
+    // seat with no session argument whatsoever.
+    if !mode.resume_args.is_empty() {
+        // THE FIRST ONE THAT IS REALLY THERE.
+        //
+        // Taking only the first candidate and declining it if absent was
+        // the bug: a ghost in front of a real conversation meant the real
+        // one was never tried, and the seat started blank on top of work
+        // that was still on disk.
+        for h in candidates {
+            match exists(h) {
+                // Checked and absent: a ghost. Try the next one.
+                Some(false) => continue,
+                // Either checked and there, or not checkable at all.
+                _ => return ResumePlan::Resume(h.clone()),
+            }
+        }
+    }
+    if !mode.session_id_args.is_empty() {
+        return ResumePlan::NameFresh;
+    }
+    if !mode.resume_latest_args.is_empty() && store_has_prior {
+        return ResumePlan::ContinueLatest;
+    }
+    ResumePlan::Nothing
+}
+
+/// Does the conversation this handle names actually exist?
+///
+/// `None` when the CLI does not say where conversations live -- nothing is
+/// checkable, so nothing is refused.
+///
+/// This exists because a named conversation is recorded BEFORE the CLI has
+/// created it. A start that fails leaves a handle pointing at nothing, and
+/// `claude --resume <nothing>` answers "No conversation found with session
+/// ID" and exits immediately -- so the seat cannot start at all, with an
+/// error nobody would trace back to nexmesh having named it. Seen on the
+/// live fleet: the handle 7a8a2910-… existed in the hub and in no project
+/// directory anywhere.
+fn conversation_exists(
+    mode: &nexmesh_proto::cli_descriptor::ModeSpec,
+    handle: &str,
+    cwd: &str,
+) -> Option<bool> {
+    Some(conversation_exists_at(mode.session_path.as_ref()?, handle, cwd))
+}
+
+/// The same question, from the path template alone.
+fn conversation_exists_at(tpl: &str, handle: &str, cwd: &str) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    // How claude names the project directory for a working directory: every
+    // slash becomes a dash, leading one included.
+    let slug = cwd.replace('/', "-");
+    let path = tpl
+        .replace("{id}", handle)
+        .replace("{cwd_slug}", &slug);
+    let path = if let Some(rest) = path.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        path
+    };
+    std::path::Path::new(&path).exists()
+}
+
+/// Give one seat its own copy of a CLI's data directory.
+///
+/// Returns the environment variable to set, its value, and whether that
+/// store ALREADY holds a conversation -- which is what makes "continue the
+/// last one" mean this seat's last one rather than whichever seat happened
+/// to run most recently.
+///
+/// Shared entries are symlinked out of the real store, so credentials,
+/// configuration and installed packages are not duplicated and do not drift.
+/// Everything else is per seat: that is the whole point.
+///
+/// Best-effort. A store that cannot be prepared must not stop a seat
+/// starting -- it only costs that seat its resume -- so this reports and
+/// returns None rather than failing the spawn.
+fn prepare_session_store(
+    store: &nexmesh_proto::cli_descriptor::SessionStore,
+    slot_id: &str,
+    cli_id: &str,
+) -> Option<(String, String, bool)> {
+    let home = std::env::var("HOME").ok()?;
+    let expand = |p: &str| -> String {
+        if let Some(rest) = p.strip_prefix("~/") {
+            format!("{home}/{rest}")
+        } else {
+            p.to_string()
+        }
+    };
+    // Per seat AND per CLI: one seat respawned under a different CLI is a
+    // different conversation, and mixing the two stores would offer it one
+    // that the new CLI cannot read.
+    //
+    // `NEXMESH_CLI_STATE` moves the whole tree. These stores hold real
+    // conversation history and grow, so the machine where that cannot live
+    // under $HOME -- a small root filesystem, a tmpfs home -- needs to be
+    // able to say where it goes. It is also what lets a test use one.
+    let root_dir = std::env::var("NEXMESH_CLI_STATE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{home}/.nexmesh/cli-state"));
+    let base = format!("{root_dir}/{cli_id}/{slot_id}");
+    let dir = if store.store_rel.is_empty() {
+        base.clone()
+    } else {
+        format!("{base}/{}", store.store_rel)
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(%slot_id, %cli_id, dir = %dir, error = %e,
+                       "could not make this seat its own data directory; it will not resume");
+        return None;
+    }
+    let root = expand(&store.root);
+    let mut shared = 0usize;
+    for entry in &store.share {
+        let from = format!("{root}/{entry}");
+        let to = format!("{dir}/{entry}");
+        if !std::path::Path::new(&from).exists() {
+            continue; // one list serves several versions of a CLI
+        }
+        if std::path::Path::new(&to).exists() {
+            shared += 1;
+            continue;
+        }
+        match std::os::unix::fs::symlink(&from, &to) {
+            Ok(()) => shared += 1,
+            Err(e) => tracing::warn!(%slot_id, entry = %entry, error = %e,
+                                     "could not share this entry into the seat's store"),
+        }
+    }
+    // Is there a conversation in here already? Anything that is not one of
+    // the entries we linked ourselves. Deliberately generic: the node does
+    // not need to understand a CLI's storage format to tell whether it has
+    // written any.
+    let prior = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    !store.share.iter().any(|s| *s == name)
+                })
+        })
+        .unwrap_or(false);
+    tracing::info!(%slot_id, %cli_id, dir = %dir, shared, prior,
+                   "this seat has a data directory of its own");
+    Some((store.env.clone(), base, prior))
+}
+
 fn shim_env(spec: &SpawnSpec, sock_path: &str) -> Vec<(String, String)> {
     vec![
         ("NEXMESH_AGENT_ID".into(), spec.agent_id.clone()),
@@ -80,6 +333,40 @@ fn descriptor_env(d: &nexmesh_proto::cli_descriptor::CliDescriptor) -> Vec<(Stri
         .collect()
 }
 
+/// The fleet-wide orchestrator MCP server, for a seat whose role is
+/// `orchestrator`.
+///
+/// Returns None when this machine has no `nexmesh-orch` beside the mcpd, or no
+/// paired identity for it to authenticate with. Both are the ordinary case on a
+/// node that runs only ordinary seats, so neither is an error.
+///
+/// No token is written into the config: `nexmesh-orch` takes the hub address
+/// and its client certificate from the identity directory, so the secret stays
+/// in one file with one owner instead of being copied into a file per seat.
+fn fleet_entry(mcpd_path: &str, env_key: Option<&str>) -> Option<serde_json::Value> {
+    let orch = PathBuf::from(mcpd_path).parent()?.join("nexmesh-orch");
+    if !orch.is_file() {
+        tracing::warn!(expected = %orch.display(),
+            "orchestrator seat, but no nexmesh-orch on this node: no fleet tools");
+        return None;
+    }
+    let identity = PathBuf::from(expand(
+        &std::env::var("NEXMESH_IDENTITY").unwrap_or_else(|_| "~/.nexmesh".into()),
+    ));
+    if !identity.join("identity.json").is_file() {
+        tracing::warn!(expected = %identity.display(),
+            "orchestrator seat, but no paired identity: no fleet tools");
+        return None;
+    }
+    let mut entry = serde_json::json!({
+        "command": orch.to_string_lossy(),
+        "args": [],
+    });
+    entry[env_key.unwrap_or("env")] =
+        serde_json::json!({ "NEXMESH_IDENTITY": identity.to_string_lossy() });
+    Some(entry)
+}
+
 /// Merge our MCP server entry into whichever config this CLI reads, and return
 /// a path to pass on the command line if it takes one.
 ///
@@ -100,6 +387,23 @@ pub fn write_mcp_config(
             let mut root = serde_json::json!({});
             let value = render_entry(entry, env_key.as_deref(), mcpd_path, &env);
             set_pointer(&mut root, pointer, value).map_err(|e| anyhow::anyhow!(e))?;
+
+            // An orchestrator seat is given fleet reach as well as its own
+            // session. Without it the one agent whose job is to talk to other
+            // sessions is the only one that cannot, and has to borrow the
+            // operator's identity over ssh to do it.
+            //
+            // Only in this arm. A private per-seat file is ours to extend; the
+            // JsonFile and TomlFile arms merge into a config shared with every
+            // CLI the user starts by hand on this machine, and operator reach
+            // written there would be handed to all of them.
+            if spec.role.as_deref() == Some("orchestrator") {
+                if let Some(fleet) = fleet_entry(mcpd_path, env_key.as_deref()) {
+                    let parent = pointer.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                    set_pointer(&mut root, &format!("{parent}/nexmesh-fleet"), fleet)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
             std::fs::create_dir_all(state_dir)?;
             let path = state_dir.join(format!("mcp-{}.json", spec.agent_id));
             std::fs::write(&path, serde_json::to_string_pretty(&root)?)
@@ -185,7 +489,7 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         .descriptor(&spec.cli_id)
         .ok_or_else(|| anyhow::anyhow!("no descriptor for CLI '{}'", spec.cli_id))?
         .clone();
-    let bin = crate::cli_detect::resolve(&d.cli.command, &d.cli.extra_paths)
+    let mut bin = crate::cli_detect::resolve(&d.cli.command, &d.cli.extra_paths)
         .ok_or_else(|| anyhow::anyhow!("'{}' is not installed on {}", d.cli.command, ctx.node_name))?;
 
     // A plugin driver's helper is resolved here, before the CLI is started:
@@ -261,25 +565,170 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         // it and the adoption cannot come back after a node restart.
         crate::tmux::clear_stale_view(&tmux_view(&spec.slot_id));
     }
+    // A data directory of this seat's own, for a CLI that keeps its
+    // conversations in one shared store and tells nobody which is which.
+    // Prepared BEFORE the resume decision, because whether that store
+    // already holds a conversation is what decides it.
+    let store = d
+        .session_store
+        .as_ref()
+        .and_then(|s| prepare_session_store(s, &spec.slot_id, &spec.cli_id));
+
     // Resuming a conversation we already know the id of...
     let mut fresh_session: Option<String> = None;
-    if spec.resume_handle.is_some() {
-        for a in &mode.resume_args {
-            let mut s = a.clone();
-            for (k, v) in &vars {
-                s = s.replace(&format!("{{{k}}}"), v);
+    // A directory this CLI will not start in unless it has been told it is
+    // trusted. Done before the spawn, because afterwards the seat is
+    // already sitting on a modal question nothing can answer.
+    if let Some(t) = &d.trust {
+        if let Some(file) = ensure_trusted(t, &spec.cwd) {
+            tracing::info!(slot = %spec.slot_id, cwd = %spec.cwd, %file,
+                           "recorded this directory as trusted for the CLI");
+            let _ = ctx
+                .send_hub(&proto::NodeToHub::Noted {
+                    agent_id: spec.agent_id.clone(),
+                    text: format!(
+                        "[nexmesh] marked {} as trusted for this CLI in {file}, because this \
+                         seat is configured to run there and the CLI will not start \
+                         otherwise \u{2014} it asks a modal question nothing can answer. Undo \
+                         it there if that is not what you want.",
+                        spec.cwd
+                    ),
+                })
+                .await;
+        }
+    }
+
+    // What this spawn says about conversations, decided in one place so it
+    // can be tested rather than believed. See `resume_plan`.
+    // Every conversation the hub thinks this seat might be on, best first.
+    // A hub from before `resume_candidates` sends only `resume_handle`, so
+    // that stands in for the list and the behaviour is unchanged.
+    let candidates: Vec<String> = if spec.resume_candidates.is_empty() {
+        spec.resume_handle.iter().cloned().collect()
+    } else {
+        spec.resume_candidates.clone()
+    };
+    let plan = resume_plan(
+        &mode,
+        &candidates,
+        |h| conversation_exists(&mode, h, &spec.cwd),
+        store.as_ref().map(|(_, _, prior)| *prior).unwrap_or(false),
+    );
+    // Say what was skipped and why. Without this the operator sees a seat
+    // quietly start over -- or, before the check existed, a bare "no
+    // conversation found" from the CLI and no reason to connect it to
+    // nexmesh having named one.
+    let ghosts: Vec<&String> = candidates
+        .iter()
+        .take_while(|h| !matches!(&plan, ResumePlan::Resume(r) if r == *h))
+        .filter(|h| conversation_exists(&mode, h, &spec.cwd) == Some(false))
+        .collect();
+    if !ghosts.is_empty() {
+        tracing::warn!(
+            slot = %spec.slot_id, cwd = %spec.cwd, skipped = ghosts.len(),
+            "conversations this seat would have resumed are not here"
+        );
+        let resumed = match &plan {
+            ResumePlan::Resume(r) => format!("Resuming {r} instead, which is here."),
+            _ => "Starting a NEW one, so the seat comes up and has something to continue \
+                  next time."
+                .to_string(),
+        };
+        let _ = ctx
+            .send_hub(&proto::NodeToHub::Noted {
+                agent_id: spec.agent_id.clone(),
+                text: format!(
+                    "[nexmesh] {} of this seat's recorded conversations {} not in {} on this \
+                     machine ({}). {resumed}",
+                    ghosts.len(),
+                    if ghosts.len() == 1 { "is" } else { "are" },
+                    spec.cwd,
+                    ghosts.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", "),
+                ),
+            })
+            .await;
+    }
+    match &plan {
+        ResumePlan::Resume(_) => {
+            for a in &mode.resume_args {
+                let mut s = a.clone();
+                for (k, v) in &vars {
+                    s = s.replace(&format!("{{{k}}}"), v);
+                }
+                args.push(s);
             }
-            args.push(s);
         }
-    } else if !mode.session_id_args.is_empty() {
-        // ...or naming one, so that there IS an id to resume next time. An
-        // interactive CLI never tells anyone its conversation id, so a seat
-        // whose process was replaced used to start its thinking over.
-        let fresh = uuid::Uuid::new_v4().to_string();
-        for a in &mode.session_id_args {
-            args.push(a.replace("{session_uuid}", &fresh));
+        ResumePlan::NameFresh => {
+            // A NEW conversation, NAMED -- so there is an id to resume next
+            // time, and so a seat whose old conversation has gone still
+            // comes up with one of its own rather than with nothing.
+            let fresh = uuid::Uuid::new_v4().to_string();
+            for a in &mode.session_id_args {
+                args.push(a.replace("{session_uuid}", &fresh));
+            }
+            fresh_session = Some(fresh);
         }
-        fresh_session = Some(fresh);
+        ResumePlan::ContinueLatest => {
+            // For a CLI that will not name a conversation but will continue
+            // its last one. Only safe because this seat has a store of its
+            // own, so "the last one" is unambiguously the one THIS seat was
+            // on; without that isolation it would be whichever conversation
+            // another seat happened to finish most recently.
+            for a in &mode.resume_latest_args {
+                args.push(a.clone());
+            }
+            tracing::info!(slot = %spec.slot_id, cli = %spec.cli_id,
+                           "continuing this seat's last conversation from its own store");
+        }
+        ResumePlan::Nothing => {}
+    }
+
+    // THE SEAT'S OWN SYSTEM PROMPT.
+    //
+    // `append` adds to what the CLI already tells the model and is almost
+    // always what is wanted: the CLI's own prompt carries how to use its
+    // tools, and replacing it to add a sentence about what a seat is for
+    // throws that away. `replace` is for when that prompt is the problem.
+    //
+    // A CLI that declares neither is told so out loud rather than starting
+    // without it: a seat whose operator believes it has been given a prompt,
+    // and has not, is worse than one that was refused.
+    if let Some(text) = spec.system_prompt.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let replace = spec.system_prompt_mode.as_deref() == Some("replace");
+        let chosen = if replace {
+            (&mode.system_prompt_args, "replace")
+        } else {
+            (&mode.append_system_prompt_args, "append")
+        };
+        // Falling back the other way would silently do something other than
+        // what was asked: appending when told to replace leaves the CLI's
+        // own prompt in place, and replacing when told to append throws it
+        // away. Both are worse than saying so.
+        if chosen.0.is_empty() {
+            tracing::warn!(
+                slot = %spec.slot_id, cli = %spec.cli_id, mode = chosen.1,
+                "this seat has a system prompt but this CLI declares no way to {} one; \
+                 starting without it", chosen.1
+            );
+            // Said once the agent EXISTS: the hub has no row for it until the
+            // node reports the start, and a note sent before that is dropped.
+            ctx.note_when_started(
+                &spec.agent_id,
+                format!(
+                    "[nexmesh] this seat carries a system prompt to {}, but {} takes no \
+                     argument for that, so it is running WITHOUT it. Set it on a seat \
+                     whose CLI supports one, or put it in the seat's instructions \
+                     instead, which go through the conversation.",
+                    chosen.1, spec.cli_id
+                ),
+            );
+        } else {
+            for a in chosen.0 {
+                args.push(a.replace("{prompt}", text));
+            }
+            tracing::info!(slot = %spec.slot_id, mode = chosen.1, bytes = text.len(),
+                           "gave this seat its own system prompt");
+        }
     }
 
     // How this CLI is told which model to run, when it takes a flag at all.
@@ -302,19 +751,195 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     // Descriptor environment first, the shim's own afterwards so it wins.
     let mut env = descriptor_env(&d);
     env.extend(shim_env(&spec, &ctx.sock_path));
+    // Point the CLI at this seat's own data directory. Last, so it wins over
+    // anything inherited -- and NOT over an explicit value in the descriptor
+    // or the spawn spec, which are deliberate.
+    if let Some((key, value, _)) = &store {
+        if !env.iter().any(|(k, _)| k == key) && !spec.env.iter().any(|(k, _)| k == key) {
+            env.push((key.clone(), value.clone()));
+        }
+    }
 
     tracing::info!(cli = %spec.cli_id, agent = %spec.agent_id, mode = mode_name,
         cwd = %spec.cwd, "spawning: {} {}", bin, args.join(" "));
 
+    // KEEPING THE CLI ALIVE WHEN THE NODE RESTARTS.
+    //
+    // Normally the CLI is the node's own child on a pty the node owns, which
+    // makes the node's lifetime the agent's: stop the node and the master
+    // closes, the slave sends SIGHUP, and the conversation dies. So
+    // deploying a node binary ends every conversation on that machine.
+    //
+    // With `[supervise] kind = "tmux"` the CLI lives in a tmux session
+    // instead. The tmux server owns the real pty and outlives the node; the
+    // node attaches a SECOND, grouped client under a pty of its own, which
+    // is exactly what adoption already does, so everything downstream of the
+    // pty is unchanged. Restart the node and it finds the session still
+    // there and attaches again.
+    //
+    // If anything about that fails we fall through and start the CLI
+    // directly. A seat that comes up the old way beats a seat that does not
+    // come up.
+    let mut held: Option<String> = None;
+    let mut reattached = false;
+    if matches!(spec.mode, RunMode::Interactive)
+        && d.supervise.as_ref().is_some_and(|s| s.kind == "tmux")
+    {
+        let name = crate::tmux::held_session(&spec.slot_id);
+        let already = crate::tmux::has_session(&name);
+        // AM I ALREADY WATCHING THIS SEAT?
+        //
+        // A view session is this node's own grouped client, named after the
+        // slot, so a client on one means a start of this seat already
+        // succeeded. Starting a second collides on that name: the new client
+        // dies in milliseconds, the exit is reported, the hub decides the
+        // seat is empty, and `attach` -- which starts a seat that has no
+        // process -- starts it again. That is a loop with no exit, and it
+        // ran four times on the live fleet before anybody could type.
+        //
+        // So the answer is not a second view. If the agent behind that view
+        // is still ours, the hub has merely lost sight of it and the remedy
+        // is to say so again. If it is not ours, the client is an orphan
+        // from a start that went wrong, and it has to go or this seat can
+        // never be started again.
+        let view = tmux_view(&spec.slot_id);
+        if already && crate::tmux::view_has_client(&view) {
+            match ctx.agent_in_slot(&spec.slot_id) {
+                Some(mine) => {
+                    tracing::info!(slot = %spec.slot_id, agent = %mine.agent_id, view = %view,
+                        "this node is already watching this seat; re-announcing it \
+                         instead of starting a second view");
+                    // Re-announce rather than spawn. The hub keys an agent by
+                    // id, so this restores the row it lost without giving one
+                    // seat two agents -- and the caller's agent id is simply
+                    // not used, which is correct: nothing was started.
+                    reannounce(&ctx, &mine).await;
+                    return Ok(());
+                }
+                None => {
+                    crate::tmux::force_clear_view(&view);
+                }
+            }
+        }
+        let ready = if already {
+            // THE WHOLE POINT: the CLI is still in there, from before this
+            // node started. Attach to it rather than starting a second one.
+            tracing::info!(slot = %spec.slot_id, session = %name,
+                "the CLI is still held in tmux from before; attaching to it");
+            // Say it again to a session this node did not create: `hold`
+            // never ran for it, so nothing has told it that a CLI which
+            // exits must take the session with it. Without this a seat held
+            // across a node upgrade keeps whatever the host's own tmux
+            // config says, which is exactly the seat most likely to
+            // outlive several node binaries.
+            crate::tmux::lock_held(&name);
+            reattached = true;
+            Ok(())
+        } else {
+            crate::tmux::hold(&name, &spec.cwd, &bin, &args, &env, &d.cli.env_unset)
+        };
+        match ready {
+            Ok(()) => {
+                // The node's child becomes a grouped client on that session.
+                // `-t` groups rather than attaches, so this client has its
+                // OWN size and a viewer on a small terminal does not resize
+                // the CLI under its own feet.
+                bin = "tmux".to_string();
+                args = vec![];
+                // Whichever tmux server this node is pointed at -- normally
+                // the user's own, under test one of the suite's own. `-L`
+                // has to come BEFORE the subcommand, and without it the
+                // client talks to the default server, does not find the
+                // session, and exits at once: the seat then looks alive
+                // (the CLI really is held) with no pty behind it, so
+                // nothing can attach to it or type at it.
+                if let Some(sock) = crate::tmux::socket() {
+                    args.extend(["-L".to_string(), sock]);
+                }
+                args.extend([
+                    "new-session".to_string(),
+                    "-t".to_string(),
+                    name.clone(),
+                    "-s".to_string(),
+                    tmux_view(&spec.slot_id),
+                ]);
+                // Our own view from the previous node may still be there --
+                // the client died with the node but tmux keeps the grouped
+                // session -- and `new-session -s` collides with it, which is
+                // exactly the case this feature exists for.
+                crate::tmux::clear_stale_view(&tmux_view(&spec.slot_id));
+                held = Some(name);
+                // Reattaching means the ARGUMENTS ARE DISCARDED: the CLI in
+                // that pane was started earlier, with whatever it was given
+                // then. For most of them that changes nothing, but a seat
+                // whose system prompt was set since is a seat the operator
+                // believes they have changed and have not -- so it is said
+                // out loud rather than left to be noticed in the agent's
+                // behaviour.
+                if reattached {
+                    tracing::info!(slot = %spec.slot_id,
+                        "reattached, so this start's arguments do not apply to the running CLI");
+                    if spec
+                        .system_prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|t| !t.is_empty())
+                    {
+                        ctx.note_when_started(
+                            &spec.agent_id,
+                            "[nexmesh] this seat's CLI was still held in tmux from before, \
+                             so it was reattached rather than started. It is running with \
+                             whatever system prompt it was given then: this seat's current \
+                             one reaches it only when the process itself is replaced."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(slot = %spec.slot_id, error = %e,
+                    "could not hold this CLI in tmux; starting it directly instead");
+                ctx.note_when_started(
+                    &spec.agent_id,
+                    format!(
+                        "[nexmesh] this seat was to be held in tmux so it survives a node \
+                         restart, but that failed ({e}). It is running the ordinary way \
+                         instead, which means a node restart will end it."
+                    ),
+                );
+            }
+        }
+    }
+
     // An interactive agent runs under a pty so it can be WATCHED AND TAKEN OVER
     // from any machine. A headless agent is a protocol on a pipe; there is no
     // terminal to take over, so it gets pipes and its attach is view-only.
+    // WHICH CONVERSATION THIS PROCESS IS IN, as far as this node can tell
+    // from what it just put on the command line.
+    //
+    // Distinct from `fresh_session`, which is only a conversation this spawn
+    // NAMED and which is reported to the hub once it exists. This one
+    // includes a resumed conversation too, and it is not reported anywhere:
+    // it is kept on the node, where it answers "which file do I read to see
+    // how full this agent's context is".
+    //
+    // Known here and nowhere else. Waiting for the hub's record instead left
+    // a second seat in the same directory unmeasurable, because the node
+    // will not guess between two conversations in one project directory --
+    // and rightly, since measuring one seat against another's context is
+    // worse than not measuring it.
+    let started_on = fresh_session.clone().or(match &plan {
+        ResumePlan::Resume(h) => Some(h.clone()),
+        _ => None,
+    });
     if matches!(spec.mode, RunMode::Interactive) {
         spawn_on_pty(ctx, spec, bin, args, env, d.cli.env_unset.clone(),
-                     mode.prompt_on_stdin, d.driver.clone(), fresh_session).await
+                     mode.prompt_on_stdin, d.driver.clone(), fresh_session,
+                     started_on, mode.session_path.clone(), held).await
     } else {
         spawn_on_pipes(ctx, spec, bin, args, env, d.cli.env_unset.clone(),
-                       mode.prompt_on_stdin, d.driver.clone(), fresh_session).await
+                       mode.prompt_on_stdin, d.driver.clone(), fresh_session,
+                       started_on, mode.session_path.clone()).await
     }
 }
 
@@ -354,6 +979,48 @@ pub fn push_capable(driver: &DriverSpec) -> bool {
 /// Deterministic on purpose: `nexmesh-<slot>` can be addressed later, which
 /// an auto-named session cannot. It also makes the adoption visible in
 /// `tmux ls`, where an unexplained second session is alarming.
+/// Tell the hub again about an agent this node already has.
+///
+/// For the one case where a start must NOT start anything: the seat's CLI is
+/// held in tmux, this node is already watching it, and the hub has lost the
+/// row -- after its own restart, or after an earlier start of this seat
+/// collided and reported an exit. Re-announcing is the whole remedy, and it
+/// is the only thing that can be done without giving one seat two agents.
+///
+/// Deliberately a re-announcement of the EXISTING agent, with its existing
+/// id and its existing identity triple, not a new registration: the id is
+/// how the hub keys everything it knows about a running process.
+async fn reannounce(ctx: &Arc<NodeCtx>, rec: &crate::ctx::AgentRec) {
+    let (typable, io_kind) = match ctx.io.lock().unwrap().get(&rec.agent_id) {
+        Some(io) => (io.typable(), io.io_kind_name().to_string()),
+        // No I/O handle means the view is there but nothing is reading it,
+        // which is not an agent anybody can reach. Say nothing rather than
+        // announce a seat that cannot be typed at.
+        None => {
+            tracing::warn!(agent = %rec.agent_id, slot = %rec.slot_id,
+                "asked to re-announce an agent with no live I/O; leaving it alone");
+            return;
+        }
+    };
+    let r = ctx
+        .send_hub(&proto::NodeToHub::AgentUp {
+            agent_id: rec.agent_id.clone(),
+            slot_id: rec.slot_id.clone(),
+            proc: rec.proc.clone(),
+            provenance: Provenance::Managed,
+            cwd: String::new(),
+            resume_handle: None,
+            push_capable: pushable(&rec.driver, RunMode::Interactive, typable),
+            io_kind: Some(io_kind),
+            typed_delivery: typable
+                && typed_delivery(ctx, &rec.cli_id, RunMode::Interactive),
+        })
+        .await;
+    if let Err(e) = r {
+        tracing::warn!(agent = %rec.agent_id, error = %e, "could not re-announce this agent");
+    }
+}
+
 pub fn tmux_view(slot_id: &str) -> String {
     format!("nexmesh-{slot_id}")
 }
@@ -383,6 +1050,12 @@ async fn register_started(
     pid: i32,
     io: Arc<crate::ctx::AgentIo>,
     driver: DriverSpec,
+    // The conversation this process was started on, as far as the command
+    // line says: what makes this agent's context measurable from the moment
+    // it comes up rather than once the hub has a record of it.
+    conversation: Option<String>,
+    // Is this seat held in tmux, with our own child being a client onto it?
+    supervised: bool,
 ) -> Result<ProcIdentity> {
     // Capture the identity triple IMMEDIATELY: if we waited, the pid could be
     // recycled and we would record an identity that is not this process.
@@ -401,7 +1074,29 @@ async fn register_started(
             // An adopted session is joined under a session name of our own
             // (see clis/tmux.toml), so the node can ask tmux where ITS view
             // is pointing rather than guess.
-            tmux_view: spec.tmux_target.as_ref().map(|_| tmux_view(&spec.slot_id)),
+            // Set for an adopted terminal AND for a supervised one: both are
+            // a grouped client onto a pane, and the checks that run before
+            // anything is typed into a pane need to know which pane.
+            tmux_view: (spec.tmux_target.is_some() || supervised)
+                .then(|| tmux_view(&spec.slot_id)),
+            // Where its conversations live, and which one it is in. Both are
+            // what `context::Watcher` needs to find the file that says how
+            // full this agent is; the conversation is refined later, when
+            // this CLI's own shim registers and says what the CLI thinks.
+            cwd: spec.cwd.clone(),
+            // What this node just put on the command line. Refined later
+            // if this CLI's own shim reports a different one -- which is
+            // what `/clear` looks like from here.
+            conversation,
+            // The level the hub read when it decided to start this seat.
+            // Unknown or absent parses to `Agent`: a hub from before this
+            // sends nothing, and the plain-agent tool list is the safe
+            // answer.
+            authority: spec
+                .authority
+                .as_deref()
+                .map(nexmesh_proto::authority::Authority::parse)
+                .unwrap_or_default(),
         },
     );
     // Read before the handle is given away: the map owns it after this.
@@ -446,6 +1141,12 @@ async fn register_started(
             crate::termlink::on_terminal_adopted(&ctx2, &agent).await;
         });
     }
+
+    // Anything the start path wanted to say about HOW this agent was started.
+    // It is said here and not where it was decided, because until the line
+    // above the hub had no row for this agent and a note about it was
+    // discarded -- see `note_when_started`.
+    ctx.flush_notes(&spec.agent_id).await;
     Ok(identity)
 }
 
@@ -503,6 +1204,19 @@ async fn spawn_on_pty(
     // The conversation id this process was TOLD to use, if the descriptor
     // says how. Reported to the hub so the next spawn can resume it.
     fresh_session: Option<String>,
+    // The conversation this process is ACTUALLY in: the one just named, or
+    // the one it was told to resume. Kept on the node to find the file that
+    // says how full this agent's context is.
+    started_on: Option<String>,
+    // Where this CLI keeps conversations, so the report can wait until the
+    // conversation really exists rather than overwriting a good record with
+    // a handle the CLI never got as far as creating.
+    session_path: Option<String>,
+    // The tmux session HOLDING the CLI, when this seat is supervised. Our
+    // own child is then a tmux client, not the CLI: the agent's identity has
+    // to be the process in the pane, or every check that asks "is this still
+    // the same CLI" is asking about the wrong process.
+    held: Option<String>,
 ) -> Result<()> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -524,8 +1238,26 @@ async fn spawn_on_pty(
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
-    // A TUI needs to know what terminal it is talking to.
-    if std::env::var("TERM").is_err() {
+    // A TUI needs to know what terminal it is talking to -- and the terminal
+    // it is talking to is the PTY THIS NODE JUST CREATED, not whatever
+    // terminal, if any, happened to launch the daemon.
+    //
+    // This used to fall back only when TERM was UNSET, which is not the case
+    // that bites. Started by sysvinit, the node's own environment carries
+    // `TERM=unknown`: that is "set", so the fallback never fired and every
+    // agent inherited it. A TUI told it is talking to an unknown terminal
+    // turns off colour, the mouse and the alternate screen, so every seat
+    // respawned by a service restart came back monochrome and unable to
+    // scroll -- while seats started earlier from somebody's shell were fine,
+    // which is what made it look like a change in nexmesh rather than a
+    // change in how the node was started.
+    //
+    // So it is set unconditionally, and only an explicit TERM from the
+    // descriptor or the spawn spec wins: those are deliberate statements
+    // about a particular CLI, and this is a default.
+    let term_given = env.iter().any(|(k, _)| k == "TERM")
+        || spec.env.iter().any(|(k, _)| k == "TERM");
+    if !term_given {
         cmd.env("TERM", "xterm-256color");
     }
 
@@ -533,9 +1265,48 @@ async fn spawn_on_pty(
     // The slave fd must go, or the master never sees EOF when the child exits.
     drop(pair.slave);
 
-    let pid = child
+    let child_pid = child
         .process_id()
         .ok_or_else(|| anyhow::anyhow!("child exited before reporting a pid"))? as i32;
+
+    // WHICH PROCESS IS THE AGENT.
+    //
+    // Normally our child IS the CLI. Under tmux supervision our child is a
+    // tmux CLIENT and the CLI is the process in the pane, so the agent's
+    // identity has to be that one -- otherwise every check that asks "is
+    // this still the same CLI" (`is_same_process`), and the guard that asks
+    // "is the CLI really inside the pane this view looks at" before typing a
+    // teammate's message into it, are both asking about the wrong process.
+    // The typing guard in particular would answer no, because a client is a
+    // sibling of the pane's process rather than a descendant of it, and the
+    // seat would silently stop receiving messages.
+    let pid = match &held {
+        None => child_pid,
+        Some(name) => {
+            // tmux has to have got as far as running the pane's command.
+            let mut found = None;
+            for _ in 0..40 {
+                if let Some(p) = crate::tmux::pane_pid(name) {
+                    found = Some(p);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            match found {
+                Some(p) => p,
+                None => {
+                    // Nothing in the pane after two seconds means the CLI
+                    // never started. Better to fail the spawn than to
+                    // register an agent whose pid is a tmux client.
+                    crate::tmux::release(name);
+                    anyhow::bail!(
+                        "tmux held the session but nothing is running in its pane; \
+                         the CLI did not start"
+                    );
+                }
+            }
+        }
+    };
 
     let reader = pair.master.try_clone_reader().context("cloning the pty reader")?;
     let mut writer = pair.master.take_writer().context("taking the pty writer")?;
@@ -552,8 +1323,30 @@ async fn spawn_on_pty(
     });
 
     let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pty, Some(in_tx.clone()), Some(pair.master));
-    register_started(&ctx, &spec, pid, io.clone(), driver).await?;
-    report_session(&ctx, &spec, &fresh_session).await;
+    // When this pty is a TMUX CLIENT -- a seat held in tmux, or an adopted
+    // pane -- resizing it is not enough to resize what the CLI sees. tmux
+    // learns of a client resize only by SIGWINCH, and one that arrives
+    // before its handler is installed is gone: the default disposition of
+    // SIGWINCH is to ignore it. So the size is stated to tmux as well. See
+    // `AgentIo::set_view`.
+    if held.is_some() || spec.tmux_target.is_some() {
+        io.set_view(&tmux_view(&spec.slot_id));
+        // A SEAT HELD IN TMUX IS ONE AGENT, NOT A WAY ONTO THE MACHINE.
+        //
+        // This client had tmux's whole keyboard, so `Ctrl-B %` in an attach
+        // split the pane and handed whoever was attached a SHELL on this
+        // host, and `Ctrl-B c` another. The lock is on the view the node
+        // created, so the operator's own `tmux attach -t nexmesh-cli-<slot>`
+        // is untouched -- that is their way in when they do want a terminal
+        // here. Off this thread: tmux may take a moment to answer, and a
+        // lock that fails is a log line, not a seat that will not start.
+        let view = tmux_view(&spec.slot_id);
+        tokio::task::spawn_blocking(move || crate::tmux::lock_view(&view));
+    }
+    register_started(&ctx, &spec, pid, io.clone(), driver, started_on.clone(),
+                     held.is_some())
+        .await?;
+    report_session(&ctx, &spec, &fresh_session, session_path.clone()).await;
 
     if prompt_on_stdin {
         let _ = in_tx.send(format!("{}\n", spec.prompt).into_bytes()).await;
@@ -615,6 +1408,8 @@ async fn spawn_on_pty(
     {
         let ctx = ctx.clone();
         let agent_id = spec.agent_id.clone();
+        let held = held.clone();
+        let slot_id = spec.slot_id.clone();
         tokio::spawn(async move {
             let code = tokio::task::spawn_blocking(move || {
                 child.wait().ok().map(|s| s.exit_code() as i32)
@@ -622,6 +1417,22 @@ async fn spawn_on_pty(
             .await
             .ok()
             .flatten();
+            // A DEAD CLIENT IS NOT A DEAD CLI.
+            //
+            // Under supervision what just exited is our tmux client. The CLI
+            // is still sitting in its session -- which is the entire point --
+            // and announcing an exit here would mark a living agent dead,
+            // throw its viewers off and invite recovery to start a SECOND
+            // one in the same seat on top of it.
+            if let Some(name) = &held {
+                if crate::tmux::has_session(name) {
+                    tracing::info!(
+                        slot = %slot_id, session = %name,
+                        "our view of this seat closed but the CLI is still held in tmux"
+                    );
+                    return;
+                }
+            }
             announce_exit(&ctx, &agent_id, code).await;
         });
     }
@@ -640,6 +1451,14 @@ async fn spawn_on_pipes(
     // The conversation id this process was TOLD to use, if the descriptor
     // says how. Reported to the hub so the next spawn can resume it.
     fresh_session: Option<String>,
+    // The conversation this process is ACTUALLY in: the one just named, or
+    // the one it was told to resume. Kept on the node to find the file that
+    // says how full this agent's context is.
+    started_on: Option<String>,
+    // Where this CLI keeps conversations, so the report can wait until the
+    // conversation really exists rather than overwriting a good record with
+    // a handle the CLI never got as far as creating.
+    session_path: Option<String>,
 ) -> Result<()> {
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
@@ -701,7 +1520,9 @@ async fn spawn_on_pipes(
         // Register before the URL is known: the hub should see the agent as up
         // even if the server is slow to announce itself.
         let io = crate::ctx::AgentIo::new_push(inject_tx);
-        register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+        register_started(&ctx, &spec, pid, io.clone(), driver.clone(), started_on.clone(),
+                         false)
+            .await?;
 
         {
             let ctx2 = ctx.clone();
@@ -796,7 +1617,9 @@ async fn spawn_on_pipes(
         };
         let (inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<proto::Envelope>>(64);
         let io = crate::ctx::AgentIo::new_push(inject_tx);
-        register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+        register_started(&ctx, &spec, pid, io.clone(), driver.clone(), started_on.clone(),
+                         false)
+            .await?;
         if let Some(err) = child.stderr.take() {
             let ctx2 = ctx.clone();
             let agent_id = spec.agent_id.clone();
@@ -854,7 +1677,9 @@ async fn spawn_on_pipes(
         }
         let (inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<proto::Envelope>>(64);
         let io = crate::ctx::AgentIo::new_push(inject_tx);
-        register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
+        register_started(&ctx, &spec, pid, io.clone(), driver.clone(), started_on.clone(),
+                         false)
+            .await?;
         if let Some(err) = child.stderr.take() {
             let ctx2 = ctx.clone();
             let agent_id = spec.agent_id.clone();
@@ -915,8 +1740,10 @@ async fn spawn_on_pipes(
     }
 
     let io = crate::ctx::AgentIo::new(crate::ctx::IoKind::Pipes, Some(in_tx.clone()), None);
-    register_started(&ctx, &spec, pid, io.clone(), driver.clone()).await?;
-    report_session(&ctx, &spec, &fresh_session).await;
+    register_started(&ctx, &spec, pid, io.clone(), driver.clone(), started_on.clone(),
+                         false)
+            .await?;
+    report_session(&ctx, &spec, &fresh_session, session_path.clone()).await;
 
     if prompt_on_stdin {
         let line = match &driver {
@@ -973,16 +1800,75 @@ async fn spawn_on_pipes(
 /// transcript, and to every viewer currently attached.
 /// Tell the hub the conversation id this process was told to use, so a
 /// replacement can resume it rather than starting the thinking over.
-async fn report_session(ctx: &Arc<NodeCtx>, spec: &SpawnSpec, fresh: &Option<String>) {
-    let Some(handle) = fresh else { return };
-    let _ = ctx
-        .send_hub(&proto::NodeToHub::ResumeHandle {
-            agent_id: spec.agent_id.clone(),
-            slot_id: spec.slot_id.clone(),
-            handle: handle.clone(),
-        })
-        .await;
-    tracing::info!(agent = %spec.agent_id, %handle, "named this seat's conversation");
+async fn report_session(
+    ctx: &Arc<NodeCtx>,
+    spec: &SpawnSpec,
+    fresh: &Option<String>,
+    // Where this CLI keeps conversations, when it says. Without it nothing
+    // is checkable and the handle is reported as it always was.
+    session_path: Option<String>,
+) {
+    let Some(handle) = fresh.clone() else { return };
+    let (agent_id, slot_id, cwd) =
+        (spec.agent_id.clone(), spec.slot_id.clone(), spec.cwd.clone());
+    let ctx = ctx.clone();
+
+    // A HANDLE IS NOT REPORTED UNTIL THE CONVERSATION EXISTS.
+    //
+    // This used to fire the instant the process started, before the CLI had
+    // written anything -- and it OVERWRITES whatever the seat had recorded
+    // before. So a CLI that exited at once left the seat pointing at a
+    // conversation that was never created, and the real one was gone from
+    // every store the hub has. A crash loop did it twice in six seconds on
+    // the live fleet, and a seat came back with no history at all.
+    //
+    // The existence check elsewhere stops a seat DYING on such a ghost. It
+    // does nothing about the ghost displacing a good handle, which is this.
+    //
+    // So: wait for the file. If the CLI dies first, nothing is reported and
+    // what the seat already had still stands.
+    let Some(tpl) = session_path else {
+        let _ = ctx
+            .send_hub(&proto::NodeToHub::ResumeHandle {
+                agent_id: agent_id.clone(),
+                slot_id,
+                handle: handle.clone(),
+            })
+            .await;
+        tracing::info!(agent = %agent_id, %handle,
+            "named this seat's conversation (this CLI does not say where they live)");
+        return;
+    };
+    tokio::spawn(async move {
+        for _ in 0..120 {
+            if conversation_exists_at(&tpl, &handle, &cwd) {
+                // Locally as well as at the hub: the node is what has to
+                // FIND this conversation on disk to measure how full it is.
+                ctx.note_conversation(&agent_id, &handle);
+                let _ = ctx
+                    .send_hub(&proto::NodeToHub::ResumeHandle {
+                        agent_id: agent_id.clone(),
+                        slot_id,
+                        handle: handle.clone(),
+                    })
+                    .await;
+                tracing::info!(agent = %agent_id, %handle,
+                    "this seat's conversation exists now; recorded it");
+                return;
+            }
+            // Gone before it wrote anything: say so, and leave the seat's
+            // existing record alone rather than replacing it with a ghost.
+            if ctx.agent(&agent_id).is_none() {
+                tracing::warn!(agent = %agent_id, %handle,
+                    "the CLI went before writing its conversation; \
+                     leaving this seat's recorded one as it was");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        tracing::warn!(agent = %agent_id, %handle,
+            "this conversation has not appeared in 60s; not recording it");
+    });
 }
 
 pub(crate) async fn emit_output(
@@ -1053,6 +1939,182 @@ mod tests {
     use super::*;
     use nexmesh_proto::cli_descriptor::CliDescriptor;
 
+    fn claude_like() -> nexmesh_proto::cli_descriptor::ModeSpec {
+        nexmesh_proto::cli_descriptor::ModeSpec {
+            resume_args: vec!["--resume".into(), "{resume}".into()],
+            session_id_args: vec!["--session-id".into(), "{session_uuid}".into()],
+            ..Default::default()
+        }
+    }
+
+    /// A RESUME THAT CANNOT BE HONOURED STARTS A NEW CONVERSATION.
+    ///
+    /// Never nothing. The seat has to come up, and come up with a
+    /// conversation of its own so the next restart has something to
+    /// continue -- otherwise a stale handle leaves a seat that cannot be
+    /// opened and an operator with nothing to do about it.
+    #[test]
+    fn a_resume_that_cannot_be_honoured_names_a_new_conversation() {
+        let m = claude_like();
+
+        // The live failure: a handle for a conversation that was never
+        // written. Checked, absent -- so a NEW one is named.
+        assert_eq!(
+            resume_plan(&m, &["never-written".into()], |_| Some(false), false),
+            ResumePlan::NameFresh
+        );
+
+        // The seat has moved machines, so the conversation is not here.
+        // Same answer: come up, with a new conversation.
+        assert_eq!(resume_plan(&m, &["on-another-machine".into()], |_| Some(false), true),
+                   ResumePlan::NameFresh);
+
+        // A handle whose conversation IS there is honoured.
+        assert_eq!(
+            resume_plan(&m, &["real".into()], |_| Some(true), false),
+            ResumePlan::Resume("real".into())
+        );
+
+        // No handle at all: a new named conversation, as before.
+        assert_eq!(resume_plan(&m, &[], |_| None, false), ResumePlan::NameFresh);
+
+        // Unverifiable (the CLI does not say where conversations live): the
+        // handle is still tried, because refusing one on a guess would
+        // throw away every resume for those CLIs.
+        assert_eq!(
+            resume_plan(&m, &["unknown".into()], |_| None, false),
+            ResumePlan::Resume("unknown".into())
+        );
+    }
+
+    #[test]
+    fn a_cli_that_cannot_be_told_to_resume_is_not_left_with_nothing() {
+        // Holding a handle for a CLI with no `resume_args` used to skip the
+        // naming branch, so the seat got no session argument at all -- it
+        // could neither continue anything nor be continued next time.
+        let m = nexmesh_proto::cli_descriptor::ModeSpec {
+            session_id_args: vec!["--session-id".into(), "{session_uuid}".into()],
+            ..Default::default()
+        };
+        assert_eq!(resume_plan(&m, &["ignored".into()], |_| None, false), ResumePlan::NameFresh);
+    }
+
+    #[test]
+    fn a_cli_that_names_nothing_continues_its_last_only_from_its_own_store() {
+        // codex and opencode: no naming, so "the last one" is the only
+        // option -- and only trustworthy inside a store of this seat's own.
+        let m = nexmesh_proto::cli_descriptor::ModeSpec {
+            resume_latest_args: vec!["resume".into(), "--last".into()],
+            ..Default::default()
+        };
+        assert_eq!(resume_plan(&m, &[], |_| None, true), ResumePlan::ContinueLatest);
+        // Nothing in its store yet: say nothing rather than continue
+        // whatever another seat finished most recently.
+        assert_eq!(resume_plan(&m, &[], |_| None, false), ResumePlan::Nothing);
+    }
+
+    /// A GHOST IN FRONT OF A REAL CONVERSATION.
+    ///
+    /// This is the one that cost real work. The hub used to send a single
+    /// handle; if it was a ghost the node declined it and started blank --
+    /// even though another of the seat's recorded conversations was sitting
+    /// on disk the whole time. Three seats on the live fleet, with 130MB,
+    /// 61MB and 4.9MB of conversation between them, and it was caught by
+    /// hand in pre-flight rather than by anything in the code.
+    #[test]
+    fn a_ghost_does_not_hide_a_real_conversation_behind_it() {
+        let m = claude_like();
+        let plan = resume_plan(
+            &m,
+            &["ghost".into(), "also-ghost".into(), "real".into()],
+            |h| Some(h == "real"),
+            false,
+        );
+        assert_eq!(plan, ResumePlan::Resume("real".into()));
+    }
+
+    /// And when every candidate is a ghost, it starts a NEW one rather than
+    /// dying on the last of them.
+    #[test]
+    fn all_ghosts_means_a_fresh_conversation() {
+        let m = claude_like();
+        let plan =
+            resume_plan(&m, &["ghost".into(), "also-ghost".into()], |_| Some(false), false);
+        assert_eq!(plan, ResumePlan::NameFresh);
+    }
+
+    /// Order is preference: the first candidate that is really there wins,
+    /// not the best-looking one further down. The hub offers them in the
+    /// order it would have chosen anyway -- this machine's binding first.
+    #[test]
+    fn the_first_one_that_exists_wins() {
+        let m = claude_like();
+        let plan = resume_plan(
+            &m,
+            &["mine".into(), "also-real".into()],
+            |_| Some(true),
+            false,
+        );
+        assert_eq!(plan, ResumePlan::Resume("mine".into()));
+    }
+
+    /// A CLI that does not say where conversations live cannot be checked,
+    /// so the first candidate is taken as before. Unknown is not refused.
+    #[test]
+    fn uncheckable_takes_the_first_candidate() {
+        let m = claude_like();
+        let plan = resume_plan(&m, &["a".into(), "b".into()], |_| None, false);
+        assert_eq!(plan, ResumePlan::Resume("a".into()));
+    }
+
+    /// A handle is only worth passing if the conversation is really there.
+    ///
+    /// The live failure this prevents: nexmesh named a conversation with
+    /// `--session-id 7a8a2910-...`, the start then failed before claude
+    /// persisted anything, the hub recorded the handle anyway -- it is
+    /// recorded at spawn, before the conversation exists -- and every later
+    /// spawn ran `--resume 7a8a2910-...`, which claude answers with "No
+    /// conversation found with session ID" and exits at once. A seat that
+    /// cannot start, with an error nobody would trace back to nexmesh
+    /// having named it. That id existed in the hub and in no project
+    /// directory anywhere on the machine.
+    #[test]
+    fn a_conversation_that_was_never_written_is_not_resumed() {
+        let dir = std::env::temp_dir().join(format!("nexmesh-conv-{}", std::process::id()));
+        let cwd = "/home/someone/work";
+        let slug = cwd.replace('/', "-");
+        std::fs::create_dir_all(dir.join(&slug)).unwrap();
+        let tpl = format!("{}/{{cwd_slug}}/{{id}}.jsonl", dir.display());
+        let mode = nexmesh_proto::cli_descriptor::ModeSpec {
+            session_path: Some(tpl),
+            ..Default::default()
+        };
+
+        // Nothing on disk: refused, so the seat starts fresh instead of
+        // dying on a resume that cannot work.
+        assert_eq!(conversation_exists(&mode, "never-written", cwd), Some(false));
+
+        // Written: resumable.
+        std::fs::write(dir.join(&slug).join("real-one.jsonl"), b"{}").unwrap();
+        assert_eq!(conversation_exists(&mode, "real-one", cwd), Some(true));
+
+        // THE OTHER HALF of the same problem: `--resume` only finds a
+        // conversation in the project directory it is launched in, so a
+        // real conversation belonging to another directory is still not
+        // resumable here -- which is why the check is per cwd.
+        assert_eq!(
+            conversation_exists(&mode, "real-one", "/home/someone/elsewhere"),
+            Some(false)
+        );
+
+        // A CLI that does not say where conversations live cannot be
+        // checked, and nothing is refused on a guess.
+        let silent = nexmesh_proto::cli_descriptor::ModeSpec::default();
+        assert_eq!(conversation_exists(&silent, "anything", cwd), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The hub used to fill an empty cwd from its OWN `HOME`, naming a
     /// directory on the hub's machine owned by the hub's user. Every
     /// workspace-less spawn then failed on the node with a bare
@@ -1072,6 +2134,7 @@ mod tests {
 
     fn spec(cwd: &str) -> SpawnSpec {
         SpawnSpec {
+            authority: None,
             slot_id: "sl-1".into(),
             agent_id: "ag-1".into(),
             session_id: "se-1".into(),
@@ -1083,6 +2146,9 @@ mod tests {
             prompt: "do the thing".into(),
             env: vec![],
             resume_handle: None,
+            resume_candidates: vec![],
+            system_prompt: None,
+            system_prompt_mode: None,
             tmux_target: None,
             model: None,
         }
@@ -1110,6 +2176,58 @@ mod tests {
         assert_eq!(json["mcpServers"]["nexmesh"]["command"], "/usr/bin/nexmesh-mcpd");
         assert_eq!(json["mcpServers"]["nexmesh"]["env"]["NEXMESH_AGENT_ID"], "ag-1");
         assert_eq!(json["mcpServers"]["nexmesh"]["env"]["NEXMESH_SOCK"], "/run/nexmesh/node.sock");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_orchestrator_seat_also_gets_the_fleet_server() {
+        let dir = tmp("fleet");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mcpd = bin.join("nexmesh-mcpd");
+        std::fs::write(&mcpd, "").unwrap();
+        std::fs::write(bin.join("nexmesh-orch"), "").unwrap();
+        let ident = dir.join("identity");
+        std::fs::create_dir_all(&ident).unwrap();
+        std::fs::write(ident.join("identity.json"), "{}").unwrap();
+        std::env::set_var("NEXMESH_IDENTITY", &ident);
+
+        let mut s = spec(dir.to_str().unwrap());
+        s.role = Some("orchestrator".into());
+        let path = write_mcp_config(&desc("claude"), &s, mcpd.to_str().unwrap(),
+            "/run/nexmesh/node.sock", &dir).unwrap().expect("inline config path");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(json["mcpServers"]["nexmesh"]["command"], mcpd.to_str().unwrap(),
+            "its own session server is still there");
+        assert_eq!(json["mcpServers"]["nexmesh-fleet"]["command"],
+            bin.join("nexmesh-orch").to_str().unwrap());
+        assert_eq!(json["mcpServers"]["nexmesh-fleet"]["env"]["NEXMESH_IDENTITY"],
+            ident.to_str().unwrap(), "the identity directory, never a token");
+        assert!(json["mcpServers"]["nexmesh-fleet"]["env"].get("NEXMESH_OPERATOR_TOKEN").is_none(),
+            "no secret is copied into a per-seat file");
+
+        std::env::remove_var("NEXMESH_IDENTITY");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_ordinary_seat_gets_no_fleet_server() {
+        let dir = tmp("nofleet");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mcpd = bin.join("nexmesh-mcpd");
+        std::fs::write(&mcpd, "").unwrap();
+        std::fs::write(bin.join("nexmesh-orch"), "").unwrap();
+
+        let path = write_mcp_config(&desc("claude"), &spec(dir.to_str().unwrap()),
+            mcpd.to_str().unwrap(), "/run/nexmesh/node.sock", &dir).unwrap().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(json["mcpServers"].get("nexmesh-fleet").is_none(),
+            "a seat with no orchestrator role never gets fleet reach, \
+             even with the binary sitting right there");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1155,6 +2273,40 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(json["mcp"]["servers"]["nexmesh"].is_object());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_project_config_in_a_subdirectory_gets_that_subdirectory_made() {
+        // freebuff reads `.agents/mcp.json` and cursor reads
+        // `.cursor/mcp.json`, and neither directory exists in a fresh
+        // workspace. Writing the file without making the directory first
+        // leaves the seat with no team tools and nothing in the log beyond
+        // one failed write.
+        for (cli, rel) in [("freebuff", ".agents/mcp.json"), ("cursor", ".cursor/mcp.json")] {
+            let dir = tmp(cli);
+            let got = write_mcp_config(&desc(cli), &spec(dir.to_str().unwrap()),
+                "/usr/bin/nexmesh-mcpd", "/run/nexmesh/node.sock", &dir).unwrap();
+            assert!(got.is_none(), "{cli} is configured by file, not by flag");
+            let cfg = dir.join(rel);
+            let json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap())
+                    .unwrap_or_else(|e| panic!("{cli}: {} -- {e}", cfg.display()));
+            let entry = &json["mcpServers"]["nexmesh"];
+            assert_eq!(entry["command"], "/usr/bin/nexmesh-mcpd", "{cli}");
+            assert_eq!(entry["env"]["NEXMESH_AGENT_ID"], "ag-1", "{cli}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn cursor_gets_the_stdio_type_its_loader_insists_on() {
+        let dir = tmp("cursor-type");
+        write_mcp_config(&desc("cursor"), &spec(dir.to_str().unwrap()),
+            "/usr/bin/nexmesh-mcpd", "/run/nexmesh/node.sock", &dir).unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".cursor/mcp.json")).unwrap()).unwrap();
+        assert_eq!(json["mcpServers"]["nexmesh"]["type"], "stdio");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -1205,5 +2357,110 @@ mod push_tests {
     fn the_mcp_floor_is_not_pushed_to() {
         // It has no input channel; delivery rides its next tool result.
         assert!(!push_capable(&DriverSpec::McpOnly));
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use nexmesh_proto::cli_descriptor::TrustPath;
+
+    /// A directory the CLI will not start in unless it is told to trust it.
+    ///
+    /// claude asks a modal question nothing can answer, so the seat sits
+    /// there and looks like a CLI that refuses to run -- which is how it was
+    /// reported from the fleet.
+    #[test]
+    fn a_directory_is_recorded_as_trusted_and_only_once() {
+        let dir = std::env::temp_dir().join(format!("nexmesh-trust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("cli.json");
+        std::fs::write(&cfg, br#"{"projects":{"/other":{"hasTrustDialogAccepted":true}}}"#)
+            .unwrap();
+        let t = TrustPath {
+            file: cfg.to_string_lossy().to_string(),
+            pointer: "/projects/{cwd}/hasTrustDialogAccepted".into(),
+        };
+
+        // First time: it changes something and says which file.
+        let said = ensure_trusted(&t, "/home/someone/work");
+        assert_eq!(said.as_deref(), Some(cfg.to_string_lossy().as_ref()));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            v["projects"]["/home/someone/work"]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+        // What was already there is untouched: this is somebody's live config.
+        assert_eq!(
+            v["projects"]["/other"]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+
+        // Second time: nothing to change, so nothing is announced -- the
+        // operator should not be told about it on every single spawn.
+        assert_eq!(ensure_trusted(&t, "/home/someone/work"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_config_that_is_not_there_is_left_alone() {
+        // Nothing is created from nothing: a CLI that has never run has no
+        // config, and inventing one is not this function's business.
+        let t = TrustPath {
+            file: "/nonexistent/nexmesh-trust-test.json".into(),
+            pointer: "/projects/{cwd}/hasTrustDialogAccepted".into(),
+        };
+        assert_eq!(ensure_trusted(&t, "/tmp"), None);
+    }
+}
+
+#[cfg(test)]
+mod handle_report_tests {
+    use super::*;
+
+    /// A HANDLE MUST NOT BE RECORDED BEFORE ITS CONVERSATION EXISTS.
+    ///
+    /// Reporting a freshly named conversation OVERWRITES whatever the seat
+    /// had recorded before. Done at spawn time, a CLI that exits at once
+    /// leaves the seat pointing at a conversation that was never created and
+    /// the real one gone from every store the hub has. On the live fleet a
+    /// crash loop did exactly that twice in six seconds, and the seat came
+    /// back with no history.
+    ///
+    /// The existence check used when RESUMING stops a seat dying on such a
+    /// ghost. It does nothing about the ghost displacing a good handle,
+    /// which is what this guards.
+    #[test]
+    fn a_conversation_that_was_never_written_is_not_there_to_report() {
+        let dir = std::env::temp_dir().join(format!("nexmesh-rep-{}", std::process::id()));
+        let proj = dir.join("projects").join("-tmp-work");
+        std::fs::create_dir_all(&proj).unwrap();
+        let tpl = format!("{}/projects/{{cwd_slug}}/{{id}}.jsonl", dir.to_string_lossy());
+
+        // The CLI was told to use this one and died before writing it.
+        assert!(!conversation_exists_at(&tpl, "never-written", "/tmp/work"));
+
+        // And one it did write is reportable.
+        std::fs::write(proj.join("real.jsonl"), b"{}").unwrap();
+        assert!(conversation_exists_at(&tpl, "real", "/tmp/work"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The cwd becomes the project directory name by turning every slash
+    /// into a dash, the leading one included. Getting this wrong would make
+    /// every conversation look like a ghost, which would be worse than the
+    /// bug: nothing would ever be recorded.
+    #[test]
+    fn the_project_directory_is_named_from_the_cwd() {
+        let dir = std::env::temp_dir().join(format!("nexmesh-slug-{}", std::process::id()));
+        let proj = dir.join("projects").join("-home-someone-deep-work");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("c.jsonl"), b"{}").unwrap();
+        let tpl = format!("{}/projects/{{cwd_slug}}/{{id}}.jsonl", dir.to_string_lossy());
+        assert!(conversation_exists_at(&tpl, "c", "/home/someone/deep/work"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

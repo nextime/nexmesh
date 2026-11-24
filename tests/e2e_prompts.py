@@ -23,7 +23,12 @@ except ModuleNotFoundError:
     websocket = None
 
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
-           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           # This seat's OWN identity: inherited when the suite is run
+           # from inside a managed seat, and then every test's shim
+           # registers as an agent the test's node has never heard of.
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
     os.environ.pop(_v, None)
 
 SCR = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +56,15 @@ _d = open(f"{SCR}/fake-cli/faketyped.toml").read().replace(
     'extra_paths = ["tests/fake-cli"]', f'extra_paths = ["{SCR}/fake-cli"]')
 # The dialog waits to be answered, and says what it was answered with.
 _d += f'\n[cli.env]\nFAKETYPED_DIALOG_WAIT = "1"\nFAKETYPED_LOG = "{LOG}"\n'
+# Long enough for the node to read the first of a chained pair off the screen
+# and report it -- which it will not do for the first six seconds after the
+# previous answer, because a CLI that has not redrawn yet still has the dialog
+# it just answered on the tail of its screen.
+_d += '\nFAKETYPED_CHAIN_SECONDS = "12"\n'
+# What a person would type at this CLI to compact it. The fake logs every
+# line it is given, so what the node typed is observable.
+_d = _d.replace("[modes.interactive]\n",
+                '[modes.interactive]\ncompact_command = "/squash-now"\n', 1)
 open(f"{CLIS}/faketyped.toml", "w").write(_d)
 
 procs, fails = [], []
@@ -75,6 +89,22 @@ def http(m, p, b=None, tok=None):
         return e.code, json.loads(e.read() or b"{}")
 
 
+def until(fn, seconds=25.0, step=0.3):
+    """Wait for something to become true. A check that reads once races the
+    thing it is checking, which is how a suite comes to fail only under
+    load."""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            v = fn()
+            if v:
+                return v
+        except Exception:
+            pass
+        time.sleep(step)
+    return None
+
+
 def fake_log():
     try:
         return open(LOG).read()
@@ -82,10 +112,10 @@ def fake_log():
         return ""
 
 
-def system_notes(sid, tok):
+def chat_lines(sid, tok, needle):
+    """Lines in the session's chat that say something, matched loosely."""
     s, j = http("GET", f"/v1/sessions/{sid}/log?limit=200", tok=tok)
-    return [m for m in (j.get("messages") or [])
-            if "[nexmesh] answered a prompt" in str(m.get("body", ""))]
+    return [m for m in (j.get("messages") or []) if needle in str(m.get("body", ""))]
 
 
 def main():
@@ -113,7 +143,12 @@ def main():
         [f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}", "--name", "machine-b",
          "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
         stdout=open(f"{T}/node.log", "w"), stderr=subprocess.STDOUT,
-        env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1")))
+        # TERM=unknown on purpose: that is what the node inherits when
+        # sysvinit starts it, and it used to be passed straight through to
+        # every agent -- which turns a TUI monochrome and takes away its
+        # mouse and alternate screen.
+        env=dict(os.environ, NEXMESH_TOKEN=tok, RUST_LOG="info", NO_COLOR="1",
+                 TERM="unknown")))
     ok = False
     for _ in range(120):
         s, j = http("GET", "/v1/nodes", tok=optok)
@@ -149,18 +184,87 @@ def main():
             break
         time.sleep(0.25)
 
-    # ---- unattended: the node answers it ---------------------------------
+    # ---- the pty it was given is a usable terminal -----------------------
+    # The agent's TERM describes the pty THIS NODE created, never the
+    # terminal that launched the daemon -- which under sysvinit is
+    # `TERM=unknown`, and a TUI told that turns off colour, the mouse and the
+    # alternate screen.
+    term = ""
+    for _ in range(40):
+        for line in fake_log().splitlines():
+            if "TERM=" in line:
+                term = line.split("TERM=", 1)[1].strip()
+        if term:
+            break
+        time.sleep(0.25)
+    check("the agent is told it has a real terminal, not the daemon's",
+          term and term != "unknown" and term != "<unset>", f"TERM={term!r}")
+    check("and specifically a colour one", "color" in term or "256" in term,
+          f"TERM={term!r}")
+
+    # ---- compaction, when the operator asks for it -----------------------
+    # Compaction is a slash command inside the TUI in every CLI checked, so
+    # the node types the CLI's OWN command -- which the descriptor names,
+    # because the hub does not know the slash commands of every CLI.
+    s, j = http("POST", f"/v1/sessions/{sid}/messages", {"text": "/compact Ida"}, tok=optok)
+    check("the operator can ask for a compaction", s == 200 and j.get("command") is True,
+          str(j))
+    typed = until(lambda: "/squash-now" in fake_log(), 30)
+    check("the CLI's own compaction command was typed at it", bool(typed),
+          fake_log()[-200:])
+    check("and it is recorded in the agent's transcript",
+          until(lambda: "to compact this context" in (http(
+              "GET", f"/v1/agents/{aid}/transcript?tail=4000", tok=optok)[1].get("transcript") or "")),
+          "")
+
+    # ---- unattended: the question goes to the OPERATOR -------------------
+    # It used to be answered here by the node. That kept the fleet moving and
+    # meant nobody had authorised anything, so now it waits for a person.
     http("POST", f"/v1/sessions/{sid}/messages", {"text": "please dialog now", "to": "Ida"},
          tok=optok)
+    ap = None
+    for _ in range(60):
+        s, j = http("GET", "/v1/approvals", tok=optok)
+        if j.get("approvals"):
+            ap = j["approvals"][0]
+            break
+        time.sleep(0.4)
+    check("the prompt is raised with the operator, not answered", ap is not None,
+          str(fake_log()[-200:]))
+    if not ap:
+        return 1
+    check("it names the agent that is stopped", ap.get("agent") == "Ida", str(ap))
+    opts = ap.get("options") or []
+    check("the operator is shown the choices the CLI itself offered", len(opts) >= 2,
+          str(opts))
+    check("with each one carrying the keystroke that picks it",
+          all(o.get("keys") for o in opts), str(opts))
+    check("and the affirmative told apart from the refusal",
+          [o.get("affirmative") for o in opts] == [True, False], str(opts))
+    check("and nothing has been typed at the agent",
+          "dialog answered with" not in fake_log(), fake_log()[-200:])
+    asked_lines = chat_lines(sid, optok, "is asking permission")
+    check("the question is in the session chat", bool(asked_lines), str(asked_lines)[:300])
+    if asked_lines:
+        check("as a pre-claimed record, so no agent is handed it to answer",
+              asked_lines[0].get("kind") == "approval"
+              and asked_lines[0].get("claimed") is not False,
+              str(asked_lines[0])[:300])
+
+    # ---- the operator answers it, and the agent carries on ---------------
+    s, j = http("POST", f"/v1/approvals/{ap['id']}/decide", {"choice": "allow"}, tok=optok)
+    check("the operator can answer it", s == 200 and j.get("ok"), str(j))
+    check("and the hub confirms the keystroke reached the terminal", j.get("typed") is True,
+          str(j))
     answered = ""
     for _ in range(50):
         answered = fake_log()
         if "dialog answered with" in answered:
             break
         time.sleep(0.4)
-    check("the dialog was answered with nobody attached",
-          "dialog answered with" in answered, answered[-200:])
-    check("and it was answered with the narrow affirmative, not 'always'",
+    check("the choice was typed at the agent", "dialog answered with" in answered,
+          answered[-200:])
+    check("and it was the narrow affirmative, never an 'always'",
           "dialog answered with '1'" in answered, answered[-200:])
     moved = ""
     for _ in range(30):
@@ -170,22 +274,78 @@ def main():
             break
         time.sleep(0.3)
     check("so the agent carried on past it", "Edit applied" in moved, moved[-160:])
-    check("the answer is in the agent's own transcript",
-          "[nexmesh] answered a prompt" in moved, moved[-300:])
-    notes = []
-    for _ in range(30):
-        notes = system_notes(sid, optok)
-        if notes:
+    check("the decision is in the agent's own transcript",
+          "[nexmesh] answered the prompt" in moved, moved[-300:])
+    s, j = http("GET", "/v1/approvals", tok=optok)
+    check("and nothing is left waiting", not j.get("approvals"), str(j))
+
+    # ---- a standing auto-approval answers without asking -----------------
+    http("POST", f"/v1/slots/{slot}/auto-approve", {"on": True}, tok=optok)
+    before = fake_log().count("dialog answered with")
+    http("POST", f"/v1/sessions/{sid}/messages", {"text": "dialog again please", "to": "Ida"},
+         tok=optok)
+    after = before
+    for _ in range(50):
+        after = fake_log().count("dialog answered with")
+        if after > before:
             break
         time.sleep(0.4)
-    check("and in the session's chat, as a record", len(notes) >= 1,
-          str(notes)[:200])
-    if notes:
-        check("the record says what was chosen and why",
-              "1. Yes" in notes[0]["body"] and "nobody was attached" in notes[0]["body"],
-              notes[0]["body"][:200])
-        check("and it is pre-claimed, so no agent acts on it",
-              notes[0].get("kind") == "system", str(notes[0].get("kind")))
+    check("an auto-approved seat is answered with nobody asked", after > before,
+          f"{before} -> {after}")
+    s, j = http("GET", "/v1/approvals", tok=optok)
+    check("so nothing waits for the operator", not j.get("approvals"), str(j))
+    check("and the chat still says what was decided for them",
+          bool(chat_lines(sid, optok, "automatically")),
+          str(chat_lines(sid, optok, ""))[-300:])
+    http("POST", f"/v1/slots/{slot}/auto-approve", {"on": False}, tok=optok)
+
+    # ---- answered at its own terminal, with the next question behind it ----
+    # The operator answers in the agent's own CLI rather than in the
+    # dashboard, and the agent stops on something else straight away -- so its
+    # screen never passes through a moment with nothing on it to answer. The
+    # card for the question she already dealt with used to stay there, with
+    # live buttons, until she answered it a SECOND time in the dashboard. On a
+    # seat under tmux, whose status line carries a clock, a new card arrived
+    # every minute and only the newest could ever be retired: 77 of them for
+    # three seats was the state this was found in.
+    http("POST", f"/v1/sessions/{sid}/messages", {"text": "chain please", "to": "Ida"},
+         tok=optok)
+    first = None
+    for _ in range(60):
+        rows = http("GET", "/v1/approvals", tok=optok)[1].get("approvals") or []
+        if rows:
+            first = rows[0]
+            break
+        time.sleep(0.4)
+    check("the first question reaches the operator", first is not None, fake_log()[-200:])
+    if not first:
+        return 1
+    check("and it is the one on the screen", "make this edit" in first.get("question", ""),
+          str(first.get("question"))[:200])
+    # The fake answers that one itself, standing in for her at its keyboard,
+    # and puts a different question up.
+    second = None
+    for _ in range(60):
+        rows = http("GET", "/v1/approvals", tok=optok)[1].get("approvals") or []
+        if any("run the tests" in (r.get("question") or "") for r in rows):
+            second = rows
+            break
+        time.sleep(0.5)
+    check("the question it stopped on next reaches her too", second is not None,
+          str(http("GET", "/v1/approvals", tok=optok)[1])[:300])
+    if second:
+        check("and the one she answered at the terminal is gone from the dashboard",
+              len(second) == 1, str([r.get("question", "")[:60] for r in second]))
+        check("without her having to answer it a second time",
+              first["id"] not in [r["id"] for r in second], str(second)[:200])
+        check("and she is told why it went, rather than watching it vanish",
+              bool(chat_lines(sid, optok, "different question now")),
+              str(chat_lines(sid, optok, ""))[-300:])
+        # Answer the live one, so the seat is not left stopped behind the rest
+        # of the suite.
+        http("POST", f"/v1/approvals/{second[0]['id']}/decide", {"choice": "1"}, tok=optok)
+        check("the second one is answerable", until(
+            lambda: "second dialog answered with" in fake_log(), 20), fake_log()[-200:])
 
     # ---- attached: the choice belongs to the person ------------------------
     if websocket is None:
@@ -206,18 +366,21 @@ def main():
     http("POST", f"/v1/sessions/{sid}/messages", {"text": "another dialog please", "to": "Ida"},
          tok=optok)
     time.sleep(9)
-    check("with a viewer attached the node does not answer it",
+    check("with a viewer attached nothing is typed for them",
           fake_log().count("dialog answered with") == before,
           f"{before} -> {fake_log().count('dialog answered with')}")
-    # And once the viewer leaves, it is dealt with again.
+    check("and the operator is not asked either, because somebody is looking at it",
+          not http("GET", "/v1/approvals", tok=optok)[1].get("approvals"),
+          str(http("GET", "/v1/approvals", tok=optok)[1]))
+    # And once the viewer leaves, it comes to the operator.
     ws.close()
-    after = before
+    raised = False
     for _ in range(40):
-        after = fake_log().count("dialog answered with")
-        if after > before:
+        if http("GET", "/v1/approvals", tok=optok)[1].get("approvals"):
+            raised = True
             break
         time.sleep(0.5)
-    check("and answers it once the viewer detaches", after > before, f"{before} -> {after}")
+    check("once the viewer detaches it is raised with the operator", raised)
     return 1 if fails else 0
 
 

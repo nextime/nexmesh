@@ -12,11 +12,17 @@ Both orders are exercised, because both happen: adopting a pane that already
 holds a registered CLI (what you do), and a CLI registering into a pane that
 was adopted earlier.
 """
-import json, os, shutil, signal, sqlite3, subprocess, sys, tempfile, time
+import fcntl, json, os, pty, select, shutil, signal, sqlite3, struct, subprocess
+import sys, tempfile, termios, time
 import urllib.request, urllib.error
 
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
-           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           # This seat's OWN identity: inherited when the suite is run
+           # from inside a managed seat, and then every test's shim
+           # registers as an agent the test's node has never heard of.
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
     os.environ.pop(_v, None)
 
 SCR = os.path.dirname(os.path.abspath(__file__))
@@ -229,8 +235,36 @@ def main():
     print("\n=== 7. the CLI dies: nothing is typed into the shell it leaves behind ===")
     # The CLI exits, leaving the pane at a shell prompt. This is the case the
     # whole design is guarding: a message typed there would be EXECUTED.
+    #
+    # FIRST, GIVE THE SEAT SOMETHING TO CARRY. A hand-run seat that exits
+    # having carried nothing is now RETIRED -- the seat goes when the CLI
+    # does. So without this the seat is gone before the message is written,
+    # the POST below cannot address it, no message exists, and the two checks
+    # at the end of this section fail having tested nothing. Worse, they
+    # failed intermittently: whether the exit or the message was processed
+    # first decided whether the seat survived to be messaged.
+    #
+    # Retirement is not what this section is about, and it makes the
+    # dangerous case UNREACHABLE rather than safe. A seat that has carried
+    # work DOES outlive its CLI, and that is the seat whose pane a message
+    # must never be typed into.
+    #
+    # Pinned with an operator action rather than by messaging it: anything
+    # sent to the CLI goes through its STDIN, and a CLI busy reading a
+    # message does not see the `quit` that is supposed to end it -- which
+    # leaves a LIVE CLI and a section testing nothing again, the other way
+    # round.
+    s, j = http("POST", f"/v1/slots/{seat2['id']}/role",
+                {"role": "kept on purpose"})
+    check("the seat is configured, so it outlives its CLI", s == 200, f"{s} {j}")
     tmux("send-keys", "-t", "Hand2", "quit", "Enter")
-    time.sleep(2.0)
+    # WAIT FOR IT TO ACTUALLY BE DEAD. Sleeping and hoping is how this came
+    # to assert against a CLI that was still running.
+    check("the CLI is gone", until(lambda: not q(
+        "SELECT 1 FROM agents WHERE slot_id = ? AND exited_at_ms IS NULL", (seat2["id"],)), 40),
+        str(q("SELECT id, exited_at_ms FROM agents WHERE slot_id = ?", (seat2["id"],))))
+    check("but the seat is still there", bool(q("SELECT 1 FROM slots WHERE id = ?",
+          (seat2["id"],))), str(seat2["id"]))
     before = read(HANDLOG2)
     http("POST", f"/v1/sessions/{seat2['session_id']}/messages",
          {"to": "Hand2", "text": "rm -rf would run here"})
@@ -299,6 +333,60 @@ def main():
     row = [a for a in st if a["slot_id"] == slot][0]
     check("status says the seat is typed through a terminal",
           row.get("io_kind") == "tmux" and row.get("typed_via_terminal") is True, str(row))
+
+    print("\n=== 9. the adoption dies but the CLI does not: attach brings it back ===")
+    # Reported from the fleet as a dead end with no way out.
+    #
+    # A node restart kills the ADOPTION -- the node owned that tmux client,
+    # the CLI in the pane did not -- while the CLI carries on with its
+    # conversation. `attach` then said "its CLI was started by hand, so only
+    # its own shim reaches it" and advised `nexmesh seat`, which would have
+    # started a SECOND CLI on that conversation; `spawn` refused because the
+    # seat was occupied; and attaching again said the same thing. The only
+    # way out was to know a `term-*` seat existed and start it by hand.
+    termslot = q("SELECT id FROM slots WHERE session_id=? AND cli_id='tmux'", (sid,))[0]["id"]
+    # Recovery off, or it re-adopts before attach gets the chance and the
+    # test proves nothing.
+    http("POST", f"/v1/slots/{termslot}/autorespawn", {"on": False})
+    tpid = q("SELECT pid FROM agents WHERE slot_id=? AND exited_at_ms IS NULL "
+             "ORDER BY started_at_ms DESC LIMIT 1", (termslot,))[0]["pid"]
+    os.kill(tpid, signal.SIGKILL)
+    check("the adoption is gone",
+          until(lambda: not q("SELECT id FROM agents WHERE slot_id=? AND exited_at_ms IS NULL",
+                              (termslot,)), seconds=30))
+    # The CLI is untouched: that is the whole point of the complaint.
+    check("but the CLI is still running in its pane",
+          "Hand" in tmux("list-sessions", "-F", "#{session_name}"),
+          tmux("list-sessions", "-F", "#{session_name}"))
+
+    class Term:
+        def __init__(self, args, cols=100, rows=30):
+            self.master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            self.p = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave,
+                                      close_fds=True, cwd=ROOT)
+            os.close(slave); procs.append(self.p); self.buf = ""
+        def expect(self, text, seconds=45.0):
+            end = time.time() + seconds
+            while time.time() < end:
+                if text in self.buf: return True
+                r, _, _ = select.select([self.master], [], [], 0.3)
+                if r:
+                    try: d = os.read(self.master, 65536)
+                    except OSError: break
+                    if not d: break
+                    self.buf += d.decode(errors="replace")
+            return text in self.buf
+
+    t = Term([f"{BIN}/nexmesh", "--hub", HUB, "attach", sid, "Hand"])
+    check("attach says it is adopting the pane again",
+          t.expect("adopting it again"), t.buf[-400:])
+    check("and then attaches, instead of explaining what to type",
+          t.expect("attached to Hand"), t.buf[-400:])
+    check("the seat is reachable by keyboard once more",
+          until(lambda: (next((a for a in http("GET", f"/v1/sessions/{sid}/status")[1]["agents"]
+                               if a.get("slot_id") == slot), {}) or {}).get("io_kind") == "tmux",
+                seconds=30))
 
     print()
     if fails:

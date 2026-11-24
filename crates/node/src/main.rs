@@ -23,11 +23,13 @@ mod attachsock;
 mod putfile;
 mod cli_detect;
 mod codegraph;
+mod context;
 mod codex;
 mod ctx;
 mod driver;
 mod gitsync;
 mod localsock;
+mod loopguard;
 mod opencode;
 mod plugin;
 mod prompts;
@@ -229,9 +231,42 @@ fn default_mcpd() -> String {
         .unwrap_or_else(|| "nexmesh-mcpd".into())
 }
 
+/// A log sink that never reports an I/O error.
+///
+/// The node is built `panic = "abort"`, and its stdout and stderr are the one
+/// logfile a service writes to (`… >> node.log 2>&1`). The fmt layer, when a
+/// write to its writer fails, falls back to `eprintln!` to say so -- and that
+/// write lands on the same failing file, where `_eprint` panics ("failed
+/// printing to stderr"). So a filesystem filling under the logfile would abort
+/// the whole node, and every pty seat on the host with it -- which is exactly
+/// how workstation went down when one seat's model download filled root. Dropping the
+/// line is the right thing to lose when the disk is full; the node keeps running.
+struct NeverErr(std::io::Stdout);
+
+impl std::io::Write for NeverErr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::Write::write_all(&mut self.0, buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::Write::flush(&mut self.0);
+        Ok(())
+    }
+}
+
+struct SafeWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SafeWriter {
+    type Writer = NeverErr;
+    fn make_writer(&'a self) -> Self::Writer {
+        NeverErr(std::io::stdout())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(SafeWriter)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -452,22 +487,96 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
         tokio::spawn(async move {
             let mut seq = 0u64;
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(heartbeat_ms));
+            // How full each agent's context is, and whether it is going
+            // round in circles. Both come from following the same file, so
+            // one watcher answers both and reads it once. It belongs to this
+            // task rather than to `NodeCtx`: it is a cache keyed by agent
+            // id, and a cache in shared state is one that outlives the
+            // agents and leaks between tests. The mutex is only so the
+            // blocking read can borrow it -- nothing else touches it.
+            let watcher = std::sync::Arc::new(std::sync::Mutex::new(context::Watcher::default()));
+            // Not on every heartbeat. A heartbeat is seconds; a conversation
+            // changes on the scale of a turn, and the first look at a seat
+            // reads megabytes.
+            let mut look = tokio::time::interval(context_every());
+            look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
-                seq += 1;
-                let agents: Vec<AgentHealth> = {
-                    let map = ctx.agents.lock().unwrap();
-                    map.values()
-                        .map(|a| AgentHealth {
-                            agent_id: a.agent_id.clone(),
-                            alive: proc::is_same_process(a.proc.pid, a.proc.start_ticks),
-                            idle_ms: 0,
+                tokio::select! {
+                    _ = tick.tick() => {
+                        seq += 1;
+                        let agents: Vec<AgentHealth> = {
+                            let map = ctx.agents.lock().unwrap();
+                            map.values()
+                                .map(|a| AgentHealth {
+                                    agent_id: a.agent_id.clone(),
+                                    alive: proc::is_same_process(a.proc.pid, a.proc.start_ticks),
+                                    idle_ms: 0,
+                                })
+                                .collect()
+                        };
+                        let frame = NodeToHub::Heartbeat { seq, agents };
+                        if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = look.tick() => {
+                        // Off the async thread: this reads files, and a
+                        // blocking read in the heartbeat task is a node that
+                        // stops answering while a 450MB transcript is
+                        // opened for the first time.
+                        let c = ctx.clone();
+                        let w = watcher.clone();
+                        let found = tokio::task::spawn_blocking(move || {
+                            w.lock().unwrap().poll(&c)
                         })
-                        .collect()
-                };
-                let frame = NodeToHub::Heartbeat { seq, agents };
-                if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
-                    break;
+                        .await;
+                        let Ok(found) = found else { continue };
+                        for (agent_id, r) in found.usage {
+                            tracing::debug!(agent = %agent_id, used = r.used, limit = r.limit,
+                                "context");
+                            let frame = NodeToHub::ContextUsage {
+                                agent_id,
+                                used: r.used,
+                                limit: r.limit,
+                                source: r.source,
+                            };
+                            if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
+                                break;
+                            }
+                        }
+                        // WHICH CONVERSATION a seat is really in. Reported
+                        // through the same frame a fresh conversation uses,
+                        // so the hub's one handler does all three things it
+                        // already does with a handle: the seat's record, the
+                        // per-machine binding, and the durable one kept
+                        // against the seat's identity.
+                        for (agent_id, slot_id, handle) in found.conversations {
+                            let frame = NodeToHub::ResumeHandle {
+                                agent_id: agent_id.clone(),
+                                slot_id,
+                                handle: handle.clone(),
+                            };
+                            if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
+                                break;
+                            }
+                            // And locally, so the next pass agrees with the
+                            // hub and says nothing further.
+                            ctx.note_conversation(&agent_id, &handle);
+                        }
+                        for (agent_id, c) in found.loops {
+                            tracing::info!(agent = %agent_id, period = c.period,
+                                repeats = c.repeats,
+                                "this agent has repeated the same turns back to back");
+                            let frame = NodeToHub::LoopSuspected {
+                                agent_id,
+                                period: c.period as i64,
+                                repeats: c.repeats as i64,
+                            };
+                            if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -490,6 +599,28 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
     Ok(())
 }
 
+/// How often each agent's conversation is looked at.
+///
+/// Not the heartbeat. A heartbeat is about liveness and is measured in
+/// seconds; a conversation grows by a turn at a time and the first look at a
+/// seat reads megabytes off disk. Twenty seconds is far finer than any
+/// threshold worth setting -- a turn cannot take a seat from under a limit
+/// to over it and back in that time -- and it is cheap, because after the
+/// first look only what has been appended is read.
+const CONTEXT_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The same, overridable -- for tests, which otherwise spend twenty seconds
+/// waiting for each assertion about a conversation that was written in a
+/// millisecond. A knob rather than a shorter default: twenty seconds is the
+/// right cadence on a real fleet, and a suite that needs a faster one should
+/// say so rather than making every node on the fleet poll harder.
+fn context_every() -> std::time::Duration {
+    match std::env::var("NEXMESH_CONTEXT_EVERY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) if ms >= 100 => std::time::Duration::from_millis(ms),
+        _ => CONTEXT_EVERY,
+    }
+}
+
 async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc::Sender<String>) {
     match frame {
         HubToNode::Ping { seq } => {
@@ -503,6 +634,9 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             let slot_id = spec.slot_id.clone();
             if let Err(e) = spawn::spawn_agent(ctx.clone(), spec).await {
                 tracing::error!(%agent_id, error = %e, "spawn failed");
+                // It never registered, so nothing it wanted to say about how
+                // it was started has anywhere to go.
+                ctx.forget_notes(&agent_id);
                 // Report it as an immediate exit so the hub stops waiting.
                 let _ = ctx
                     .send_hub(&NodeToHub::AgentExited { agent_id, code: None, signal: None })
@@ -552,10 +686,16 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             ctx.complete_tool(&call_id, ToolOutcome { result, deliver });
         }
 
-        HubToNode::JoinGranted { req_id, slot_id, session_id, agent_id, display_name, role } => {
+        HubToNode::JoinGranted {
+            req_id, slot_id, session_id, agent_id, display_name, role, authority,
+        } => {
             ctx.complete_join(
                 req_id,
-                JoinOutcome { granted: Ok((slot_id, session_id, agent_id, display_name, role)) },
+                JoinOutcome {
+                    granted: Ok(ctx::Granted {
+                        slot_id, session_id, agent_id, display_name, role, authority,
+                    }),
+                },
             );
         }
 
@@ -580,6 +720,29 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
 
         HubToNode::AttachData { attach_id, data } => {
             attachsock::input(&ctx, attach_id, data).await;
+        }
+
+        HubToNode::TreeFingerprint { req_id, workspace_id, path } => {
+            // Cheap, but still a walk of somebody's tree: off the session
+            // loop like the parse, so a slow disk does not stall spawns.
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let root = std::path::PathBuf::from(&path);
+                let (fingerprint, files, partial) = tokio::task::spawn_blocking(move || {
+                    codegraph::fingerprint(&root, &codegraph::Limits::default())
+                })
+                .await
+                .unwrap_or_else(|_| (String::new(), 0, true));
+                let _ = ctx
+                    .send_hub(&NodeToHub::TreeFingerprintResult {
+                        req_id,
+                        workspace_id,
+                        fingerprint,
+                        files,
+                        partial,
+                    })
+                    .await;
+            });
         }
 
         HubToNode::BuildCodeGraph { req_id, workspace_id, path } => {
@@ -731,6 +894,114 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
             attachsock::close(&ctx, &attach_id);
         }
 
+        // STOP what this agent is doing, without ending it.
+        //
+        // Raw keys straight at the terminal, and deliberately NOT through
+        // `type_line`: that writes a line and presses Enter, and an agent
+        // mid-turn is not reading a line. An interrupt has to land as a
+        // keystroke while the CLI is busy, which is the only moment it is
+        // ever wanted.
+        HubToNode::Interrupt { agent_id, by } => {
+            let Some(io) = ctx.agent_io(&agent_id) else {
+                tracing::warn!(%agent_id, "interrupt for an agent this node does not have");
+                return;
+            };
+            let keys = ctx
+                .agent(&agent_id)
+                .map(|rec| rec.cli_id.clone())
+                .and_then(|cli| {
+                    ctx.descriptor(&cli)
+                        .and_then(|d| d.modes.get("interactive"))
+                        .and_then(|m| m.interrupt_keys.clone())
+                });
+            match (keys, &io.input) {
+                (Some(keys), Some(tx)) if !keys.is_empty() => {
+                    let sent = tx.send(keys.as_bytes().to_vec()).await.is_ok();
+                    tracing::info!(%agent_id, %by, sent, "interrupting this agent");
+                    if sent {
+                        crate::prompts::say(ctx, &agent_id, &io, &format!(
+                            "[nexmesh] interrupted \u{2014} {by}. Nothing has been lost: this \
+                             conversation is intact and your seat is where it was."
+                        )).await;
+                    }
+                }
+                (None, _) => {
+                    tracing::info!(%agent_id, %by,
+                        "nothing to interrupt with: this CLI declares no interrupt keys");
+                    crate::prompts::say(ctx, &agent_id, &io, &format!(
+                        "[nexmesh] {by} \u{2014} but this CLI declares no way to be \
+                         interrupted, so nothing was typed. Add `interrupt_keys` to its \
+                         descriptor if it has one."
+                    )).await;
+                }
+                _ => {
+                    tracing::warn!(%agent_id, "this seat has no terminal to interrupt");
+                }
+            }
+        }
+
+        // Compact this agent's context, now, because the operator said so.
+        //
+        // The node resolves WHAT to type, from the descriptor it holds: the
+        // hub does not know the slash commands of every CLI and should not
+        // have to. Refused when the screen is waiting for an answer, like
+        // any other keystroke -- a compaction request must not be the Enter
+        // that approves a tool call nobody read.
+        HubToNode::Compact { agent_id, by } => {
+            let Some(io) = ctx.agent_io(&agent_id) else {
+                tracing::warn!(%agent_id, "compact for an agent this node does not have");
+                return;
+            };
+            // The agent's CLI, then that CLI's interactive mode, then what it
+            // says to type. Any of the three being absent means "this CLI
+            // does not declare one", which is reported rather than guessed.
+            let cmd = ctx
+                .agent(&agent_id)
+                .map(|rec| rec.cli_id.clone())
+                .and_then(|cli| {
+                    ctx.descriptor(&cli)
+                        .and_then(|d| d.modes.get("interactive"))
+                        .and_then(|m| m.compact_command.clone())
+                });
+            match cmd {
+                None => {
+                    crate::prompts::say(ctx, &agent_id, &io, &format!(
+                        "[nexmesh] {by} asked this seat to compact its context, but its \
+                         CLI declares no compaction command, so nothing was typed. Add \
+                         `compact_command` to its descriptor if it has one."
+                    )).await;
+                }
+                Some(cmd) => {
+                    match crate::prompts::type_line(&io, &cmd).await {
+                        Ok(()) => {
+                            crate::prompts::say(ctx, &agent_id, &io, &format!(
+                                "[nexmesh] typed {cmd:?} to compact this context \u{2014} {by} \
+                                 asked for it."
+                            )).await;
+                        }
+                        Err(why) => {
+                            crate::prompts::say(ctx, &agent_id, &io, &format!(
+                                "[nexmesh] {by} asked this seat to compact, but {why}; \
+                                 nothing was typed."
+                            )).await;
+                        }
+                    }
+                }
+            }
+        }
+        // A permission prompt the operator (or a standing auto-approval) has
+        // answered. Only this node can type at that terminal, and only this
+        // node read the menu, so the hub is handing back one of the options
+        // this node reported rather than a decision of its own.
+        HubToNode::ApprovalDecided { approval_id, agent_id, keys, label, by } => {
+            let Some(io) = ctx.agent_io(&agent_id) else {
+                tracing::warn!(%agent_id, %approval_id,
+                               "an approval came back for an agent this node does not have");
+                return;
+            };
+            tracing::info!(%agent_id, %approval_id, %by, %label, "answering a permission prompt");
+            crate::prompts::apply_decision(ctx, &agent_id, &io, &keys, &label, &by).await;
+        }
         HubToNode::Inject { agent_id, messages, expect_cli } => {
             // A typed delivery into an adopted terminal is allowed only on
             // the node's own evidence, re-gathered now. The hub's record was

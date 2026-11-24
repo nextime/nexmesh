@@ -41,6 +41,14 @@ attachable = true   # `opencode attach` opens a real TUI onto the same session
 [modes.interactive]
 args = ["{cwd}"]
 resume_args = ["--session", "{resume}"]
+# `--continue` is opencode's own "continue the last session". Safe only
+# because this seat has a store of its own; see the session_store section.
+resume_latest_args = ["--continue"]
+# No compact_command: this CLI's compaction command was not verified here --
+# neither its --help nor its package names one, and the commands next to it
+# (/clear, /new) are destructive, so guessing in that neighbourhood is not
+# worth it. `/compact <agent>` reports that rather than typing a guess. Add
+# the real command here and it works immediately.
 attachable = true
 # Typing a line at this prompt is a message to the agent, not a command
 # to a shell -- so a seat the fleet put in a terminal can be reached by
@@ -63,3 +71,34 @@ path = "~/.config/opencode/opencode.json"
 pointer = "/mcp/servers/{name}"
 env_key = "environment"
 entry = { type = "local", command = ["{command}"], enabled = true }
+
+# No [skill] section: this CLI has no skills directory to write one into. It
+# gets the same ground rules through the MCP `instructions` field, which the
+# hub sends every client at initialize (see proto::tools::team_instructions).
+
+[session_store]
+# A data directory per SEAT, for the same reason as codex: opencode 1.19
+# exports no session id to its MCP children, names no session at launch, and
+# keeps every seat's sessions in one opencode.db whose `session` rows carry a
+# directory but nothing identifying the process. Two seats spawned together
+# here were 610ms apart with the same cwd.
+#
+# XDG_DATA_HOME is the PARENT of the store, which is why store_rel names the
+# subdirectory opencode appends to it.
+#
+# THE LOGIN IS SHARED, THE CONVERSATIONS ARE NOT.
+#
+# This list was empty, on the reading that opencode keeps provider credentials
+# in a `credential` table inside opencode.db -- which cannot be shared without
+# sharing the conversations beside it. Measured against opencode 1.19 on a host
+# logged in with `opencode auth`, that table holds ZERO rows and the login is a
+# separate `auth.json` in the same directory, which is an ordinary file and
+# shares like any other. With the list empty, an isolated seat on such a host
+# came up logged out -- so the trade was being paid without buying anything.
+#
+# A provider configured by API key in the environment, which is how the
+# fleet's own gateway is set up, never needed either.
+env = "XDG_DATA_HOME"
+store_rel = "opencode"
+root = "~/.local/share/opencode"
+share = ["auth.json"]

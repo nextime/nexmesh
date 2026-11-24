@@ -15,6 +15,8 @@
 //! what makes a pid stored in this database harmless.
 
 mod api;
+mod approvals;
+mod folds;
 mod asks;
 mod attach;
 mod auth;
@@ -23,7 +25,9 @@ mod chatcmd;
 mod control;
 mod dashboard;
 mod delivery;
+mod fleet;
 mod graph;
+mod guests;
 mod launch;
 mod leiden;
 mod nodes;
@@ -35,9 +39,11 @@ mod peer;
 mod pki;
 mod prompt;
 mod seat;
+mod skills;
 mod state;
 mod sync;
 mod tools;
+mod watchdog;
 mod webauth;
 
 use anyhow::{Context, Result};
@@ -130,6 +136,61 @@ struct Args {
     /// address. Only for a hub already behind its own authenticating proxy.
     #[arg(long, env = "NEXMESH_ALLOW_ANONYMOUS")]
     allow_anonymous: bool,
+    /// How full a seat's context may get, as a percentage of its window,
+    /// before the hub types that CLI's own compaction command at it.
+    ///
+    /// The FLEET-WIDE default, and the bottom of three levels: a seat's own
+    /// setting wins, then its team's, then this. 0 is off, and off is the
+    /// default -- compacting an agent throws away context it may still need,
+    /// which is not a thing to start doing to every seat on a fleet because
+    /// a hub was upgraded. Set it per seat with `nexmesh compact-at`.
+    #[arg(long, env = "NEXMESH_COMPACT_AT_PCT", default_value_t = 0)]
+    compact_at_pct: i64,
+    /// How many times a seat may repeat the same turn before the hub
+    /// interrupts it and pauses its seat. Fleet-wide default; 0 is off, and
+    /// off is the default. Set it per seat with `nexmesh loop-guard`.
+    ///
+    /// Below 2 is refused: one "repeat" is a single turn.
+    #[arg(long, env = "NEXMESH_LOOP_REPEATS", default_value_t = 0)]
+    loop_repeats: i64,
+    /// How many messages one seat may send a minute before the hub starts
+    /// refusing them. Fleet-wide default; 0 is off, and off is the default.
+    ///
+    /// A seat's own setting wins, then its team's, then this. The refusal
+    /// goes to the AGENT and says what to do instead, so it is a brake
+    /// rather than a trap -- and its work is not stopped, only its messages.
+    /// 30 is a number no team doing real work reaches; a runaway reaches it
+    /// in seconds.
+    #[arg(long, env = "NEXMESH_MSG_RATE_PER_MIN", default_value_t = 0)]
+    msg_rate_per_min: i64,
+    /// How many messages two seats may exchange with EACH OTHER in ten
+    /// minutes. Fleet-wide default; 0 is off, and off is the default.
+    ///
+    /// Separate from the rate because a ping-pong is not fast, it is
+    /// relentless: two agents answering each other every twenty seconds
+    /// never trip a per-minute rate, and between them burn two turns a
+    /// minute for as long as nobody looks. 20 is generous for a pair that is
+    /// actually working.
+    #[arg(long, env = "NEXMESH_MSG_PAIR_LIMIT", default_value_t = 0)]
+    msg_pair_limit: i64,
+    /// This fleet's OWN role templates and skill fragments:
+    /// `<dir>/roles/<role>.toml` and `<dir>/skills/<name>.md`.
+    ///
+    /// A file here replaces the built-in of the same name and a new name adds
+    /// a role, so local wording survives an upgrade instead of being
+    /// overwritten by it. Omitted, the built-in templates are used -- there
+    /// is always a full set, because they are compiled into the binary.
+    #[arg(long, env = "NEXMESH_PROMPTS_DIR")]
+    prompts_dir: Option<String>,
+    /// A Digital Asset Links file to serve at `/.well-known/assetlinks.json`.
+    ///
+    /// Only needed for a HEADSET package. Horizon OS has no install button in
+    /// its browser: a Quest app is a signed package built from this hub's
+    /// manifest, and an immersive one refuses to launch unless the origin it
+    /// claims serves this file naming its package and signing fingerprint.
+    /// Generate it with Bubblewrap and point this at it.
+    #[arg(long, env = "NEXMESH_ASSETLINKS")]
+    assetlinks: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -194,9 +255,30 @@ enum Cmd {
         /// Restrict the token to one session.
         #[arg(long)]
         session: Option<String>,
+        /// Seat whoever uses this token as an OBSERVER: it can read the
+        /// team's state and memory, answer whoever asks it, and ask a seat
+        /// for its progress -- and nothing else. No messages of its own, no
+        /// writes, no touching a seat.
+        ///
+        /// For letting somebody outside the team watch it: a browser-based
+        /// Claude session, a dashboard of their own, a person on a phone.
+        /// The restriction is on the TOKEN, so whoever holds it cannot opt
+        /// out of it, which is what makes it safe to hand out.
+        #[arg(long)]
+        observer: bool,
     },
     /// List known nodes.
     Nodes,
+    /// Fork the built-in skills and role templates into a directory as files,
+    /// to edit them in bulk on disk. Idempotent: a file already there is LEFT
+    /// ALONE. NOTE a forked file then SHADOWS its built-in and stops tracking
+    /// upgrades to it -- which is why an install does NOT run this; it only
+    /// makes the directory, and the built-ins serve from the binary until an
+    /// operator deliberately overrides one (through the dashboard, or here).
+    SeedPrompts {
+        /// The store directory; `skills/` and `roles/` are created under it.
+        dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -295,6 +377,38 @@ pub fn build_tls(
     Ok(std::sync::Arc::new(cfg))
 }
 
+/// Write the built-in skills and templates into a store directory as editable
+/// files, skipping any that already exist. Returns (written, kept).
+///
+/// Idempotent by design: the installer runs it on every install and upgrade,
+/// and an operator's edit to a seeded file -- or a file they added -- must
+/// survive that. So an existing file is never touched; only genuinely new
+/// built-ins (a skill added in a later release) are written.
+fn seed_prompts(dir: &str) -> anyhow::Result<(usize, usize)> {
+    let root = std::path::Path::new(dir);
+    std::fs::create_dir_all(root.join("skills"))?;
+    std::fs::create_dir_all(root.join("roles"))?;
+    let mut wrote = 0;
+    let mut kept = 0;
+    let mut seed = |sub: &str, name: &str, ext: &str, body: &str| -> anyhow::Result<()> {
+        let p = root.join(sub).join(format!("{name}.{ext}"));
+        if p.exists() {
+            kept += 1;
+        } else {
+            std::fs::write(&p, body)?;
+            wrote += 1;
+        }
+        Ok(())
+    };
+    for (name, body) in nexmesh_proto::roles::builtin_skills() {
+        seed("skills", name, "md", body)?;
+    }
+    for (id, body) in nexmesh_proto::roles::builtin_roles() {
+        seed("roles", id, "toml", body)?;
+    }
+    Ok((wrote, kept))
+}
+
 /// Refuse an administrative subcommand whose database is not there.
 ///
 /// Only applied when the path is the built-in default: an explicit `--db` or
@@ -305,7 +419,12 @@ pub fn build_tls(
 fn guard_db_exists(args: &Args) -> anyhow::Result<()> {
     let administrative = !matches!(
         args.cmd,
-        None | Some(Cmd::Serve) | Some(Cmd::Pki(_)) | Some(Cmd::GenCert { .. })
+        None | Some(Cmd::Serve)
+            | Some(Cmd::Pki(_))
+            | Some(Cmd::GenCert { .. })
+            // Seeding the prompts store touches no database -- it is run at
+            // install time, when there may be none yet.
+            | Some(Cmd::SeedPrompts { .. })
     );
     if !administrative || args.db != DEFAULT_DB || std::env::var_os("NEXMESH_DB").is_some() {
         return Ok(());
@@ -338,13 +457,51 @@ async fn main() -> Result<()> {
     // credential the running hub has never heard of -- with no error to say
     // so. Only `serve` may bring a database into being.
     guard_db_exists(&args)?;
+    // Seed the editable store and exit, before any database is opened: this
+    // is what the package installer runs to lay down the built-ins as files.
+    if let Some(Cmd::SeedPrompts { dir }) = &args.cmd {
+        let (wrote, kept) = seed_prompts(&state::expand(dir))?;
+        println!("seeded {wrote} new file(s) into {dir}; left {kept} existing file(s) alone");
+        return Ok(());
+    }
+    // Where this fleet's own skills and templates live, if anywhere. The flag
+    // (or NEXMESH_PROMPTS_DIR) wins; absent it, fall back to the packaged
+    // store at /var/lib/nexmesh/prompts BUT ONLY IF it exists -- so an
+    // installed fleet picks up its editable store with no configuration,
+    // while a dev run with neither flag nor directory is unchanged and keeps
+    // using the built-ins compiled into the binary.
+    let prompts_dir = args.prompts_dir.clone().or_else(|| {
+        let d = "/var/lib/nexmesh/prompts";
+        std::path::Path::new(d).is_dir().then(|| d.to_string())
+    });
     let st = AppState::open(&args.db)?
         .with_pki_dir(&args.pki_dir)
         .with_pair_listen(args.pair_listen.clone())
         .with_identity_binding(!args.no_bind_identity)
+        .with_watchdog(args.compact_at_pct, args.loop_repeats)
+        .with_prompts_dir(prompts_dir)
+        .with_assetlinks(args.assetlinks.clone())
+        .with_flood(args.msg_rate_per_min, args.msg_pair_limit)
         .with_trusted_proxies(args.trusted_proxies.clone());
 
+    // A LOCAL TEMPLATE THAT WILL NOT PARSE IS SKIPPED, AND SAID OUT LOUD.
+    //
+    // Skipped because one bad file must not take away the other thirteen
+    // roles, and a hub that refuses to start over a typo in a prompt is
+    // worse than one that starts without it. Said out loud because an
+    // operator who wrote a template and then sees the built-in behaviour
+    // has nothing at all to go on.
+    for complaint in nexmesh_proto::roles::complaints(st.prompts_dir()) {
+        tracing::warn!("role template ignored: {complaint}");
+    }
+    if let Some(dir) = st.prompts_dir() {
+        tracing::info!(dir = %dir.display(), roles = nexmesh_proto::roles::all(Some(dir)).len(),
+            "role templates (this fleet's own, over the built-in ones)");
+    }
+
     match args.cmd {
+        // Handled before the database was opened; it never reaches here.
+        Some(Cmd::SeedPrompts { .. }) => unreachable!(),
         Some(Cmd::DashboardSetupCode) => {
             let db = st.db.lock().unwrap();
             match webauth::issue_setup_code(&db) {
@@ -399,7 +556,7 @@ async fn main() -> Result<()> {
             println!("revoked {n} token(s) for {node_name}");
             return Ok(());
         }
-        Some(Cmd::ParticipantToken { label, session }) => {
+        Some(Cmd::ParticipantToken { label, session, observer }) => {
             let token = random_token(48);
             let db = st.db.lock().unwrap();
             let session_id: Option<String> = match &session {
@@ -413,16 +570,50 @@ async fn main() -> Result<()> {
                 ),
                 None => None,
             };
+            let authority = observer.then(|| {
+                nexmesh_proto::authority::Authority::Observer.as_str().to_string()
+            });
+            if observer && session_id.is_none() {
+                // An observer token with no session would seat its holder in
+                // whichever team it names -- and a watcher that can pick its
+                // own team is not what anybody means by an observer.
+                anyhow::bail!(
+                    "an observer token has to name the team it may watch: \
+                     --session <team>"
+                );
+            }
             db.execute(
-                "INSERT INTO participant_tokens (token_sha256, label, session_id, issued_at_ms)
-                 VALUES (?,?,?,?)",
-                params![sha256_hex(&token), label, session_id, now_ms()],
+                "INSERT INTO participant_tokens (token_sha256, label, session_id, authority,
+                                                 issued_at_ms)
+                 VALUES (?,?,?,?,?)",
+                params![sha256_hex(&token), label, session_id, authority, now_ms()],
             )?;
             println!("participant: {label}");
             if let Some(s) = &session_id {
                 println!("session:     {s}");
             }
+            if observer {
+                println!("authority:   observer (reads and reports; cannot steer anything)");
+            }
             println!("token:       {token}");
+            // What to DO with it. A token with no instructions is a token
+            // that sits in a terminal scrollback until it is lost.
+            let addr = args.listen.first().cloned().unwrap_or_else(|| "127.0.0.1:7870".into());
+            let scheme = if args.tls_cert.is_some() { "https" } else { "http" };
+            println!("\nMCP endpoint: {scheme}://{addr}/v1/mcp");
+            println!("  header:     Authorization: Bearer <the token above>");
+            if observer {
+                println!(
+                    "\nPoint an outside MCP client at that endpoint with this token and it \
+                     takes a\nseat in the team that can watch and nothing else: it reads \
+                     `check_team_status`,\n`get_plan`, `query_knowledge`, `recall` and the \
+                     team's history, answers with `reply`,\nand can ask one seat for \
+                     progress, test results or an ETA with `ask_progress`.\n\
+                     It cannot send a message of its own writing, change anything, or \
+                     touch a seat --\nenforced in the hub on every call, not asked for in \
+                     a prompt."
+                );
+            }
             println!("\nShown once. This token may call team tools; it cannot spawn processes.");
             return Ok(());
         }
@@ -611,6 +802,20 @@ async fn main() -> Result<()> {
     // stale `running` row from before the restart surviving as a fact.
     st.demote_running_agents();
 
+    // A permission prompt is a stopped agent waiting for a person, so it
+    // means nothing once that agent is gone -- and nothing will ever mention
+    // it again, so no node can mend it. Swept here because this is the only
+    // place that sees the whole table at once: a hub has been found holding
+    // 77 cards with live buttons for three seats that had died days earlier.
+    {
+        let db = st.db.lock().unwrap();
+        let n = approvals::retire_gone(&db);
+        if n > 0 {
+            tracing::info!(retired = n,
+                           "permission requests for agents that are gone were retired");
+        }
+    }
+
     // Delivery and recovery. Driven agents get messages pushed to them within
     // a tick instead of waiting for their next tool call; crashed agents come
     // back with a handoff.
@@ -625,6 +830,14 @@ async fn main() -> Result<()> {
                 delivery::interactive_tick(&st).await;
                 delivery::recovery_tick(&st).await;
                 delivery::stalled_tick(&st).await;
+                // A code graph whose tree has moved. One per tick: parsing
+                // is minutes of a node's CPU.
+                graph::stale_tick(&st).await;
+                // And whether any tree HAS moved: a fingerprint is a walk
+                // with the parsing taken out, so this is the cheap half of
+                // keeping a graph honest. One workspace per tick, and each
+                // is asked at most once every ten minutes.
+                graph::fresh_tick(&st).await;
             }
         });
     }
@@ -692,17 +905,61 @@ async fn main() -> Result<()> {
         .route("/v1/nodes", get(api::list_nodes))
         .route("/v1/sessions", get(api::list_sessions).post(api::create_session))
         .route("/v1/sessions/:id/name", post(api::rename_session))
-        .route("/v1/sessions/:id", axum::routing::delete(api::remove_session))
+        .route(
+            "/v1/sessions/:id",
+            get(api::session_detail).delete(api::remove_session),
+        )
+        .route("/v1/sessions/:id/instructions", post(api::set_session_instructions))
         .route("/v1/sessions/:id/slots", post(api::create_slot))
         .route("/v1/sessions/:id/adopt", post(api::adopt_slot))
         .route("/v1/sessions/:id/sync", post(api::sync_workspaces))
         .route("/v1/sessions/:id/workspaces", post(api::add_workspace))
         .route("/v1/slots/:id/name", post(api::rename_slot))
         .route("/v1/slots/:id/role", post(api::set_role))
+        .route("/v1/slots/:id/authority", post(api::set_authority))
+        .route("/v1/slots/:id/auto-approve", post(api::slot_auto_approve))
+        .route("/v1/slots/:id/autorespawn", post(api::slot_autorespawn))
+        .route("/v1/slots/:id/resume-handle", post(api::set_resume_handle))
+        // What a seat tells its agent: GET reads the text, POST sets or
+        // clears it. Deliberately not part of the status poll.
+        .route(
+            "/v1/roles",
+            axum::routing::get(api::roles),
+        )
+        .route(
+            "/v1/roles/:id",
+            axum::routing::get(api::role).put(api::write_role).delete(api::delete_role),
+        )
+        // The editable skill library: GET the whole catalogue with each
+        // skill's text and source, PUT to add or edit one, DELETE to remove
+        // a local one (a built-in reverts rather than vanishes). And the
+        // three-scope enable/disable dials.
+        .route("/v1/skills", axum::routing::get(api::list_skills))
+        .route(
+            "/v1/skills/prefs",
+            axum::routing::get(api::get_skill_prefs).post(api::set_skill_pref),
+        )
+        .route(
+            "/v1/skills/:name",
+            axum::routing::get(api::read_skill)
+                .put(api::write_skill)
+                .delete(api::delete_skill),
+        )
+        .route(
+            "/v1/slots/:id/prompt",
+            get(api::slot_prompt).post(api::set_slot_prompt),
+        )
+        .route("/v1/sessions/:id/auto-approve", post(api::session_auto_approve))
+        .route("/v1/sessions/:id/guests",
+               get(api::session_guests).post(api::session_guest))
+        .route("/v1/approvals", get(api::list_approvals))
+        .route("/v1/approvals/:id/decide", post(api::decide_approval))
         .route("/v1/slots/:id/owns", post(api::set_owns))
         .route("/v1/sessions/:id/plan", post(api::add_plan_item))
         .route("/v1/sessions/:id/upload", post(api::upload))
         .route("/v1/sessions/:id/messages/clear", post(api::clear_unclaimed))
+        // Withdraw a message nobody has seen, so it is never delivered.
+        .route("/v1/sessions/:id/messages/cancel", post(api::cancel_messages))
         .route("/v1/sessions/:id/seats/tidy", post(api::tidy_seats))
         // A person at the dashboard using the fleet's own services --
         // transcription, speech -- rather than only agents being able to.
@@ -723,6 +980,16 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/pause", post(api::pause))
         .route("/v1/sessions/:id/budget", post(api::set_budget))
         .route("/v1/sessions/:id/groups", post(api::set_group))
+        // WHAT THE FLEET REMEMBERS, across every scope, and the operator's
+        // own way to write it. Not under a session on purpose: global
+        // memory belongs to no session, and a seat's own notes belong to
+        // the seat.
+        .route("/v1/memory", get(api::list_memory).post(api::write_memory))
+        .route("/v1/memory/history", get(api::memory_history))
+        // The last thing an agent said, out of the screen it drew. The rule
+        // for what is furniture lives in the proto crate and is shared with
+        // the console; the screen itself lives in the browser.
+        .route("/v1/speech/reply", post(api::screen_reply))
         .route("/v1/auth/users", post(webauth::create_user))
         .route("/v1/sessions/:id/release", post(api::release))
         .route("/v1/sessions/:id/status", get(api::session_status))
@@ -764,6 +1031,13 @@ async fn main() -> Result<()> {
         .route("/sw.js", get(dashboard::service_worker))
         .route("/term.js", get(dashboard::term_js))
         .route("/xr", get(dashboard::xr_page))
+        // The room, installable in its own right: an app installed from the
+        // dashboard's manifest starts at the dashboard, and an installed app
+        // has no address bar to type `/xr` into.
+        .route("/manifest-xr.webmanifest", get(dashboard::manifest_xr))
+        // What a headset package is verified against. 404 with an
+        // explanation until `--assetlinks` says otherwise.
+        .route("/.well-known/assetlinks.json", get(dashboard::assetlinks))
         .route("/xr.js", get(dashboard::xr_js))
         .route("/healthz", get(api::health))
         // Signing in cannot itself require being signed in. These three are

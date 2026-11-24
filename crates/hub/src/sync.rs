@@ -224,4 +224,11 @@ pub fn record(st: &AppState, workspace_id: &str, node_id: &str, v: &Value) {
             v["detail"].as_str().unwrap_or("")
         ],
     );
+    // A successful publish means the tree this workspace's code graph was
+    // built from has moved. Marked rather than rebuilt here: parsing a large
+    // tree is minutes, and the agent that published is waiting on this call.
+    // `graph::stale_tick` picks it up.
+    if v["ok"].as_bool() == Some(true) {
+        crate::graph::mark_stale(&db, workspace_id);
+    }
 }

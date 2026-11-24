@@ -86,6 +86,9 @@ pub struct Opts<'a> {
     pub cwd: Option<&'a str>,
     pub dry_run: bool,
     pub attach: bool,
+    /// Take the seat of this name back, with the conversation it was last
+    /// on, instead of starting a new agent beside it.
+    pub reuse: bool,
 }
 
 /// What to do about the session this directory belongs to.
@@ -126,20 +129,46 @@ pub fn seat_name(cli: &str, host: &str) -> String {
 }
 
 /// `name`, or the first of `name-2`, `name-3`, ... that nobody has.
+///
+/// A name that ALREADY ends in a number counts on from there, so asking for
+/// `Claude-laptop-2` when it is taken gives `Claude-laptop-3` rather than
+/// `Claude-laptop-2-2` -- and a third gives `-4`, instead of a `-2-2-2` that
+/// gets longer every time somebody runs it.
 pub fn free_name(name: &str, taken: &[String]) -> String {
     if !taken.iter().any(|t| t == name) {
         return name.to_string();
     }
-    (2..1000)
-        .map(|n| format!("{name}-{n}"))
+    let (stem, from) = match name.rsplit_once('-') {
+        Some((stem, n)) => match n.parse::<u32>() {
+            Ok(n) if !stem.is_empty() => (stem, n.saturating_add(1).max(2)),
+            _ => (name, 2),
+        },
+        None => (name, 2),
+    };
+    (from..1000)
+        .map(|n| format!("{stem}-{n}"))
         .find(|candidate| !taken.iter().any(|t| t == candidate))
         // A thousand seats of one name on one machine is not a case to
         // design for; it is a case not to loop for ever over.
         .unwrap_or_else(|| format!("{name}-1000"))
 }
 
-/// What a session covering this directory should be called: the directory's
-/// own name, which is how a person refers to it. `$HOME` is not "alice".
+/// Where a `run` goes when nothing says otherwise.
+///
+/// It used to invent a session per DIRECTORY -- `nexmesh`, `motus`, `home` --
+/// so running a CLI in three directories left three one-agent teams that
+/// nobody asked for, and `nexmesh sessions` filled up with them. A default
+/// team is easier to find things in, and moving an agent out of it is one
+/// command when it turns out to deserve its own.
+///
+/// A session that already OWNS the directory still wins: running inside a
+/// team's workspace is how you join that team, which is the behaviour worth
+/// keeping.
+pub const DEFAULT_SESSION: &str = "default";
+
+/// What a workspace covering this directory should be called: the
+/// directory's own name, which is how a person refers to it. `$HOME` is not
+/// "alice".
 pub fn session_name(cwd: &str, home: &str) -> String {
     let t = cwd.trim_end_matches('/');
     if !home.is_empty() && t == home.trim_end_matches('/') {
@@ -148,10 +177,31 @@ pub fn session_name(cwd: &str, home: &str) -> String {
     t.rsplit('/').find(|p| !p.is_empty()).unwrap_or("work").to_string()
 }
 
-/// Whether a seat is free to be taken: a seat whose last process has gone.
-/// A seat somebody is sitting in is not offered, because two CLIs in one seat
-/// is the bug `seat` and `spawn` already refuse.
-pub fn pick_seat(seats: &[Value], want: &str) -> Seat {
+/// Which seat this run should use.
+///
+/// A NEW ONE, unless asked otherwise. `run` is how you start an agent, and
+/// starting one is not the same as picking up whatever was last in a seat of
+/// that name: two people running `nexmesh run` in one directory should get
+/// two agents with two conversations, not the second quietly inheriting the
+/// first one's history.
+///
+/// `reuse` asks for the old behaviour -- take the seat of this name if its
+/// process has gone, and with it the conversation it was last on. A seat
+/// somebody is sitting in is never offered either way, because two CLIs in
+/// one seat is the bug `seat` and `spawn` already refuse.
+pub fn pick_seat(seats: &[Value], want: &str, reuse: bool) -> Seat {
+    if !reuse {
+        let taken: Vec<String> = seats
+            .iter()
+            .filter_map(|a| a["name"].as_str().map(String::from))
+            .collect();
+        return Seat::Make { name: free_name(want, &taken) };
+    }
+    pick_free_seat(seats, want)
+}
+
+/// A seat of this name whose last process has gone, or a new one.
+fn pick_free_seat(seats: &[Value], want: &str) -> Seat {
     let taken: Vec<String> = seats
         .iter()
         .filter_map(|a| a["name"].as_str().map(String::from))
@@ -277,12 +327,34 @@ pub async fn run(
         ),
         None => match owner["session"].as_str().filter(|s| !s.is_empty()) {
             Some(name) => Team::Join(name.to_string(), covering),
+            // Nobody owns this directory: the default team. Not a team per
+            // directory -- see DEFAULT_SESSION.
+            //
+            // Looked up rather than created blind: creating a session does
+            // not refuse a name that is already taken, so running in two
+            // directories would otherwise leave two teams both called
+            // `default`, which is worse than the thing being fixed.
             None => {
-                Team::Make(session_name(&cwd, &std::env::var("HOME").unwrap_or_default()))
+                let existing =
+                    crate::get(c, format!("{base}/v1/sessions")).await.ok().and_then(|v| {
+                        v["sessions"].as_array().map(|rows| {
+                            rows.iter().any(|s| s["name"].as_str() == Some(DEFAULT_SESSION))
+                        })
+                    });
+                if existing == Some(true) {
+                    // It is there; this directory is simply not in it yet,
+                    // so it gets a mount of its own below.
+                    Team::Join(DEFAULT_SESSION.to_string(), None)
+                } else {
+                    Team::Make(DEFAULT_SESSION.to_string())
+                }
             }
         },
     };
 
+    // The workspace already covering this directory, if the team has one.
+    // Only used by `--reuse`.
+    let covering_ws: Option<String>;
     let host_label = node.clone();
     let want = o.name.map(String::from).unwrap_or_else(|| seat_name(&cli, &host_label));
 
@@ -290,73 +362,94 @@ pub async fn run(
         match &team {
             Team::Join(s, ws) => println!(
                 "session:   join {s}{}",
-                match ws {
+                match ws.as_ref().filter(|_| o.reuse) {
                     Some(w) => format!(", working in its \"{w}\" workspace"),
-                    None => format!(", mounting {cwd} into it"),
+                    None => String::new(),
                 }
             ),
-            Team::Make(s) => println!("session:   create {s}, with {cwd} mounted on {node}"),
+            Team::Make(s) => println!("session:   create {s}"),
         }
-        println!("seat:      {want} (reused if it is here and empty)");
+        // Said plainly, because both of these changed: a run makes its OWN
+        // seat and its OWN workspace rather than sharing whatever is already
+        // in the directory.
+        if o.reuse {
+            println!("seat:      {want} (taken back if it is here and empty, with its conversation)");
+            println!("workspace: whichever one covers {cwd}");
+        } else {
+            println!("seat:      {want} (new; -2, -3 ... if that name is taken)");
+            println!("workspace: {want}, its own mount of {cwd} on {node}");
+        }
         println!("spawn:     {cli} on {node}, interactive, in {cwd}");
-        println!("then:      attach this terminal to it");
+        println!(
+            "then:      {}",
+            if o.attach { "attach this terminal to it" } else { "leave it running" }
+        );
         return Ok(());
     }
 
-    // The session, made if this directory belongs to nobody -- and in either
-    // case a workspace that covers this directory, because that is what tells
-    // the node where to start the CLI.
-    let (session, workspace) = match team {
+    // THE SESSION FIRST, THEN THE SEAT, THEN ITS WORKSPACE.
+    //
+    // In that order, because the workspace is named after the seat and the
+    // seat's name is not known until the session's seats have been read: a
+    // second run in one directory becomes `...-2`, and naming the workspace
+    // before that collided on the session's unique workspace name and failed
+    // the whole run.
+    let session = match team {
         Team::Join(s, ws) => {
             println!("session    {s}");
-            let ws = match ws {
-                Some(w) => w,
-                None => {
-                    // The team does not know about this directory yet. Mount
-                    // it rather than starting the CLI somewhere else.
-                    let name = session_name(&cwd, &std::env::var("HOME").unwrap_or_default());
-                    let v = crate::post(
-                        c,
-                        format!("{base}/v1/sessions/{s}/workspaces"),
-                        json!({ "name": name, "kind": "node_local",
-                                "node": node, "path": cwd }),
-                    )
-                    .await?;
-                    crate::bail_on_error(&v)?;
-                    println!("workspace  {name} (mounting {cwd} on {node})");
-                    name
-                }
-            };
-            (s, ws)
+            // Remembered for `--reuse`, which keeps the old behaviour of
+            // working in whatever workspace already covers the directory.
+            covering_ws = ws;
+            s
         }
         Team::Make(name) => {
-            let v = crate::post(
-                c,
-                format!("{base}/v1/sessions"),
-                json!({
-                    "name": name,
-                    "workspaces": [{
-                        "name": name, "kind": "node_local",
-                        "node": node, "path": cwd,
-                    }],
-                }),
-            )
-            .await?;
+            // Without workspaces: the one that matters is added below, once
+            // the seat it belongs to has a name.
+            let v =
+                crate::post(c, format!("{base}/v1/sessions"), json!({ "name": name })).await?;
             crate::bail_on_error(&v)?;
-            println!("session    {name} (new, owning {cwd} on {node})");
-            (name.clone(), name)
+            println!("session    {name} (new)");
+            covering_ws = None;
+            name
         }
     };
 
     // The seat: the one of this name that is free, or a new one.
     let status = crate::get(c, format!("{base}/v1/sessions/{session}/status")).await?;
     let seats = status["agents"].as_array().cloned().unwrap_or_default();
-    let (slot, name) = match pick_seat(&seats, &want) {
+    let (slot, name) = match pick_seat(&seats, &want, o.reuse) {
         Seat::Reuse { slot, name } => {
             println!("seat       {name} ({slot}, taking the seat it left)");
             (slot, name)
         }
         Seat::Make { name } => {
+            // A WORKSPACE OF THIS SEAT'S OWN.
+            //
+            // Sharing the one already covering the directory made two agents
+            // in one path share a workspace, and with it everything keyed on
+            // the workspace. They are separate agents doing separate work;
+            // the directory being the same is not a reason to join them
+            // together. So each gets its own mount of that same path, named
+            // after the seat -- which is why this happens here, where the
+            // seat's final name is known.
+            //
+            // `--reuse` works in whatever covers the directory instead,
+            // because taking a seat back means taking back what it had.
+            let workspace = match covering_ws.clone().filter(|_| o.reuse) {
+                Some(w) => w,
+                None => {
+                    let v = crate::post(
+                        c,
+                        format!("{base}/v1/sessions/{session}/workspaces"),
+                        json!({ "name": name, "kind": "node_local",
+                                "node": node, "path": cwd }),
+                    )
+                    .await?;
+                    crate::bail_on_error(&v)?;
+                    println!("workspace  {name} (its own mount of {cwd} on {node})");
+                    name.clone()
+                }
+            };
             let mut body = json!({
                 "cli_id": cli, "display_name": name, "mode": "interactive",
                 "placement": { "node": node },
@@ -391,7 +484,10 @@ pub async fn run(
     // A CLI needs a moment to put something on its screen; attaching into an
     // empty pty looks like nothing happened.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let reason = crate::attach(base, c, &session, &name, 0, ca_cert, identity).await?;
+    // Through the waiting wrapper, so `run` rides out a node restart the
+    // same way `attach` does rather than dropping the operator at a shell.
+    let reason =
+        crate::attach_until_ended(base, c, &session, &name, 0, ca_cert, identity).await?;
     println!("{reason}");
     println!("It is still here: nexmesh attach {session} {name}");
     Ok(())
@@ -484,15 +580,16 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_seat_of_the_right_name_is_taken_not_duplicated() {
-        // The whole point of a stable name: run it again tomorrow and the
-        // conversation that seat was on is the one that comes back.
+    fn with_reuse_an_empty_seat_of_the_right_name_is_taken() {
+        // What `--reuse` is for: run it again tomorrow and the conversation
+        // that seat was on is the one that comes back. NOT the default --
+        // see the tests below.
         let seats = vec![json!({
             "name": "Claude-machine-b", "slot_id": "sl-1", "exited": true,
             "agent_status": "exited",
         })];
         assert_eq!(
-            pick_seat(&seats, "Claude-machine-b"),
+            pick_seat(&seats, "Claude-machine-b", true),
             Seat::Reuse { slot: "sl-1".into(), name: "Claude-machine-b".into() }
         );
     }
@@ -504,7 +601,7 @@ mod tests {
             "agent_status": "running",
         })];
         assert_eq!(
-            pick_seat(&seats, "Claude-machine-b"),
+            pick_seat(&seats, "Claude-machine-b", true),
             Seat::Make { name: "Claude-machine-b-2".into() }
         );
     }
@@ -520,7 +617,7 @@ mod tests {
         // Reused -- which is right: `run` would start the next turn there
         // itself. What must not happen is a second seat beside it.
         assert_eq!(
-            pick_seat(&seats, "Hermes-machine-d"),
+            pick_seat(&seats, "Hermes-machine-d", true),
             Seat::Reuse { slot: "sl-h".into(), name: "Hermes-machine-d".into() }
         );
     }
@@ -532,7 +629,7 @@ mod tests {
             "agent_status": "running",
         })];
         assert_eq!(
-            pick_seat(&seats, "Claude-machine-b"),
+            pick_seat(&seats, "Claude-machine-b", true),
             Seat::Make { name: "Claude-machine-b".into() }
         );
     }
@@ -542,5 +639,102 @@ mod tests {
         assert_eq!(urlencoding("/working/nexmesh"), "/working/nexmesh");
         assert_eq!(urlencoding("/home/a b"), "/home/a%20b");
         assert_eq!(urlencoding("machine-b"), "machine-b");
+    }
+}
+
+#[cfg(test)]
+mod default_seat_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `run` STARTS AN AGENT. It does not pick up whoever was last here.
+    ///
+    /// Reusing an empty seat of the same name meant a second `nexmesh run`
+    /// in a directory inherited the first agent's conversation instead of
+    /// getting one of its own -- which is not what "run" says, and is
+    /// surprising in the one way that matters: somebody else's history
+    /// turning up in your terminal.
+    #[test]
+    fn run_makes_a_new_seat_even_when_an_empty_one_has_that_name() {
+        let seats = vec![json!({
+            "name": "Claude-machine-b", "slot_id": "sl-1", "exited": true,
+            "agent_status": "exited",
+        })];
+        assert_eq!(
+            pick_seat(&seats, "Claude-machine-b", false),
+            Seat::Make { name: "Claude-machine-b-2".into() }
+        );
+    }
+
+    /// And it keeps numbering, so a third run is a third agent rather than
+    /// a collision with the second.
+    #[test]
+    fn each_run_in_one_directory_is_another_agent() {
+        let seats = vec![
+            json!({"name": "Claude-machine-b", "slot_id": "sl-1", "exited": false,
+                   "agent_status": "running"}),
+            json!({"name": "Claude-machine-b-2", "slot_id": "sl-2", "exited": true,
+                   "agent_status": "exited"}),
+        ];
+        assert_eq!(
+            pick_seat(&seats, "Claude-machine-b", false),
+            Seat::Make { name: "Claude-machine-b-3".into() }
+        );
+    }
+
+    /// A seat somebody is sitting in is never taken, with or without the
+    /// flag: two CLIs in one seat resume the same conversation, which is the
+    /// bug `spawn` refuses outright.
+    #[test]
+    fn an_occupied_seat_is_never_taken_either_way() {
+        let seats = vec![json!({
+            "name": "Claude-machine-b", "slot_id": "sl-1", "exited": false,
+            "agent_status": "running",
+        })];
+        for reuse in [true, false] {
+            assert_eq!(
+                pick_seat(&seats, "Claude-machine-b", reuse),
+                Seat::Make { name: "Claude-machine-b-2".into() },
+                "reuse={reuse}"
+            );
+        }
+    }
+
+    /// An empty session: the first run is the plainly named seat.
+    #[test]
+    fn the_first_run_gets_the_unsuffixed_name() {
+        assert_eq!(
+            pick_seat(&[], "Claude-machine-b", false),
+            Seat::Make { name: "Claude-machine-b".into() }
+        );
+    }
+}
+
+#[cfg(test)]
+mod free_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_numeric_suffix_is_counted_on_from() {
+        let taken: Vec<String> =
+            ["Claude-laptop", "Claude-laptop-2"].iter().map(|s| s.to_string()).collect();
+        // Asking for the plain name when it is taken.
+        assert_eq!(free_name("Claude-laptop", &taken), "Claude-laptop-3");
+        // Asking for one that already ends in a number: count on, rather
+        // than producing `Claude-laptop-2-2` and then `-2-2-2`.
+        assert_eq!(free_name("Claude-laptop-2", &taken), "Claude-laptop-3");
+    }
+
+    #[test]
+    fn a_free_name_is_left_as_asked() {
+        assert_eq!(free_name("Claude-laptop", &[]), "Claude-laptop");
+        assert_eq!(free_name("Claude-laptop-7", &[]), "Claude-laptop-7");
+    }
+
+    #[test]
+    fn a_name_that_merely_contains_a_dash_is_not_a_suffix() {
+        // `claude-dev` is a CLI id, not `claude` numbered.
+        let taken = vec!["Claude-dev".to_string()];
+        assert_eq!(free_name("Claude-dev", &taken), "Claude-dev-2");
     }
 }

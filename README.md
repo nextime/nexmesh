@@ -2,11 +2,11 @@
 
 **One team of AI agents, across every machine you own.**
 
-nexmesh runs agent CLIs (Claude Code, Codex, opencode, qwen, gemini, anything
-that speaks MCP) on as many machines as you like and makes them one team: one
-message log, one shared memory, one plan, one set of file locks. You watch it
-and drive it from a terminal, a browser or a phone, and you can attach to any
-agent's real terminal from anywhere.
+nexmesh runs agent CLIs (Claude Code, Codex, opencode, qwen, gemini, Cursor,
+Freebuff, anything that speaks MCP) on as many machines as you like and makes
+them one team: one message log, one shared memory, one plan, one set of file
+locks. You watch it and drive it from a terminal, a browser or a phone, and
+you can attach to any agent's real terminal from anywhere.
 
 ![The dashboard: four agents on two machines, one awaiting review](docs/images/dashboard-agents.png)
 
@@ -138,6 +138,7 @@ A line beginning with `/` is an instruction instead of an utterance:
 /move Dev #payments
 /start Dev interactive
 /new claude Reviewer
+/fold Dev
 /remove Dev force
 ```
 
@@ -176,7 +177,17 @@ reply as it arrives, spoken through the same bridge. A long answer is split to
 fit the model's context and the pieces are joined back into one, so a
 paragraph is read as a paragraph.
 
-Nothing is submitted for you. Enter stays yours.
+What gets read is **the reply, not the screen**. An agent CLI draws its own
+input box, spinner, status row and tool output, and a terminal read line by
+line is all of that — so every line is sorted into the agent's own words or the
+CLI's furniture, and only the words are spoken. One rule, in one place, used by
+the browser terminal and the console alike.
+
+Nothing is submitted for you. Enter stays yours — and a transcription arrives
+as one line whatever the transcriber does with newlines, because a newline
+typed at a prompt *is* Enter. What was heard is shown as well as typed: a
+microphone whose only evidence is what a CLI happens to echo is one you cannot
+tell from a microphone that is not working.
 
 ### A dashboard that is also an app
 
@@ -213,7 +224,13 @@ else is running, which is the useful thing most of the time: a game or a
 workspace in front of you, the fleet off to one side. It is the same PWA, so
 it installs and behaves the same way.
 
-`/xr` is the other mode: the team standing in the room with you.
+`/xr` is the other mode: the team standing in the room with you. **`the room`
+in the dashboard's header** is the way in — a link, because an installed app
+has no address bar — and the room installs as its own app, starting there
+instead of at the dashboard. On a Quest, `/xr` opens in the browser; an
+installed headset app is a package built with Meta's Bubblewrap, which the
+hub's `--assetlinks` option feeds the one file such a package has to be
+verified against.
 
 ![The team, standing in a room](docs/images/xr-team.png)
 
@@ -339,6 +356,81 @@ A review state machine the agents cannot skip: `idle → working →
 done_pending_review → addressing_feedback → approved → released`, with
 reviewers self-approving and nobody disconnecting mid-loop.
 
+### Context that outlives the window it was learned in
+
+A long-lived agent spends its context twice: once working, and then again
+carrying what it did. A CLI's own compaction answers the second cost by
+summarising its context into its context, where the next compaction summarises
+the summary -- four generations of that remember the shape of the work and
+none of its facts, and none of it survives a restart on a CLI that cannot
+resume.
+
+So an agent **folds** instead. It writes down what a stretch of work
+established -- the decision and the reason for it, the paths with their line
+numbers, the exact error -- and hands the raw material over as detail, which
+nexmesh keeps out of its context and gives back **in full** whenever anything
+asks for it. `search_context` finds a fold by any word in its summary *or* in
+the detail it put away, `unfold_context` returns that detail verbatim, and
+folds fold into folds, so a month of work is a handful of summaries over a
+tree of detail that is read downwards only where a question needs it.
+
+The ordering is the point. Well before any threshold, a seat that has taken on
+another quarter of a window is asked to fold what the step it is on has
+finished with; at the threshold it is asked again, plainly, because a
+compaction is about to replace its context -- and the compaction then happens
+whether or not it answered, because a full context is worse than a fold nobody
+wrote. What was folded survives all of it, and a seat that starts or restarts
+is handed its own folds in its brief.
+
+Scoped like the rest of the memory: a seat's own working context, the team's,
+or the whole fleet's for ever.
+
+### A team that does not run away by itself
+
+Three failures that happen at three in the morning, each a number you set per
+seat, per team or fleet-wide, and each **off until you set it**:
+
+- **A context filling up.** How full every seat is, read to the token from the
+  CLI's own conversation file -- not estimated, and not scraped off a status
+  line -- against the window its *model* has. The seat is asked to fold what
+  it no longer needs first, so what it chose to keep is out of harm's way;
+  past your percentage, nexmesh types that CLI's own compaction command at it,
+  before it loses the middle of its own conversation mid-task.
+- **An agent going round in circles.** An agent in a loop is a *busy* one: it
+  answers heartbeats and burns tokens and looks like it is working. Every turn
+  is reduced to what it DID, and a repeating cycle -- including two failing
+  steps alternating -- gets the seat interrupted, paused and reported to you,
+  with its conversation intact. Different arguments are different work, so an
+  agent reading forty files is never flagged.
+- **A flood of messages.** One seat sending too much, and -- separately -- two
+  seats talking only to each other, which no per-seat rate ever catches. The
+  message is refused and the agent is told what to do instead; its work is not
+  stopped, only its messages.
+
+### Briefs, team rules, and a seat that only watches
+
+Fourteen **role templates** -- orchestrator, supervisor, coder, engineer,
+hacker, reviewer, planner, coordinator, designer, sysadmin, reverser,
+webmaster, assistant, observer -- each a ready-made brief that says what that
+job is, carrying named fragments of craft that several roles share: how to
+change a live system, what a handoff has to contain, what counts as evidence
+when the thing that checked the work shares the assumptions of the thing that
+made it. Nine fragments, each citing where its claims come from. Compiled in,
+so every hub has them; overridable per fleet by a file, so your wording
+survives an upgrade.
+
+**Rules for a whole team** live on the session, not in fourteen prompts: every
+new seat gets them near the top of its first prompt, everybody already running
+is told in the chat, and only the operator or an orchestrating seat may write
+them.
+
+An **observer** is a level below a plain agent: it reads the state and the
+team's memory, answers whoever asks it, and can ask one seat for progress,
+test results or an ETA -- in the hub's words, not its own. It cannot send a
+message of its own, write anything, or touch a seat. Hand out an observer
+token and point any MCP client at the hub, and somebody outside the team can
+watch it without being able to steer it.
+
 ### Security that assumes the network is real
 
 Per-node enrolment tokens, hashed at rest. An operator token carries a scope:
@@ -403,7 +495,7 @@ default for a conversation that has never been placed, not a verdict.
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nextime/nexmesh/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dev/nexmesh/main/packaging/install.sh | sh
 ```
 
 Static musl binaries: no libc version to match, nothing to compile. There are
@@ -515,6 +607,18 @@ by Graphify Labs**: parse deterministically and query the graph rather than
 asking a model to read files, say which edges are facts and which are guesses,
 treat communities as subsystems. For a code knowledge graph on its own, use
 graphify.
+
+Folds follow **[billion-context](https://github.com/ranxianglei/billion-context)
+by ranxianglei** and its `acp-kernel`: an LSM tree over prose, the model doing
+the summarising against a written doctrine, the kernel owning the layout, and
+a growth gate rather than an overflow alarm deciding when to ask. Its own form
+is a proxy in front of the model API that rewrites each request's history, and
+it is the better tool for that job; nexmesh is not in that position -- it
+drives CLIs that hold their own conversations, several of them signed in with
+a subscription rather than an API key -- so what is reimplemented here is the
+mechanism, with the three jobs a proxy does split between the MCP server
+nexmesh already is inside every seat, this store, and each CLI's own
+compaction. No code was taken.
 
 [docs/CREDITS.md](docs/CREDITS.md) is the long version: what was taken, what
 was not, and what each project is better at. It is worth reading before this

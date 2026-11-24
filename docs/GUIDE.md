@@ -25,6 +25,10 @@ it, and how to watch a fleet without installing anything.
 - [Getting a message to a working agent](#getting-a-message-to-a-working-agent)
 - [Pausing and releasing](#pausing-and-releasing)
 - [Roles, and the one role that means something](#roles-and-the-one-role-that-means-something)
+- [A ready-made brief per role](#a-ready-made-brief-per-role)
+- [Rules for a whole team](#rules-for-a-whole-team)
+- [A seat that only watches](#a-seat-that-only-watches)
+- [Keeping a team from running away](#keeping-a-team-from-running-away)
 - [Giving the team a file to look at](#giving-the-team-a-file-to-look-at)
 - [Dividing a repository between agents](#dividing-a-repository-between-agents)
 - [Delegating across teams](#delegating-across-teams)
@@ -109,6 +113,9 @@ and the shim reports it:
 | claude | `CLAUDE_CODE_SESSION_ID` | yes, by dumping the environment it gives an MCP server |
 | codex | `CODEX_THREAD_ID` | yes |
 | opencode | none | publishes none; falls back to directory and name |
+| freebuff | none | publishes none; given a store per seat instead, so "the last conversation" is unambiguous |
+| gemini | none | documents none; a seat of it starts a new conversation |
+| cursor | none | documents none; `create-chat` prints one, which a driver could use |
 | anything | `NEXMESH_CLI_SESSION` | an explicit override, consulted first |
 
 So two windows on the same project get two seats, and `/resume` returns to its
@@ -344,9 +351,9 @@ inbox.
 ### Running the fleet from whatever CLI you use
 
 Driving a fleet should not require one particular CLI. `nexmesh-orch` is a
-plain MCP stdio server, so Claude Code, Codex, opencode, qwen, Gemini, or a
-program of your own, can load it and spin up teams from the session you are
-already in.
+plain MCP stdio server, so Claude Code, Codex, opencode, qwen, Gemini, Cursor,
+Freebuff, or a program of your own, can load it and spin up teams from the
+session you are already in.
 
 ```bash
 nexmesh install-orchestrator --cli claude   --token <operator-token>
@@ -529,8 +536,9 @@ arrive where the agent can open it.
 The same two are buttons on the browser terminal, where they do exactly the
 same thing: the paperclip and the camera beside `keys` upload to the agent
 whose terminal is open, not to whichever machine happens to hold a copy of the
-workspace. Holding a line of the terminal, or right-clicking it, reads that
-line aloud, or whatever is selected.
+workspace. The loudspeaker there reads **the last thing the agent said**, not
+the screen — see below. Holding a line of the terminal, or right-clicking it,
+reads that line aloud, or whatever is selected.
 
 A picture sent this way is shown in the chat line that announces it, and opens
 full size on a click. The hub stores no files, so it fetches the bytes back
@@ -545,6 +553,34 @@ nexmesh camera payments --to Max --seconds 8     # a clip from this webcam
 
 `nexmesh camera` needs `ffmpeg` and a `/dev/video*` on this machine. Without
 them it says so rather than offering a key that does nothing.
+
+**What "the last reply" means on a screen.** A chat has messages; a terminal
+running an agent CLI has a screen, with the reply somewhere between an input
+box, a status row, a spinner, a list of files the agent read and whatever the
+CLI wants to say about updates. Reading the screen aloud reads all of that —
+which is what it used to do, line by line, with a full stop inserted between
+every line, so a wrapped paragraph came out as a dozen one-word sentences and
+then recited the input box and `auto mode on (shift+tab to cycle)`.
+
+So every line is sorted into one of two kinds: the agent's own words, or the
+CLI's **furniture** — boxes, rules, prompts, spinners, counters, tool calls and
+their output, all of it there to be looked at rather than listened to. The
+reply is the last run of the first kind. The furniture is a *table* per CLI
+family rather than a parser, so a spinner that changes glyph between releases
+is a one-line edit, and the generic set alone already drops the boxes and the
+status rows of a CLI nobody has described yet.
+
+One rule, in one place (`nexmesh_proto::screenread`), used by the browser
+terminal and by the console: the screen lives in the browser, so the page sends
+it to the hub and gets the reply back rather than there being two
+implementations of the same judgement, one of which would quietly rot. In an
+attached terminal the same rule is applied as the bytes arrive, which also
+takes care of repaints — a full-screen CLI prints its spinner forty times while
+it thinks, and forty identical lines is not forty sentences.
+
+On a screen with nothing said on it yet, that is what you are told. Selecting a
+line still wins over all of this: asking to hear a particular line is not a
+guess about which lines matter.
 
 Anything being read aloud can be stopped: `V` again in the console, `Ctrl-_`
 again in an attached terminal, and the loudspeaker button in the browser
@@ -837,6 +873,283 @@ thing `ask_capability` routes on. A role says what somebody is for; a
 capability says what they can be asked for. See
 [Asking a teammate for something you cannot do](#asking-a-teammate-for-something-you-cannot-do).
 
+### A ready-made brief per role
+
+A seat carries a **system prompt** -- who the agent in it is -- and you can
+write one by hand (`nexmesh seat-prompt`, below). The trouble with by hand is
+that it gets written once, for one seat, at the moment that seat is made: the
+fourth reviewer on a fleet ends up with a worse brief than the first, and
+nothing anywhere says what a "reviewer" is supposed to do here.
+
+So the common roles have **templates**:
+
+```bash
+nexmesh roles                                    # what there is
+nexmesh roles reviewer                           # read one in full
+nexmesh seat-prompt payments Iris --template reviewer
+nexmesh seat-prompt payments Ops --template sysadmin --skills live-systems
+```
+
+```
+ROLE           WHAT IT IS FOR
+orchestrator   Runs one team: splits the work, assigns it, keeps the plan, ...
+               carries: plan-shape, handover, independent-evidence
+coder          Writes and changes code in one part of the workspace, ...
+               carries: small-steps, secrets-hygiene, handover
+reviewer       Reviews teammates' work for defects that matter, ...
+               carries: review-craft, independent-evidence
+sysadmin       Looks after real machines and services: careful, reversible ...
+               carries: live-systems, secrets-hygiene, handover
+observer       Watches and reports progress. Cannot direct the work.
+```
+
+There are fourteen: `orchestrator`, `supervisor`, `coder`, `engineer`,
+`hacker`, `reviewer`, `planner`, `coordinator`, `designer`, `sysadmin`,
+`reverser`, `webmaster`, `assistant` and `observer`.
+
+A template says what the **job** is and nothing about how a team works -- the
+protocol, who owns what, how to reach the operator are in every first prompt
+already, and repeating them per role is how the two drift apart.
+
+**Skills.** A template carries named fragments of craft that several roles
+want and none should restate. There are nine, and what each one says is
+drawn from published practice rather than invented -- every fragment lists
+its sources in its own front matter, which is stripped before the text
+reaches a model:
+
+| | |
+|---|---|
+| `small-steps` | change one thing, verify it with something that would fail |
+| `handover` | what to write down, and what a handoff to another agent must carry |
+| `review-craft` | reviewing, including the three ways code a model wrote fails |
+| `plan-shape` | steps that end somewhere observable, criteria an agent can satisfy, non-goals |
+| `independent-evidence` | what counts as proof when the checker shares the author's assumptions |
+| `live-systems` | change safety on machines in use: blast radius, and rollback as a designed path |
+| `secrets-hygiene` | why a credential that reaches an agent's context is already exposed |
+| `authorised-scope` | staying inside an authorised scope, and what to do with what turns up |
+| `interface-states` | loading, empty, error and too-much-data, and who cannot see them |
+
+`--skills a,b` takes a different set, and `--skills ''` takes none.
+
+**And per seat, afterwards.** A seat remembers the template it was built from
+and which of its skills it carries, so one can be turned on or off without
+restating the rest:
+
+```bash
+nexmesh seat-prompt payments Iris --skill secrets-hygiene   # one more
+nexmesh seat-prompt payments Iris --no-skill handover       # one fewer
+nexmesh seat-prompt payments Iris                           # what it carries now
+```
+
+```
+Iris is built from the sysadmin template.
+  carries: live-systems, secrets-hygiene, review-craft
+  not carrying: authorised-scope, handover (this role suggests it), ...
+  --skill <name> adds one, --no-skill <name> takes one away.
+```
+
+In the dashboard the same thing is a checkbox per skill in the seat's prompt
+dialog, under a template picker. Each tick re-renders that seat's brief from
+its own template, so two people with the dialog open cannot overwrite each
+other's selection -- a tick sends one name, not the whole list.
+
+Deselecting everything leaves the role's own brief in place: the skills are
+additions to it, not the whole of it.
+
+**Writing the prompt yourself drops the template.** Once there are words an
+operator typed, re-rendering from a template would throw them away -- so the
+link is cleared and the skills stop being editable until a template is
+applied again. Applying one replaces the text, which is why it is a
+deliberate act rather than something a checkbox does by accident.
+
+Applying a template **stores the rendered text on the seat**. It is not a
+reference: you can read it back, edit it, and a running team does not change
+under itself because somebody improved a template.
+
+**Your own templates win.** Point the hub at a directory and a file there
+replaces the built-in of the same name; a new name adds a role:
+
+```
+~/.nexmesh/prompts/roles/coder.toml      # replaces the built-in coder
+~/.nexmesh/prompts/skills/house-style.md # a skill only this fleet has
+```
+
+```bash
+nexmesh-hub --prompts-dir ~/.nexmesh/prompts serve
+```
+
+```toml
+id = "coder"
+title = "Our Coder"
+summary = "Writes code the way we write it here."
+skills = ["house-style", "small-steps"]
+prompt = """
+...
+"""
+```
+
+The built-ins are compiled into the binary, so every hub has a full set with
+nothing to deploy; a local file is what survives an upgrade instead of being
+overwritten by it. One that will not parse is **skipped and named in the hub
+log** rather than taking the other thirteen away.
+
+### Rules for a whole team
+
+A seat's prompt is about that seat. Some of what a team needs to be told is
+about the **work**: the conventions, what not to touch, how this team does
+releases. Written into every seat's prompt it drifts the moment one is edited,
+so it lives on the session:
+
+```bash
+nexmesh team-rules payments                      # read them
+nexmesh team-rules payments --from rules.md      # set them
+cat rules.md | nexmesh team-rules payments --from -
+nexmesh team-rules payments --clear
+```
+
+Every seat started from then on gets them **near the top of its first
+prompt**, before the general guidance, and is told they outrank its own
+preferences about how to work. Everybody **already running** is told in the
+chat, because the prompt only reaches a seat when its next process starts and
+that may be days.
+
+Who may write them: **the operator**, and a seat holding orchestrator or
+superorchestrator authority, through its own `set_team_rules` tool. An
+ordinary agent cannot -- rules an agent can rewrite are not rules, and a
+confused agent would edit them first. Every seat can **read** them with
+`team_rules`, which is worth doing after a compaction.
+
+Keep them short. Eight kilobytes is the limit, and rules nobody can hold in
+their head are rules nobody follows; the detail belongs in the team's
+knowledge.
+
+### A seat that only watches
+
+Somebody outside a team often wants to **see** what it is doing -- a
+browser-based Claude session, a dashboard of their own, a person with a phone
+-- without being able to steer it. That is an `observer`: a level **below** a
+plain agent, and the only one that takes tools away rather than adding them.
+
+```bash
+nexmesh-hub participant-token browser --session payments --observer
+```
+
+```
+participant: browser
+session:     se-1a2b3c4d
+authority:   observer (reads and reports; cannot steer anything)
+token:       ...
+
+MCP endpoint: http://10.0.0.2:7870/v1/mcp
+  header:     Authorization: Bearer <the token above>
+```
+
+Point any MCP client at that endpoint with that token and it takes a seat in
+the team. It can:
+
+- read the state: `check_team_status`, `list_peers`, `get_plan`,
+  `get_history`, `workspace_status`, `view_file_locks`, `who_owns`;
+- read what the team knows: `query_knowledge`, `recall`, `memory_history`,
+  `query_code_graph`, `team_rules` -- which is most of the point, since an
+  outside reader wants the team's own account of the work;
+- answer whoever asks it: `check_messages`, `claim_messages`, `reply`,
+  `notify_operator`, and `set_summary` for its own status line;
+- ask **one** seat how it is getting on: `ask_progress`, for `progress`,
+  `tests` or an `eta`.
+
+It cannot send a message of its own writing, write to the team's memory, take
+a lock, change a plan, or touch a seat. `ask_progress` deliberately takes **no
+free text**: the question is the hub's words, and it tells the seat receiving
+it that the observer cannot give it instructions. An observer with a free-text
+message is `send_message` with extra steps, and watching a team turns into
+steering it one helpful suggestion at a time.
+
+**Enforced, not asked for.** The restriction is on the token, so whoever
+holds it cannot opt out; the tool list the seat is shown follows it; and every
+tool call is checked against it in the hub. A brief saying "do not give
+instructions" is a request, and a model that believes it is helping will route
+around a request.
+
+An existing seat can be made one from the chat, the dashboard or the API:
+
+```
+/authority Watcher observer
+```
+
+```bash
+curl -X POST .../v1/slots/<slot>/authority -d '{"authority":"observer"}'
+```
+
+### Keeping a team from running away
+
+Three things go wrong on their own, at three in the morning, and all three are
+**off until you turn them on**: compacting a seat throws away context it may
+need, pausing one stops work that may be fine, and refusing a message could
+break a team. Each is set per seat, per team, or fleet-wide -- a seat's own
+setting wins, then its team's, then the hub's flag -- and `off` on a seat
+holds even where its team has it on.
+
+**A context filling up.** An agent that hits its window mid-task loses the
+middle of its own conversation at the worst moment. nexmesh reads how full
+each seat is from the CLI's own conversation file -- to the token, from the
+same record the CLI shows its user -- and can type that CLI's own compaction
+command at it before it gets there:
+
+```bash
+nexmesh compact-at payments Dev 85        # this seat, at 85% of its window
+nexmesh compact-at payments session 80    # everybody who has not set their own
+nexmesh compact-at payments Dev off       # never, whatever the team says
+nexmesh status payments                   # the CTX column: how full each seat is now
+```
+
+The window is the **model's**, declared per model in the CLI's descriptor
+(`[context]` in `clis/claude.toml`), because one `claude` binary runs several
+and they do not agree. A seat is asked once and not again for five minutes --
+compaction takes about a minute and every reading during it is still over --
+and asked again next time it fills up.
+
+**An agent going round in circles.** An agent in a loop is not a stuck
+process, it is a busy one: it answers heartbeats, it burns tokens, and from
+outside it looks like an agent working hard. What gives it away is doing the
+*same thing* over and over:
+
+```bash
+nexmesh loop-guard payments Dev 5         # five identical turns is a loop
+nexmesh loop-guard payments poller off    # a seat that polls is meant to repeat itself
+```
+
+Every turn is reduced to a signature -- what it did, not how it phrased it --
+and a loop is a repeating cycle in that sequence, including an agent
+alternating between two failing steps. Different arguments are different work:
+an agent reading forty files is never flagged. Over the threshold the seat is
+**interrupted** (the keystroke its CLI declares, Escape for claude), its seat
+is **paused**, and it is reported to you with its conversation left intact --
+whatever drove it into a loop is in there, and it is the only way anybody will
+work out what happened.
+
+**A flood of messages.** Two different failures, so two numbers:
+
+```bash
+nexmesh flood payments session --per-min 30 --per-pair 20
+nexmesh flood payments coordinator --per-min 90   # it legitimately sends more
+nexmesh flood payments Dev off
+```
+
+`--per-min` catches one seat sending too much, to anybody. `--per-pair`
+catches two seats talking only to **each other**: a ping-pong is not fast, it
+is relentless, and two agents answering each other every twenty seconds never
+trip a per-minute rate while burning two turns a minute for as long as nobody
+looks. Over the limit the message is **refused** and the agent is told what to
+do instead -- its work is not stopped, only its messages -- and you are told
+once, not once per refusal.
+
+Fleet-wide defaults, for a hub that should start with them on:
+
+```bash
+nexmesh-hub --compact-at-pct 85 --loop-repeats 5 \
+            --msg-rate-per-min 30 --msg-pair-limit 20 serve
+```
+
 ### Giving the team a file to look at
 
 An agent reads files. A screenshot, a PDF or a recording has to *be* somewhere
@@ -1013,8 +1326,12 @@ A CLI is a descriptor in `clis/`, not Rust. Delivery has three tiers:
   between.
 
 Shipped and verified against the real binaries: `claude`, `opencode`, `qwen`,
-`codex`, `gemini`. A malformed descriptor is skipped loudly rather than taking
-the node down, and `cargo test` validates every shipped descriptor.
+`codex`, `freebuff`. Shipped from the CLI's own published documentation, with
+nothing run against it here: `gemini`, `cursor` -- the descriptors say so at
+the top, and say which facts are therefore absent rather than guessed (where a
+CLI keeps its conversations, which key stops a turn). A malformed descriptor is
+skipped loudly rather than taking the node down, and `cargo test` validates
+every shipped descriptor.
 
 > **opencode is a special case worth exploiting.** It already has a client/server
 > split of its own: `opencode serve --port N --hostname H` plus `opencode attach
@@ -1384,6 +1701,35 @@ grammar crate, the same reasoning as the CLI descriptors. Dependency and build
 directories are never walked, because burying a project's own code under
 `node_modules` would poison every answer drawn from the graph.
 
+**Kept honest, not kept once.** A graph used to be marked stale only when work
+was *published* into a workspace — a git sync, which a `node_local` workspace
+never has. On a real fleet that meant every graph was built the day its seat
+was made and never again: five graphs between eight and ten days old while the
+trees under them changed every hour, and an agent asking a structural question
+got an answer about a codebase that no longer existed with no way to tell.
+
+So the hub asks instead. Every few minutes it picks one workspace and asks the
+node that holds the files for a **fingerprint**: the same walk with the parsing
+taken out — how many source files, their total size, the newest mtime among
+them. Seconds, not minutes. When it differs from the one the graph was built
+from, the graph is stale and the ordinary rebuild picks it up within a minute
+or two; when it does not, nothing is reparsed however old the graph is. Each
+workspace is asked at most once every ten minutes, one per tick, because a
+fleet with a dozen workspaces should not walk all of them in the same second.
+
+A node too old to know that question never answers it, which is a fleet
+mid-upgrade rather than a failure. Those workspaces fall back to the clock:
+older than six hours, and the graph is rebuilt anyway, with
+`this node cannot say whether the tree has moved` as the reason.
+
+**A partial graph says what it is missing, and why.** The walk stops at 12,000
+source files or four minutes, whichever comes first, and either way the graph
+is labelled `partial` with the limit that stopped it — in every answer an agent
+gets and as a sentence on the dashboard, not a tooltip on a badge, because on a
+phone there is no hover and `partial` on its own reads as broken. Every answer
+also carries its age once that is worth knowing (`Parsed 9 day(s) ago`), and
+says so outright when the files have moved since.
+
 **Derived, never authored.** The graph is regenerated from the files and holds
 no opinions, which is exactly why it can be thrown away; anything an agent
 *concluded* goes in `memory`, which is attributed and scoped. Keeping them
@@ -1478,6 +1824,32 @@ memory_history {"key": "db"}
 Entries may carry a TTL, and `prune` reclaims them. A fact that was only true
 for a while says so.
 
+**Where to read all of it.** The dashboard's **knowledge** tab is the operator's
+view of memory rather than a team's: every scope, nothing shadowed, each row
+labelled with what its scope points at — a team's name, a seat's name, a group.
+Agents read memory nearest-first and never see another seat's private notes;
+the person running the fleet needs the opposite, because "a global default
+exists AND one team has overridden it" is a thing to know. The four scopes are
+always listed with their counts, whether or not anything is in them: a page
+that leaves an empty scope out cannot tell you the scope is empty, which is
+exactly how a fleet whose seats had only ever written session notes came to
+look as though session scope was the only one there was.
+
+The same page **writes** one. Scope, what it belongs to, category, key, value —
+and `forget`, and `rev N` opens what the key used to say. It is attributed to
+`operator`, so a convention somebody typed is never mistaken for something a
+model concluded. The `memory-writer` capability still gates global memory for
+agents, because its job is to stop one seat giving itself fleet-wide reach; the
+person who grants that capability is the person at the page, and before this
+there was no way at all to put a fleet-wide convention into memory by hand.
+
+```bash
+curl -s "$HUB/v1/memory?scope=global"                     # everything fleet-wide
+curl -s "$HUB/v1/memory?q=argon2"                         # a value, without the key
+curl -sX POST "$HUB/v1/memory" -d '{"scope":"global","key":"working-hours",
+      "value":"nothing destructive after 23:00","category":"convention"}'
+```
+
 #### Continuity across sessions
 
 `slots.resume_handle` is cascade-deleted with its session, so yesterday's
@@ -1497,6 +1869,141 @@ When you last worked here you wrote: rewrote the tokeniser; next is the parser
 The summary matters independently of the handle: some CLIs cannot resume at
 all, and a handle is opaque, so it cannot be read by a different CLI picking
 the work up. One rehydrates the conversation, the other rehydrates the intent.
+
+#### Folds: context that outlives the window it was learned in
+
+A long-lived agent spends its context twice. Once working, and then again
+carrying what it did — and the second cost is the one that ends the session.
+A CLI's own compaction answers it by summarising its context into its context,
+where the next compaction summarises the summary; what survives four
+generations of that is the shape of the work without its facts, nothing of it
+survives a restart on a CLI that cannot resume, and no teammate can read any
+of it.
+
+A **fold** is the alternative. The agent writes down what a stretch of its
+work established, and hands the raw material over as `detail`; nexmesh keeps
+the detail out of the context and gives it back in full whenever anything asks.
+
+```
+fold_context {"topic": "the tenant migration",
+              "summary": "tenant_id added in migrations/0041.sql:12; the backfill is
+                          idempotent and runs in batches of 5000",
+              "detail":  "<four thousand lines of psql output>"}
+
+Folded as fd-9c1f20ab41e2 (tier 1, agent memory). About 31200 tokens of detail
+now cost you 38 to carry. You can let that detail go: `unfold_context` with
+that id gives it back in full, and `search_context` finds it by its words.
+```
+
+Four tools, and the shape of the thing is in them:
+
+| | |
+|---|---|
+| `fold_context` | fold a stretch away. `covers` names earlier folds to put one summary above a group of them — that is the tier |
+| `unfold_context` | the detail back, verbatim. On a fold that covers others, the folds underneath it, so a question descends only as far as it has to |
+| `search_context` | by any word in a topic, a summary **or** the detail that was put away |
+| `context_map` | how full this seat is, what it has folded, per tier, and the rule |
+
+**The doctrine is part of the product, not a prompt.** One rule decides when —
+fold a stretch when, and only when, the step you are on no longer needs it —
+and two lists decide what: keep paths with their line numbers, signatures, the
+exact error text, decisions together with their reasons, exact values, and how
+the goal has changed; drop the output of a command once the result is out of
+it, a file read twice, the route to a conclusion, and a dead end (but keep
+what the dead end taught). A summary written without those lists keeps the
+narrative and loses the facts, which is exactly what a CLI's own compaction
+produces. The text travels with the tool description, the nudge and the map,
+so an agent never has to have read this page.
+
+**The tier is what makes it bounded.** Tier 1 folds the agent's own work; tier
+2 folds tier-1 folds; and so on. A covered fold is retired from the map but
+not deleted — it is reachable through its parent, with its detail — so a month
+of work is a handful of summaries over a tree that is read downwards only
+where a question needs it, and a stretch of work is never under two parents.
+
+**Scoped like the rest of the memory**, and defaulting to `agent`: most of
+what a seat folds is its own working context, and a team whose every seat
+folded into the session scope would bury what the team actually needs under
+everybody's housekeeping. `session` is for what the team should know,
+`global` for what outlives every team. The read path is the memory store's
+nearest-first list, so a fold in another seat's private scope cannot be
+unfolded by guessing its id.
+
+**When it happens, without anybody asking.** Two steps, in this order, both
+riding on the compaction threshold that is already set:
+
+- Well under the threshold — above a floor of six tenths of it, so the recent
+  part of the conversation is never summarised — a seat that has taken on
+  another **quarter of a window** since it was last asked gets a nudge. It
+  says what to fold and names no percentage: the ordinary ask reads better as
+  an efficiency habit than as an overflow warning, and a model told it is
+  nearly out of room folds in a hurry and keeps the wrong things.
+- At the threshold, the ask is made again and plainly — a compaction is about
+  to replace its context — and nothing is typed at the terminal for ninety
+  seconds. If a fold arrives, the compaction follows at once, because what the
+  agent wanted to keep is already out of harm's way. If none does, it happens
+  anyway: a full context is worse than a fold nobody wrote. Over 95% nothing
+  waits for anything, because there is no room left to write a fold in.
+
+The ask is a message, not a keystroke, because the judgement belongs to the
+only thing that can make it: the agent knows which stretch of its own context
+the step it is on has finished with, and the hub does not. On a seat that is
+typed at, that message is typed into the terminal like any other — which costs
+a couple of hundred tokens of the context it is asking the agent to save, and
+queues the compaction keystroke behind it for as long as the typing takes.
+Both are worth it, but neither is free, and that is why the gate is a quarter
+of a window rather than a reminder.
+
+**Asking by hand.** `/fold <agent>` in the chat asks one seat to fold now,
+whatever CLI it is on — before you restart it, or before you hand its work to
+somebody else. It is a message rather than a keystroke, which is why it works
+on every seat on the fleet and not only the ones whose conversation nexmesh
+can read. The automatic nudge above needs an occupancy reading, and that comes
+from a `[context]` section in the CLI's descriptor: today only `claude`
+declares one, so on every other CLI the folding happens when the agent decides
+to or when you ask.
+
+**And it is handed back.** A seat that starts or restarts gets its own folds
+in its brief, highest tier first and capped, beside the `[CONTINUING EARLIER
+WORK]` summary above:
+
+```
+[WHAT YOU PUT AWAY]
+You folded these stretches of earlier work. The detail of each is kept whole:
+`unfold_context` with an id gives it back, and `search_context` finds a fold
+by its words. Read the summaries; unfold only what the work in front of you
+needs.
+- fd-4a18e0c9 (tier 2) the week: three days of migration work, in one line
+- fd-9c1f20ab (tier 1) the tenant migration: tenant_id added in migrations/...
+[END]
+```
+
+**Where this comes from, and what is different here.** The design is
+[billion-context](https://github.com/ranxianglei/billion-context)'s, with the
+kernel published as `acp-kernel` — an LSM tree over prose, the model doing the
+summarising against a written doctrine, a growth gate rather than an alarm.
+Its own form is a proxy in front of the model API: it rewrites each request's
+history into summary blocks plus a raw recent zone, injects its tools, and
+executes the compression itself. nexmesh is not in that position and does not
+want to be — it drives CLIs that hold their own conversations, and the seats
+that matter most on a real fleet sign in with a subscription rather than an
+API key, so there is no request to rewrite and no base URL that could carry
+them. The three jobs a proxy does are split instead: **injecting** through the
+MCP server nexmesh already is inside every seat, **retrieving** through the
+tools above, and **evicting** through each CLI's own compaction — with the
+fold written first, which is the whole ordering.
+
+What that costs: no fold can be taken mid-turn, so folding costs the agent a
+tool call, and the raw material is handed over rather than excised behind its
+back. What it buys: a fold is scoped and shared, so a teammate, an observer or
+the same seat on a different CLI next week can read what was put away, and
+none of it depends on a credential being in nexmesh's hands. No code of
+billion-context's was taken; see [CREDITS.md](CREDITS.md).
+
+`tests/e2e_folds.py` covers the tools against a live hub, including that the
+detail comes back whole after the hub restarts, and `tests/e2e_watchdog.py`
+covers the ordering: a seat over its threshold is asked to fold, nothing is
+typed while that is outstanding, and the compaction follows once it folds.
 
 ## Terminals, failure and recovery
 
@@ -1550,6 +2057,32 @@ So a `claude` agent that nexmesh launched on machine-a in interactive mode is fu
 drivable from machine B. A `claude` you started yourself in a bare ssh session
 on machine-a is **not**: that pty belongs to your shell. Start it inside tmux and
 `nexmesh adopt` reaches it — see above.
+
+**An attach is one agent, not the machine it runs on.** A seat held in tmux is
+reached through a second, grouped client the node attaches — and that client had
+tmux's whole keyboard. `Ctrl-B %` split the pane and handed whoever was attached
+a *shell* on that host, `Ctrl-B c` opened a window with another, `Ctrl-B :` was
+a tmux command prompt, and tmux's right-click menu offered the same splits with
+the mouse. None of that is what pressing "attach" says it does.
+
+So the view the node creates has **no prefix key at all** (`prefix` and
+`prefix2` are session options, set on that view), and the viewer drops
+button-3 reports before they reach tmux — that half has to be done in the
+viewer, because tmux key bindings are per *server* and unbinding the mouse menu
+there would change your own tmux. The wheel still scrolls the pane's history,
+`Ctrl-F` still hands the mouse back and forth, and `Ctrl-]` still detaches.
+
+Your own way in is untouched on purpose: `tmux attach -t nexmesh-cli-<slot>`
+has tmux's ordinary keyboard, because that *is* how you get a terminal on a
+machine. The lock is on the door nexmesh opens, not on tmux.
+
+**And when the CLI goes, the seat goes.** Surviving a node restart is the whole
+point of holding a CLI in tmux, which made the opposite case worth stating:
+`remain-on-exit` is set `off` on the held session, so a CLI that exits or
+crashes takes its session with it rather than leaving a dead pane behind. The
+node's client then exits, the hub is told the agent exited, and every viewer is
+detached — instead of sitting in front of a dead screen with the hub still
+reporting a running seat.
 
 ### Starting a CLI that is attachable from the first keystroke
 
@@ -1833,33 +2366,79 @@ ways each CLI asks are not the same:
 | opencode, driven | `permission.asked` events on its HTTP stream | answered `{"reply": "always"}` — the server blocks the turn until something answers |
 | claude | its own settings, not a flag nexmesh passes | nothing is injected; in `stream-json` mode it does not prompt |
 
-**When nobody is attached, the node answers the prompt itself.** A seat with a
+**When nobody is attached, the question goes to the operator.** A seat with a
 viewer on it belongs to the person looking at it, and taking the choice out
 from under them would be worse than waiting — so the node checks, every quiet
 second, whether a screen is waiting for an answer *and* whether its attach set
-is empty. Only then does it act, and two rules keep that safe to do unwatched:
+is empty. Only then does it report it: the menu as the CLI itself wrote it,
+every option with the keystroke that picks it, flagged for whether it is a yes
+and whether it grants more than the question asked. The node answers nothing.
+A standing auto-approval (`/autoapprove`, per seat or per team) answers at
+once instead, and two rules make that safe to leave on:
 
 - **The narrowest affirmative, never the widest.** `1. Yes` and `1. Allow` are
   taken. `Yes, and don't ask again`, `Allow for this session` and `Always
   allow` are not: a decision taken for somebody must not also be a decision
-  taken for every future case.
-- **An unrecognised shape is left alone and reported.** A guessed keystroke at
+  taken for every future case. When every yes on the screen widens, it waits
+  for a person like anything else.
+- **An unrecognised shape is never guessed at.** It is reported with no
+  buttons and the operator reads the screen themselves. A guessed keystroke at
   an unknown prompt is how an agent comes to have approved something nobody
   chose.
 
 Every answer is written into the agent's own transcript *and* posted to the
 session's chat as a pre-claimed system line, so a decision made while you were
 not looking can be found afterwards — in the console, the dashboard, the phone
-or the room. A prompt it declines to answer is reported the same way, once,
+or the room. A prompt nothing can answer is reported the same way, once,
 rather than every second.
 
 It checks on every quiet tick rather than only after new output, because a
 prompt raised while somebody was attached and then abandoned when they
 detached produces no further output at all and would otherwise sit there for
-ever. `tests/e2e_prompts.py` covers both halves against an agent whose dialog
-waits to be answered, so the keystroke it received is observable: answered
-with `1` when unattached, untouched while a viewer is on it, answered again
-once that viewer leaves.
+ever.
+
+**One seat, one card.** A terminal shows one question, so the dashboard shows
+one request per seat — the one that is actually on the screen. Four separate
+things enforce that, and each of them was a way the old code left a card
+nobody could answer:
+
+- **A new question retires the last.** Answer a prompt in the agent's own CLI
+  and the agent will often ask the next thing immediately, so its screen never
+  passes through a moment with nothing on it. The node reports only what it
+  can see; everything else pending for that seat is stale by definition, and
+  the chat says so rather than letting a card vanish silently.
+- **The same question, read through a moving screen, keeps its card.** What
+  identifies a question is the choices it offers, not the pixels around them.
+  A seat under tmux has tmux's status line on its screen *with a clock in it*:
+  fingerprinting the tail as it stood made one dialog a new question every
+  minute — 77 cards for three seats, each one a notification, none of which
+  could be retired because only the newest was remembered. The node now
+  fingerprints the words rather than the characters, and the hub treats a
+  matching set of choices as the request it already has and refreshes it in
+  place.
+- **The choices belong to the live dialog.** Scrollback is append-only, so a
+  dialog answered a moment ago is still on the screen above the current one.
+  The menu is read as the *last* run of option lines, not as every numbered
+  line in the tail: taking the first `1.` it found offered the operator the
+  previous dialog's words beside this dialog's keystrokes.
+- **A request for an agent that is gone is retired.** A pending approval is a
+  stopped agent waiting for a person; once the process has exited, or the seat
+  has been through a newer one, the buttons can only fail. Swept when an agent
+  exits and once when the hub starts — the second because nothing a node says
+  will ever mention a dead agent again, so nothing else can clear it. An agent
+  that is merely *disconnected* is left alone: its node may come back with the
+  dialog still up.
+
+A node that restarted has forgotten what it reported, while the hub's row
+outlived it, so the first quiet tick on a seat with no question up tells the
+hub exactly that — the clearing is about the seat, not about one dialog.
+
+`tests/e2e_prompts.py` covers all of it against an agent whose dialog waits to
+be answered, so the keystroke it received is observable: answered with `1`
+when unattended, untouched while a viewer is on it, raised again once that
+viewer leaves, and — for the case above — a dialog the agent answers *at its
+own keyboard* before stopping on a different one, where the first card has to
+go without anybody clicking it.
 
 **An interactive seat must not be launched into a CLI that will stop and ask.**
 The reason is specific: a teammate's message is *typed* at such a seat, and a
@@ -1946,6 +2525,35 @@ is as close to canon pastels as it is to the point. Both are CSS tokens on
 code graph as a structure with a far side. It is one file of WebGL2 and WebXR
 (`xr.js`) served by the hub, with no 3D library and no external assets, and it
 works on a flat screen as well as in a headset.
+
+**Getting to it.** `the room` in the dashboard's header, which is a link
+rather than a button on purpose: an installed app has no address bar, so a
+page with no link to `/xr` makes the room unreachable from inside it. The
+dashboard's manifest also offers the room as a shortcut, which is how a
+long-press on the icon on Android, or a right-click on the desktop, reaches a
+second page of one app.
+
+**The room installs as its own app.** `/manifest-xr.webmanifest` starts at
+`/xr`, where the dashboard's manifest starts at the dashboard. Two manifests,
+so a headset and a phone get the app each of them wants.
+
+**A headset package.** A Meta Quest will open `/xr` in its browser, but
+Horizon OS has no install button there: a Quest app is a signed package built
+from a hosted manifest with Meta's Bubblewrap, in `immersive` mode, pointed at
+`/manifest-xr.webmanifest`. An immersive package then refuses to launch unless
+the origin it claims serves a Digital Asset Links file naming the package and
+the SHA-256 fingerprint of the certificate it was signed with. Neither is
+knowable before the package is built, so the hub serves a file it is given:
+
+```
+nexmesh-hub --assetlinks /etc/nexmesh/assetlinks.json ... serve
+```
+
+at `/.well-known/assetlinks.json`, and answers 404 with that instruction until
+it has one. The installed app asks for the headset as it loads rather than
+waiting for a button — Meta's documentation treats the tap on the app icon as
+the user activation `requestSession` needs, and in a headset there is no mouse
+to press a button with anyway.
 
 **Flat-screen controls.** Drag to look, scroll to step back, click a teammate
 to open their terminal, drag a screen to move it, drag one of its corners to

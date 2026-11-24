@@ -523,3 +523,309 @@ mod tests {
         assert!(w.contains(&MAX_PATIENCE_MS.to_string()));
     }
 }
+
+use anyhow::Result;
+use rusqlite::{params, Connection};
+
+/// Retire the seat of a hand-run CLI that has exited.
+///
+/// A seat exists so the fleet can put something back in it. For a MANAGED
+/// seat that is the whole point: the process goes, the hub starts another,
+/// and the conversation, name, role and history are waiting for it. For a
+/// seat that a hand-run CLI took by itself there is nothing to come back --
+/// the operator closed a terminal -- and the seat stays in the roster with
+/// an exited agent in it, which is a teammate that is not there.
+///
+/// NOT EVERY ONE, though. A hand-run conversation RETURNS TO ITS OWN SEAT:
+/// `slots.cli_session` is what makes `nexmesh move-agent` stick, so that a
+/// conversation placed in a team is in that team again the next time it is
+/// opened. Deleting the seat throws that away, and the next run arrives as a
+/// stranger with a default name in whatever team the installer picks.
+///
+/// So the seat goes only when it is CARRYING NOTHING: never configured by an
+/// operator, and never part of the room's history. Anything the operator put
+/// on it -- a role, a system prompt, an instruction, ownership of part of the
+/// tree -- is a statement that this seat is meant to exist, and so is having
+/// spoken in the team.
+pub fn retire_if_throwaway(db: &Connection, slot_id: &str) -> Result<bool> {
+    // Still occupied? Then this was one of several and the seat is in use.
+    let live: i64 = db.query_row(
+        "SELECT COUNT(*) FROM agents WHERE slot_id = ? AND exited_at_ms IS NULL",
+        [slot_id],
+        |r| r.get(0),
+    )?;
+    if live > 0 {
+        return Ok(false);
+    }
+    // Only ever a seat that nothing but a hand-run CLI has sat in. One
+    // managed agent in its history means the fleet has started this seat
+    // before and may again.
+    let not_attached: i64 = db.query_row(
+        "SELECT COUNT(*) FROM agents WHERE slot_id = ? AND provenance <> 'attached'",
+        [slot_id],
+        |r| r.get(0),
+    )?;
+    if not_attached > 0 {
+        return Ok(false);
+    }
+    // Anything an operator set on it.
+    //
+    // The `?` is deliberate, and was a bug here: this once named a column
+    // that does not exist and swallowed the error with unwrap_or(0), so the
+    // guard read "nothing was configured" and the seat was deleted. A check
+    // that cannot run must refuse to delete, never approve.
+    // NOT `role`. The installer writes one: `nexmesh install-seat` puts
+    // NEXMESH_ROLE into the CLI's own MCP config, so every hand-run claude
+    // on a machine arrives calling itself an engineer. Treating that as
+    // operator intent would keep every seat and make this do nothing, which
+    // is exactly what it did until the live config was read.
+    let configured: i64 = db.query_row(
+        "SELECT COUNT(*) FROM slots
+          WHERE id = ?
+            AND (COALESCE(role_description,'') <> ''
+              OR COALESCE(system_prompt,'') <> ''
+              OR COALESCE(instructions,'') <> ''
+              OR COALESCE(authority,'agent') <> 'agent'
+              OR COALESCE(supervisor,0) <> 0
+              OR COALESCE(voice,'') <> ''
+              OR COALESCE(model,'') <> ''
+              OR workspace_id IS NOT NULL)",
+        [slot_id],
+        |r| r.get(0),
+    )?;
+    if configured > 0 {
+        return Ok(false);
+    }
+    // And anything the OPERATOR ever did to this seat, which is the honest
+    // signal that they mean it to exist: renaming it, moving it, giving it a
+    // role or a prompt, pinning a conversation to it. Every one of those
+    // writes an audit row naming the slot.
+    let acted_on: i64 = db.query_row(
+        "SELECT COUNT(*) FROM audit
+          WHERE actor = 'operator' AND detail LIKE '%\"slot\":\"' || ? || '\"%'",
+        [slot_id],
+        |r| r.get(0),
+    )?;
+    if acted_on > 0 {
+        return Ok(false);
+    }
+    // Ownership of part of the tree is a statement that this seat answers
+    // for something, and it lives in its own table.
+    let owns: i64 = db.query_row(
+        "SELECT COUNT(*) FROM ownership WHERE slot_id = ?",
+        [slot_id],
+        |r| r.get(0),
+    )?;
+    if owns > 0 {
+        return Ok(false);
+    }
+    // And anything it said, or that was said to it. Removing a seat does not
+    // remove messages -- they carry a slot id and no foreign key -- so this
+    // is not about losing them. It is that a name in the room's history
+    // should still resolve to something.
+    let spoke: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE from_slot = ? OR to_slot = ?",
+        params![slot_id, slot_id],
+        |r| r.get(0),
+    )?;
+    if spoke > 0 {
+        return Ok(false);
+    }
+    // Nor one that is remembered.
+    let remembered: i64 = db.query_row(
+        "SELECT COUNT(*) FROM memory WHERE author_slot = ?",
+        [slot_id],
+        |r| r.get(0),
+    )?;
+    if remembered > 0 {
+        return Ok(false);
+    }
+
+    let agents = db.execute("DELETE FROM agents WHERE slot_id = ?", [slot_id])?;
+    db.execute("DELETE FROM slots WHERE id = ?", [slot_id])?;
+    let _ = db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+        params![
+            nexmesh_proto::now_ms(),
+            "hub",
+            "slot_retired",
+            serde_json::json!({ "slot": slot_id, "agents": agents,
+                                "why": "a hand-run CLI exited and its seat carried nothing" })
+            .to_string()
+        ],
+    );
+    tracing::info!(slot = %slot_id, agents,
+        "a hand-run CLI exited and its seat carried nothing; retired it");
+    Ok(true)
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+    use rusqlite::OptionalExtension;
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(nexmesh_proto::SCHEMA_SQL).unwrap();
+        crate::state::migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn seat(c: &Connection, slot: &str) {
+        c.execute(
+            "INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+             VALUES (?,'s1','Hand','claude',1)",
+            [slot],
+        )
+        .unwrap();
+    }
+
+    fn agent(c: &Connection, id: &str, slot: &str, provenance: &str, exited: bool) {
+        c.execute(
+            "INSERT INTO agents (id,slot_id,provenance,status,started_at_ms,last_seen_ms,exited_at_ms)
+             VALUES (?,?,?,'exited',1,1,?)",
+            params![id, slot, provenance, if exited { Some(2i64) } else { None }],
+        )
+        .unwrap();
+    }
+
+    fn exists(c: &Connection, slot: &str) -> bool {
+        c.query_row("SELECT 1 FROM slots WHERE id = ?", [slot], |_| Ok(true))
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    /// The case this exists for: a CLI run by hand, closed, carrying nothing.
+    #[test]
+    fn a_throwaway_hand_run_seat_goes() {
+        let c = db();
+        seat(&c, "sl-1");
+        agent(&c, "ag-1", "sl-1", "attached", true);
+        assert!(retire_if_throwaway(&c, "sl-1").unwrap());
+        assert!(!exists(&c, "sl-1"));
+    }
+
+    /// A MANAGED seat never goes: the fleet starts it again, and its
+    /// conversation and history are waiting for it.
+    #[test]
+    fn a_managed_seat_stays() {
+        let c = db();
+        seat(&c, "sl-2");
+        agent(&c, "ag-2", "sl-2", "managed", true);
+        assert!(!retire_if_throwaway(&c, "sl-2").unwrap());
+        assert!(exists(&c, "sl-2"));
+    }
+
+    /// Nor one that is still occupied by somebody else.
+    #[test]
+    fn a_seat_with_someone_still_in_it_stays() {
+        let c = db();
+        seat(&c, "sl-3");
+        agent(&c, "ag-3a", "sl-3", "attached", true);
+        agent(&c, "ag-3b", "sl-3", "attached", false);
+        assert!(!retire_if_throwaway(&c, "sl-3").unwrap());
+        assert!(exists(&c, "sl-3"));
+    }
+
+    /// A CONFIGURED seat stays, because a hand-run conversation returns to
+    /// its own seat: `cli_session` is what makes `move-agent` stick, and
+    /// deleting the seat would make the next run arrive as a stranger.
+    #[test]
+    fn a_seat_an_operator_set_up_stays() {
+        for (what, sql) in [
+            ("a role description", "UPDATE slots SET role_description='reads diffs' WHERE id='sl-4'"),
+            ("a system prompt", "UPDATE slots SET system_prompt='you are' WHERE id='sl-4'"),
+            ("an instruction", "UPDATE slots SET instructions='do this' WHERE id='sl-4'"),
+            ("authority", "UPDATE slots SET authority='orchestrator' WHERE id='sl-4'"),
+        ] {
+            let c = db();
+            seat(&c, "sl-4");
+            agent(&c, "ag-4", "sl-4", "attached", true);
+            c.execute_batch(sql).unwrap();
+            assert!(!retire_if_throwaway(&c, "sl-4").unwrap(), "{what} should keep the seat");
+            assert!(exists(&c, "sl-4"), "{what} should keep the seat");
+        }
+    }
+
+    /// A role ALONE is not operator intent: `install-seat` writes
+    /// NEXMESH_ROLE into the CLI's own config, so every hand-run claude on
+    /// the machine arrives calling itself an engineer. This is the case the
+    /// whole feature is for, and reading `role` as configuration made it do
+    /// nothing at all.
+    #[test]
+    fn the_role_the_installer_gives_every_hand_run_cli_is_not_configuration() {
+        let c = db();
+        seat(&c, "sl-7");
+        agent(&c, "ag-7", "sl-7", "attached", true);
+        c.execute_batch("UPDATE slots SET role='engineer' WHERE id='sl-7'").unwrap();
+        assert!(retire_if_throwaway(&c, "sl-7").unwrap(), "an installer default must not keep it");
+        assert!(!exists(&c, "sl-7"));
+    }
+
+    /// But an operator who did something to the seat keeps it, whatever the
+    /// seat's columns say: renaming, moving and pinning all leave a trace.
+    #[test]
+    fn a_seat_the_operator_touched_stays() {
+        let c = db();
+        seat(&c, "sl-8");
+        agent(&c, "ag-8", "sl-8", "attached", true);
+        c.execute(
+            "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+             VALUES (1,'operator',NULL,'role_changed',?)",
+            [r#"{"slot":"sl-8","from":null,"to":"reviewer"}"#],
+        )
+        .unwrap();
+        assert!(!retire_if_throwaway(&c, "sl-8").unwrap());
+        assert!(exists(&c, "sl-8"));
+        // And a trace naming a DIFFERENT seat does not save this one.
+        let c2 = db();
+        seat(&c2, "sl-9");
+        agent(&c2, "ag-9", "sl-9", "attached", true);
+        c2.execute(
+            "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+             VALUES (1,'operator',NULL,'role_changed',?)",
+            [r#"{"slot":"sl-90","to":"reviewer"}"#],
+        )
+        .unwrap();
+        assert!(retire_if_throwaway(&c2, "sl-9").unwrap());
+    }
+
+    /// And one that took part in the room stays, so a name in the history
+    /// still resolves to something.
+    #[test]
+    fn a_seat_that_spoke_stays() {
+        let c = db();
+        seat(&c, "sl-5");
+        agent(&c, "ag-5", "sl-5", "attached", true);
+        c.execute(
+            "INSERT INTO messages (session_id,from_slot,to_slot,kind,body,sent_at_ms)
+             VALUES ('s1','sl-5',NULL,'text','I found it',1)",
+            [],
+        )
+        .unwrap();
+        assert!(!retire_if_throwaway(&c, "sl-5").unwrap());
+        assert!(exists(&c, "sl-5"));
+    }
+
+    /// Or that left something in the team's memory.
+    #[test]
+    fn a_seat_that_is_remembered_stays() {
+        let c = db();
+        seat(&c, "sl-6");
+        agent(&c, "ag-6", "sl-6", "attached", true);
+        c.execute(
+            "INSERT INTO memory (scope,scope_ref,key,category,value,author_slot,
+                                 created_at_ms,updated_at_ms)
+             VALUES ('session','s1','k','context','v','sl-6',1,1)",
+            [],
+        )
+        .unwrap();
+        assert!(!retire_if_throwaway(&c, "sl-6").unwrap());
+        assert!(exists(&c, "sl-6"));
+    }
+}

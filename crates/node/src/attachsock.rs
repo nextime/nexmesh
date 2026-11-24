@@ -98,10 +98,13 @@ pub async fn open(
                 }
             }
 
-            // Size the pty to the viewer's terminal before replaying, so a TUI
-            // redraws at the right dimensions rather than wrapping oddly.
-            io.resize(cols, rows);
+            // Size the pty before replaying, so a TUI redraws at the right
+            // dimensions rather than wrapping oddly -- but as THIS viewer's
+            // contribution, reconciled with whoever else is watching. An
+            // arriving viewer used to resize the pty to its own window,
+            // which shrank somebody else's terminal mid-edit.
             io.add_attach(&attach_id);
+            io.resize_from(&attach_id, cols, rows);
             let _ = ctx
                 .send_hub(&NodeToHub::AttachOpened {
                     attach_id: attach_id.clone(),
@@ -201,7 +204,9 @@ pub fn resize(ctx: &Arc<NodeCtx>, attach_id: &str, cols: u16, rows: u16) {
             if let Some(v) = ctx.viewer(&attach_id) {
                 v.resize(cols, rows);
             } else if let Some(io) = ctx.io_for_attach(&attach_id) {
-                io.resize(cols, rows);
+                // Per viewer: the pty's size is what every viewer can show,
+                // not whichever one spoke last. See `AgentIo::resize_from`.
+                io.resize_from(&attach_id, cols, rows);
             }
         }
 

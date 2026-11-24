@@ -508,8 +508,7 @@ fn feed_lines<'a>(msgs: &[Value], th: Theme, width: usize, height: usize) -> Vec
             break;
         }
         let from = s(m, "from");
-        let body = s(m, "body").replace(['\n', '\r', '\t'], " ");
-        let chunks = textwrap(&body, avail);
+        let chunks = wrap_shaped(&s(m, "body"), avail);
         let cut = chunks.len() > MAX_PER_MESSAGE;
         for (i, c) in chunks.iter().take(MAX_PER_MESSAGE).enumerate() {
             if lines.len() >= height {
@@ -804,7 +803,7 @@ fn chat(f: &mut Frame, area: Rect, app: &App) {
         // nick in a narrow pane would otherwise leave three characters for
         // the message.
         let indent = pre.min(w / 3);
-        let chunks = textwrap(&body.replace(['\n', '\r', '\t'], " "), w.saturating_sub(indent));
+        let chunks = wrap_shaped(&body, w.saturating_sub(indent));
         let mut rest = chunks.as_slice();
         if let Some(first) = chunks.first() {
             // The first line only joins the header if it fits beside it.
@@ -1295,6 +1294,41 @@ fn side(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Wrap a message, keeping the shape it was written in.
+///
+/// `textwrap` alone wraps on `split_whitespace`, which is a way of saying it
+/// deletes every newline, blank line and indent it is given. Both chat panes
+/// used to hand it a body with the newlines already replaced by spaces on top
+/// of that, so a teammate's numbered list, diff or indented snippet reached
+/// the reader as one run-on paragraph -- and the formatting is most of what a
+/// snippet IS.
+///
+/// Each line keeps its own indent, and a wrapped line keeps it too, so a
+/// block shifts without reflowing. Runs of blank lines collapse to one and
+/// the ends are trimmed, because vertical room in a pane is scarce.
+fn wrap_shaped(s: &str, w: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in s.replace('\r', "\n").replace('\t', "    ").split('\n') {
+        if raw.trim().is_empty() {
+            // One blank line between paragraphs, never two, and never at
+            // the top where it would push the message off its own header.
+            if !out.is_empty() && !out.last().map(|l| l.is_empty()).unwrap_or(true) {
+                out.push(String::new());
+            }
+            continue;
+        }
+        let indent: String = raw.chars().take_while(|c| *c == ' ').collect();
+        let pad = indent.chars().count();
+        for piece in textwrap(raw.trim_start_matches(' '), w.saturating_sub(pad)) {
+            out.push(format!("{indent}{piece}"));
+        }
+    }
+    while out.last().map(|l| l.is_empty()).unwrap_or(false) {
+        out.pop();
+    }
+    out
+}
+
 /// Wrap on spaces. `textwrap` would be a dependency for eleven lines.
 fn textwrap(s: &str, w: usize) -> Vec<String> {
     let w = w.max(8);
@@ -1347,7 +1381,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
     let keys = match app.pane {
         Pane::Chat => " j/k channel · ↑↓ a name · Enter talks to it · a attach · i type · v say · ? help",
         Pane::Graph => " 1-8 panes · j/k subsystem · w workspace · p panel · t theme · ? help · q quit",
-        Pane::Agents => " a attach · n new · S start · m move · e rename · x remove · P camera · , . sort · ? help",
+        Pane::Agents => " a attach · n new · S start · m move · e rename · E prompt · x remove · P camera · , . sort · ? help",
         Pane::Memory => " j/k move · Enter opens it · PgDn scrolls · s scope · ? help · q quit",
         _ => " 1-8 panes · j/k move · s scope · p panel · t theme · r refresh · ? help · q quit",
     };
@@ -1385,6 +1419,7 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
         row("S", "start a process for the seat under the cursor"),
         row("m", "move that seat into another session"),
         row("e", "rename it"),
+        row("E", "edit what it tells its agent: system prompt, arrival instruction"),
         row("x", "remove it, seat and history"),
         row(", .", "sort the agents by the previous / next column"),
         row("R", "reverse the agent order"),
@@ -1571,5 +1606,47 @@ mod tests {
         assert_eq!(n(&v, "nope"), 0);
         assert!(b(&v, "b"));
         assert!(!b(&v, "nope"));
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::wrap_shaped;
+
+    #[test]
+    fn a_list_keeps_its_lines_and_its_indent() {
+        // The chat panes used to replace every newline with a space and then
+        // wrap on whitespace, so this arrived as one run-on line.
+        let got = wrap_shaped("do these:\n  1. rebase\n  2. test", 40);
+        assert_eq!(got, vec!["do these:", "  1. rebase", "  2. test"]);
+    }
+
+    #[test]
+    fn a_wrapped_line_keeps_the_indent_it_started_with() {
+        // Otherwise the continuation of an indented bullet lands under the
+        // left margin and reads as a new one.
+        let got = wrap_shaped("    aaa bbb ccc ddd", 12);
+        assert!(got.iter().all(|l| l.starts_with("    ")), "{got:?}");
+        assert!(got.len() > 1, "{got:?}");
+    }
+
+    #[test]
+    fn blank_lines_are_kept_but_not_hoarded() {
+        // One blank between paragraphs is structure; four is a pane with no
+        // room left for the next message.
+        let got = wrap_shaped("one\n\n\n\ntwo", 40);
+        assert_eq!(got, vec!["one", "", "two"]);
+    }
+
+    #[test]
+    fn the_ends_are_trimmed() {
+        let got = wrap_shaped("\n\n  hi  \n\n", 40);
+        assert_eq!(got, vec!["  hi"]);
+    }
+
+    #[test]
+    fn a_tab_becomes_an_indent_rather_than_vanishing() {
+        let got = wrap_shaped("fn a() {\n\tb();\n}", 40);
+        assert_eq!(got, vec!["fn a() {", "    b();", "}"]);
     }
 }

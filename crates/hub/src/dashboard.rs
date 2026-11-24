@@ -97,10 +97,106 @@ pub async fn manifest() -> Response {
     { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
     { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
     { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "shortcuts": [
+    { "name": "The room", "short_name": "room", "url": "./xr",
+      "description": "The same fleet as a room you can stand in",
+      "icons": [ { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" } ] }
   ]
 }"##,
     )
         .into_response()
+}
+
+/// The room, installable on its own.
+///
+/// The dashboard's manifest cannot do this job: its `start_url` is the flat
+/// dashboard, so an app installed from the room page opens the dashboard and
+/// the room is unreachable -- an installed app has no address bar to type a
+/// path into. A headset wants the opposite of a phone, so it gets its own
+/// app, whose start page IS the room.
+///
+/// This is also the manifest to hand Meta's Bubblewrap when packaging for a
+/// headset: Horizon OS has no install button in its browser, so a Quest app
+/// is a signed package built from a hosted manifest, and an IMMERSIVE one
+/// launches straight into WebXR. Meta's WebXR PWA documentation says only
+/// `name`, `short_name`, `start_url`, `scope` and `icons` are read and that
+/// everything else is ignored, so the fields below are chosen to be the ones
+/// that are read -- with `display` and the colours kept for ordinary browsers,
+/// which do read them.
+pub async fn manifest_xr() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/manifest+json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        r##"{
+  "name": "nexmesh room",
+  "short_name": "room",
+  "description": "Your fleet as a room you can stand in.",
+  "start_url": "./xr?immersive=1",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#08090d",
+  "theme_color": "#08090d",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}"##,
+    )
+        .into_response()
+}
+
+/// Digital Asset Links, for a headset package that claims this origin.
+///
+/// Meta's own requirement, and the one thing that cannot be arranged from
+/// outside the hub: an immersive WebXR app packaged for Horizon OS "does not
+/// launch if this verification fails", and what it verifies is a file served
+/// by the origin at exactly this path, naming the package and the SHA-256
+/// fingerprint of the certificate it was signed with. Both are known only
+/// once the package has been built, so the file is given to the hub rather
+/// than invented by it: `--assetlinks <file>`.
+///
+/// Unset, this answers 404 and says what to do, which is the honest answer --
+/// there is no package claiming this origin, so nothing may be verified
+/// against it.
+pub async fn assetlinks(State(st): State<AppState>) -> Response {
+    let Some(path) = st.assetlinks.as_ref().clone() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "No Digital Asset Links file is configured on this hub. A headset package \
+             (Bubblewrap) needs one: generate it with `bubblewrap fingerprint add \
+             <sha256-of-your-signing-certificate>` and start the hub with \
+             --assetlinks /path/to/assetlinks.json.\n",
+        )
+            .into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            // Said out loud rather than 404'd: a file that was configured and
+            // cannot be read is a deployment mistake, and a headset that
+            // refuses to launch gives no clue which.
+            tracing::warn!(path = %path.display(), error = %e,
+                           "the configured Digital Asset Links file could not be read");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the Digital Asset Links file configured on this hub \
+                         ({}) could not be read: {e}\n", path.display()),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// The installed app's icon. One SVG at any size, so there is nothing to
@@ -405,7 +501,12 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         let Some(sid) = sx["id"].as_str().map(String::from) else { continue };
         let outside: Vec<Value> = db
             .prepare(
-                "SELECT s.id, s.display_name, s.role, s.status, s.participant_kind
+                "SELECT s.id, s.display_name, s.role, s.status, s.participant_kind,
+                        -- Where it says it runs, from its newest run: a
+                        -- service is somewhere, even when it is not a node.
+                        (SELECT a.host_hint FROM agents a
+                          WHERE a.slot_id = s.id AND a.host_hint IS NOT NULL
+                          ORDER BY a.started_at_ms DESC LIMIT 1)
                    FROM slots s
                   WHERE s.session_id = ? AND s.participant_kind <> 'cli'
                   ORDER BY s.display_name",
@@ -418,6 +519,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         "role": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                         "status": r.get::<_, String>(3)?,
                         "kind": r.get::<_, String>(4)?,
+                        "host": r.get::<_, Option<String>>(5)?,
                     }))
                 })
                 .and_then(|m| m.collect())
@@ -454,8 +556,13 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             s.task_state, s.summary, s.status, s.restarts,
                             COALESCE(sx.name, ''),
                             COALESCE(a.provenance, '-'), {word},
-                            COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external'
-                                                  ELSE '-' END),
+                            -- An external participant has no node row, but it
+                            -- may have said where it runs. Naming the host
+                            -- beats the bare word external, which reads as
+                            -- nowhere.
+                            COALESCE(n.name, a.host_hint,
+                                     CASE WHEN a.provenance='external' THEN 'external'
+                                          ELSE '-' END),
                             COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0),
                             COALESCE(a.cache_read_tokens,0), COALESCE(a.push_capable,0),
                             a.id, s.mode, s.paused, a.pid,
@@ -472,6 +579,12 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                                         AND v.exited_at_ms IS NULL)
                                 END, a.id),
                             s.voice,
+                            -- A guest: its home is another team and it also
+                            -- answers in the one being looked at. In the
+                            -- all-sessions view nothing is a guest, because
+                            -- every room is on screen.
+                            (?1 <> '*' AND s.session_id <> ?1),
+                            COALESCE(s.autorespawn, 1), COALESCE(s.auto_approve, 0),
                             -- The adopted terminal's SLOT, alive or not, and
                             -- whether its process is still there. Without
                             -- these a client can only report that an attach
@@ -480,14 +593,36 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             -- when a tmux view has exited under a seat.
                             (SELECT v.slot_id FROM agents v WHERE v.id = s.terminal_via),
                             (SELECT CASE WHEN v.exited_at_ms IS NULL THEN 1 ELSE 0 END
-                               FROM agents v WHERE v.id = s.terminal_via)
+                               FROM agents v WHERE v.id = s.terminal_via),
+                            -- What this seat tells its agent, as sizes: the
+                            -- text is at /v1/slots/<id>/prompt, so the roster
+                            -- can badge it without carrying it.
+                            LENGTH(COALESCE(s.system_prompt, '')),
+                            COALESCE(s.system_prompt_mode, 'append'),
+                            LENGTH(COALESCE(s.instructions, '')),
+                            -- HOW FULL this seat's context is, and the window
+                            -- it has to fit in. Not the token counts above,
+                            -- which are what it has SPENT: a seat can spend
+                            -- twelve windows and be a third full, and it is
+                            -- this pair that says whether it is about to lose
+                            -- the middle of its own conversation.
+                            a.context_used_tokens, a.context_limit_tokens,
+                            -- Whether anything is set to act on that, and on
+                            -- repeating itself. NULL means it follows its
+                            -- team, which is what most seats do.
+                            s.compact_at_pct, s.loop_guard_repeats,
+                            a.loop_repeats
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
                         SELECT id FROM agents WHERE slot_id = s.id
                         ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
                      LEFT JOIN nodes n ON n.id = a.node_id
-                     WHERE (?1 = '*' OR s.session_id = ?1)
+                     -- Guests included: a seat whose home is another team and
+                     -- that also answers in this one is addressable here, so
+                     -- the roster has to show it. `session` already carries
+                     -- its home, which is how the page tells them apart.
+                     WHERE (?1 = '*' OR {here})
                        -- Adopted terminals are not teammates: they are the
                        -- screens other seats are sitting in, and every seat
                        -- they serve carries `attach_agent_id` so the terminal
@@ -497,6 +632,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                        AND COALESCE(s.cli_id,'') <> 'tmux' AND s.tmux_target IS NULL
                      ORDER BY 2",
                     word = crate::seat::agent_word("s", "a"),
+                    here = crate::guests::in_session("s", "?1"),
                 ))
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
@@ -532,8 +668,19 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             // Which voice reads this one out, when the fleet
                             // is being listened to rather than read.
                             "voice": r.get::<_, Option<String>>(24)?,
-                            "terminal_slot": r.get::<_, Option<String>>(25)?,
-                            "terminal_live": r.get::<_, Option<i64>>(26)? == Some(1),
+                            "visiting": r.get::<_, bool>(25)?,
+                            "autorespawn": r.get::<_, i64>(26)? == 1,
+                            "auto_approve": r.get::<_, i64>(27)? == 1,
+                            "terminal_slot": r.get::<_, Option<String>>(28)?,
+                            "terminal_live": r.get::<_, Option<i64>>(29)? == Some(1),
+                            "system_prompt_bytes": r.get::<_, i64>(30)?,
+                            "system_prompt_mode": r.get::<_, String>(31)?,
+                            "instruction_bytes": r.get::<_, i64>(32)?,
+                            "context_used_tokens": r.get::<_, Option<i64>>(33)?,
+                            "context_limit_tokens": r.get::<_, Option<i64>>(34)?,
+                            "compact_at_pct": r.get::<_, Option<i64>>(35)?,
+                            "loop_guard_repeats": r.get::<_, Option<i64>>(36)?,
+                            "loop_repeats": r.get::<_, Option<i64>>(37)?,
                         }))
                     })
                     .and_then(|m| m.collect())
@@ -554,7 +701,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             m.claimed_at_ms IS NOT NULL, COALESCE(m.claimed_by, ''),
                             COALESCE(m.from_slot, ''), COALESCE(m.to_slot, ''),
                             m.session_id,
-                            m.attachment, u.name, u.media_type, u.bytes, u.node_name
+                            m.attachment, u.name, u.media_type, u.bytes, u.node_name,
+                            m.cancelled_at_ms IS NOT NULL, COALESCE(m.cancelled_by, '')
                      FROM messages m
                      LEFT JOIN slots sf ON sf.id = m.from_slot
                      LEFT JOIN slots st2 ON st2.id = m.to_slot
@@ -586,6 +734,12 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             // The file this message is about, so the chat can
                             // show it rather than name a path on a machine the
                             // reader may not even be able to reach.
+                            // Withdrawn before anyone saw it. Shown rather
+                            // than hidden: the operator should see what they
+                            // cancelled, and a message that vanished from the
+                            // log would be worse than one marked.
+                            "cancelled": r.get::<_, bool>(19)?,
+                            "cancelled_by": r.get::<_, String>(20)?,
                             "file": match r.get::<_, Option<String>>(14)? {
                                 Some(up) => json!({
                                     "id": up,
@@ -629,20 +783,35 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             vec![]
         });
 
-            // Session memory, plus the global memory this session can see.
-            // Scope is carried through so the page can distinguish a fleet-wide
-            // convention from something this team decided; reading the old flat
-            // `knowledge` table here is what made the dashboard go blank when
-            // memory gained scopes.
+            // Every scope the operator should see: what this team decided,
+            // what holds fleet-wide, what its groups keep, and what each seat
+            // keeps for itself. Agent scope is private BETWEEN AGENTS -- the
+            // operator is the person running the fleet and already sees
+            // everything else about those seats -- and the page labels each
+            // row with its scope, because a fleet-wide convention and one
+            // seat's working note deserve different weight.
+            //
+            // Reading the old flat `knowledge` table here is what made the
+            // dashboard go blank when memory gained scopes.
             let knowledge: Vec<Value> = db
                 .prepare(
                     "SELECT m.key, m.category, m.value,
                             COALESCE(s.display_name, s.role, '?'), m.updated_at_ms,
                             m.scope, m.revision
                      FROM memory m LEFT JOIN slots s ON s.id = m.author_slot
-                     WHERE (m.scope = 'session' AND (?1 = '*' OR m.scope_ref = ?1))
-                        OR m.scope = 'global'
-                       AND (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2)
+                     WHERE (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2)
+                       AND (
+                            m.scope = 'global'
+                         OR (m.scope = 'session' AND (?1 = '*' OR m.scope_ref = ?1))
+                         -- A seat's own, and its groups': keyed by slot, so
+                         -- only the seats in the room being looked at.
+                         OR (m.scope = 'agent' AND m.scope_ref IN (
+                               SELECT id FROM slots WHERE ?1 = '*' OR session_id = ?1))
+                         OR (m.scope = 'group' AND m.scope_ref IN (
+                               SELECT g.group_name FROM memory_groups g
+                                 JOIN slots sl ON sl.id = g.slot_id
+                                WHERE ?1 = '*' OR sl.session_id = ?1))
+                       )
                      ORDER BY m.scope, m.category, m.key",
                 )
                 .and_then(|mut stmt| {
@@ -660,6 +829,52 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             tracing::error!(error = %e, "a dashboard query failed; showing nothing for it");
             vec![]
         });
+
+            // WHAT THE SEATS PUT AWAY. Beside the memory on purpose: both
+            // are the team's account of its own work, and a fold is where
+            // the detail of it went. The summary is shown and the detail is
+            // not -- it is often tens of thousands of tokens, and the point
+            // of a fold is that nobody carries it unless they ask.
+            let folds: Vec<Value> = db
+                .prepare(
+                    "SELECT f.id, f.tier, f.topic, f.summary, f.scope,
+                            COALESCE(s.display_name, s.role, f.author_slot, '?'),
+                            f.tokens_before, f.tokens_after, f.created_at_ms,
+                            f.unfolded_count, LENGTH(f.detail)
+                     FROM folds f LEFT JOIN slots s ON s.id = f.author_slot
+                     WHERE f.active = 1
+                       AND (
+                            f.scope = 'global'
+                         OR (f.scope = 'session' AND (?1 = '*' OR f.scope_ref = ?1))
+                         OR (f.scope = 'agent' AND f.scope_ref IN (
+                               SELECT id FROM slots WHERE ?1 = '*' OR session_id = ?1))
+                         OR (f.scope = 'group' AND f.scope_ref IN (
+                               SELECT g.group_name FROM memory_groups g
+                                 JOIN slots sl ON sl.id = g.slot_id
+                                WHERE ?1 = '*' OR sl.session_id = ?1))
+                       )
+                     ORDER BY f.tier DESC, f.created_at_ms DESC LIMIT 200",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![sid], |r| {
+                        Ok(json!({
+                            "id": r.get::<_, String>(0)?, "tier": r.get::<_, i64>(1)?,
+                            "topic": r.get::<_, String>(2)?,
+                            "summary": r.get::<_, String>(3)?,
+                            "scope": r.get::<_, String>(4)?, "who": r.get::<_, String>(5)?,
+                            "tokens_before": r.get::<_, i64>(6)?,
+                            "tokens_after": r.get::<_, i64>(7)?,
+                            "at_ms": r.get::<_, i64>(8)?,
+                            "unfolded": r.get::<_, i64>(9)?,
+                            "detail_bytes": r.get::<_, i64>(10)?,
+                        }))
+                    })
+                    .and_then(|m| m.collect())
+                })
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "the folds query failed; showing nothing");
+                    vec![]
+                });
 
             let locks: Vec<Value> = db
                 .prepare(
@@ -760,13 +975,19 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 .filter(|a| a["task_state"] == "done_pending_review")
                 .count();
             let live = agents.iter().filter(|a| a["status"] == "running").count();
+            // A withdrawn message is not waiting on anybody, so it is not
+            // counted here -- that tile is the number a person acts on.
             let undelivered = messages
                 .iter()
-                .filter(|m| m["delivered"] == false && m["in_flight"] == false)
+                .filter(|m| m["delivered"] == false && m["in_flight"] == false
+                            && m["cancelled"] == false)
                 .count();
             // Delivered is not dealt with. This is the number a person
             // actually wants: what is waiting on somebody.
-            let unclaimed = messages.iter().filter(|m| m["claimed"] == false).count();
+            let unclaimed = messages
+                .iter()
+                .filter(|m| m["claimed"] == false && m["cancelled"] == false)
+                .count();
             let tin: i64 = agents.iter().filter_map(|a| a["input_tokens"].as_i64()).sum();
             let tout: i64 = agents.iter().filter_map(|a| a["output_tokens"].as_i64()).sum();
             let flapping = agents.iter().filter(|a| a["slot_status"] == "flapping").count();
@@ -820,6 +1041,33 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                     // so a rename does not need the graph parsed again.
                     view["workspace"] = json!(ws_name);
                     view["workspace_id"] = json!(ws_id);
+                    // WHETHER THIS STILL DESCRIBES THE TREE.
+                    //
+                    // The view above is built when the graph is STORED, so
+                    // everything in it that changes afterwards -- the tree
+                    // moving, a rebuild failing, when the files were last
+                    // looked at -- has to be read fresh. Showing a page that
+                    // says "parsed 9 days ago" with no word on whether that
+                    // still matches the files is what made a stale graph
+                    // look like a broken one.
+                    #[allow(clippy::type_complexity)]
+                    let live: Option<(Option<i64>, Option<String>, Option<i64>, Option<i64>)> = db
+                        .query_row(
+                            "SELECT stale_at_ms, stale_reason, fp_at_ms, fp_files
+                               FROM code_graph_meta WHERE workspace_id = ?",
+                            [ws_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten();
+                    if let Some((stale_at, why, fp_at, fp_files)) = live {
+                        view["stale"] = json!(stale_at.is_some());
+                        view["stale_since_ms"] = json!(stale_at);
+                        view["stale_reason"] = json!(why);
+                        view["files_checked_at_ms"] = json!(fp_at);
+                        view["files_now"] = json!(fp_files);
+                    }
                     Some(view)
                 })
                 .collect();
@@ -830,6 +1078,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 "messages": messages,
                 "plan": plan,
                 "knowledge": knowledge,
+                "folds": folds,
                 "graph": graph,
                 "locks": locks,
                 "zones": zones,
@@ -844,6 +1093,17 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         }
     };
 
+    // Every permission prompt waiting on the operator, FLEET-WIDE rather than
+    // for the session on screen: an agent stopped on a question the operator
+    // never saw because they were looking at another team is the failure this
+    // whole path exists to prevent. The dashboard renders them as buttons and
+    // notifies on new ones.
+    // `db` is the lock this function has held since the top. Taking
+    // `st.db.lock()` again here DEADLOCKED the hub on the first dashboard
+    // poll -- std::sync::Mutex is not reentrant, and the wedged request
+    // holds the lock for ever, so every later request for anything needing
+    // the database hangs behind it too. The whole fleet goes quiet.
+    let approvals = crate::approvals::pending(&db, None);
     Json(json!({
         "hub": { "version": env!("CARGO_PKG_VERSION"), "authenticated": authed,
                  "now_ms": now, "pair_listen": pair_listen, "pki_ready": pki_ready,
@@ -854,8 +1114,86 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
         "nodes": nodes["nodes"],
         "sessions": sessions,
         "orchestrators": orchestrators,
+        "approvals": approvals,
         "detail": detail,
     }))
+}
+
+#[cfg(test)]
+mod headset_tests {
+    use super::*;
+
+    async fn body(r: Response) -> String {
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8_lossy(&b).to_string()
+    }
+
+    #[tokio::test]
+    async fn the_room_is_installable_as_its_own_app() {
+        // Installed from the dashboard's manifest, the app starts at the
+        // dashboard -- and an installed app has no address bar, so there is
+        // no way to reach the room from inside it. This is that way.
+        let m: Value = serde_json::from_str(&body(manifest_xr().await).await).unwrap();
+        assert!(m["start_url"].as_str().unwrap().contains("xr"), "{m:#}");
+        assert_eq!(m["display"], "standalone");
+        // Meta reads only name, short_name, start_url, scope and icons for a
+        // WebXR package, so all five have to be there.
+        for field in ["name", "short_name", "start_url", "scope", "icons"] {
+            assert!(!m[field].is_null(), "a headset package needs {field}: {m:#}");
+        }
+        let sizes: Vec<&str> = m["icons"].as_array().unwrap().iter()
+            .filter_map(|i| i["sizes"].as_str()).collect();
+        assert!(sizes.contains(&"512x512"), "{sizes:?}");
+    }
+
+    #[tokio::test]
+    async fn the_dashboards_app_can_still_reach_the_room() {
+        // The other half: a shortcut on the installed dashboard, which is
+        // how Android and the desktop offer a second page of one app.
+        let m: Value = serde_json::from_str(&body(manifest().await).await).unwrap();
+        let urls: Vec<&str> = m["shortcuts"].as_array().unwrap().iter()
+            .filter_map(|c| c["url"].as_str()).collect();
+        assert!(urls.iter().any(|u| u.contains("xr")), "{m:#}");
+    }
+
+    #[tokio::test]
+    async fn digital_asset_links_are_served_from_a_file_or_explained() {
+        // Meta's requirement: an immersive package does not launch unless
+        // the origin it claims serves this, naming the package and the
+        // fingerprint of the certificate it was signed with. Neither is
+        // knowable before the package exists, so the hub serves a file it is
+        // given and says so plainly when it has none -- a headset that
+        // refuses to launch otherwise gives no clue which half is missing.
+        let st = AppState::in_memory().unwrap();
+        let r = assetlinks(State(st.clone())).await;
+        assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND);
+        let said = body(r).await;
+        assert!(said.contains("--assetlinks"), "{said}");
+
+        let dir = std::env::temp_dir().join(format!("nexmesh-al-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("assetlinks.json");
+        std::fs::write(&f, r#"[{"relation":["delegate_permission/common.handle_all_urls"]}]"#)
+            .unwrap();
+        let st = st.with_assetlinks(Some(f.to_string_lossy().to_string()));
+        let r = assetlinks(State(st)).await;
+        assert_eq!(r.status(), axum::http::StatusCode::OK);
+        assert_eq!(r.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
+        assert!(body(r).await.contains("handle_all_urls"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_configured_file_that_cannot_be_read_says_so_rather_than_404() {
+        // A 404 here reads as "this hub does not do headsets", which would
+        // be a lie, and the deployment mistake would go looking in the wrong
+        // place.
+        let st = AppState::in_memory().unwrap()
+            .with_assetlinks(Some("/nonexistent/assetlinks.json".into()));
+        let r = assetlinks(State(st)).await;
+        assert_eq!(r.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body(r).await.contains("could not be read"));
+    }
 }
 
 #[cfg(test)]

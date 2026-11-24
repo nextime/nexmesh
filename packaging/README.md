@@ -5,7 +5,7 @@ Three ways in, in order of how much you want to think about it.
 ## One command
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nextime/nexmesh/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dev/nexmesh/main/packaging/install.sh | sh
 ```
 
 Static musl binaries, so the only requirement is a Linux kernel: no libc

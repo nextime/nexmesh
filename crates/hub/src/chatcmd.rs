@@ -49,6 +49,40 @@ pub enum Cmd {
     /// supervisors is delivered to it as an ordinary message, in its own
     /// session, with a return address it can answer.
     Supervisor { who: String, on: bool },
+    /// Grant or take away what a seat may do TO THE FLEET. Not `role`, which
+    /// is the seat's job and confers nothing.
+    Authority { who: String, level: String },
+    /// Answer this agent's own prompts without asking. `who` may be an
+    /// agent, or `session`/`team` for every seat in the room.
+    AutoApprove { who: String, on: bool },
+    /// Have a seat from somewhere else also answer in THIS room, or stop.
+    /// For service seats -- a capability bridge, a reviewer -- that one team
+    /// should not have to own a private copy of.
+    Guest { who: String, join: bool },
+    /// Whether the hub brings this seat back by itself when it exits.
+    AutoRespawn { who: String, on: bool },
+    /// Make an agent's CLI compact its own context, now.
+    Compact { who: String },
+    /// Ask a seat to fold what it no longer needs, now. Works on any CLI:
+    /// it is a message to the agent, not a keystroke, so it needs nothing
+    /// of that CLI except that it reads its messages.
+    Fold { who: String },
+    /// How full a seat's context may get before the hub compacts it for
+    /// them. `who` may be an agent or `session`/`team` for the whole room.
+    /// `pct` of 0 is off, and None restores "inherit".
+    CompactAt { who: String, pct: Option<i64> },
+    /// How many times a seat may repeat the same turn before the hub
+    /// interrupts it and pauses it. Same shape as `CompactAt`.
+    LoopGuard { who: String, repeats: Option<i64> },
+    /// Read or set the TEAM's standing rules: what everybody here is told,
+    /// over and above their own brief. `text` of None is a read.
+    Rules { text: Option<String> },
+    /// How much a seat may send: messages a minute, and messages exchanged
+    /// with one other seat in ten minutes. Same three states again.
+    Flood { who: String, per_min: Option<i64>, per_pair: Option<i64> },
+    /// Answer a permission prompt that is waiting. `who` narrows it to one
+    /// agent when several are stopped at once.
+    Decide { who: Option<String>, allow: bool },
 }
 
 /// What the chat can be told to do, as the chat itself explains it.
@@ -63,10 +97,78 @@ pub fn help() -> String {
      \u{2022} /owns <agent> +<pattern>       \u{2014} add one instead of replacing the list\n\
      \u{2022} /voice <agent> <voice|none>   \u{2014} which voice reads that agent aloud\n\
      \u{2022} /supervisor <agent> [off]      \u{2014} this seat hears what agents raise to the supervisors\n\
+     \u{2022} /allow [agent] \u{2502} /deny [agent]  \u{2014} answer a permission prompt that is waiting\n\
+     \u{2022} /autoapprove <agent|session> [off]\n\
+     \u{2022} /fold <agent>\n\
+     \u{2003} \u{2014} answer that seat's (or the whole room's) prompts without asking\n\
+     \u{2022} /compact <agent>             \u{2014} tell that agent's CLI to compact its \
+     own context now, by typing its own compaction command at it\n\
+     \u{2022} /compact-at <agent|session> <pct|off|default>\n\
+     \u{2003} \u{2014} compact that seat by itself once its context passes that \
+     percentage of its window. `off` for never, `default` to follow the \
+     team's or the fleet's setting. Off everywhere unless somebody sets it.\n\
+     \u{2022} /loop-guard <agent|session> <repeats|off|default>\n\
+     \u{2003} \u{2014} stop that seat if it repeats the same turn that many times \
+     in a row: it is interrupted, paused and reported to you, with its \
+     conversation intact. Off everywhere unless somebody sets it.\n\
+     \u{2022} /rules [text]                \u{2014} what everybody in this team is told, \
+     over and above their own brief: the conventions, what not to touch. With no \
+     text it shows them; `clear` removes them. Only you and an orchestrating \
+     seat can set them.\n\
+     \u{2022} /flood <agent|session> <per-minute> [per-pair]\n\
+     \u{2003} \u{2014} refuse messages from that seat beyond that many a minute, or \
+     beyond that many exchanged with any ONE other seat in ten minutes. The \
+     refusal goes to the agent and says what to do instead; its work is not \
+     stopped, only its messages. `-` leaves one of the two alone, `off` clears \
+     both. Off everywhere unless somebody sets it.\n\
+     \u{2022} /autorespawn <agent> [off]\n\
+     \u{2003} \u{2014} whether the hub brings that seat back by itself when its process \
+     exits; it prepares the seat for you to attach to, it does not reattach your terminal\n\
+     \u{2022} /invite <agent> \u{2502} /uninvite <agent>\n\
+     \u{2003} \u{2014} have a seat from another team also answer here, for a service \
+     every team needs (a capability bridge, a reviewer) rather than one copy each\n\
+     \u{2022} /authority <agent> <observer|agent|orchestrator|super>\n\
+     \u{2003} \u{2014} what that seat may do to the FLEET, not its job: an observer \
+     reads and reports and cannot steer anything, an agent is the ordinary case, \
+     an orchestrator runs its own session and can elect others there, and a \
+     superorchestrator runs the fleet. `/elect` is the same command.\n\
      \u{2022} /help\n\
      An agent is named by its name, its role or its seat id. Say something \
      starting with a slash by doubling it: //like this."
         .to_string()
+}
+
+/// A setting that is a number, or `off`, or "whatever the level above says".
+///
+/// Three states, one argument, because that is what the setting is: a seat
+/// can be off while its team is on, which is the first thing an operator
+/// reaches for and is not expressible with a number alone. `None` is the
+/// "inherit" state and is what `default` means.
+fn policy_number(
+    arg: Option<&str>,
+    what: &str,
+    low: i64,
+    high: i64,
+) -> Result<Option<i64>, String> {
+    let Some(arg) = arg.map(str::trim).filter(|a| !a.is_empty()) else {
+        return Err(format!("say {what}, or `off`, or `default`"));
+    };
+    match arg.to_lowercase().as_str() {
+        "off" | "no" | "none" | "never" => Ok(Some(0)),
+        "default" | "inherit" | "clear" | "unset" => Ok(None),
+        n => {
+            let n: i64 = n
+                .trim_end_matches('%')
+                .parse()
+                .map_err(|_| format!("'{arg}' is not {what}"))?;
+            if n < low || n > high {
+                return Err(format!(
+                    "{what} has to be between {low} and {high}, or `off`"
+                ));
+            }
+            Ok(Some(n))
+        }
+    }
 }
 
 /// Read a chat line.
@@ -98,6 +200,127 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
 
     match verb.as_str() {
         "help" | "?" | "commands" => Ok(Parsed::Do(Cmd::Help)),
+        // Answering a prompt from the console, which is where an operator
+        // watching a terminal already is.
+        "allow" | "approve" | "yes" => Ok(Parsed::Do(Cmd::Decide {
+            who: args.first().map(|s| s.to_string()),
+            allow: true,
+        })),
+        "deny" | "reject" | "no" => Ok(Parsed::Do(Cmd::Decide {
+            who: args.first().map(|s| s.to_string()),
+            allow: false,
+        })),
+        "invite" | "guest" => {
+            let who = one("an agent")?;
+            Ok(Parsed::Do(Cmd::Guest { who, join: true }))
+        }
+        "uninvite" | "release" => {
+            let who = one("an agent")?;
+            Ok(Parsed::Do(Cmd::Guest { who, join: false }))
+        }
+        "compact" | "squash" => {
+            let who = one("an agent")?;
+            Ok(Parsed::Do(Cmd::Compact { who }))
+        }
+        "fold" => {
+            let who = one("an agent")?;
+            Ok(Parsed::Do(Cmd::Fold { who }))
+        }
+        // The REST OF THE LINE, not words: these are sentences somebody
+        // wrote, and splitting and rejoining them on whitespace would
+        // quietly reflow what the team is told.
+        "rules" | "team-rules" | "teamrules" => {
+            let text = rest
+                .splitn(2, char::is_whitespace)
+                .nth(1)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            let text = match text.as_deref() {
+                // `off`/`clear` is how every other setting here is cleared,
+                // and somebody typing it means it rather than meaning to
+                // make it the team's only rule.
+                Some("off") | Some("clear") | Some("none") => Some(String::new()),
+                _ => text,
+            };
+            Ok(Parsed::Do(Cmd::Rules { text }))
+        }
+        "compact-at" | "compactat" => {
+            let who = one("an agent, or 'session'")?;
+            let pct = policy_number(args.get(1).copied(), "a percentage", 1, 100)?;
+            Ok(Parsed::Do(Cmd::CompactAt { who, pct }))
+        }
+        "flood" | "rate" => {
+            let who = one("an agent, or 'session'")?;
+            // Two numbers, in order, either of which may be `-` to leave
+            // alone: `/flood Ida 30 20`, `/flood Ida - 20`, `/flood Ida off`.
+            let first = args.get(1).copied();
+            let second = args.get(2).copied();
+            if first
+                .map(|a| matches!(a.to_lowercase().as_str(), "off" | "no" | "none" | "never"))
+                .unwrap_or(false)
+            {
+                return Ok(Parsed::Do(Cmd::Flood {
+                    who,
+                    per_min: Some(0),
+                    per_pair: Some(0),
+                }));
+            }
+            if first.is_none() {
+                return Err("say how many messages a minute, then optionally how many \
+                            between one pair in ten minutes \u{2014} or `off`, or \
+                            `default`"
+                    .to_string());
+            }
+            // `-` means "leave that one as it is", which is the only way to
+            // set the pair limit without restating the rate.
+            fn given<'a>(a: Option<&'a str>) -> Option<&'a str> {
+                a.filter(|x| *x != "-" && !x.is_empty())
+            }
+            let per_min = match given(first) {
+                None => None,
+                a => policy_number(a, "a number of messages a minute", 1, 1000)?,
+            };
+            let per_pair = match given(second) {
+                None => None,
+                a => policy_number(a, "a number of messages for one pair", 2, 1000)?,
+            };
+            Ok(Parsed::Do(Cmd::Flood { who, per_min, per_pair }))
+        }
+        "loop-guard" | "loopguard" | "loop" => {
+            let who = one("an agent, or 'session'")?;
+            // Two is the floor: one "repeat" is a single turn, and a guard
+            // that fires on that stops every agent the moment it is set.
+            let repeats = policy_number(args.get(1).copied(), "a number of repeats", 2, 99)?;
+            Ok(Parsed::Do(Cmd::LoopGuard { who, repeats }))
+        }
+        "autorespawn" | "respawn" => {
+            let who = one("an agent")?;
+            let off = args[1..]
+                .iter()
+                .any(|a| matches!(a.to_lowercase().as_str(), "off" | "no" | "none" | "never"));
+            Ok(Parsed::Do(Cmd::AutoRespawn { who, on: !off }))
+        }
+        "autoapprove" | "auto" => {
+            let who = one("an agent, or 'session'")?;
+            let off = args[1..]
+                .iter()
+                .any(|a| matches!(a.to_lowercase().as_str(), "off" | "no" | "none" | "clear"));
+            Ok(Parsed::Do(Cmd::AutoApprove { who, on: !off }))
+        }
+        // `/elect` reads naturally for promoting someone and `/authority`
+        // for inspecting or demoting; they are the same command.
+        "authority" | "elect" | "promote" => {
+            let who = one("an agent and a level")?;
+            let level = args[1..].join(" ").trim().to_lowercase();
+            if level.is_empty() {
+                return Err(format!(
+                    "/{verb} needs a level: agent, orchestrator or super. {}",
+                    usage("authority")
+                ));
+            }
+            Ok(Parsed::Do(Cmd::Authority { who, level }))
+        }
         "supervisor" | "supervise" => {
             let who = one("an agent")?;
             let off = args[1..]
@@ -205,6 +428,21 @@ fn usage(verb: &str) -> String {
         "new" | "seat" => "/new <cli> <name> [interactive|headless]",
         "owns" | "own" | "assign" => "/owns <agent> <pattern>... (prefix + to add)",
         "voice" | "speaks" => "/voice <agent> <voice|none>",
+        "authority" | "elect" | "promote" =>
+            "/authority <agent> <observer|agent|orchestrator|super>",
+        "allow" | "approve" | "yes" | "deny" | "reject" | "no" => "/allow [agent]  |  /deny [agent]",
+        "autoapprove" | "auto" => "/autoapprove <agent|session> [off]",
+        "autorespawn" | "respawn" => "/autorespawn <agent> [off]",
+        "compact" | "squash" => "/compact <agent>",
+        "fold" => "/fold <agent>",
+        "rules" | "team-rules" | "teamrules" => "/rules [the team's rules, or 'clear']",
+        "compact-at" | "compactat" => "/compact-at <agent|session> <pct|off|default>",
+        "flood" | "rate" => "/flood <agent|session> <per-minute|-|off> [per-pair]",
+        "loop-guard" | "loopguard" | "loop" => {
+            "/loop-guard <agent|session> <repeats|off|default>"
+        }
+        "invite" | "guest" => "/invite <agent>",
+        "uninvite" | "release" => "/uninvite <agent>",
         _ => "/help",
     };
     format!("Usage: {line}")
@@ -222,6 +460,20 @@ mod tests {
         assert_eq!(parse("/").unwrap(), Parsed::Say("/".into()));
         assert_eq!(parse("/ etc").unwrap(), Parsed::Say("/ etc".into()));
         assert!(matches!(parse("/usr/bin is on PATH"), Err(_)), "that IS a mistyped command");
+    }
+
+    #[test]
+    fn a_seat_can_be_asked_to_fold_whatever_cli_it_is_on() {
+        // A message, not a keystroke, so this is the one way of asking that
+        // works on every CLI on the fleet -- including the ones whose
+        // conversation nexmesh cannot read and whose fullness it therefore
+        // cannot measure.
+        assert_eq!(parse("/fold Max").unwrap(), Parsed::Do(Cmd::Fold { who: "Max".into() }));
+        let e = parse("/fold").unwrap_err();
+        assert!(e.contains("an agent"), "{e}");
+        assert!(e.contains("Usage"), "a complaint must say the shape: {e}");
+        // And it is in the list, or nobody finds it.
+        assert!(help().contains("/fold"), "{}", help());
     }
 
     #[test]
@@ -308,8 +560,8 @@ mod tests {
         );
         // A leading + adds instead of replacing.
         assert_eq!(
-            parse("/owns Max +digesta").unwrap(),
-            Parsed::Do(Cmd::Owns { who: "Max".into(), patterns: vec!["digesta".into()], add: true })
+            parse("/owns Max +team").unwrap(),
+            Parsed::Do(Cmd::Owns { who: "Max".into(), patterns: vec!["team".into()], add: true })
         );
         let e = parse("/owns Max").unwrap_err();
         assert!(e.contains("pattern"), "{e}");

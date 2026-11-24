@@ -8,6 +8,17 @@ import urllib.request, urllib.error
 # shim here the same identity and make them all claim a single seat -- which
 # looks like a bug in the hub and is not. The tests choose their own.
 import os as _os
+
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
     _os.environ.pop(_v, None)
@@ -96,6 +107,40 @@ def main():
     check("a message is delivered normally", bool(until(lambda: acked("baseline one"), 25)),
           str(q("SELECT body,acked_at_ms FROM messages")))
 
+    print("\n=== a message nobody has seen can be withdrawn ===")
+    # A message waits until it is delivered, and nothing expires it. Sent to
+    # a seat that has gone, or sent in error, it sits there for ever: the
+    # sender believes it was heard, and the next process to take that seat is
+    # handed something stale the moment it starts.
+    #
+    # Pause the seat first, so the message is genuinely waiting rather than
+    # racing delivery -- this is about the queue, not about timing.
+    http("POST", f"/v1/sessions/{sid}/pause", {"paused": True, "who": "Bo",
+                                               "reason": "staging a withdrawal"})
+    http("POST", f"/v1/sessions/{sid}/messages", {"to": "Bo", "text": "WITHDRAW-ME please"})
+    check("it is queued and unseen", bool(until(
+        lambda: q("SELECT 1 FROM messages WHERE body LIKE '%WITHDRAW-ME%'"), 15)))
+    mid = q("SELECT id FROM messages WHERE body LIKE '%WITHDRAW-ME%'")[0]["id"]
+    s, j = http("POST", f"/v1/sessions/{sid}/messages/cancel", {"id": mid})
+    check("the hub cancels it", s == 200 and j.get("cancelled") == 1, f"{s} {j}")
+    # Now let the seat run again. The withdrawn message must NOT arrive.
+    http("POST", f"/v1/sessions/{sid}/pause", {"paused": False, "who": "Bo"})
+    http("POST", f"/v1/sessions/{sid}/messages", {"to": "Bo", "text": "AFTER-IT arrives"})
+    check("a later message to the same seat still arrives",
+          bool(until(lambda: acked("AFTER-IT"), 25)),
+          str(q("SELECT body,acked_at_ms FROM messages")))
+    # Checked AFTER a later message to that seat was acked, so "not delivered"
+    # means withheld rather than merely slow.
+    check("and the withdrawn one was never delivered", not acked("WITHDRAW-ME"),
+          str(q("SELECT body,acked_at_ms,cancelled_at_ms FROM messages "
+                "WHERE body LIKE '%WITHDRAW-ME%'")))
+    # A message an agent HAS seen cannot be unsent: the log is read later to
+    # work out what an agent knew when it acted.
+    seen_id = q("SELECT id FROM messages WHERE body LIKE '%AFTER-IT%'")[0]["id"]
+    s, j = http("POST", f"/v1/sessions/{sid}/messages/cancel", {"id": seen_id})
+    check("one already seen is refused, and says why",
+          j.get("cancelled") == 0 and "cannot be unsent" in str(j.get("said", "")), str(j))
+
     print("\n=== pausing one agent stops work reaching it ===")
     s, j = http("POST", f"/v1/sessions/{sid}/pause",
                 {"paused": True, "who": "Ann", "reason": "operator is looking at something"})
@@ -167,6 +212,48 @@ def main():
           not q("SELECT 1 FROM agents WHERE slot_id=? AND exited_at_ms IS NULL", (slots["Ann"],)))
     check("Bo is still going", bool(q("SELECT 1 FROM agents WHERE slot_id=? AND exited_at_ms IS NULL",
                                       (slots["Bo"],))), "releasing one stopped the other")
+
+    print("\n=== autorespawn is the operator's, per seat ===")
+    # The hub always brought a managed seat back. That is right until it is
+    # not: a seat whose work is over, or one being stopped deliberately to
+    # look at it, was respawned out from under the operator every few
+    # seconds. Now it is a switch, and it is per seat.
+    import os as _os, signal as _signal
+    s, j = http("POST", f"/v1/slots/{slots['Bo']}/autorespawn", {"on": False})
+    check("it can be turned off for one seat", s == 200 and j.get("autorespawn") is False,
+          str(j))
+    before_bo = q("SELECT restarts FROM slots WHERE id=?", (slots["Bo"],))[0]["restarts"]
+    pid = q("SELECT pid FROM agents WHERE slot_id=? AND exited_at_ms IS NULL",
+            (slots["Bo"],))
+    check("Bo has a live process to stop", bool(pid), str(pid))
+    if pid:
+        try: _os.kill(pid[0]["pid"], _signal.SIGKILL)
+        except Exception as e: check("could stop it", False, str(e))
+    gone = until(lambda: not q("SELECT 1 FROM agents WHERE slot_id=? AND exited_at_ms IS NULL",
+                               (slots["Bo"],)), 30)
+    check("its process is gone", bool(gone))
+    time.sleep(12)   # several recovery ticks
+    check("a seat with autorespawn off STAYS down",
+          not q("SELECT 1 FROM agents WHERE slot_id=? AND exited_at_ms IS NULL",
+                (slots["Bo"],)),
+          str(q("SELECT id,exited_at_ms FROM agents WHERE slot_id=?", (slots["Bo"],))))
+    check("and nothing counted as a restart",
+          q("SELECT restarts FROM slots WHERE id=?", (slots["Bo"],))[0]["restarts"] == before_bo)
+
+    s, j = http("POST", f"/v1/slots/{slots['Bo']}/autorespawn", {"on": True})
+    check("turning it back on is accepted", s == 200 and j.get("autorespawn") is True, str(j))
+    back = until(lambda: bool(q("SELECT 1 FROM agents WHERE slot_id=? AND exited_at_ms IS NULL",
+                                (slots["Bo"],))), 40)
+    check("and then the hub brings the seat back by itself", bool(back),
+          str(q("SELECT id,exited_at_ms FROM agents WHERE slot_id=?", (slots["Bo"],))))
+    # It PREPARES the seat. Nothing attaches anybody's terminal to it, which
+    # is the whole distinction: whose terminal that would be is not the
+    # hub's to decide.
+    check("the seat is ready to attach to, with nothing attached to it",
+          not q("SELECT 1 FROM agents WHERE slot_id=? AND exited_at_ms IS NULL "
+                "AND COALESCE(attach_count,0) > 0", (slots["Bo"],))
+          if q("SELECT 1 FROM pragma_table_info('agents') WHERE name='attach_count'")
+          else True)
 
     print("\n=== releasing the team ===")
     s, j = http("POST", f"/v1/sessions/{sid}/release", {"note": "we are done"})

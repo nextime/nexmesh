@@ -167,6 +167,42 @@ pub fn store(
     category: &str,
     ttl_seconds: Option<i64>,
 ) -> Result<String> {
+    may_write(db, slot_id, scope)?;
+    write(db, slot_id, scope, key, value, category, ttl_seconds)
+}
+
+/// The operator writing a memory themselves.
+///
+/// The capability gate on global memory is about one AGENT not giving itself
+/// fleet-wide reach. The person running the fleet is who grants that
+/// capability in the first place, so they are not asking anybody's
+/// permission -- and without this there was no way at all to put a
+/// fleet-wide convention into memory by hand, which left the global scope
+/// permanently empty on a real fleet.
+///
+/// Attributed to `operator`, which is not a slot id and cannot be mistaken
+/// for one.
+pub fn operator_store(
+    db: &Connection,
+    scope: &Scope,
+    key: &str,
+    value: &str,
+    category: &str,
+    ttl_seconds: Option<i64>,
+) -> Result<String> {
+    write(db, "operator", scope, key, value, category, ttl_seconds)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write(
+    db: &Connection,
+    slot_id: &str,
+    scope: &Scope,
+    key: &str,
+    value: &str,
+    category: &str,
+    ttl_seconds: Option<i64>,
+) -> Result<String> {
     let key = key.trim();
     if key.is_empty() {
         bail!("a memory needs a key");
@@ -174,7 +210,6 @@ pub fn store(
     if !CATEGORIES.contains(&category) {
         bail!("category must be one of: {}", CATEGORIES.join(", "));
     }
-    may_write(db, slot_id, scope)?;
     let now = now_ms();
     let expires = ttl_seconds.filter(|s| *s > 0).map(|s| now + s * 1000);
 
@@ -349,6 +384,128 @@ pub fn forget(db: &Connection, slot_id: &str, scope: &Scope, key: &str) -> Resul
         bail!("no '{}' in {} memory", key.trim(), scope.name());
     }
     Ok(format!("Forgot '{}' from {} memory.", key.trim(), scope.name()))
+}
+
+/// The operator removing a memory themselves. See [`operator_store`].
+pub fn operator_forget(db: &Connection, scope: &Scope, key: &str) -> Result<String> {
+    let n = db.execute(
+        "DELETE FROM memory WHERE scope = ? AND scope_ref = ? AND key = ?",
+        params![scope.name(), scope.reference(), key.trim()],
+    )?;
+    if n == 0 {
+        bail!("no '{}' in {} memory", key.trim(), scope.name());
+    }
+    Ok(format!("Forgot '{}' from {} memory.", key.trim(), scope.name()))
+}
+
+/// One entry as the OPERATOR sees it: everything, labelled.
+///
+/// An agent reads memory through [`recall`], which hides the scopes it may
+/// not see and shadows a wider scope with a nearer one -- both right for an
+/// agent and both wrong for the person running the fleet, who needs to see
+/// that a global default exists AND that one team has overridden it.
+pub struct Row {
+    pub scope: String,
+    pub scope_ref: String,
+    /// What the reference means: a session's name, a seat's name, a group.
+    pub scope_label: String,
+    pub key: String,
+    pub category: String,
+    pub value: String,
+    pub author: String,
+    pub revision: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    /// How many earlier values are kept behind this one.
+    pub revisions_kept: i64,
+}
+
+/// Everything remembered, for the operator: every scope, nothing shadowed.
+///
+/// `scope` narrows to one of global/session/group/agent, `reference` to one
+/// session, group or seat, and `search` matches a key or a value. An expired
+/// entry is left out -- it is gone as far as every reader is concerned --
+/// unless `expired` asks for it.
+pub fn all(
+    db: &Connection,
+    scope: Option<&str>,
+    reference: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Row>> {
+    let like = search
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let mut stmt = db.prepare(
+        "SELECT m.id, m.scope, m.scope_ref, m.key, m.category, m.value,
+                COALESCE(s.display_name, s.role, m.author_slot, '?'),
+                m.revision, m.created_at_ms, m.updated_at_ms, m.expires_at_ms,
+                -- What the reference POINTS AT, said in the words the page
+                -- uses elsewhere: a slot id in a table of memories is a
+                -- fact about the database, not about the fleet.
+                CASE m.scope
+                  WHEN 'session' THEN COALESCE((SELECT name FROM sessions WHERE id = m.scope_ref),
+                                               m.scope_ref)
+                  WHEN 'agent' THEN COALESCE((SELECT COALESCE(display_name, role, id)
+                                                FROM slots WHERE id = m.scope_ref), m.scope_ref)
+                  ELSE m.scope_ref
+                END,
+                (SELECT COUNT(*) FROM memory_history h WHERE h.memory_id = m.id)
+           FROM memory m LEFT JOIN slots s ON s.id = m.author_slot
+          WHERE (m.expires_at_ms IS NULL OR m.expires_at_ms > ?1)
+            AND (?2 IS NULL OR m.scope = ?2)
+            AND (?3 IS NULL OR m.scope_ref = ?3)
+            AND (?4 IS NULL OR LOWER(m.key) LIKE ?4 OR LOWER(m.value) LIKE ?4)
+          ORDER BY CASE m.scope WHEN 'global' THEN 0 WHEN 'session' THEN 1
+                                WHEN 'group' THEN 2 ELSE 3 END,
+                   m.scope_ref, m.category, m.key
+          LIMIT ?5",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                now_ms(),
+                scope.map(str::trim).filter(|s| !s.is_empty() && *s != "all"),
+                reference.map(str::trim).filter(|s| !s.is_empty()),
+                like,
+                limit.clamp(1, 2000)
+            ],
+            |r| {
+                Ok(Row {
+                    scope: r.get(1)?,
+                    scope_ref: r.get(2)?,
+                    key: r.get(3)?,
+                    category: r.get(4)?,
+                    value: r.get(5)?,
+                    author: r.get(6)?,
+                    revision: r.get(7)?,
+                    created_at_ms: r.get(8)?,
+                    updated_at_ms: r.get(9)?,
+                    expires_at_ms: r.get(10)?,
+                    scope_label: r.get(11)?,
+                    revisions_kept: r.get(12)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<Row>, _>>()?;
+    Ok(rows)
+}
+
+/// How much is remembered in each scope, whether or not anything matches a
+/// filter: a page that shows nothing for `global` should say the scope is
+/// empty rather than leave the operator wondering what it is not showing.
+pub fn counts(db: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = db.prepare(
+        "SELECT scope, COUNT(*) FROM memory
+          WHERE expires_at_ms IS NULL OR expires_at_ms > ?1
+          GROUP BY scope",
+    )?;
+    let rows = stmt
+        .query_map(params![now_ms()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<(String, i64)>, _>>()?;
+    Ok(rows)
 }
 
 /// Previous values of one key, newest first.

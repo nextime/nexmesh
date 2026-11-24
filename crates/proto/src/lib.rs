@@ -17,6 +17,7 @@
 //! Everything below -- spawns, kills, message injection and interactive
 //! attach -- is multiplexed over that single socket.
 
+pub mod authority;
 pub mod cli_descriptor;
 pub mod codegraph;
 pub mod identity;
@@ -25,6 +26,9 @@ pub mod pair_client;
 pub mod attachsock;
 pub mod localsock;
 pub mod plugin;
+pub mod roles;
+pub mod screenread;
+pub mod skill;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};
@@ -201,12 +205,22 @@ pub fn render_pending(deliver: &[Envelope]) -> String {
             (Some(_), Some(n)) => n.clone(),
             (Some(_), None) => "a teammate".to_string(),
         };
-        body.push_str(&format!("- #{} from {}: {}\n", m.id, who, m.body));
+        // The body keeps its newlines -- this path always could, and the
+        // formatting is often the point -- but it is indented under its own
+        // bullet so that where one message ends and the next begins stays
+        // legible when several arrive together. A uniform shift preserves
+        // the relative indent of a list or a code block.
+        let shaped = m.body.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\n  ");
+        body.push_str(&format!("- #{} from {}: {}\n", m.id, who, shaped));
     }
     body.push_str("[END PENDING MESSAGES]\n");
     if from_operator {
         body.push_str(
-            "The operator is a person, reading this session's chat. Answer them with              `reply` and the message's own number -- reply(to: <#>, text: ...) -- which              puts your answer in the chat they are reading WITHOUT sending it to your              teammates. `broadcast` is for something the whole team needs; using it to              answer one person is how six agents come to read a note meant for one.\n",
+            "The operator is a person, reading this session's chat. Answer them with \
+             `reply` and the message's own number -- reply(to: <#>, text: ...) -- which \
+             puts your answer in the chat they are reading WITHOUT sending it to your \
+             teammates. `broadcast` is for something the whole team needs; using it to \
+             answer one person is how six agents come to read a note meant for one.\n",
         );
     }
     body.push_str("Respond to these before continuing.\n\n");
@@ -240,6 +254,42 @@ pub struct SpawnSpec {
     /// Resume handle from a previous incarnation of this slot, if any.
     #[serde(default)]
     pub resume_handle: Option<String>,
+    /// Every conversation this seat might be resuming, best first.
+    ///
+    /// There is more than one place a conversation id can come from -- the
+    /// per-machine binding, the seat's last handle, the id the CLI itself
+    /// reported, an earlier session's continuity record -- and the hub cannot
+    /// tell which of them still EXISTS, because the files are on the node.
+    ///
+    /// Sending one and hoping was the bug: a ghost handle in front of a real
+    /// conversation meant the real one was never tried, and the seat started
+    /// blank on top of work that was still there. So the hub offers all of
+    /// them in order and the node, which can see the disk, takes the first
+    /// that is really there.
+    ///
+    /// `resume_handle` stays as the first of these, so a node from before
+    /// this behaves exactly as it did.
+    #[serde(default)]
+    pub resume_candidates: Vec<String>,
+    /// A system prompt this seat carries, and whether it adds to the CLI's
+    /// own or replaces it ("append" / "replace").
+    /// What this seat is allowed to do TO THE FLEET, as the hub holds it.
+    ///
+    /// The node needs it for ONE reason: the tool list a shim advertises.
+    /// Authority is checked hub-side on every call, so this is not the gate
+    /// -- but a tool that is never advertised is a tool the model cannot
+    /// call at all, however much authority the seat holds. A
+    /// superorchestrator whose shim advertised the plain-agent list was
+    /// super on paper and powerless in practice.
+    ///
+    /// Absent means `agent`: a node or hub from before this, or a level this
+    /// build does not know, must fail CLOSED.
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub system_prompt_mode: Option<String>,
     /// For an adopted slot: the tmux target whose terminal to mirror.
     #[serde(default)]
     pub tmux_target: Option<String>,
@@ -355,6 +405,20 @@ pub enum NodeToHub {
         #[serde(default = "crate::yes")]
         last: bool,
     },
+    /// What the tree looks like now, without parsing it: see
+    /// [`HubToNode::TreeFingerprint`]. `files` is how many source files the
+    /// walk would have parsed, and `fingerprint` changes whenever any of
+    /// them is added, removed, resized or rewritten.
+    TreeFingerprintResult {
+        req_id: u64,
+        workspace_id: String,
+        fingerprint: String,
+        files: u64,
+        /// Set when the walk could not look at the whole tree, so a
+        /// fingerprint that did not change is not proof the tree did not.
+        #[serde(default)]
+        partial: bool,
+    },
     /// The model an agent reports it is actually running.
     ///
     /// Separate from the one requested, because a CLI may substitute or fall
@@ -382,6 +446,40 @@ pub enum NodeToHub {
         input: i64,
         output: i64,
         cache_read: i64,
+    },
+    /// How full this agent's context is NOW, and the window it has to fit
+    /// in. Not spending: see `agents.context_used_tokens` in the schema for
+    /// why the two are different numbers and why summing one to get the
+    /// other is wrong.
+    ///
+    /// The node sends it because only the node can see the conversation --
+    /// and the node sends the LIMIT too, because the limit comes from the
+    /// CLI's descriptor, which only the node holds. The hub compares the two
+    /// against the threshold the operator set and decides what to do; it is
+    /// not asked to know the context window of every model on the fleet.
+    ContextUsage {
+        agent_id: String,
+        used: i64,
+        limit: i64,
+        /// Where the reading came from, verbatim, for an operator asking why
+        /// a seat was compacted: a transcript path, or a driver's name.
+        source: String,
+    },
+    /// This agent has been doing the same thing over and over.
+    ///
+    /// `period` is how many turns the repeating unit is (1 is the same step
+    /// again and again, 2 an agent flipping between two) and `repeats` is
+    /// how many times it has repeated back to back, up to and including the
+    /// most recent turn.
+    ///
+    /// The node reports the cycle it can SEE and does not decide whether it
+    /// matters: how many repeats are too many is the operator's setting, and
+    /// it lives with the rest of them in the hub. Sent when the cycle
+    /// changes, not on every turn.
+    LoopSuspected {
+        agent_id: String,
+        period: i64,
+        repeats: i64,
     },
     /// An agent called an MCP tool its shim could not answer locally.
     ToolCall {
@@ -476,6 +574,29 @@ pub enum NodeToHub {
         agent_id: String,
         text: String,
     },
+    /// This agent is stopped at a permission prompt and nobody is attached.
+    ///
+    /// The node does not answer it. It reports the question and the choices
+    /// the CLI offered, and waits for `ApprovalDecided` -- which the hub may
+    /// send back immediately if a standing auto-approval covers this seat.
+    ApprovalAsked {
+        agent_id: String,
+        /// `pty_prompt` for a dialog on a terminal.
+        kind: String,
+        /// The question in the CLI's own words.
+        question: String,
+        options: Vec<PromptOption>,
+        /// The shape of the screen that asked, so one dialog is raised once
+        /// however many idle ticks notice it.
+        fingerprint: String,
+    },
+    /// The prompt went away on its own -- the agent gave up waiting, or
+    /// somebody attached and answered it. The approval is retired rather
+    /// than left looking live in the operator's chat.
+    ApprovalWithdrawn {
+        agent_id: String,
+        fingerprint: String,
+    },
     AttachOpened {
         attach_id: String,
         agent_id: String,
@@ -517,6 +638,33 @@ pub struct AgentHealth {
 
 // --------------------------------------------------------- hub -> node ----
 
+/// One choice a CLI offered at a permission prompt.
+///
+/// Carried verbatim from the terminal to the operator's buttons. The LABEL is
+/// the CLI's own wording and the KEYS are exactly what has to be typed to
+/// pick it, because the two are not derivable from each other: a menu whose
+/// affirmative reads "Yes, and don't ask again" must not be shown as "Yes",
+/// and the keystroke for it is a digit nobody could guess from the text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptOption {
+    /// Stable within one approval: the digit, the letter, or "enter".
+    pub key: String,
+    /// As the CLI wrote it.
+    pub label: String,
+    /// The bytes to send to choose it.
+    pub keys: String,
+    /// Does picking this let the action proceed? Used to decide what a
+    /// standing auto-approval picks, and never to relabel the button.
+    #[serde(default)]
+    pub affirmative: bool,
+    /// Does it also widen permission beyond this one action ("don't ask
+    /// again", "allow all edits")? An auto-approval must never pick one of
+    /// these: the operator's standing decision is "answer this prompt for
+    /// me", not "let the agent turn its own guardrails off".
+    #[serde(default)]
+    pub widens: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum HubToNode {
@@ -530,6 +678,47 @@ pub enum HubToNode {
         reason: String,
     },
     Spawn(SpawnSpec),
+    /// How a permission prompt was answered, so the node can type it.
+    ///
+    /// The hub sends the KEYS rather than the choice, because the node is
+    /// what read the menu and the hub is only echoing back one of the
+    /// options the node gave it. Nothing is interpreted in between.
+    ApprovalDecided {
+        approval_id: String,
+        agent_id: String,
+        /// Exactly what to type. Empty means "do not answer" -- the prompt
+        /// was withdrawn, or somebody answered it at the terminal.
+        keys: String,
+        /// For the note that goes in the agent's own scrollback.
+        label: String,
+        /// Who decided: `operator`, `auto:agent`, `auto:session`.
+        by: String,
+    },
+    /// Stop what this agent is doing, without ending it.
+    ///
+    /// The node resolves the keystroke from the CLI's descriptor, as with
+    /// `Compact`: the hub does not know how to interrupt every CLI and
+    /// should not have to. Sent when a seat is being stopped for looping --
+    /// pausing a seat withholds future work, and an agent already round the
+    /// bend will go on spending until the turn it is on is cut short.
+    Interrupt {
+        agent_id: String,
+        by: String,
+    },
+    /// Ask this agent's CLI to compact its own context now.
+    ///
+    /// The hub does not say WHAT to type: compaction is a slash command and
+    /// which one differs per CLI, so the node looks it up in the descriptor
+    /// it already holds. The hub only says which agent, and who asked.
+    ///
+    /// Typed at the terminal like any other keystroke, so it is refused when
+    /// the screen is waiting for an answer -- a compaction request must not
+    /// be the Enter that approves a tool call nobody read.
+    Compact {
+        agent_id: String,
+        /// For the note that goes in the agent's own scrollback and the chat.
+        by: String,
+    },
     /// Let an agent finish and go.
     ///
     /// Distinct from `Kill`: the node closes the agent's input first, which is
@@ -588,6 +777,10 @@ pub enum HubToNode {
         agent_id: String,
         display_name: Option<String>,
         role: Option<String>,
+        /// The seat's fleet authority, for the shim's tool list. See
+        /// `SpawnSpec::authority`; absent means `agent`.
+        #[serde(default)]
+        authority: Option<String>,
     },
     JoinDenied { req_id: u64, reason: String },
     AttachOpen {
@@ -607,6 +800,22 @@ pub enum HubToNode {
     /// Parse a workspace and send its code graph back. The node does this
     /// because the node is where the files are.
     BuildCodeGraph {
+        req_id: u64,
+        workspace_id: String,
+        path: String,
+    },
+    /// HAS THE TREE MOVED?
+    ///
+    /// Parsing a workspace is minutes of somebody else's CPU, so the hub
+    /// cannot rebuild a graph on a timer and call it fresh. This asks the
+    /// node for something far cheaper: a fingerprint of the source files it
+    /// would have parsed -- how many, how large, and the newest timestamp
+    /// among them. The walk is the same walk, without the parsing.
+    ///
+    /// A node too old to know this frame logs it and carries on, which is
+    /// why the hub also has an age rule for graphs it cannot get a
+    /// fingerprint for.
+    TreeFingerprint {
         req_id: u64,
         workspace_id: String,
         path: String,

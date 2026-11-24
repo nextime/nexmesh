@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""A CLI that runs an MCP shim, the way a real agent CLI does.
+
+Every real CLI here starts `nexmesh-mcpd` as its own child and talks MCP to
+it; that child is what calls fleet tools, and it is told its agent id ONCE,
+when the CLI starts. This stands in for that, in as few lines as will still
+reproduce it: start the shim, register, and call a tool whenever a line is
+typed at this process.
+
+Why it exists: a seat held in tmux survives a node restart, the node
+reattaches it under a NEW agent id, and the shim is still saying the id it
+was given at the spawn that started the CLI. Nothing the shim can do changes
+that -- its config was written then. So the node has to recognise the shim by
+the process it is running inside, and this is what proves it does, from the
+outside, through a real shim over the real socket.
+
+$FAKESHIM_LOG gets one line per event, so a test can read what happened after
+the restart rather than inferring it from a terminal.
+"""
+import json, os, subprocess, sys, threading
+
+if "--version" in sys.argv:
+    print("fakeshim 1.0.0"); sys.exit(0)
+
+LOG = os.environ.get("FAKESHIM_LOG", "/dev/null")
+MCPD = os.environ.get("FAKESHIM_MCPD", "nexmesh-mcpd")
+
+def note(what):
+    with open(LOG, "a") as f:
+        f.write(what + "\n")
+        f.flush()
+
+note(f"cli up pid={os.getpid()} agent={os.environ.get('NEXMESH_AGENT_ID', '-')}")
+
+# The shim, as a child of this process -- which is the whole point: its
+# ancestry is what identifies the seat it belongs to.
+shim = subprocess.Popen(
+    [MCPD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=open(f"{LOG}.shim", "a"), env=os.environ.copy(),
+    text=True, bufsize=1,
+)
+seq = [0]
+
+def rpc(method, params=None):
+    seq[0] += 1
+    msg = {"jsonrpc": "2.0", "id": seq[0], "method": method}
+    if params is not None:
+        msg["params"] = params
+    try:
+        shim.stdin.write(json.dumps(msg) + "\n")
+        shim.stdin.flush()
+        line = shim.stdout.readline()
+        return json.loads(line) if line else {"error": "shim closed"}
+    except Exception as e:
+        return {"error": str(e)}
+
+r = rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "fakeshim", "version": "1"}})
+note("initialize: " + ("ok" if "result" in r else json.dumps(r)[:200]))
+
+def call(tool, args):
+    r = rpc("tools/call", {"name": tool, "arguments": args})
+    if "result" in r:
+        text = ""
+        for c in r["result"].get("content") or []:
+            text += c.get("text", "")
+        err = r["result"].get("isError")
+        note(f"tool {tool}: {'ERROR' if err else 'ok'} {text[:220]}")
+    else:
+        note(f"tool {tool}: NO RESULT {json.dumps(r)[:220]}")
+
+def restart_shim(new_conversation):
+    """What `/clear` and `/new` do, from the fleet's point of view.
+
+    The CLI keeps running and starts a FRESH conversation, and it restarts
+    its MCP servers with the new conversation id in their environment --
+    claude puts CLAUDE_CODE_SESSION_ID there itself. Nothing else tells the
+    fleet, so this is the only moment it can learn that the conversation it
+    recorded for this seat is no longer the one in it."""
+    global shim
+    try:
+        shim.stdin.close(); shim.terminate(); shim.wait(timeout=10)
+    except Exception:
+        pass
+    env = os.environ.copy()
+    env["CLAUDE_CODE_SESSION_ID"] = new_conversation
+    shim = subprocess.Popen(
+        [MCPD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=open(f"{LOG}.shim", "a"), env=env, text=True, bufsize=1,
+    )
+    r = rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "fakeshim", "version": "1"}})
+    note(f"cleared to {new_conversation}: " + ("ok" if "result" in r else json.dumps(r)[:160]))
+
+def note_tools(when):
+    """WHAT THIS CLI WAS OFFERED, which is not the same as what it may do.
+
+    A real CLI asks for the tool list once, at startup, and a model can only
+    call what that list named. So a seat's authority has to reach the list and
+    not only the hub's check -- and the only way to see that from outside is
+    to write down what the shim actually advertised."""
+    r = rpc("tools/list")
+    names = sorted(t.get("name", "") for t in (r.get("result") or {}).get("tools") or [])
+    note(f"tools {when}: " + ",".join(names))
+
+note_tools("at startup")
+
+# A tool on arrival, so the test has a before as well as an after.
+call("set_summary", {"summary": "fakeshim is up"})
+
+print("FAKESHIM READY", flush=True)
+print("agent> ", end="", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line in ("quit", "exit"):
+        break
+    if line == "tools":
+        note_tools("on request")
+        print("\nagent> ", end="", flush=True)
+        continue
+    if "newconv " in line:
+        restart_shim(line.split("newconv ", 1)[1].split()[0].strip())
+        print("\nagent> ", end="", flush=True)
+        continue
+    # Any line typed at this CLI makes it call a tool, which is how a test
+    # asks "do your tools still work?" at a moment of its choosing.
+    call("set_summary", {"summary": f"asked at {line[:40]}"})
+    print(f"\nyou said: {line}", flush=True)
+    print("agent> ", end="", flush=True)

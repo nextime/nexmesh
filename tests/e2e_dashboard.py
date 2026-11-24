@@ -8,6 +8,17 @@ import urllib.request, urllib.error
 # shim here the same identity and make them all claim a single seat -- which
 # looks like a bug in the hub and is not. The tests choose their own.
 import os as _os
+
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
     _os.environ.pop(_v, None)
@@ -323,6 +334,86 @@ def main():
     uses_cache = any(x in sw for x in ("caches.open", "caches.match", "cache.put",
                                        "CacheStorage", "cache.add"))
     check("and it caches nothing", not uses_cache, sw[:200])
+
+    print("\n=== the knowledge page reads every scope, not one team's ===")
+    # The page used to read memory out of a session's snapshot -- what that
+    # TEAM can see -- so on a fleet whose seats had only written session
+    # notes it looked as though session scope was the only scope there was.
+    s, html3 = req("/", raw=True)
+    check("the page asks the hub for all of it", "/v1/memory" in html3,
+          "the knowledge view should read /v1/memory")
+    for scope in ("global", "session", "group", "agent"):
+        check(f"and offers the {scope} scope by name", f'chip("{scope}"' in html3)
+    check("with a way to write one by hand", "openMemWrite" in html3)
+    s, j = req("/v1/memory", optok)
+    check("which answers even with nothing remembered yet",
+          s == 200 and isinstance(j.get("memory"), list), str(j)[:200])
+    check("and says what categories a memory may have",
+          "convention" in (j.get("categories") or []), str(j.get("categories")))
+    # And a way to narrow the by-session/group/agent views to one of them,
+    # which the memory endpoint has always supported but the page did not use.
+    check("the memory view can pick one team/group/agent", "memPick(" in html3,
+          "a reference selector should narrow the scope")
+
+    print("\n=== the skills & templates library is on the page ===")
+    s, html4 = req("/", raw=True)
+    check("there is a skills tab", '"skills"' in html4 and "viewSkills" in html4)
+    check("it reads the role templates and the skill library",
+          "/v1/skills" in html4 and "/v1/roles" in html4)
+    check("skills can be edited, added and reset from the page",
+          "putJSON(" in html4 and "setSkillDial(" in html4 and "resetSkill(" in html4)
+    check("the launch form can build a seat from a template",
+          'id="aaTpl"' in html4 and "aaPickTemplate(" in html4)
+    check("and the per-seat control is findable as skills",
+          "prompt &amp; skills" in html4)
+    # The endpoint answers, listing the built-ins even with no store configured.
+    s, j = req("/v1/skills", optok)
+    check("the skills endpoint answers with the built-in library",
+          s == 200 and isinstance(j.get("skills"), list) and len(j["skills"]) >= 9, str(j)[:160])
+    check("each skill says where it comes from",
+          all("source" in sk for sk in j.get("skills", [])), str(j)[:160])
+    s, j = req("/v1/roles", optok)
+    check("the roles endpoint carries each template's skills and source",
+          s == 200 and all("skills" in r and "source" in r for r in j.get("roles", [])),
+          str(j)[:160])
+
+    print("\n=== and the room is reachable from the installed app ===")
+    # An installed app has NO ADDRESS BAR. Without a link on the page there
+    # is no way to reach /xr from inside it at all, which is how this was
+    # found: installed, the room did not exist.
+    s, html2 = req("/", raw=True)
+    check("the page links the room", 'href="xr"' in html2 or "href='xr'" in html2,
+          "the dashboard should link /xr")
+    check("and the manifest offers it as a shortcut too",
+          any("xr" in (c.get("url") or "") for c in m.get("shortcuts", [])),
+          str(m.get("shortcuts")))
+    # And the room is installable in its own right, because an app installed
+    # from the manifest above starts at the DASHBOARD.
+    s, mx = req("/manifest-xr.webmanifest", raw=True)
+    check("the room has a manifest of its own", s == 200, str(s))
+    mr = _json.loads(mx)
+    check("which starts at the room, not the dashboard",
+          "xr" in (mr.get("start_url") or ""), str(mr.get("start_url")))
+    check("and names itself something else, so two apps are two apps",
+          mr.get("name") != m.get("name"), f"{mr.get('name')} vs {m.get('name')}")
+    # Meta reads exactly these five fields when packaging a WebXR app for a
+    # headset and ignores the rest, so all five have to be present.
+    for field in ("name", "short_name", "start_url", "scope", "icons"):
+        check(f"a headset package has what it reads: {field}",
+              mr.get(field) is not None, str(sorted(mr)))
+    s, xrhtml = req("/xr", raw=True)
+    check("the room page points at its own manifest",
+          "manifest-xr.webmanifest" in xrhtml, "the room should not link the dashboard's")
+    s, xrjs = req("/xr.js", raw=True)
+    check("and asks for the headset when it was LAUNCHED, not clicked",
+          "display-mode: standalone" in xrjs and "immersive" in xrjs,
+          "a headset has no mouse to press a button with")
+    # Horizon OS has no install button in its browser: a Quest app is a
+    # signed package, and an immersive one refuses to launch unless this
+    # origin serves the file that names it.
+    s, al = req("/.well-known/assetlinks.json", raw=True)
+    check("with no headset package configured, that is said rather than 404'd blankly",
+          s == 404 and "--assetlinks" in al, f"{s} {al[:120]}")
 
     print("\n=== messages stay unread until somebody claims them ===")
     # Reading is not answering: a message glanced at used to be a message

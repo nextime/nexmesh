@@ -55,3 +55,10 @@ replay_user_messages = true
 style = "command"
 argv = ["claude", "mcp", "add", "--scope", "user", "nexmesh", "--", "{mcpd}"]
 env_flag = "-e"
+
+[skill]
+# This profile points CLAUDE_CONFIG_DIR elsewhere, so its skills live there
+# too. Writing to ~/.claude/skills instead would install the skill for a
+# DIFFERENT account -- which reports success for a seat that never reads it.
+dir = "~/.claude-router/skills"
+name = "nexmesh"

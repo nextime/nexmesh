@@ -42,6 +42,11 @@ pub enum In {
     Opened { read_only: bool },
     /// It is over, and why.
     Ended(String),
+    /// The NODE went away, not the agent. Nothing more will arrive on this
+    /// connection, but the agent is very likely still running and the right
+    /// thing is to wait for the node and attach again -- not to put the
+    /// operator back at a shell prompt.
+    Paused(String),
 }
 
 pub struct Wire {
@@ -187,6 +192,13 @@ pub async fn open_hub(
     let (mut sink, mut stream) = ws.split();
     let (in_tx, rx) = mpsc::channel::<In>(1024);
     let (tx, mut out_rx) = mpsc::channel::<Out>(256);
+    // Did WE hang up? A socket that simply dies means the hub went away --
+    // a restart, a network blip -- and the agent is almost certainly still
+    // running, so the viewer should wait and come back. But a DETACH the
+    // operator asked for also ends the socket, and reconnecting after that
+    // would reattach them to the thing they just left.
+    let we_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let we_closed_r = we_closed.clone();
 
     tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
@@ -198,6 +210,13 @@ pub async fn open_hub(
                         Some("opened") => {
                             In::Opened { read_only: v["read_only"].as_bool() == Some(true) }
                         }
+                        // The node went away, but the agent very likely did
+                        // not. Distinct from `closed` so the viewer waits
+                        // rather than putting the operator back at a shell
+                        // prompt for something that fixes itself.
+                        Some("paused") => In::Paused(
+                            v["reason"].as_str().unwrap_or("the node went away").to_string(),
+                        ),
                         Some("closed") | Some("error") => In::Ended(
                             v["reason"]
                                 .as_str()
@@ -215,7 +234,15 @@ pub async fn open_hub(
                 return;
             }
         }
-        let _ = in_tx.send(In::Ended("connection closed".into())).await;
+        // The socket ended without the hub saying why. If we did not hang
+        // up, the hub did -- which is a PAUSE, not the end of the agent.
+        // This is the case the operator asked about: "when we restart the
+        // hub, can we not disconnect the agents attached to a terminal?"
+        let _ = if we_closed_r.load(std::sync::atomic::Ordering::SeqCst) {
+            in_tx.send(In::Ended("detached".into())).await
+        } else {
+            in_tx.send(In::Paused("the connection to the hub dropped".into())).await
+        };
     });
 
     tokio::spawn(async move {
@@ -232,6 +259,7 @@ pub async fn open_hub(
                 return;
             }
             if last {
+                we_closed.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = sink.close().await;
                 return;
             }

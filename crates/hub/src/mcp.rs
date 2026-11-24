@@ -175,7 +175,7 @@ pub async fn post(
             .into_response();
     }
     // The participant token is the credential, exactly as on the HTTP door.
-    let scoped = match api::auth_participant(&st, &headers) {
+    let who = match api::auth_participant(&st, &headers) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -214,7 +214,7 @@ pub async fn post(
     };
 
     if method == "initialize" {
-        return initialize(&st, &params, &req, id, &token, scoped).await;
+        return initialize(&st, &params, &req, id, &token, who).await;
     }
 
     // Everything else needs the session minted by initialize.
@@ -234,15 +234,27 @@ pub async fn post(
     match method.as_str() {
         "ping" => Json(jok(id, json!({}))).into_response(),
 
-        "tools/list" => Json(jok(
-            id,
-            json!({ "tools": proto::tools::team_tools().iter().map(|t| json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.input_schema,
-            })).collect::<Vec<_>>() }),
-        ))
-        .into_response(),
+        // What this caller is SHOWN is what this caller may call. A seat
+        // without the authority is not offered the fleet tools at all: a
+        // tool a model can see is a tool it will try, and reword, and try
+        // again before it believes the refusal. The refusal still stands
+        // independently in `tools::dispatch` -- an advertisement is not an
+        // authorisation.
+        "tools/list" => {
+            let authority = {
+                let db = st.db.lock().unwrap();
+                crate::fleet::authority_of_agent(&db, &door.agent_id)
+            };
+            Json(jok(
+                id,
+                json!({ "tools": proto::tools::team_tools_for(authority).iter().map(|t| json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })).collect::<Vec<_>>() }),
+            ))
+            .into_response()
+        }
 
         "tools/call" => {
             let name = req["params"]["name"].as_str().unwrap_or("").to_string();
@@ -327,8 +339,12 @@ async fn initialize(
     req: &Value,
     id: Value,
     token: &str,
-    scoped: Option<String>,
+    // The token, authenticated: the session it may join, and what a seat
+    // taken with it is allowed to do. The second is how an OBSERVER gets in
+    // -- the restriction is on the token, so the client cannot decline it.
+    who: crate::api::Participant,
 ) -> Response {
+    let scoped = who.session.clone();
     let asked = req["params"]["protocolVersion"].as_str().unwrap_or(PREFERRED);
     let version = if SUPPORTED.contains(&asked) { asked } else { PREFERRED };
 
@@ -341,6 +357,16 @@ async fn initialize(
     // Reconnecting, or merely being health-checked, must not cost a new seat.
     let (agent_id, slot_id, reused) = match reuse_seat(st, token, &name) {
         Some((agent_id, slot_id, session_id)) => {
+            // A token that has since been restricted takes effect on this
+            // reconnection. Down only: an observer token must never be able
+            // to promote the seat it is returning to.
+            if who.authority.is_read_only() {
+                let db = st.db.lock().unwrap();
+                let _ = db.execute(
+                    "UPDATE slots SET authority = ? WHERE id = ?",
+                    rusqlite::params![who.authority.as_str(), slot_id],
+                );
+            }
             tracing::info!(%agent_id, %slot_id, %name,
                 "an MCP client re-initialised; keeping its existing seat");
             let _ = session_id;
@@ -366,8 +392,16 @@ async fn initialize(
                         c.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
                     })
                     .unwrap_or_default(),
+                            // The front door does not know where its client runs; an
+                // MCP client is a conversation, not a service with a host.
+                host: None,
             };
-            let seated = match api::join_participant(st, join, scoped) {
+            let seated = match api::join_participant_as(
+                st,
+                join,
+                scoped.clone(),
+                who.authority,
+            ) {
                 Ok(v) => v,
                 Err(e) => return e.into_response(),
             };

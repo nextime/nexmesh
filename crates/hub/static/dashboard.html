@@ -90,7 +90,7 @@
   }
   .brand { font-weight: 650; letter-spacing: .2px; }
   .brand span { color: var(--accent); }
-  select, input, button {
+  select, input, button, textarea {
     font: inherit; color: var(--fg); background: var(--panel2);
     border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px;
   }
@@ -104,6 +104,13 @@
   .dot.stale { background: var(--bad); }
   .muted { color: var(--dim); }
   .tiny { font-size: 12px; }
+  /* A link that belongs in a row of buttons. */
+  a.btn {
+    display: inline-flex; align-items: center; text-decoration: none;
+    font: inherit; font-size: 12px; padding: 4px 8px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+  }
+  a.btn:hover { border-color: var(--accent); }
 
   .stats { display: flex; gap: 10px; flex-wrap: wrap; padding: 14px 16px 0; }
   .tile {
@@ -169,13 +176,54 @@
   /* Nobody has claimed it. Reading no longer clears a message, so this is
      the mark that matters: what is still waiting on somebody. */
   .msg.unclaimed .mark { color: var(--warn); }
+  /* Withdrawn: still in the log, visibly not going anywhere. */
+  .msg.cancelled .body { text-decoration: line-through; opacity: .55; }
+  .msg.cancelled .mark { color: var(--dim); }
   .msg.unclaimed { background: color-mix(in srgb, var(--warn) 5%, transparent); }
   /* Which team said it, in a fleet-wide read. */
   .msg .chan { color: var(--accent, #7aa2f7); font-family: var(--mono); font-size: 12px; }
+  /* A permission prompt an agent is STOPPED on. Deliberately loud: an agent
+     waiting on a question nobody noticed is the thing this prevents. */
+  .approvals { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 8px;
+               padding: 8px 12px; max-height: 42vh; overflow-y: auto; }
+  .ap { border: 1px solid var(--warn); border-left-width: 4px; border-radius: 8px;
+        background: color-mix(in srgb, var(--warn) 9%, var(--panel));
+        padding: 8px 10px; }
+  .ap .who { font-weight: 650; }
+  .ap .q { white-space: pre-wrap; word-break: break-word; font-family: var(--mono);
+           font-size: 12px; color: var(--fg); margin: 4px 0 7px; }
+  .ap .btns { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .ap .btns button { font-size: 12px; }
+  /* An option that grants more than the question asked is never styled like
+     an ordinary yes: that mistake is the whole reason this screen exists. */
+  .ap button.wide { border-color: var(--bad); color: var(--bad); }
+  .ap button.yes { border-color: var(--ok); color: var(--ok); }
+  .ap button.no { border-color: var(--dim); }
+  .ap .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 3px; }
+  .ap .unreadable { color: var(--dim); font-style: italic; font-size: 12px; }
+  /* Authority, not Role. Dimmed when it is the ordinary case, so the
+     seats that can command the fleet are the ones that stand out. */
+  .auth { font-family: var(--mono); font-size: 12px; cursor: pointer;
+          border-bottom: 1px dotted var(--faint); }
+  .auth.agent { color: var(--faint); }
+  .auth.orchestrator { color: var(--accent); font-weight: 650; }
+  .auth.super { color: var(--warn); font-weight: 700; }
+  /* The two per-seat switches. Dim when they are the quiet setting, lit when
+     they are doing something, so a glance down the column finds the seats
+     that behave differently from the rest. */
+  .switches { white-space: nowrap; }
+  .sw { cursor: pointer; font-size: 13px; padding: 0 2px; user-select: none; }
+  .sw.off { opacity: .28; }
+  .sw.on { color: var(--ok); }
+  .sw.warn { color: var(--warn); }
+  .sw:hover { opacity: 1; }
 
-  .composer { display: flex; gap: 8px; padding: 10px 12px; align-items: center;
+  .composer { display: flex; gap: 8px; padding: 10px 12px; align-items: flex-end;
               border-top: 1px solid var(--line); flex-wrap: wrap; }
-  .composer input { flex: 1 1 18em; min-width: 12em; }
+  .composer input, .composer textarea { flex: 1 1 18em; min-width: 12em; }
+  /* Grown by `chatGrow` as it is typed into; a newline is Shift+Enter. */
+  .composer textarea { resize: none; overflow-y: auto; line-height: 1.4;
+                       max-height: 33vh; font-family: inherit; }
   .composer select { max-width: 14em; }
 
   .bar { height: 7px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
@@ -373,7 +421,7 @@
       padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
     }
     #chat .composer > .mono { display: none; }
-    #chat .composer input { flex: 1 1 auto; min-width: 0; }
+    #chat .composer input, #chat .composer textarea { flex: 1 1 auto; min-width: 0; }
     #chat .composer button { flex: 0 0 auto; padding: 7px 10px; }
     /* Tapping anywhere else closes it, which is what every drawer does and
        what a thumb reaches for first. */
@@ -519,7 +567,8 @@
   }
   :root[data-theme="lcars"] nav button[aria-selected="true"] { color: #000; }
   :root[data-theme="lcars"] nav .count { color: inherit; opacity: .7; }
-  :root[data-theme="lcars"] select, :root[data-theme="lcars"] input {
+  :root[data-theme="lcars"] select, :root[data-theme="lcars"] input,
+  :root[data-theme="lcars"] textarea {
     background: #000; border: 2px solid var(--lc-dim-blue); border-radius: 999px;
     color: var(--fg); padding: 4px 12px;
   }
@@ -589,11 +638,20 @@
   .mapbox { position: relative; }
   .mapctl { position: absolute; right: 6px; top: 6px; display: flex; gap: 4px; z-index: 2; }
   .mapctl button { min-width: 2.2em; }
-  #subModal { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.55);
+  #subModal, #memModal {
+              position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.55);
               display: flex; align-items: center; justify-content: center; padding: 16px; }
-  #subModal .sheet { background: var(--panel); border: 1px solid var(--line);
+  #subModal .sheet, #memModal .sheet {
+                     background: var(--panel); border: 1px solid var(--line);
                      border-radius: 10px; padding: 14px; width: min(980px, 100%);
                      max-height: 86vh; overflow: auto; }
+  /* The one in the memory sheet is a form rather than a report: its rows
+     need to breathe, and on a phone they stack. */
+  #memModal .pair { margin: 6px 0; align-items: flex-end; }
+  #memModal label { display: flex; flex-direction: column; gap: 2px; }
+  #memModal textarea { background: var(--panel); color: var(--fg);
+                       border: 1px solid var(--line); border-radius: 6px;
+                       padding: 6px; font: inherit; }
   .subcols { display: grid; grid-template-columns: 1fr 1.4fr; gap: 16px; margin-top: 8px;
              min-width: 0; }
   /* A path is long and has no spaces in it, so without this the sheet
@@ -774,6 +832,11 @@
             title="Install this as an app on this device">install</button>
     <button id="chatBtn" class="tiny" onclick="openChat()"
             title="Full-screen chat: one channel per session">chat</button>
+    <!-- The room. A link rather than a button because an INSTALLED app has
+         no address bar: without this there is no way to reach /xr from
+         inside it at all, which is how it was found. -->
+    <a id="roomLink" class="tiny btn" href="xr"
+       title="The same fleet as a room you can stand in, in a headset or with a mouse">the room</a>
     <span class="spacer"></span>
     <select id="themeSel" class="tiny" title="Theme"
             onchange="applyTheme(this.value)">
@@ -809,6 +872,10 @@
     <form id="addAgentForm" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <input id="aaName" type="text" placeholder="name" required maxlength="40"
              style="font-family:var(--mono);width:130px">
+      <select id="aaTpl" title="Build from a role template — fills the role and lets you pick its skills"
+              onchange="aaPickTemplate()">
+        <option value="">— role written by hand —</option>
+      </select>
       <input id="aaRole" type="text" placeholder="role" maxlength="40"
              style="width:150px">
       <select id="aaNode" title="Which machine"></select>
@@ -822,6 +889,8 @@
       <button type="submit">launch</button>
       <button type="button" id="aaCancel" class="tiny">cancel</button>
       <span id="aaMsg" class="tiny muted"></span>
+      <div id="aaSkills" class="tiny muted" style="flex-basis:100%;display:none;
+           flex-wrap:wrap;gap:4px 12px;margin-top:2px"></div>
     </form>
   </div>
   <main><div id="view"></div>
@@ -836,6 +905,9 @@
     <!-- What is in a subsystem, over the top of the map that sent you
          here. Outside #view so a poll cannot close it under you. -->
     <div id="subModal" hidden onclick="if (event.target === this) closeSub()"></div>
+    <!-- Writing a memory by hand, and what a key used to say. Outside #view
+         for the same reason as the one above. -->
+    <div id="memModal" hidden onclick="if (event.target === this) closeMem()"></div>
   </main>
 
   <!-- The chat, as a room rather than a tab. Channels down the left, who is
@@ -855,6 +927,7 @@
     </div>
     <div class="chanrail" id="chanRail"></div>
     <div id="railScrim" hidden onclick="toggleRail(false)"></div>
+    <div id="approvalBox" class="approvals" hidden></div>
     <div class="chatfeed" id="chatFeed"
          onscroll="chatStick = (this.scrollHeight - this.scrollTop - this.clientHeight) < 50"></div>
     <div class="nicklist" id="nickList"></div>
@@ -915,7 +988,7 @@
 // The build this page was served as. The hub substitutes it; opened from a
 // file it stays a placeholder and the check simply never fires.
 const PAGE_BUILD = "__BUILD__";
-const TABS = ["agents", "messages", "plan", "knowledge", "graph", "files", "fleet"];
+const TABS = ["agents", "messages", "plan", "knowledge", "skills", "graph", "files", "fleet"];
 const KEY = "nexmesh.operator.token";
 let token = localStorage.getItem(KEY) || "";
 // Whether a credential was offered in this visit, so a 401 can tell "wrong"
@@ -1010,6 +1083,29 @@ const ago = (ms, now) => {
   return s < 60 ? s + "s" : s < 3600 ? Math.round(s / 60) + "m" : Math.round(s / 3600) + "h";
 };
 
+// HOW FULL a seat's context is, and what is set to happen about it.
+//
+// Distinct from the Tokens column, which is what the seat has SPENT: a seat
+// can spend twelve windows and be a third full, and only this one says
+// whether it is about to lose the middle of its own conversation.
+//
+// A seat that is never measured shows a dash rather than a zero -- its CLI
+// says nothing about its context window, which is not the same as empty.
+function contextCell(a) {
+  const used = a.context_used_tokens, lim = a.context_limit_tokens;
+  if (!(lim > 0) || used == null) return '<span class=muted>—</span>';
+  const pct = Math.floor(used * 100 / lim);
+  const cls = pct >= 90 ? "bad" : pct >= 75 ? "warn" : "";
+  const at = a.compact_at_pct;
+  const note = at === 0 ? "compaction off for this seat"
+    : at > 0 ? `compacted by itself past ${at}%`
+    : "follows its team's compaction setting";
+  const looping = a.loop_repeats > 1
+    ? ` · repeating itself ${a.loop_repeats}\u00d7` : "";
+  return `<span class="badge ${cls}" title="${human(used)} of ${human(lim)} tokens · ${note}${
+      looping}">${pct}%</span>`;
+}
+
 function stateClass(s) {
   if (s === "approved" || s === "released") return "ok";
   if (s === "working" || s === "addressing_feedback") return "info";
@@ -1101,7 +1197,13 @@ $("gateForm").addEventListener("submit", (e) => {
 });
 
 async function getJSON(url) {
-  const r = await fetch(url);
+  // The token, when this dashboard is driven by one rather than by an
+  // account: a cookie rides along on its own, a header does not. `post`
+  // has always sent it; this did not, so every GET through here worked
+  // from a signed-in browser and 401'd from a token-driven one.
+  const headers = {};
+  if (typeof token !== "undefined" && token) headers.authorization = "Bearer " + token;
+  const r = await fetch(url, { headers, credentials: "same-origin" });
   let j = {};
   try { j = await r.json(); } catch (e) { /* an empty body is fine */ }
   if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
@@ -1121,6 +1223,19 @@ async function post(url, body) {
   });
   let j = {};
   try { j = await r.json(); } catch (e) { /* an empty body is fine */ }
+  if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
+  return j;
+}
+
+/// PUT, for creating or replacing a named thing (a skill, a template).
+async function putJSON(url, body) {
+  const headers = { "content-type": "application/json" };
+  if (typeof token !== "undefined" && token) headers.authorization = "Bearer " + token;
+  const r = await fetch(url, {
+    method: "PUT", headers, credentials: "same-origin", body: JSON.stringify(body),
+  });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
   if (!r.ok) throw new Error(j.error || ("hub returned " + r.status));
   return j;
 }
@@ -1207,6 +1322,12 @@ function sorted(rows) {
   if (!sortKey) return rows;
   const val = (r) => {
     if (sortKey === "tokens") return (r.input_tokens || 0) + (r.output_tokens || 0);
+    // How FULL, not how much spent: sorting by this puts the seats about to
+    // lose the middle of their own conversation at one end.
+    if (sortKey === "context") {
+      return r.context_limit_tokens > 0
+        ? Math.floor((r.context_used_tokens || 0) * 100 / r.context_limit_tokens) : -1;
+    }
     const v = r[sortKey];
     return typeof v === "string" ? v.toLowerCase() : (v ?? "");
   };
@@ -1317,6 +1438,56 @@ async function editRole(slot, current) {
   input.addEventListener("blur", () => finish(true));
 }
 
+// Changing what a seat may do TO THE FLEET.
+//
+// A select rather than a text field: there are exactly three values, and a
+// typo in a free-text authority field is a silent demotion. This is the
+// operator's door, so the hub applies no election rules to it -- the person
+// running the fleet outranks every level in them.
+async function editAuthority(slot, current) {
+  const cell = document.getElementById("au-" + slot);
+  if (!cell || cell.dataset.editing) return;
+  cell.dataset.editing = "1";
+  editingSeat = slot;
+  const sel = document.createElement("select");
+  for (const [v, label] of [["agent", "agent"], ["orchestrator", "orchestrator"],
+                            ["super", "superorchestrator"]]) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = label; o.selected = v === current;
+    sel.appendChild(o);
+  }
+  const held = cell.innerHTML;
+  cell.innerHTML = "";
+  cell.appendChild(sel);
+  sel.focus();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const want = sel.value;
+    cell.innerHTML = held;
+    delete cell.dataset.editing;
+    editingSeat = null;
+    if (save && want !== current) {
+      try {
+        const r = await post(`/v1/slots/${encodeURIComponent(slot)}/authority`,
+                             { authority: want });
+        if (r && r.error) throw new Error(r.error);
+        note(want === "agent"
+          ? "That seat holds no authority over the fleet any more."
+          : `That seat is now ${want === "super" ? "a superorchestrator" : "an orchestrator"}.`
+            + " In force immediately; its CLI may not list the fleet tools until it reconnects.");
+      } catch (e) {
+        note(e.message || "could not change that authority");
+      }
+    }
+    tick();
+  };
+  sel.addEventListener("change", () => finish(true));
+  sel.addEventListener("keydown", (e) => { if (e.key === "Escape") finish(false); });
+  sel.addEventListener("blur", () => finish(true));
+}
+
 function editSessionName(current, placeholder, commit) {
   const sel = $("sessionSel");
   if (sel.tagName !== "SELECT") return;          // an edit is already open
@@ -1404,9 +1575,48 @@ $("addBtn").addEventListener("click", () => {
   if (!panel.hidden) {
     $("aaMsg").textContent = "";
     fillAddAgent();
+    aaFillTemplates();
     $("aaName").focus();
   }
 });
+
+// Fill the template dropdown from the hub's roles, once per page (they change
+// only when the operator edits them, and a reopen after an edit re-fetches).
+async function aaFillTemplates() {
+  try {
+    const rs = await getJSON(`/v1/roles`);
+    window.__roles = (rs && rs.roles) || [];
+    window.__allSkills = (rs && rs.skills) || [];
+  } catch (e) { window.__roles = window.__roles || []; }
+  const sel = $("aaTpl");
+  if (!sel) return;
+  const chosen = sel.value;
+  sel.innerHTML = `<option value="">— role written by hand —</option>` +
+    (window.__roles || []).map((r) => `<option value="${esc(r.id)}">${esc(r.id)}`
+      + ` — ${esc(r.summary || "")}</option>`).join("");
+  sel.value = chosen;
+  aaPickTemplate();
+}
+
+// A template chosen here fills the role and offers its skills as checkboxes;
+// "written by hand" clears them and leaves the role free-text.
+function aaPickTemplate() {
+  const sel = $("aaTpl"), role = $("aaRole"), box = $("aaSkills");
+  if (!sel || !role || !box) return;
+  const r = (window.__roles || []).find((x) => x.id === sel.value);
+  if (!r) {
+    box.style.display = "none"; box.innerHTML = "";
+    role.readOnly = false; role.placeholder = "role";
+    return;
+  }
+  role.value = r.id; role.readOnly = true;
+  const skills = r.skills || [];
+  const all = window.__allSkills || skills;
+  box.style.display = "flex";
+  box.innerHTML = `<span>skills for ${esc(r.id)}:</span>` + (all.length ? all : skills)
+    .map((k) => `<label style="white-space:nowrap"><input type="checkbox" class="aaSkill"
+        value="${esc(k)}" ${skills.includes(k) ? "checked" : ""}> ${esc(k)}</label>`).join("");
+}
 
 $("aaCancel").addEventListener("click", () => { $("addAgent").hidden = true; });
 $("aaNode").addEventListener("change", fillAddAgentClis);
@@ -1430,6 +1640,16 @@ $("addAgentForm").addEventListener("submit", async (e) => {
     const model = $("aaModel").value.trim();
     if (model) body.model = model;
     const slot = await post(`/v1/sessions/${encodeURIComponent(currentSession())}/slots`, body);
+    // Build the seat from a template BEFORE it starts, so the first agent
+    // comes up with its brief and chosen skills already in place. Reuses the
+    // same prompt endpoint the per-seat editor uses, so there is one path.
+    const tpl = $("aaTpl").value;
+    if (tpl) {
+      const skills = Array.from(document.querySelectorAll(".aaSkill"))
+        .filter((c) => c.checked).map((c) => c.value);
+      await post(`/v1/slots/${encodeURIComponent(slot.slot_id)}/prompt`,
+                 { template: tpl, skills });
+    }
     $("aaMsg").textContent = "starting it\u2026";
     // Two steps on purpose: the seat exists whether or not the process
     // starts, so a CLI that fails to launch leaves something to retry
@@ -1437,6 +1657,7 @@ $("addAgentForm").addEventListener("submit", async (e) => {
     await post(`/v1/slots/${encodeURIComponent(slot.slot_id)}/spawn`, {});
     $("aaMsg").textContent = `${name} is starting on ${node}`;
     $("aaName").value = ""; $("aaRole").value = ""; $("aaModel").value = "";
+    $("aaTpl").value = ""; aaPickTemplate();
     tick();
   } catch (err) {
     $("aaMsg").textContent = err.message;
@@ -1490,6 +1711,8 @@ async function updateApp() {
 function render() {
   if (!snap) return;
   const d = snap.detail, now = snap.hub.now_ms;
+  // Before anything else on the page: somebody is stopped waiting for you.
+  renderApprovals();
   // Is the hub serving a newer dashboard than this one?
   const served = snap.hub && snap.hub.build;
   if (served && PAGE_BUILD !== "__BUILD__" && served !== PAGE_BUILD) {
@@ -1532,7 +1755,13 @@ function render() {
   const openCodes = (snap.pairing || []).filter((c) => c.state === "open").length;
   const counts = {
     agents: (d && d.agents || []).length, messages: (d && d.messages || []).length,
-    plan: (d && d.plan || []).length, knowledge: (d && d.knowledge || []).length,
+    plan: (d && d.plan || []).length,
+    // Everything remembered, not only what this team can see: the tab is a
+    // way into the fleet's memory, and a count of one scope on it reads as
+    // though the others do not exist.
+    knowledge: memBook.rows
+      ? (memBook.counts || []).reduce((a, c) => a + (c.n || 0), 0)
+      : (d && d.knowledge || []).length,
     graph: (d && d.graph || []).reduce((n, g) => n + (g.communities || 0), 0),
     files: ((d && d.locks || []).length + (d && d.zones || []).length),
     fleet: (snap.nodes || []).length + openCodes,
@@ -1550,6 +1779,11 @@ function render() {
     end: $("pairName") ? $("pairName").selectionEnd : null,
     out: $("pairOut") ? $("pairOut").innerHTML : null,
     focus: document.activeElement ? document.activeElement.id : null,
+    // The memory search box lives INSIDE the view, and every search is a
+    // rebuild of it -- the results changed, which is the whole point. So
+    // the caret is carried across, or the second word of a search is typed
+    // into the page instead of into the box.
+    memAt: $("memQ") ? $("memQ").selectionStart : null,
   };
 
   // Anything being typed owns the view until it is finished. The poll
@@ -1565,16 +1799,31 @@ function render() {
   // graph only changes when somebody parses one, so redraw it only then.
   const sig = tab === "graph" ? graphSignature(d) : null;
   const sameMap = tab === "graph" && sig === drawnGraph && $("view").dataset.tab === "graph";
-  if (!editingSeat && !sameMap) {
+  // And the knowledge page, for a third reason: it has a search box in it.
+  // Rebuilding the view on every poll takes the caret out of that box
+  // mid-word, and on a phone closes the keyboard with it. What the fleet
+  // remembers changes when somebody writes a memory, not every two seconds.
+  const ksig = tab === "knowledge" ? knowSignature(d) : null;
+  const sameKnow =
+    tab === "knowledge" && ksig === drawnKnow && $("view").dataset.tab === "knowledge";
+  // The skills catalogue changes only when the operator edits it or the
+  // 20-second reload runs, not every poll -- and it carries dials a rebuild
+  // would close mid-click. Held still between loads, like the knowledge page.
+  const ssig = tab === "skills" ? String(skillCat.at) + "~" + currentSession() : null;
+  const sameSkills =
+    tab === "skills" && ssig === drawnSkills && $("view").dataset.tab === "skills";
+  if (!editingSeat && !sameMap && !sameKnow && !sameSkills) {
+    drawnSkills = ssig;
     $("view").dataset.tab = tab;
     drawnGraph = sig;
+    drawnKnow = ksig;
     $("view").innerHTML = (!d && tab !== "fleet")
       ? `<div class="panel"><div class="empty">No sessions yet. Press
            <strong>new</strong> above, or pair a machine on the
            <a href="#fleet">fleet</a> tab.</div></div>`
       : ({ agents: viewAgents, messages: viewMessages, plan: viewPlan,
-           knowledge: viewKnowledge, graph: viewGraph, files: viewFiles,
-           fleet: viewFleet })[tab](d, now);
+           knowledge: viewKnowledge, skills: viewSkills, graph: viewGraph,
+           files: viewFiles, fleet: viewFleet })[tab](d, now);
     if (tab === "graph") wireMaps();
     labelCells($("view"));
   }
@@ -1587,6 +1836,11 @@ function render() {
     }
   }
   if (keep.out && $("pairOut")) $("pairOut").innerHTML = keep.out;
+
+  if (keep.focus === "memQ" && $("memQ")) {
+    $("memQ").focus();
+    try { $("memQ").setSelectionRange(keep.memAt, keep.memAt); } catch (e) {}
+  }
 
   // The form lives outside #view so typing survives a poll, which means its
   // machine list has to be refreshed deliberately.
@@ -1638,6 +1892,7 @@ const seenOf = (m) => (m.to === "(team)" && typeof m.audience === "number")
   : null;
 const deliveryTitle = (m) => {
   const s = seenOf(m);
+  if (m.cancelled) return `withdrawn by ${m.cancelled_by || "the operator"}; never delivered`;
   if (m.claimed) return `claimed by ${m.claimed_by || "someone"}` + (s ? ` \u00b7 ${s}` : "");
   if (s) return s + (m.delivered ? ", nobody has claimed it" : "");
   return m.delivered ? "delivered, but nobody has claimed it"
@@ -1653,16 +1908,28 @@ function viewAgents(d, now) {
   // a new id leaves its predecessor behind. Which of those are finished
   // with is a judgement, so it is offered rather than done.
   const derelict = d.agents.filter((a) => !present(a.status) && a.kind !== "external");
+  // Have a service seat from another team also answer here: a capability
+  // bridge, a reviewer. One process serving several teams rather than a
+  // private copy per team.
+  const guestable = !all ? (((snap && snap.detail && snap.detail.agents) || [])
+    .length >= 0 ? `<div class="pair"><button onclick="inviteGuest()"
+         title="Have a seat that lives in another team also answer in this one">
+         invite a seat from another team</button>
+       <span class="tiny muted">for a service every team needs \u2014 it keeps one
+         conversation across all of them, so what it is told here it knows
+         there</span></div>` : "") : "";
   const tidy = (derelict.length && !all)
     ? `<div class="pair"><button onclick="tidySeats()">retire ${derelict.length} empty
          seat${derelict.length === 1 ? "" : "s"}</button>
        <span class="tiny muted">only seats a live one has replaced — same machine, same
          directory, same CLI; anything still waiting for them is carried over</span></div>`
     : "";
-  return panel(`<table><thead><tr>` +
+  return panel(guestable + `<table><thead><tr>` +
       th("Agent", "name") + (all ? th("Session", "session") : "") +
-      th("Role", "role") + "<th></th>" + th("Where", "host") + th("How", "cli", "hide") +
+      th("Role", "role") + th("", "switches") + th("Authority", "authority") + "<th></th>" +
+      th("Where", "host") + th("How", "cli", "hide") +
       th("State", "task_state") + th("Tokens", "tokens", "num hide") +
+      th("Context", "context", "num") +
       th("Summary", "summary") +
     `</tr></thead><tbody>` +
     sorted(d.agents).map((a) => {
@@ -1680,12 +1947,34 @@ function viewAgents(d, now) {
                   >${esc(a.name)}</span>
             <br><span class="seatid" title="seat id — what the API and the hub call it"
                   >${esc(a.slot_id)}</span>
+            ${a.visiting ? ` <span class="badge info" title="A guest: it lives in ${
+                 esc(a.session || "another team")} and also answers here. One seat serving
+                 several teams \u2014 so what it is told in one room it knows in the others."
+                 >visiting</span>` : ""}
             ${flap ? ' <span class="badge bad">flapping</span>' : ""}
             ${a.restarts ? ` <span class="badge warn" title="restarts">↻${a.restarts}</span>` : ""}</td>
         ${all ? `<td><span class="badge info">${esc(a.session)}</span></td>` : ""}
         <td class="muted"><span class="rename" title="click to change the role"
               onclick="editRole('${esc(a.slot_id)}', '${esc(a.role).replace(/'/g, "\\'")}')"
               id="rl-${esc(a.slot_id)}">${esc(a.role)}</span></td>
+        <td class="switches">
+            <span class="sw ${a.autorespawn === false ? "off" : "on"}"
+                  title="${a.autorespawn === false
+                    ? "Stays down when its process exits, until you start it."
+                    : "Comes back by itself when its process exits. That PREPARES the seat for you to attach to \u2014 it does not reattach your terminal."}"
+                  onclick="toggleSeat('${esc(a.slot_id)}','autorespawn',${a.autorespawn === false})"
+                  >\u21bb</span>
+            <span class="sw ${a.auto_approve ? "warn" : "off"}"
+                  title="${a.auto_approve
+                    ? "Answers its own permission prompts, taking the narrowest yes on offer. Click to bring them back to you."
+                    : "Permission prompts come to you. Click to let this seat answer its own."}"
+                  onclick="toggleSeat('${esc(a.slot_id)}','auto-approve',${!a.auto_approve})"
+                  >\u{1f511}</span></td>
+        <td><span class="auth ${esc(a.authority || "agent")}" id="au-${esc(a.slot_id)}"
+              title="What this seat may do TO THE FLEET \u2014 click to change.&#10;&#10;agent: no fleet tools.&#10;orchestrator: runs this team, and can elect other orchestrators in it.&#10;superorchestrator: runs the whole fleet.&#10;&#10;This is not the Role beside it, which is the seat's job and confers nothing."
+              onclick="editAuthority('${esc(a.slot_id)}', '${esc(a.authority || "agent")}')"
+              >${esc(a.authority_label || "agent")}</span>${
+              a.supervisor ? ' <span class="badge info" title="hears what agents raise to the supervisors">sup</span>' : ""}</td>
         <td>${(a.attach_agent_id || a.agent_id) && a.status === "running"
               && a.kind !== "external"
             ? `<button class="tiny" title="Open this agent's terminal here${
@@ -1700,6 +1989,15 @@ function viewAgents(d, now) {
                  onclick="startSeat('${esc(a.slot_id)}','${
                    esc(a.name).replace(/'/g, "\\'")}')"
                  >start</button>` : ""}
+            <button class="tiny" title="What this seat tells its agent: its role template
+                 and the skills it carries, a standing system prompt, and an instruction
+                 for each new occupant${
+                   a.system_prompt_bytes ? " \u2014 it has a system prompt ("
+                     + a.system_prompt_mode + ", " + a.system_prompt_bytes + " bytes)" : ""}${
+                   a.instruction_bytes ? " \u2014 it has an arrival instruction" : ""}"
+                 onclick="editSeatPrompt('${esc(a.slot_id)}','${
+                   esc(a.name).replace(/'/g, "\\'")}')"
+                 >prompt &amp; skills${a.system_prompt_bytes || a.instruction_bytes ? " \u2022" : ""}</button>
             <button class="tiny" title="Move this seat to another session"
                  onclick="moveSeat('${esc(a.slot_id)}','${
                    esc(a.name).replace(/'/g, "\\'")}','${esc(a.session || "")}')"
@@ -1724,6 +2022,7 @@ function viewAgents(d, now) {
             ${a.paused ? ' <span class="badge warn">paused</span>' : ""}</td>
         <td class="num hide tiny">${a.input_tokens || a.output_tokens
             ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}</td>
+        <td class="num tiny">${contextCell(a)}</td>
         <td class="muted">${esc(a.summary) || "<span class=tiny>—</span>"}</td>
       </tr>`;
     }).join("") + "</tbody></table>") + tidy;
@@ -1826,8 +2125,10 @@ function paintComposer(d) {
   host.hidden = tab !== "messages" || !d;
   if (host.hidden) return;
   const all = isAll();
-  const unclaimed = ((d && d.messages) || []).filter((m) => !m.claimed).length;
-  const sig = [all, unclaimed, speaking, isSpeaking(),
+  const unclaimed = ((d && d.messages) || []).filter((m) => !m.claimed && !m.cancelled).length;
+  const unseen = ((d && d.messages) || [])
+    .filter((m) => !m.delivered && !m.in_flight && !m.cancelled).length;
+  const sig = [all, unclaimed, unseen, speaking, isSpeaking(),
                (snap.sessions || []).map((x) => x.id).join("|")].join("~");
   if (host.dataset.sig === sig) return;
   host.dataset.sig = sig;
@@ -1856,6 +2157,9 @@ function paintComposer(d) {
               >${isSpeaking() ? "\u{23F9}" : (speaking ? "\u{1F50A}" : "\u{1F507}")}</button>` : ""}
       <button onclick="clearUnclaimed()" title="mark everything nobody has claimed as handled"
               ${unclaimed ? "" : "disabled"}>clear ${unclaimed || ""} unclaimed</button>
+      <button onclick="cancelUnseen()" title="Withdraw every message nobody has seen, so it is
+              never delivered. A message an agent has already seen cannot be unsent."
+              ${unseen ? "" : "disabled"}>cancel ${unseen || ""} unseen</button>
     </div>`;
   if (keep && $("sendText")) $("sendText").value = keep;
 }
@@ -1870,6 +2174,19 @@ function paintComposer(d) {
 // at all: /v1/attach/ws sits behind the operator middleware, and that accepts
 // a signed-in person as readily as a token.
 let termWs = null, term = null, termAgent = null, termRO = false;
+// The descriptor id of the CLI drawing the open terminal, so the last thing
+// it said can be told from the boxes it draws around it.
+let termCli = "";
+
+/// Which CLI a given agent is. The agent asked for may be the ADOPTED PANE a
+/// seat's CLI sits in, so the seat is matched on either id -- and what
+/// matters is the seat's CLI, because claude's furniture is on that screen,
+/// not tmux's.
+function cliOfAgent(agent) {
+  const all = (snap && snap.detail && snap.detail.agents) || [];
+  const a = all.find((x) => x.attach_agent_id === agent || x.agent_id === agent);
+  return (a && a.cli) || "";
+}
 
 function termUrl(agent, cols, rows) {
   const base = location.protocol === "https:" ? "wss://" : "ws://";
@@ -1883,6 +2200,11 @@ function openTerm(agent, name) {
   if (!window.NexTerm) { note("the terminal did not load; reload the page"); return; }
   closeTerm();
   termAgent = agent;
+  // WHOSE FURNITURE IS ON THIS SCREEN. Needed to tell the agent's own words
+  // from the boxes and status rows its CLI draws around them; looked up
+  // here rather than passed in, because every caller already has the seat
+  // on screen and none of them should have to know this exists.
+  termCli = cliOfAgent(agent);
   $("term").hidden = false;
   document.body.style.overflow = "hidden";
   $("tWho").textContent = name || agent;
@@ -2008,7 +2330,7 @@ function termDictate() {
     recog.onresult = (e) => {
       let said = "";
       for (const r of e.results) said += r[0].transcript;
-      if (said && term) term.send(said);
+      typeIntoTerm(said);
     };
     recog.onerror = (e) => note("Could not hear: " + (e.error || "unknown"));
     recog.onend = () => { recog = null; const b = $("termMic"); if (b) b.classList.remove("on"); };
@@ -2018,27 +2340,81 @@ function termDictate() {
     return;
   }
   dictateViaFleet((text) => {
-    if (text && term) { term.send(text); term.focus(); }
+    typeIntoTerm(text);
   }, $("termMic"));
 }
 
-// Read the terminal aloud: whatever is selected, or the whole screen when
-// nothing is. The same voice the chat uses -- the fleet's if it has one.
-function termSpeak() {
+// READ THE LAST REPLY ALOUD -- not the screen.
+//
+// This used to read every row of the terminal, joined with ". ", which on a
+// real seat meant: the reply, then the spinner, then "/compact", then the
+// files the agent had read, then "Update installed", then a row of dashes,
+// then the input box, then "auto mode on (shift+tab to cycle)". And because
+// every wrapped line became its own sentence, a paragraph came out as a
+// dozen fragments: "the report has never. been sent to the client."
+//
+// A terminal is a screen, not a list of replies, so deciding which lines are
+// the agent's own words is real work -- and the same work the console has to
+// do. The rule lives in the hub (`nexmesh_proto::screenread`) and is shared
+// by both, rather than existing twice and rotting on one side.
+//
+// A selection still wins: asking to hear a particular line is not a guess.
+async function termSpeak() {
   if (!term) return;
   const picked = String(window.getSelection ? window.getSelection() : "").trim();
-  say(picked || termText());
+  if (picked) { say(picked); return; }
+  let text = "";
+  try {
+    const r = await post("/v1/speech/reply", { screen: termText(), cli: termCli });
+    if (r && r.error) throw new Error(r.error);
+    text = (r && r.text) || "";
+  } catch (e) {
+    // The hub is how this page gets everything else; if it cannot answer,
+    // say so rather than falling back to reciting the furniture.
+    note(e.message || "could not work out what it said");
+    return;
+  }
+  if (!text) {
+    note("Nothing said on this screen yet \u2014 select a line to hear that instead.");
+    return;
+  }
+  say(text);
 }
 
-/// The screen as words: rows as the terminal drew them, trailing blanks and
-/// empty lines dropped, because a reader does not want fifty "blank" pauses.
+/// WHAT WAS HEARD, TYPED WHERE YOU CAN SEE IT.
+///
+/// Two things went wrong with dictation into a terminal, and they compounded
+/// each other. A transcription of several sentences comes back with NEWLINES
+/// in it -- the fleet's own transcriber returns one line per utterance -- and
+/// a newline typed at a CLI prompt is Enter: the first sentence was submitted
+/// on its own, the rest arrived as separate turns, and nothing anybody could
+/// see was ever the sentence they said. So it is flattened to one line, and
+/// Enter stays the operator's, which is what the comment on this feature has
+/// always claimed.
+///
+/// And it is SHOWN. Dictation whose only evidence is what a CLI happens to
+/// echo is dictation you cannot tell from a microphone that is not working.
+function typeIntoTerm(said) {
+  const text = String(said || "").replace(/\s+/g, " ").trim();
+  if (!text) { note("Nothing heard."); return; }
+  if (!term) return;
+  term.send(text);
+  term.focus();
+  // Said out loud, with its own wording: "typed" rather than "sent", because
+  // it is sitting in the prompt waiting for Enter.
+  note("Typed: " + text);
+}
+
+/// The screen as lines: rows as the terminal drew them, trailing blanks
+/// gone. Lines, not sentences -- what is a reply and what is furniture is
+/// decided from the SHAPE of the screen, and a screen flattened into one
+/// string has no shape left.
 function termText() {
   const host = $("termHost");
   if (!host) return "";
   return [...host.querySelectorAll(".ntrow")]
     .map((r) => r.textContent.replace(/\s+$/, ""))
-    .filter((l) => l.length)
-    .join(". ");
+    .join("\n");
 }
 
 /// Right-click, or press and hold, a line of the terminal to hear it. The
@@ -2493,9 +2869,10 @@ function renderChat(d) {
     // own APIs stand in where the fleet has none.
     host.innerHTML = `
       <span class="tiny muted mono">${chatChan === "*" ? "every channel" : "#" + esc(chatChan)}</span>
-      <input id="chatText" type="text" autocomplete="off"
+      <textarea id="chatText" rows="1" autocomplete="off" spellcheck="false"
              placeholder="say something to ${chatChan === "*" ? "every team" : "#" + esc(chatChan)}, as the operator"
-             onkeydown="if(event.key==='Enter')chatSend()">
+             oninput="chatGrow(this)"
+             onkeydown="chatKey(event)"></textarea>
       <button onclick="pickFiles()" title="put a file in the workspace for the agents to read"
               >📎</button>
       ${navigator.mediaDevices && navigator.mediaDevices.getUserMedia
@@ -2515,7 +2892,7 @@ function renderChat(d) {
               title="${isSpeaking() ? "stop talking" : `read new messages in this channel aloud (${
                 fleetHas("tts") ? "spoken by the fleet" : "by this browser"})`}"
               >${isSpeaking() ? "\u{23F9}" : (speaking ? "\u{1F50A}" : "\u{1F507}")}</button>` : ""}`;
-    if (keep && $("chatText")) $("chatText").value = keep;
+    if (keep && $("chatText")) { $("chatText").value = keep; chatGrow($("chatText")); }
   }
 }
 
@@ -2544,6 +2921,184 @@ function mediaKind(url) {
 
 /// The body of a message: escaped text, links made clickable, and whatever
 /// media it refers to collected for showing underneath.
+// Enter sends; Shift+Enter (or Ctrl/Cmd+Enter) makes a line.
+//
+// The composer was an <input type="text">, which cannot hold a newline: a
+// list or a snippet was not something the operator could type here at all,
+// whatever the rest of the chain preserved.
+function chatKey(e) {
+  if (e.key !== "Enter") return;
+  if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return; // a line, not a send
+  e.preventDefault();
+  chatSend();
+}
+
+// Grow with the text, up to a third of the viewport, so a long message is
+// visible while it is written without the feed disappearing behind it.
+function chatGrow(el) {
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, Math.round(window.innerHeight / 3)) + "px";
+}
+
+// Permission prompts an agent is STOPPED on, waiting for you.
+//
+// Rendered from the snapshot rather than from the chat line that announced
+// them, so what is on screen is always what is actually still pending: a
+// button that silently stops working reads as a broken dashboard.
+//
+// The buttons are the CLI's OWN options, in its own words. One that grants
+// more than the question asked ("Yes, and don't ask again") is marked, never
+// relabelled as a plain yes -- presenting it as one is exactly the mistake
+// this screen exists to prevent.
+let seenApprovals = new Set();
+
+function renderApprovals() {
+  const list = (snap && snap.approvals) || [];
+  const box = $("approvalBox");
+  if (box) {
+    box.hidden = list.length === 0;
+    box.innerHTML = list.map((a) => {
+      const opts = Array.isArray(a.options) ? a.options : [];
+      const btns = opts.map((o) => {
+        const cls = o.widens ? "wide" : (o.affirmative ? "yes" : "no");
+        const tip = o.widens
+          ? "This grants more than this one action \u2014 it also stops the agent asking next time."
+          : "Types " + JSON.stringify(o.keys) + " at its terminal";
+        return `<button class="tiny ${cls}" title="${esc(tip)}"
+                  onclick="decide('${esc(a.id)}','${esc(o.key)}')">${esc(o.label)}</button>`;
+      }).join("");
+      const always = opts.length ? `<span class="sep"></span>
+        <button class="tiny" title="Allow this, and answer this agent's future prompts automatically"
+          onclick="decide('${esc(a.id)}','allow','agent')">allow + always this agent</button>
+        <button class="tiny" title="Allow this, and answer the whole team's future prompts automatically"
+          onclick="decide('${esc(a.id)}','allow','session')">\u2026 always this team</button>` : "";
+      const unreadable = opts.length ? "" :
+        `<div class="unreadable">I cannot read the choices this prompt is offering \u2014
+          attach to its terminal to answer it.</div>`;
+      return `<div class="ap" data-id="${esc(a.id)}">
+        <div><span class="who">\u{1f511} ${esc(a.agent)}</span>
+             <span class="tiny muted"> is asking permission \u00b7 ${hhmmss(a.asked_at_ms)}</span></div>
+        <div class="q">${esc(a.question)}</div>
+        <div class="btns">${btns}${always}${unreadable}</div>
+      </div>`;
+    }).join("");
+  }
+
+  // Notify ONCE per request, whether or not the chat is open: an agent
+  // stopped on a question is not something to discover by looking.
+  for (const a of list) {
+    if (seenApprovals.has(a.id)) continue;
+    seenApprovals.add(a.id);
+    notifyOperator(a.agent + " is asking permission", a.question);
+  }
+  // Forget the ones that are gone, so a re-raised prompt notifies again.
+  const live = new Set(list.map((a) => a.id));
+  for (const id of [...seenApprovals]) if (!live.has(id)) seenApprovals.delete(id);
+}
+
+// Invite a seat from another team into the one on screen.
+//
+// Offered as a list of what is actually elsewhere rather than a free-text
+// box: a name is only unique within a team, so typing one is ambiguous
+// exactly when it matters.
+async function inviteGuest() {
+  const sid = chanId(chatChan) || (snap && snap.detail && snap.detail.session_id);
+  const here = new Set(((snap && snap.detail && snap.detail.agents) || [])
+                       .map((a) => a.slot_id));
+  let rows = [];
+  try {
+    const all = await (await fetch("/v1/sessions", { cache: "no-store" })).json();
+    for (const s of all.sessions || []) {
+      if (s.id === sid) continue;
+      const st = await (await fetch(`/v1/sessions/${encodeURIComponent(s.id)}/status`,
+                                    { cache: "no-store" })).json();
+      for (const a of st.agents || []) {
+        if (here.has(a.slot_id) || a.visiting) continue;
+        rows.push({ slot: a.slot_id, label: `${a.name} \u2014 ${s.name}` });
+      }
+    }
+  } catch (e) {
+    note("could not list the other teams: " + (e.message || e));
+    return;
+  }
+  if (!rows.length) { note("There is no seat in another team to invite."); return; }
+  const pick = prompt("Which seat should also answer here?\n\n"
+    + rows.map((r, i) => `${i + 1}. ${r.label}`).join("\n")
+    + "\n\nType its number:");
+  const i = parseInt(pick, 10);
+  if (!i || i < 1 || i > rows.length) return;
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/guests`,
+                         { agent: rows[i - 1].slot });
+    if (r && r.error) throw new Error(r.error);
+    note(r.said || "Invited.");
+  } catch (e) {
+    note(e.message || "could not invite that seat");
+  }
+  tick();
+}
+
+// The per-seat switches: whether it comes back by itself, and whether its
+// permission prompts are answered without asking. Both are the operator's,
+// both are per seat, and both read back from the next poll rather than being
+// assumed -- a switch that lies about its state is worse than no switch.
+async function toggleSeat(slot, what, on) {
+  try {
+    const r = await post(`/v1/slots/${encodeURIComponent(slot)}/${what}`, { on: !!on });
+    if (r && r.error) throw new Error(r.error);
+    note(what === "autorespawn"
+      ? (on ? "That seat will come back by itself \u2014 prepared for you to attach to, not reattached."
+            : "That seat will stay down when it exits.")
+      : (on ? "That seat will answer its own permission prompts (narrowest yes only)."
+            : "That seat's permission prompts come back to you."));
+  } catch (e) {
+    note(e.message || "could not change that");
+  }
+  tick();
+}
+
+async function decide(id, choice, remember) {
+  try {
+    const body = { choice };
+    if (remember) body.remember = remember;
+    const r = await post(`/v1/approvals/${encodeURIComponent(id)}/decide`, body);
+    if (r && r.error) throw new Error(r.error);
+    // `typed` is whether the keystroke actually reached the terminal. A
+    // decision recorded against an offline node is not an answered prompt.
+    note(r && r.typed === false
+      ? (r.said || "Recorded") + " \u2014 but its node could not be reached, so nothing was typed yet."
+      : (r && r.said) || "Answered.");
+  } catch (e) {
+    note(e.message || "could not answer that");
+  }
+  tick();
+}
+
+// A notification where the browser allows one, and the in-page line always.
+// Permission is asked for only when there is something to say: a page that
+// demands it on load is refused once and for ever.
+let askedToNotify = false;
+
+function notifyOperator(title, body) {
+  note("\u{1f511} " + title);
+  try {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted") {
+      const n = new Notification(title, { body: String(body || "").slice(0, 300),
+                                          tag: "nexmesh-approval", renotify: true });
+      n.onclick = () => { window.focus(); try { openChat(); } catch (e) {} };
+      return;
+    }
+    if (Notification.permission === "default" && !askedToNotify) {
+      askedToNotify = true;
+      Notification.requestPermission().then((p) => {
+        if (p === "granted") notifyOperator(title, body);
+      });
+    }
+  } catch (e) { /* a notification is never worth an exception */ }
+}
+
 function renderBody(body) {
   const found = [];
   // A base64 payload is thousands of characters of noise in a chat log. It
@@ -2997,7 +3552,8 @@ async function chatSend() {
   const text = (box.value || "").trim();
   if (!text) return;
   box.value = "";
-  if (!(await sendChatText(text))) box.value = text;
+  chatGrow(box);
+  if (!(await sendChatText(text))) { box.value = text; chatGrow(box); }
 }
 
 /// Send words to the channel on screen, however they were produced.
@@ -3063,10 +3619,10 @@ function viewMessages(d, now) {
 
   // The snapshot is newest-first; read it oldest-first like a conversation.
   const rows = d.messages.slice().reverse().map((m) => {
-    const cls = [m.claimed ? "" : "unclaimed",
-                 m.delivered ? "" : (m.in_flight ? "inflight" : "undelivered")]
+    const cls = [m.cancelled ? "cancelled" : (m.claimed ? "" : "unclaimed"),
+                 m.cancelled ? "" : (m.delivered ? "" : (m.in_flight ? "inflight" : "undelivered"))]
                 .filter(Boolean).join(" ");
-    const mark = !m.claimed ? "\u25cf" : "";
+    const mark = m.cancelled ? "\u2298" : (!m.claimed ? "\u25cf" : "");
     const title = deliveryTitle(m);
     const kind = m.kind === "text" ? "" : `<span class="badge tiny">${esc(m.kind)}</span> `;
     const chan = all && m.session
@@ -3078,7 +3634,12 @@ function viewMessages(d, now) {
              >${esc(m.from)}</span> <span class="arrow">→</span>
            <span class="who" title="${esc(m.to_slot || "the team")}"
              >${esc(m.to)}</span><br>
-           <span class="body">${kind}${esc(m.body)}</span></div>
+           <span class="body">${kind}${esc(m.body)}</span>${
+             !m.cancelled && !m.delivered && !m.in_flight
+               ? ` <button class="tiny" title="Withdraw this: it has not been seen, and
+                     cancelling stops it being delivered at all"
+                     onclick="cancelMessage(${m.id}, '${esc(m.session || "")}')"
+                     >cancel</button>` : ""}</div>
     </div>`;
   }).join("");
   return panel(`<div class="feed" onscroll="this.dataset.stick=
@@ -3552,6 +4113,42 @@ async function sendOperatorMessage() {
 
 // Messages no longer clear themselves, so somebody has to be able to say
 // "this no longer matters" without pretending an agent dealt with it.
+/// Withdraw a message nobody has seen, so it is never delivered.
+///
+/// Not the same as clearing unclaimed, which is about the board: that marks
+/// what a person has dealt with and the message is still delivered. This
+/// stops it arriving at all, and only works while nobody has seen it -- a
+/// message that reached a model cannot be unsent.
+async function cancelMessage(id, session) {
+  const sid = session || (isAll() ? ($("sendTo") || {}).value : currentSession());
+  if (!sid) { note("Pick a session first."); return; }
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/messages/cancel`, { id });
+    if (r && r.error) throw new Error(r.error);
+    note(r.said || "cancelled");
+  } catch (e) {
+    note(e.message || "could not cancel that");
+  }
+  tick();
+}
+
+async function cancelUnseen() {
+  const sid = isAll() ? ($("sendTo") || {}).value : currentSession();
+  if (!sid) { note("Pick a session to cancel in."); return; }
+  if (!confirm("Withdraw every message in this team that nobody has seen?\n\n"
+             + "They will never be delivered. Messages an agent has already seen "
+             + "are not touched.")) return;
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/messages/cancel`,
+                         { all_unseen: true });
+    if (r && r.error) throw new Error(r.error);
+    note(r.said || "cancelled");
+  } catch (e) {
+    note(e.message || "could not cancel those");
+  }
+  tick();
+}
+
 async function clearUnclaimed() {
   const sid = isAll() ? ($("sendTo") || {}).value : currentSession();
   if (!sid) { note("Pick a session to clear."); return; }
@@ -4022,6 +4619,174 @@ async function openSub(ws, id) {
       </div></div>`;
 }
 
+// ---- what a seat tells its agent ---------------------------------------
+//
+// Two separate things, and the sheet says so rather than leaving the
+// operator to guess which one reaches a running agent:
+//
+//  * the SYSTEM PROMPT is who the agent in this seat is. It goes to the CLI
+//    as a system prompt and every agent that ever fills the seat gets it.
+//  * the INSTRUCTION is what to do on arrival, said to each new occupant.
+//
+// Neither reaches the agent sitting there now, which is the one thing an
+// operator gets wrong about this, so it is written on the sheet.
+async function editSeatPrompt(slot, name) {
+  const host = $("subModal");
+  host.hidden = false;
+  const head = (body) => `<div class="sheet"><div class="row">
+      <strong>what ${esc(name)} tells its agent</strong>
+      <button class="tiny" onclick="closeSub()">close</button></div>${body}</div>`;
+  host.innerHTML = head(`<div class="empty tiny">Reading it…</div>`);
+  let d;
+  try {
+    d = await getJSON(`/v1/slots/${encodeURIComponent(slot)}/prompt`);
+    if (d && d.error) throw new Error(d.error);
+    // The templates this hub has, fetched when the dialog opens rather than
+    // at boot: one small request, only for somebody who is looking, and it
+    // cannot go stale against a hub whose templates have changed.
+    if (!window.__roles) {
+      const rs = await getJSON(`/v1/roles`);
+      window.__roles = (rs && rs.roles) || [];
+    }
+  } catch (e) {
+    host.innerHTML = head(`<div class="empty tiny">${esc(e.message || "could not read it")}</div>`);
+    return;
+  }
+  const mode = d.system_prompt_mode === "replace" ? "replace" : "append";
+  // THE TEMPLATE AND ITS SKILLS, as checkboxes.
+  //
+  // A seat remembers what it was built from, so each skill is a thing you
+  // can turn on or off for THIS seat without restating the rest. A prompt
+  // written by hand has no template and therefore nothing to tick: saying so
+  // is better than an empty list that looks broken.
+  const roles = (window.__roles || []);
+  const skills = d.skills || [];
+  const suggests = d.template_skills || [];
+  const picker = `
+    <label class="tiny muted" for="spTpl">Built from a role template &mdash; its brief
+      becomes this seat's system prompt, and you choose which of its skills it
+      carries.</label>
+    <div class="pair" style="margin:4px 0 10px">
+      <select id="spTpl" onchange="applyTemplate('${esc(slot)}','${
+        esc(name).replace(/'/g, "\\'")}')">
+        <option value=""${d.template ? "" : " selected"}>&mdash; written by hand &mdash;</option>
+        ${roles.map((r) => `<option value="${esc(r.id)}"${
+          d.template === r.id ? " selected" : ""}>${esc(r.id)} &mdash; ${
+          esc(r.summary || "")}</option>`).join("")}
+      </select>
+      <span class="tiny muted">Changing it re-renders the text below. Editing the text
+        yourself drops the link, because re-rendering would throw your words away.</span>
+    </div>
+    ${d.template ? `<div class="tiny muted" style="margin:0 0 4px">Skills this seat
+        carries. ${suggests.length ? "This role suggests " + suggests.map(esc).join(", ") +
+        "." : "This role suggests none."}</div>
+      <div class="row" style="flex-wrap:wrap;gap:4px 12px;margin:0 0 10px">
+        ${(d.skills_available || []).map((k) => `<label class="tiny"
+            style="white-space:nowrap"><input type="checkbox" ${
+            skills.includes(k) ? "checked " : ""}onchange="toggleSkill('${esc(slot)}','${
+            esc(name).replace(/'/g, "\\'")}','${esc(k)}',this.checked)"> ${esc(k)}${
+            suggests.includes(k) ? "" : "<span class=muted> (extra)</span>"}</label>`).join("")}
+      </div>` : `<div class="tiny muted" style="margin:0 0 10px">Written by hand, so there
+        are no skills to choose. Pick a template above and they become editable.</div>`}`;
+  host.innerHTML = head(`${picker}
+    <div class="tiny muted" style="margin:4px 0 10px">
+      Neither of these reaches the agent sitting there now: the system prompt
+      applies to the next process started in this seat, the instruction to the
+      next agent that fills it.</div>
+    <label class="tiny muted" for="spMode">System prompt &mdash; who the agent in this
+      seat is. Markdown; every agent that ever fills the seat gets it.</label>
+    <div class="pair" style="margin:4px 0">
+      <select id="spMode">
+        <option value="append"${mode === "append" ? " selected" : ""}
+          >append &mdash; add it to the CLI's own system prompt</option>
+        <option value="replace"${mode === "replace" ? " selected" : ""}
+          >replace &mdash; use this INSTEAD of the CLI's own</option>
+      </select>
+      <span class="tiny muted">Replacing throws away what the CLI tells the model about
+        its own tools. Right for a seat not meant to behave like that CLI, a trap
+        otherwise.</span></div>
+    <textarea id="spText" rows="12" spellcheck="false"
+      style="width:100%;font-family:var(--mono);font-size:13px"
+      placeholder="You are the reviewer for this team…">${esc(d.system_prompt || "")}</textarea>
+    <label class="tiny muted" for="spInstr" style="display:block;margin-top:12px"
+      >Said to each new agent that takes the seat &mdash; what to do on arrival.</label>
+    <textarea id="spInstr" rows="6" spellcheck="false"
+      style="width:100%;font-family:var(--mono);font-size:13px;margin-top:4px"
+      placeholder="Start with crates/node and report what you find…">${
+        esc(d.instructions || "")}</textarea>
+    <div class="row" style="margin-top:10px">
+      <button onclick="saveSeatPrompt('${esc(slot)}','${esc(name).replace(/'/g, "\\'")}')"
+        >save</button>
+      <button class="tiny" onclick="closeSub()">cancel</button>
+      <span class="tiny muted" id="spSaid"></span></div>`);
+  const t = document.getElementById("spText");
+  if (t) t.focus();
+}
+
+// Turn one skill on or off for this seat. The hub re-renders the brief from
+// the seat's own template, so nothing else in the selection moves -- which is
+// why this sends one name rather than the whole list: two people with the
+// dialog open would otherwise overwrite each other with whatever they loaded.
+async function toggleSkill(slot, name, skill, on) {
+  try {
+    const body = on ? { skills_on: [skill] } : { skills_off: [skill] };
+    const r = await post(`/v1/slots/${encodeURIComponent(slot)}/prompt`, body);
+    if (r && r.error) throw new Error(r.error);
+    note(`${name}: ${on ? "carries" : "no longer carries"} ${skill}.`);
+    editSeatPrompt(slot, name);
+  } catch (e) {
+    note(`${name}: ${e.message || "could not change that skill"}`);
+  }
+}
+
+// Build this seat's prompt from a role template, or let it go back to being
+// written by hand.
+async function applyTemplate(slot, name) {
+  const sel = document.getElementById("spTpl");
+  if (!sel) return;
+  try {
+    // No template means hand-written from here on, which is what sending the
+    // text as its own does: the link is dropped and the words stand.
+    const body = sel.value
+      ? { template: sel.value }
+      : { system_prompt: document.getElementById("spText").value };
+    const r = await post(`/v1/slots/${encodeURIComponent(slot)}/prompt`, body);
+    if (r && r.error) throw new Error(r.error);
+    note(sel.value ? `${name}: built from the ${sel.value} template.`
+                   : `${name}: its prompt is yours to edit.`);
+    editSeatPrompt(slot, name);
+  } catch (e) {
+    note(`${name}: ${e.message || "could not apply that template"}`);
+  }
+}
+
+async function saveSeatPrompt(slot, name) {
+  const text = document.getElementById("spText");
+  const instr = document.getElementById("spInstr");
+  const sel = document.getElementById("spMode");
+  if (!text || !instr || !sel) return;
+  const said = document.getElementById("spSaid");
+  if (said) said.textContent = "saving…";
+  try {
+    // Empty means clear, which is what the endpoint does with a field that
+    // is present and empty -- so an operator who deletes the text gets the
+    // seat's own prompt gone rather than a save that quietly did nothing.
+    const r = await post(`/v1/slots/${encodeURIComponent(slot)}/prompt`, {
+      system_prompt: text.value,
+      system_prompt_mode: sel.value,
+      instructions: instr.value,
+    });
+    if (r && r.error) throw new Error(r.error);
+    closeSub();
+    const when = (r.takes_effect || []).join("; ");
+    note(when ? `${name}: ${when}.` : `${name} is unchanged.`);
+  } catch (e) {
+    if (said) said.textContent = "";
+    note(e.message || "could not save that");
+  }
+  tick();
+}
+
 function closeSub() {
   const host = $("subModal");
   if (host) { host.hidden = true; host.innerHTML = ""; }
@@ -4054,12 +4819,30 @@ function viewGraph(d, now) {
                 title="parse it again">refresh</button>
         <span class="muted tiny">${human(g.files)} file${g.files === 1 ? "" : "s"}
           · ${g.communities} subsystem${g.communities === 1 ? "" : "s"}
-          · parsed ${ago(g.built_at_ms, now)}</span>
-        ${g.truncated
-          ? `<span class="badge warn" title="${esc(g.truncated_reason
-              || "a limit stopped the scan")}">partial</span>` : ""}
+          · parsed ${ago(g.built_at_ms, now)}${g.files_checked_at_ms
+            ? ` · files checked ${ago(g.files_checked_at_ms, now)}` : ""}</span>
+        ${g.truncated ? `<span class="badge warn">partial</span>` : ""}
+        ${g.stale ? `<span class="badge warn">the files moved</span>` : ""}
       </div>
-      <div class="muted tiny">${kinds}</div>`;
+      <div class="muted tiny">${kinds}</div>`
+      // WHY IT IS PARTIAL, AND WHETHER IT STILL MATCHES THE FILES.
+      //
+      // Both of these used to be a tooltip on a badge, which on a phone is
+      // nowhere: "partial" with no reason reads as broken, and a graph that
+      // had not been reparsed for nine days said nothing at all about
+      // whether that mattered. They are sentences now.
+      + (g.truncated
+          ? `<div class="muted tiny">Partial: ${esc(g.truncated_reason
+              || "a limit stopped the scan")}. What is missing is whatever the walk had
+              not reached — ask for a bigger scan rather than trusting a gap.</div>` : "")
+      + (g.stale
+          ? `<div class="muted tiny">The files have changed since this was parsed${
+              g.stale_reason ? ` (${esc(g.stale_reason)})` : ""}; a rebuild is due within
+              a minute or two.</div>`
+          : (g.files_now && g.files_now !== g.files
+              ? `<div class="muted tiny">The tree holds ${human(g.files_now)} source
+                 file${g.files_now === 1 ? "" : "s"} now; this graph covers
+                 ${human(g.files)}.</div>` : ""));
     if (!(g.subsystems || []).length)
       return panel(head + `<div class="empty tiny">Nothing in this workspace connects to
         anything else, so there are no subsystems to show.</div>`);
@@ -4098,24 +4881,667 @@ function viewGraph(d, now) {
   }).join("");
 }
 
-function viewKnowledge(d, now) {
-  if (!d.knowledge.length)
-    return empty("Nothing remembered yet. Agents call store_memory as they decide things.");
-  // Scope is shown because it says how far a fact travels: a global
-  // convention and one team's decision deserve different weight.
-  return panel(`<table><thead><tr><th>Category</th><th>Scope</th><th>Key</th><th>Value</th>
+// What the seats have folded away: the summary each one carries, and how much
+// detail is underneath it. The detail itself is deliberately NOT here -- it is
+// often tens of thousands of tokens, and the whole point of a fold is that
+// nobody carries it until they ask. `unfold_context` is how an agent asks;
+// this is the operator's view of what exists.
+function foldsPanel(d, now) {
+  const f = d.folds || [];
+  if (!f.length) return "";
+  const before = f.reduce((a, x) => a + (x.tokens_before || 0), 0);
+  const after = f.reduce((a, x) => a + (x.tokens_after || 0), 0);
+  return `<h3 class="tiny muted" style="margin:10px 2px">Folded away \u2014 ${f.length}
+      fold${f.length === 1 ? "" : "s"} carrying ${after.toLocaleString()} tokens of summary
+      over ${before.toLocaleString()} tokens of detail</h3>` + panel(
+    `<table><thead><tr><th class="num">Tier</th><th>Scope</th><th>What</th>
+      <th>The summary it carries</th><th class="num hide">Folded</th>
       <th class="hide">By</th><th class="num hide">Age</th></tr></thead><tbody>` +
-    d.knowledge.map((k) => `<tr>
-      <td><span class="badge ${k.category === "decision" ? "info"
-          : k.category === "blocker" ? "bad" : ""}">${esc(k.category)}</span></td>
-      <td><span class="badge ${k.scope === "global" ? "warn" : ""}" title="${
-          k.scope === "global" ? "outlives every session" : "this session only"
-        }">${esc(k.scope || "session")}</span></td>
-      <td class="mono">${esc(k.key)}</td>
-      <td>${esc(k.value)}${(k.revision || 1) > 1
-          ? `<span class="muted tiny"> rev ${k.revision}</span>` : ""}</td>
-      <td class="hide muted tiny">${esc(k.who)}</td>
-      <td class="num hide muted tiny">${ago(k.at_ms, now)}</td></tr>`).join("") + "</tbody></table>");
+    f.map((x) => `<tr>
+      <td class="num"><span class="badge ${x.tier > 1 ? "info" : ""}"
+          title="${x.tier > 1
+            ? "a fold over other folds: the ones underneath it are still there, with their detail"
+            : "folds a stretch of the agent's own work"}">${x.tier}</span></td>
+      <td><span class="badge ${x.scope === "global" ? "warn"
+            : x.scope === "agent" ? "" : x.scope === "group" ? "info" : ""}">${
+          esc(x.scope)}</span></td>
+      <td>${esc(x.topic)}<div class="mono tiny muted">${esc(x.id)}</div></td>
+      <td>${esc(x.summary)}</td>
+      <td class="num hide muted tiny" title="${(x.detail_bytes || 0).toLocaleString()} bytes
+          of detail kept, read back ${x.unfolded || 0} time(s)">${
+          (x.tokens_before || 0).toLocaleString()}</td>
+      <td class="hide muted tiny">${esc(x.who)}</td>
+      <td class="num hide muted tiny">${ago(x.at_ms, now)}</td></tr>`).join("") +
+    "</tbody></table>");
+}
+
+// ------------------------------------------------------ what the fleet knows
+//
+// MEMORY IS NOT A SESSION'S PROPERTY, so this page is not a session's view of
+// it. It used to be: the knowledge tab read the session snapshot, which shows
+// what the team being looked at can see. On a fleet whose seats had only ever
+// written session-scoped notes that made the page look as though session
+// scope was the only scope there is -- and gave no way at all to see what one
+// seat keeps for itself, or to put a fleet-wide convention in by hand.
+//
+// It reads `/v1/memory` instead: every scope, nothing shadowed, each row
+// labelled with what its scope points at. The operator can write and forget
+// here too, because the capability that gates global memory exists to stop an
+// AGENT giving itself fleet-wide reach, and the person who grants it is the
+// person at this page.
+let memBook = {
+  rows: null,          // null = not read yet, [] = read and empty
+  counts: [],
+  cats: ["decision", "convention", "discovery", "blocker", "context"],
+  scope: "all",
+  ref: "",             // a chosen session/group/agent within a scope, "" = all of them
+  q: "",
+  at: 0,
+  pending: false,
+  err: "",
+};
+let drawnKnow = null;
+let drawnSkills = null;
+// The skills/templates catalogue, cached like the memory view: read on open
+// and at most every 20s after, plus whenever an edit forces it.
+let skillCat = { roles: null, skills: null, at: 0, pending: false, err: "" };
+
+/// What would make the page look different. The knowledge view is held still
+/// between these, for the reason the map is: a table with a search box in it
+/// cannot be rebuilt under the hands of somebody typing into the box.
+function knowSignature(d) {
+  return [memBook.at, memBook.scope, memBook.ref, memBook.q, memBook.err,
+          memBook.rows ? memBook.rows.length : -1,
+          (d && d.folds || []).length].join("~");
+}
+
+async function loadMemory(force) {
+  if (memBook.pending) return;
+  if (!force && memBook.at && Date.now() - memBook.at < 20000) return;
+  memBook.pending = true;
+  try {
+    const u = new URLSearchParams();
+    if (memBook.scope !== "all") u.set("scope", memBook.scope);
+    if (memBook.q) u.set("q", memBook.q);
+    const r = await getJSON("/v1/memory" + (u.toString() ? "?" + u.toString() : ""));
+    if (r && r.error) throw new Error(r.error);
+    memBook.rows = r.memory || [];
+    memBook.counts = r.counts || [];
+    if ((r.categories || []).length) memBook.cats = r.categories;
+    memBook.err = "";
+  } catch (e) {
+    memBook.err = e.message || "could not read what the fleet remembers";
+    memBook.rows = [];
+  }
+  memBook.pending = false;
+  memBook.at = Date.now();
+  render();
+}
+
+function memScope(scope) {
+  memBook.scope = scope;
+  memBook.ref = "";   // a new scope has its own set of teams/groups/agents
+  loadMemory(true);
+}
+
+/// Narrow to one team, group or agent within the current scope. The rows for
+/// the whole scope are already loaded, so this filters what is shown rather
+/// than fetching again -- the selector itself is built from those rows.
+function memPick(ref) {
+  memBook.ref = ref || "";
+  render();
+}
+
+/// Typed into, so it must not re-render on every keystroke: the signature
+/// changes, the view is rebuilt, and the box loses the caret. The value is
+/// read back when the search actually runs.
+function memFind(text) {
+  memBook.q = text;
+  clearTimeout(memBook.timer);
+  memBook.timer = setTimeout(() => loadMemory(true), 400);
+}
+
+function memCount(scope) {
+  const row = (memBook.counts || []).find((c) => c.scope === scope);
+  return row ? row.n : 0;
+}
+
+function viewKnowledge(d, now) {
+  // Read once when the page is opened, and at most every twenty seconds
+  // after that while it is on screen: the memory is a live view like the
+  // rest of the dashboard, but what the fleet remembers changes when
+  // somebody decides something, not twice a second.
+  loadMemory(memBook.rows === null);
+  const rows = memBook.rows || [];
+  const total = (memBook.counts || []).reduce((a, c) => a + (c.n || 0), 0);
+  const chip = (scope, label, hint) =>
+    `<button class="tiny" aria-selected="${memBook.scope === scope}"
+             title="${hint}" onclick="memScope('${scope}')">${label}<span class="count"> ${
+      scope === "all" ? total : memCount(scope)}</span></button>`;
+  // The scopes are always all four, with their counts, whether or not
+  // anything is in them: a page that simply leaves out an empty scope is a
+  // page that cannot tell you the scope is empty.
+  // The teams/groups/agents present in this scope, for a selector that
+  // narrows to one of them. Only for the scopes that HAVE several references
+  // (not "everything" or "global", which is a single fleet-wide bucket).
+  const picks = [];
+  if (memBook.scope === "session" || memBook.scope === "group" || memBook.scope === "agent") {
+    for (const r of rows) {
+      const rf = r.scope_ref || "";
+      if (!picks.some((p) => p.ref === rf)) {
+        picks.push({ ref: rf, label: r.scope_label || rf || "(unnamed)" });
+      }
+    }
+    picks.sort((a, b) => a.label.localeCompare(b.label));
+  }
+  const noun = memBook.scope === "session" ? "team"
+    : memBook.scope === "group" ? "group" : "agent";
+  const refSel = picks.length > 1
+    ? `<select id="memRef" title="narrow to one ${noun}" onchange="memPick(this.value)">
+         <option value=""${memBook.ref ? "" : " selected"}>all ${noun}s (${picks.length})</option>
+         ${picks.map((p) => `<option value="${esc(p.ref)}"${
+           memBook.ref === p.ref ? " selected" : ""}>${esc(p.label)}</option>`).join("")}
+       </select>`
+    : "";
+  const head = `<div class="row" style="flex-wrap:wrap;gap:6px">
+      ${chip("all", "everything", "every scope")}
+      ${chip("global", "global", "fleet-wide, for ever — every team sees it")}
+      ${chip("session", "per team", "one team's own, and it goes when the team does")}
+      ${chip("group", "groups", "a named subset of a team")}
+      ${chip("agent", "per agent", "one seat's own note, private between agents")}
+      ${refSel}
+      <input id="memQ" placeholder="find a key or a value" value="${esc(memBook.q)}"
+             oninput="memFind(this.value)" style="flex:1;min-width:140px">
+      <button class="tiny" onclick="openMemWrite()"
+              title="put something in the fleet's memory yourself">remember…</button>
+    </div>`;
+  if (memBook.err)
+    return panel(head + `<div class="empty">${esc(memBook.err)}</div>`) + foldsPanel(d, now);
+  if (!rows.length) {
+    const why = memBook.q || memBook.scope !== "all"
+      ? "Nothing here matches that."
+      : "Nothing remembered yet. Agents call store_memory as they decide things, "
+        + "fold_context when a stretch of work is done with — and you can write one "
+        + "yourself with <strong>remember</strong>.";
+    return panel(head + `<div class="empty">${why}</div>`) + foldsPanel(d, now);
+  }
+  // Grouped by scope, and within a scope by what it belongs to: a fleet-wide
+  // convention and one seat's working note are different kinds of fact, and
+  // reading them interleaved makes both look provisional.
+  const groups = [];
+  for (const r of rows) {
+    // When a team/group/agent is chosen, show only its rows.
+    if (memBook.ref && (r.scope_ref || "") !== memBook.ref) continue;
+    const at = `${r.scope}\u0000${r.scope_ref || ""}`;
+    let g = groups.find((x) => x.at === at);
+    if (!g) { g = { at, scope: r.scope, label: r.scope_label || r.scope_ref, rows: [] };
+              groups.push(g); }
+    g.rows.push(r);
+  }
+  const SCOPE_WHY = {
+    global: "fleet-wide, for ever. Written by a seat holding the memory-writer capability, or by you.",
+    session: "this team, and it goes when the team does",
+    group: "a named subset of a team",
+    agent: "one seat's own note — private between agents, and the place for anything provisional",
+  };
+  const body = groups.map((g) => {
+    const where = g.scope === "global" ? "the whole fleet"
+      : g.scope === "session" ? `team ${esc(g.label)}`
+      : g.scope === "group" ? `group ${esc(g.label)}`
+      : `${esc(g.label)}'s own`;
+    return `<h3 class="tiny muted" style="margin:12px 2px 4px"
+        title="${SCOPE_WHY[g.scope] || ""}">
+        <span class="badge ${g.scope === "global" ? "warn"
+          : g.scope === "agent" ? "" : g.scope === "group" ? "info" : ""}">${esc(g.scope)}</span>
+        ${where} — ${g.rows.length} item${g.rows.length === 1 ? "" : "s"}</h3>` + panel(
+      `<table><thead><tr><th>Category</th><th>Key</th><th>Value</th>
+        <th class="hide">By</th><th class="num hide">Age</th>
+        <th class="num"></th></tr></thead><tbody>` +
+      // Addressed by their place in the list rather than by their contents:
+      // a key with an apostrophe in it, or a value with a quotation mark,
+      // ends an attribute early and takes the rest of the row with it.
+      g.rows.map((k) => `<tr>
+        <td><span class="badge ${k.category === "decision" ? "info"
+            : k.category === "blocker" ? "bad" : ""}">${esc(k.category)}</span></td>
+        <td class="mono">${esc(k.key)}</td>
+        <td>${esc(k.value)}${(k.revision || 1) > 1
+            ? ` <a href="#knowledge" class="muted tiny"
+                   onclick="openMemRowHistory(${rows.indexOf(k)});return false"
+                   title="${k.revisions_kept || 0} earlier value(s) kept"
+                 >rev ${k.revision}</a>` : ""}${k.expires_at_ms
+            ? ` <span class="badge warn tiny" title="it expires">expires ${
+                 ago(2 * now - k.expires_at_ms, now)}</span>` : ""}</td>
+        <td class="hide muted tiny">${esc(k.who)}</td>
+        <td class="num hide muted tiny">${ago(k.at_ms, now)}</td>
+        <td class="num"><button class="tiny" onclick="openMemRow(${rows.indexOf(k)})"
+              title="change it, or forget it">edit</button></td></tr>`).join("") +
+      "</tbody></table>");
+  }).join("");
+  return panel(head) + body + foldsPanel(d, now);
+}
+
+/// One of the rows on screen, by its place in the list. See the comment on
+/// the table: a memory's own words are not safe to put in an attribute.
+function openMemRow(i) {
+  const k = (memBook.rows || [])[i];
+  if (k) {
+    openMemWrite({ scope: k.scope, ref: k.scope_ref, key: k.key,
+                   value: k.value, category: k.category });
+  }
+}
+
+function openMemRowHistory(i) {
+  const k = (memBook.rows || [])[i];
+  if (k) openMemHistory(k.scope, k.scope_ref, k.key);
+}
+
+function closeMem() {
+  const host = $("memModal");
+  if (host) { host.hidden = true; host.innerHTML = ""; }
+}
+
+/// Write a memory by hand, or change one that is there.
+///
+/// The scope is a choice with consequences, so each option says what it
+/// means rather than being a bare word in a list.
+function openMemWrite(from) {
+  const host = $("memModal");
+  if (!host) return;
+  const f = from || {};
+  const sessions = (snap && snap.sessions || []).map((x) =>
+    `<option value="${esc(x.id)}" ${f.ref === x.id ? "selected" : ""}>${esc(x.name)}</option>`
+  ).join("");
+  const seats = ((snap && snap.detail && snap.detail.agents) || []).map((a) =>
+    `<option value="${esc(a.slot_id || a.id)}" ${
+      f.ref === (a.slot_id || a.id) ? "selected" : ""}>${esc(a.name)}</option>`).join("");
+  const editing = !!f.key;
+  host.hidden = false;
+  host.innerHTML = `<div class="sheet"><div class="row">
+      <strong>${editing ? "change what is remembered" : "remember something"}</strong>
+      <button class="tiny" onclick="closeMem()">close</button></div>
+    <div class="pair" style="flex-wrap:wrap">
+      <label class="tiny muted">scope
+        <select id="mwScope" onchange="memWriteScope()">
+          <option value="global" ${f.scope === "global" ? "selected" : ""}>global — the whole fleet, for ever</option>
+          <option value="session" ${f.scope === "session" || !f.scope ? "selected" : ""}>team — one session</option>
+          <option value="group" ${f.scope === "group" ? "selected" : ""}>group — a named subset</option>
+          <option value="agent" ${f.scope === "agent" ? "selected" : ""}>agent — one seat's own</option>
+        </select></label>
+      <label class="tiny muted" id="mwRefWrap">belongs to
+        <select id="mwRefSel">${sessions}</select>
+        <select id="mwSeatSel" hidden>${seats}</select>
+        <input id="mwRefText" hidden placeholder="group name" value="${
+          f.scope === "group" ? esc(f.ref || "") : ""}"></label>
+      <label class="tiny muted">category
+        <select id="mwCat">${memBook.cats.map((c) =>
+          `<option ${f.category === c ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>
+      </label>
+    </div>
+    <div class="pair" style="flex-wrap:wrap">
+      <input id="mwKey" placeholder="key — short, and the same next time"
+             value="${esc(f.key || "")}" ${editing ? "readonly" : ""} style="flex:1">
+    </div>
+    <textarea id="mwValue" rows="4" placeholder="what to remember"
+      style="width:100%">${esc(f.value || "")}</textarea>
+    <div class="pair">
+      <button onclick="saveMem()">${editing ? "save" : "remember it"}</button>
+      ${editing ? `<button class="tiny" onclick="forgetMem()">forget it</button>` : ""}
+      <span class="tiny muted">Written as <strong>operator</strong>, so a convention you
+        typed is never mistaken for something a model concluded.</span>
+    </div>
+    <div id="mwOut" class="tiny muted"></div></div>`;
+  memWriteScope();
+  const k = $("mwKey");
+  if (k && !editing) k.focus();
+}
+
+/// Which "belongs to" control the chosen scope needs. Global belongs to
+/// nothing, and asking for a reference it will not use is how a form teaches
+/// somebody the wrong thing about the model underneath it.
+function memWriteScope() {
+  const scope = ($("mwScope") || {}).value;
+  const wrap = $("mwRefWrap"), sel = $("mwRefSel"), seat = $("mwSeatSel"), text = $("mwRefText");
+  if (!wrap) return;
+  wrap.hidden = scope === "global";
+  if (sel) sel.hidden = scope !== "session";
+  if (seat) seat.hidden = scope !== "agent";
+  if (text) text.hidden = scope !== "group";
+}
+
+function memRef() {
+  const scope = ($("mwScope") || {}).value;
+  if (scope === "global") return "";
+  if (scope === "session") return (($("mwRefSel") || {}).value) || currentSession();
+  if (scope === "agent") return ($("mwSeatSel") || {}).value || "";
+  return (($("mwRefText") || {}).value || "").trim();
+}
+
+async function saveMem() {
+  const out = $("mwOut");
+  const body = {
+    scope: ($("mwScope") || {}).value,
+    ref: memRef(),
+    key: (($("mwKey") || {}).value || "").trim(),
+    value: ($("mwValue") || {}).value || "",
+    category: ($("mwCat") || {}).value,
+  };
+  if (!body.key) { if (out) out.textContent = "it needs a key"; return; }
+  try {
+    const r = await post("/v1/memory", body);
+    if (r && r.error) throw new Error(r.error);
+    closeMem();
+    note(r.said || "Remembered.");
+    loadMemory(true);
+  } catch (e) {
+    if (out) out.textContent = e.message || "could not write it";
+  }
+}
+
+async function forgetMem() {
+  const key = (($("mwKey") || {}).value || "").trim();
+  if (!key) return;
+  if (!confirm(`Forget '${key}'? The value goes; earlier revisions go with it.`)) return;
+  try {
+    const r = await post("/v1/memory",
+      { scope: ($("mwScope") || {}).value, ref: memRef(), key, forget: true });
+    if (r && r.error) throw new Error(r.error);
+    closeMem();
+    note(r.said || "Forgotten.");
+    loadMemory(true);
+  } catch (e) {
+    const out = $("mwOut");
+    if (out) out.textContent = e.message || "could not forget it";
+  }
+}
+
+/// What a key used to say. Overwrites keep the previous revision, and two
+/// agents writing one key is normal in a parallel team -- so the argument is
+/// there to read rather than lost behind the last word.
+async function openMemHistory(scope, ref, key) {
+  const host = $("memModal");
+  if (!host) return;
+  host.hidden = false;
+  host.innerHTML = `<div class="sheet"><div class="row"><strong>${esc(key)}</strong>
+      <button class="tiny" onclick="closeMem()">close</button></div>
+    <div class="empty tiny">Reading it…</div></div>`;
+  let d;
+  try {
+    const u = new URLSearchParams({ scope, key });
+    if (ref) u.set("ref", ref);
+    d = await getJSON("/v1/memory/history?" + u.toString());
+    if (d && d.error) throw new Error(d.error);
+  } catch (e) {
+    host.innerHTML = `<div class="sheet"><div class="row"><strong>${esc(key)}</strong>
+        <button class="tiny" onclick="closeMem()">close</button></div>
+      <div class="empty tiny">${esc(e.message || "could not read it")}</div></div>`;
+    return;
+  }
+  const now = Date.now();
+  const rows = (d.history || []).map((h) => `<tr>
+      <td class="num tiny muted">${h.revision}</td>
+      <td>${esc(h.value)}</td>
+      <td class="hide muted tiny">${esc(h.who || "?")}</td>
+      <td class="num muted tiny">${ago(h.at_ms, now)}</td></tr>`).join("");
+  host.innerHTML = `<div class="sheet"><div class="row"><strong>${esc(key)}</strong>
+      <span class="muted tiny">${esc(scope)}${ref ? " · " + esc(ref) : ""}</span>
+      <button class="tiny" onclick="closeMem()">close</button></div>` +
+    (rows ? `<table><thead><tr><th class="num">rev</th><th>what it said</th>
+        <th class="hide">by</th><th class="num">replaced</th></tr></thead>
+        <tbody>${rows}</tbody></table>`
+      : `<div class="empty tiny">This has only ever said one thing.</div>`) + `</div>`;
+}
+
+// ===================== Skills & Templates ============================
+//
+// The library behind every seat's brief: the role templates and the reusable
+// skill fragments they carry. Read here, edited here, and enabled or disabled
+// at three breadths -- the whole fleet, the current team, or (on a seat's own
+// "prompt & skills" button) one seat.
+
+async function loadSkills(force) {
+  if (skillCat.pending) return;
+  if (!force && skillCat.at && Date.now() - skillCat.at < 20000) return;
+  skillCat.pending = true;
+  try {
+    const [roles, skills] = await Promise.all([getJSON("/v1/roles"), getJSON("/v1/skills")]);
+    skillCat.roles = (roles && roles.roles) || [];
+    skillCat.skills = (skills && skills.skills) || [];
+    skillCat.editable = !!(skills && skills.editable);
+    skillCat.local = skills && skills.local;
+    skillCat.err = "";
+  } catch (e) {
+    skillCat.err = e.message || "could not read the skill library";
+  }
+  skillCat.pending = false;
+  skillCat.at = Date.now();
+  render();
+}
+
+function srcBadge(src) {
+  const cls = src === "builtin" ? "" : src === "override" ? "warn" : "info";
+  const word = src === "override" ? "edited" : src;  // "override" reads oddly to a person
+  return `<span class="badge ${cls}">${word}</span>`;
+}
+
+function viewSkills(d, now) {
+  loadSkills(skillCat.roles === null);
+  if (skillCat.err && skillCat.roles === null)
+    return panel(`<div class="empty">${esc(skillCat.err)}</div>`);
+  const roles = skillCat.roles || [];
+  const skills = skillCat.skills || [];
+  const sess = currentSession();
+  const readOnly = !skillCat.editable;
+  const note = readOnly
+    ? `<div class="empty tiny">This hub has no editable prompts store, so the library is
+        read-only. It is provisioned at <span class=mono>/var/lib/nexmesh/prompts</span>
+        when the package is installed; set it and restart the hub to edit, add and remove.</div>`
+    : `<div class="tiny muted" style="margin:2px">Editing a skill or template changes what
+        <strong>every seat carrying it</strong> tells its agent, from the next start.
+        Edits live in <span class=mono>${esc(skillCat.local || "the store")}</span>; the
+        built-ins underneath are never lost — “reset” brings one back.</div>`;
+
+  // --- Templates ---
+  const tplRows = roles.map((r, i) => `<tr>
+      <td class="mono">${esc(r.id)} ${srcBadge(r.source)}</td>
+      <td>${esc(r.summary || "")}<div class="tiny muted">${
+        (r.skills || []).map(esc).join(", ") || "no skills"}</div></td>
+      <td class="num">
+        <button class="tiny" onclick="editTemplate(${i})">${readOnly ? "view" : "edit"}</button>
+        ${!readOnly && r.source === "override"
+          ? `<button class="tiny" onclick="resetTemplate('${esc(r.id)}')"
+                title="drop the local copy, back to the built-in">reset</button>` : ""}
+        ${!readOnly && r.source === "local"
+          ? `<button class="tiny" onclick="resetTemplate('${esc(r.id)}')">delete</button>` : ""}
+      </td></tr>`).join("");
+  const templates = `<h3 class="tiny muted" style="margin:12px 2px 4px">Role templates — a
+      seat's brief and the skills it carries</h3>` + panel(
+    `<table><thead><tr><th>Template</th><th>What it is for</th>
+       <th class="num">${readOnly ? "" : `<button class="tiny" onclick="newTemplate()">new…</button>`}</th>
+       </tr></thead><tbody>${tplRows}</tbody></table>`);
+
+  // --- Skill library ---
+  // The dials: a skill's state globally and (if a team is selected) for that
+  // team. A seat's own dial is on its "prompt & skills" button, not here.
+  const gset = (name) => {
+    const g = (skills.find((s) => s.name === name) || {}).global;
+    return g === true ? "on" : g === false ? "off" : "";
+  };
+  const dial = (name, scope, cur) => readOnly ? "" : `<select class="tiny"
+      title="${scope === "global" ? "fleet-wide" : "for " + esc(sess)}"
+      onchange="setSkillDial('${esc(name)}','${scope}',this.value)">
+      <option value=""${cur === "" ? " selected" : ""}>default</option>
+      <option value="on"${cur === "on" ? " selected" : ""}>on</option>
+      <option value="off"${cur === "off" ? " selected" : ""}>off</option>
+    </select>`;
+  const skRows = skills.map((s, i) => `<tr>
+      <td class="mono">${esc(s.name)} ${srcBadge(s.source)}</td>
+      <td class="tiny muted">${esc((s.body || "").replace(/^---[\\s\\S]*?---/, "").trim().slice(0, 90))}…</td>
+      <td class="num">global ${dial(s.name, "global", gset(s.name))}</td>
+      <td class="num">${sess ? `${esc(sess)} ${dial(s.name, "session", "")}` : ""}</td>
+      <td class="num">
+        <button class="tiny" onclick="editSkill(${i})">${readOnly ? "view" : "edit"}</button>
+        ${!readOnly && s.source !== "builtin"
+          ? `<button class="tiny" onclick="resetSkill('${esc(s.name)}')"
+               >${s.source === "override" ? "reset" : "delete"}</button>` : ""}
+      </td></tr>`).join("");
+  const library = `<h3 class="tiny muted" style="margin:16px 2px 4px">Skill library — reusable
+      fragments, and whether each is on by default</h3>` + panel(
+    `<table><thead><tr><th>Skill</th><th>What it covers</th>
+       <th class="num">fleet</th><th class="num">${sess ? "this team" : ""}</th>
+       <th class="num">${readOnly ? "" : `<button class="tiny" onclick="newSkill()">new…</button>`}</th>
+       </tr></thead><tbody>${skRows}</tbody></table>`);
+
+  return panel(note) + templates + library;
+}
+
+// A skill's dial at a scope: "" clears it (back to default), on/off set it.
+async function setSkillDial(name, scope, value) {
+  const body = { scope, skill: name, enabled: value === "on" ? true : value === "off" ? false : null };
+  if (scope === "session") {
+    if (!currentSession()) { note("Pick a team first."); return; }
+    body.reference = currentSession();
+  }
+  try {
+    const r = await post("/v1/skills/prefs", body);
+    if (r && r.error) throw new Error(r.error);
+    const moved = r.seats_rerendered || 0;
+    note(`${name}: ${value || "default"}${moved ? ` — ${moved} seat(s) re-rendered` : ""}.`);
+    loadSkills(true);
+  } catch (e) { note(e.message || "could not set that"); }
+}
+
+function editSkill(i) {
+  const s = (skillCat.skills || [])[i];
+  if (!s) return;
+  openTextEditor({
+    title: `skill: ${s.name}`,
+    sub: `This text is injected into every seat that carries ${s.name}. `
+       + (s.source === "override" ? "Editing a built-in — reset brings the original back."
+          : s.source === "local" ? "A skill this fleet added." : "A built-in; editing creates a local copy."),
+    value: s.body || "",
+    readOnly: !skillCat.editable,
+    save: async (body) => { await putJSON(`/v1/skills/${encodeURIComponent(s.name)}`, { body }); },
+  });
+}
+
+function newSkill() {
+  const name = (prompt("A name for the new skill (lowercase, hyphens):") || "").trim();
+  if (!name) return;
+  openTextEditor({
+    title: `new skill: ${name}`,
+    sub: "Markdown. It becomes a section injected into any seat that carries it.",
+    value: `# ${name}\n\n`,
+    save: async (body) => { await putJSON(`/v1/skills/${encodeURIComponent(name)}`, { body }); },
+  });
+}
+
+async function resetSkill(name) {
+  if (!confirm(`Remove the local copy of “${name}”? A built-in reverts to the original; a skill this fleet added is deleted.`)) return;
+  try {
+    await del(`/v1/skills/${encodeURIComponent(name)}`);
+    note(`${name}: reset.`); loadSkills(true);
+  } catch (e) { note(e.message || "could not reset it"); }
+}
+
+function editTemplate(i) {
+  const r = (skillCat.roles || [])[i];
+  if (!r) return;
+  // Fetch the full text (the listing carries only the size).
+  getJSON(`/v1/roles/${encodeURIComponent(r.id)}`).then((full) => {
+    openTemplateEditor(r.id, {
+      title: r.title, summary: r.summary,
+      skills: (r.skills || []).join(", "),
+      prompt: (full && full.prompt) || "",
+      source: r.source,
+    }, !skillCat.editable);
+  });
+}
+
+function newTemplate() {
+  const id = (prompt("A name for the new template (lowercase, hyphens):") || "").trim();
+  if (!id) return;
+  openTemplateEditor(id, { title: "", summary: "", skills: "", prompt: "", source: "local" }, false);
+}
+
+async function resetTemplate(id) {
+  if (!confirm(`Remove the local copy of the “${id}” template? A built-in reverts; one this fleet added is deleted.`)) return;
+  try {
+    await del(`/v1/roles/${encodeURIComponent(id)}`);
+    note(`${id}: reset.`); loadSkills(true);
+  } catch (e) { note(e.message || "could not reset it"); }
+}
+
+// A plain text editor in the overlay the poll does not wipe: #subModal is a
+// separate element from #view, so a poll that rebuilds the catalogue behind
+// it leaves the open editor alone -- the same reason editSeatPrompt needs no
+// freeze flag. A click outside closes it through the overlay's own closeSub.
+function openTextEditor(opts) {
+  const host = $("subModal");
+  host.hidden = false;
+  host.innerHTML = `<div class="sheet"><div class="row">
+      <strong>${esc(opts.title)}</strong>
+      <button class="tiny" onclick="closeSkillEdit()">close</button></div>
+    <div class="tiny muted" style="margin:4px 0">${opts.sub || ""}</div>
+    <textarea id="skBody" rows="18" spellcheck="false" ${opts.readOnly ? "readonly" : ""}
+      style="width:100%;font-family:var(--mono);font-size:13px">${esc(opts.value)}</textarea>
+    ${opts.readOnly ? "" : `<div class="row" style="margin-top:8px">
+      <button onclick="skillSave()">save</button>
+      <button class="tiny" onclick="closeSkillEdit()">cancel</button>
+      <span class="tiny muted" id="skSaid"></span></div>`}`;
+  window.__skillSave = opts.save;
+}
+
+async function skillSave() {
+  const body = (document.getElementById("skBody") || {}).value || "";
+  const said = document.getElementById("skSaid");
+  if (said) said.textContent = "saving…";
+  try {
+    await window.__skillSave(body);
+    closeSkillEdit();
+    note("Saved."); loadSkills(true);
+  } catch (e) { if (said) said.textContent = e.message || "could not save"; }
+}
+
+function openTemplateEditor(id, t, readOnly) {
+  const host = $("subModal");
+  host.hidden = false;
+  const allSkills = (skillCat.skills || []).map((s) => s.name);
+  host.innerHTML = `<div class="sheet"><div class="row">
+      <strong>template: ${esc(id)}</strong>
+      <button class="tiny" onclick="closeSkillEdit()">close</button></div>
+    <div class="pair" style="margin:6px 0"><input id="tT" placeholder="title" value="${esc(t.title)}"
+       ${readOnly ? "readonly" : ""} style="width:100%"></div>
+    <div class="pair" style="margin:6px 0"><input id="tS" placeholder="one-line summary"
+       value="${esc(t.summary)}" ${readOnly ? "readonly" : ""} style="width:100%"></div>
+    <div class="tiny muted">Skills it carries by default (comma-separated). Known: ${
+       allSkills.map(esc).join(", ")}</div>
+    <input id="tK" value="${esc(t.skills)}" ${readOnly ? "readonly" : ""}
+       style="width:100%;font-family:var(--mono);margin:4px 0">
+    <div class="tiny muted">The brief:</div>
+    <textarea id="tP" rows="14" spellcheck="false" ${readOnly ? "readonly" : ""}
+       style="width:100%;font-family:var(--mono);font-size:13px">${esc(t.prompt)}</textarea>
+    ${readOnly ? "" : `<div class="row" style="margin-top:8px">
+      <button onclick="templateSave('${esc(id)}')">save</button>
+      <button class="tiny" onclick="closeSkillEdit()">cancel</button>
+      <span class="tiny muted" id="tSaid"></span></div>`}`;
+}
+
+async function templateSave(id) {
+  const v = (x) => (document.getElementById(x) || {}).value || "";
+  const said = document.getElementById("tSaid");
+  if (said) said.textContent = "saving…";
+  const skills = v("tK").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  try {
+    await putJSON(`/v1/roles/${encodeURIComponent(id)}`,
+      { title: v("tT"), summary: v("tS"), skills, prompt: v("tP") });
+    closeSkillEdit();
+    note(`${id}: saved.`); loadSkills(true);
+  } catch (e) { if (said) said.textContent = e.message || "could not save"; }
+}
+
+function closeSkillEdit() {
+  const host = $("subModal");
+  if (host) { host.hidden = true; host.innerHTML = ""; }
 }
 
 function viewFiles(d, now) {
@@ -4159,19 +5585,30 @@ function viewFleet(d, now) {
       </tr>`).join("") + "</tbody></table>")
     : empty("No machines yet. Pair one below.");
 
-  // Not every teammate is a machine. An external participant joins over
-  // HTTP with no node of its own -- a service, a bot, something that is not
-  // a CLI at all -- so it has no row above and used to appear nowhere on
-  // this tab, which is the first place you look for "who is on the fleet".
+  // Not every teammate is an agent CLI on a node. An external participant
+  // joins over HTTP -- a service, a bridge, a bot -- so it has no row above
+  // and used to appear nowhere on this tab, which is the first place you
+  // look for "who is on the fleet".
+  //
+  // It is not NOWHERE, though, and this used to say so: a service running
+  // on a known host was filed under "participants with no machine", which
+  // was true of what the hub knew and wrong about the world. They say where
+  // they run when they join, and that is shown.
   const outside = (snap.sessions || []).flatMap((sx) =>
     (sx.external || []).map((a) => ({ ...a, session: sx.name })));
   if (outside.length) {
-    out += `<h3 class="tiny muted" style="margin:16px 2px 4px">Participants with no machine</h3>`;
-    out += panel(`<table><thead><tr><th>Agent</th><th>Session</th><th>State</th>
+    out += `<h3 class="tiny muted" style="margin:16px 2px 4px">Services and bridges
+        <span class="muted">\u2014 teammates that are not agent CLIs on a node</span></h3>`;
+    out += panel(`<table><thead><tr><th>Agent</th><th>Session</th><th>Where</th><th>State</th>
         <th class="hide">Does</th></tr></thead><tbody>` +
       outside.map((a) => `<tr>
         <td>${esc(a.name)} <span class="muted tiny mono">${esc(a.slot_id)}</span></td>
         <td><span class="badge info">${esc(a.session)}</span></td>
+        <td>${a.host
+              ? `<span class="mono">${esc(a.host)}</span>`
+              : `<span class="muted tiny" title="This one has not said where it runs.
+                   A service reports its host when it joins; an older one, or one that
+                   does not, shows nothing here.">not said</span>`}</td>
         <td><span class="badge ${a.status === "running" ? "ok" : ""}">${esc(a.status)}</span></td>
         <td class="hide tiny muted">${esc(a.role || "")}</td>
       </tr>`).join("") + `</tbody></table>`);

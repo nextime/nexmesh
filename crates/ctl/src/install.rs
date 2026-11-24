@@ -133,6 +133,34 @@ pub fn install_seat(o: SeatOpts) -> Result<String> {
     })
 }
 
+/// Write the team skill beside the registration.
+///
+/// Registering the server gives an agent the tools; it does not tell it how a
+/// team works, and that is not derivable from a tool list. Every seat was
+/// inferring it and getting it wrong in the same few ways -- answering the
+/// operator with `broadcast`, reading messages without claiming them, leaving
+/// what it learned in its own context where the next seat cannot reach it.
+///
+/// Best-effort on purpose: a CLI with no skill mechanism, or a skills
+/// directory we cannot write, must not fail an MCP registration that worked.
+/// The outcome is reported either way, because a skill the user believes is
+/// installed and is not is worse than one they know is missing.
+fn write_skill(d: &CliDescriptor, dry_run: bool) -> Option<String> {
+    let s = d.skill.as_ref()?;
+    let dir = format!("{}/{}", expand(&s.dir), s.name);
+    let file = format!("{dir}/SKILL.md");
+    if dry_run {
+        return Some(format!("would write the team skill to {file}"));
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Some(format!("could not write the team skill to {dir}: {e}"));
+    }
+    match std::fs::write(&file, nexmesh_proto::skill::skill_md()) {
+        Ok(()) => Some(format!("Team skill written to {file}.")),
+        Err(e) => Some(format!("could not write the team skill to {file}: {e}")),
+    }
+}
+
 pub fn install(o: Opts) -> Result<String> {
     let dir = expand(o.clis_dir);
     let path = format!("{dir}/{}.toml", o.cli_id);
@@ -195,7 +223,12 @@ pub fn install(o: Opts) -> Result<String> {
                     .iter()
                     .map(|(k, v)| format!("{k}={} ", expand(v)))
                     .collect::<String>();
-                return Ok(format!("would run: {shown}{bin} {}", redact(&rendered).join(" ")));
+                let mut said =
+                    format!("would run: {shown}{bin} {}", redact(&rendered).join(" "));
+                if let Some(line) = write_skill(&d, true) {
+                    said.push_str(&format!("\n{line}"));
+                }
+                return Ok(said);
             }
             let out = cmd
                 .output()
@@ -208,10 +241,14 @@ pub fn install(o: Opts) -> Result<String> {
                     String::from_utf8_lossy(&out.stdout).trim()
                 );
             }
-            Ok(format!(
+            let mut said = format!(
                 "Registered '{}' with {} (via its own `mcp add`).",
                 o.server_name, d.cli.display_name
-            ))
+            );
+            if let Some(line) = write_skill(&d, o.dry_run) {
+                said.push_str(&format!(" {line}"));
+            }
+            Ok(said)
         }
 
         UserInstall::JsonFile { path, pointer, entry, env_key } => {
@@ -226,19 +263,27 @@ pub fn install(o: Opts) -> Result<String> {
             let ptr = pointer.replace("{name}", o.server_name);
             set_pointer(&mut root, &ptr, value).map_err(|e| anyhow::anyhow!(e))?;
             if o.dry_run {
-                return Ok(format!("would write {} at {ptr}", full.display()));
+                let mut said = format!("would write {} at {ptr}", full.display());
+                if let Some(line) = write_skill(&d, true) {
+                    said.push_str(&format!("\n{line}"));
+                }
+                return Ok(said);
             }
             if let Some(p) = full.parent() {
                 std::fs::create_dir_all(p).ok();
             }
             std::fs::write(&full, serde_json::to_string_pretty(&root)?)
                 .with_context(|| format!("writing {}", full.display()))?;
-            Ok(format!(
+            let mut said = format!(
                 "Registered '{}' with {} in {}.",
                 o.server_name,
                 d.cli.display_name,
                 full.display()
-            ))
+            );
+            if let Some(line) = write_skill(&d, o.dry_run) {
+                said.push_str(&format!(" {line}"));
+            }
+            Ok(said)
         }
 
         UserInstall::TomlFile { path, key, entry, env_key } => {
@@ -265,19 +310,27 @@ pub fn install(o: Opts) -> Result<String> {
                 .with_context(|| format!("{key} traverses a non-table"))?
                 .insert(parts[parts.len() - 1].to_string(), as_toml);
             if o.dry_run {
-                return Ok(format!("would write {} at {key}", full.display()));
+                let mut said = format!("would write {} at {key}", full.display());
+                if let Some(line) = write_skill(&d, true) {
+                    said.push_str(&format!("\n{line}"));
+                }
+                return Ok(said);
             }
             if let Some(p) = full.parent() {
                 std::fs::create_dir_all(p).ok();
             }
             std::fs::write(&full, toml::to_string_pretty(&root)?)
                 .with_context(|| format!("writing {}", full.display()))?;
-            Ok(format!(
+            let mut said = format!(
                 "Registered '{}' with {} in {}.",
                 o.server_name,
                 d.cli.display_name,
                 full.display()
-            ))
+            );
+            if let Some(line) = write_skill(&d, o.dry_run) {
+                said.push_str(&format!(" {line}"));
+            }
+            Ok(said)
         }
     }
 }

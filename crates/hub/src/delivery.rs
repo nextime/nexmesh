@@ -383,6 +383,28 @@ pub async fn recovery_tick(st: &AppState) {
             "SELECT s.id, s.session_id, s.restarts, s.last_crash_ms, s.display_name
              FROM slots s
              WHERE s.status != 'flapping'
+               -- Per seat, and the operator's to set from anywhere that can
+               -- reach the hub. A seat whose work is over, or that is being
+               -- stopped deliberately to look at it, must not be brought
+               -- back out from under them every few seconds.
+               --
+               -- EXCEPT when the last start died on a conversation the hub
+               -- told it to resume. That is not a seat exiting on its own
+               -- account, it is a bad argument we supplied -- `claude
+               -- --resume <a conversation that is not here>` prints that it
+               -- found no such conversation and exits in under a second --
+               -- and leaving it down means the operator cannot
+               -- open the seat at all, with no way to recover but to go and
+               -- find the handle by hand. So it is retried once, and the
+               -- retry carries no resume (see `resume_just_failed`), so
+               -- `resumed = 0` on it and this exemption cannot loop.
+               AND (COALESCE(s.autorespawn, 1) = 1
+                    OR (SELECT COALESCE(a.resumed, 0) = 1
+                               AND a.exited_at_ms IS NOT NULL
+                               AND a.exited_at_ms - a.started_at_ms < 10000
+                          FROM agents a WHERE a.slot_id = s.id
+                           AND a.provenance = 'managed'
+                         ORDER BY a.started_at_ms DESC LIMIT 1))
                AND (SELECT a.provenance FROM agents a WHERE a.slot_id = s.id
                      ORDER BY a.started_at_ms DESC LIMIT 1) = 'managed'
 

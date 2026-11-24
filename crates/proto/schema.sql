@@ -138,6 +138,179 @@ CREATE TABLE IF NOT EXISTS capability_asks (
 CREATE INDEX IF NOT EXISTS capability_asks_queue_idx
   ON capability_asks(to_slot, status);
 
+-- ------------------------------------------- a seat's conversations ----
+--
+-- WHICH CONVERSATION THIS SEAT IS ON, PER MACHINE.
+--
+-- A CLI conversation is a local file. It belongs to one machine and -- for
+-- claude, which keys them by project directory -- to one directory on it. A
+-- handle is therefore not portable: move a seat to another machine and the
+-- conversation does not follow. The CLI then either starts blank wearing the
+-- right name, or (claude) refuses with "No conversation found with session
+-- ID" and exits at once, which is a seat that cannot be opened at all.
+--
+-- So the binding is recorded rather than assumed, and it is recorded PER
+-- PLACE. A seat that moves workstation -> laptop -> workstation finds its workstation
+-- conversation again instead of having lost it, and a seat on a machine it
+-- has never run on starts fresh deliberately rather than by failing.
+--
+-- It follows the SEAT, so a rename changes nothing (the name is not part of
+-- the key) and moving between teams changes nothing (the session is not
+-- either). The things that DO change the conversation are the three that
+-- really do mean a different conversation: a different machine, a different
+-- working directory, a different CLI.
+CREATE TABLE IF NOT EXISTS slot_conversations (
+  slot_id       TEXT NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  node_id       TEXT NOT NULL,
+  cwd           TEXT NOT NULL,
+  cli_id        TEXT NOT NULL,
+  handle        TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (slot_id, node_id, cwd, cli_id)
+);
+CREATE INDEX IF NOT EXISTS slot_conversations_by_slot ON slot_conversations(slot_id);
+
+-- ------------------------------------------------------------- guests ----
+--
+-- A seat that serves MORE THAN ONE team.
+--
+-- A session is the isolation boundary: agents never see across one, and
+-- almost nothing should. But some seats are services rather than teammates
+-- -- a capability bridge offering OCR and transcription, a reviewer every
+-- team sends work to -- and giving each team its own copy means N processes,
+-- N models and N sets of warm context for one job.
+--
+-- So this punches a deliberate, recorded hole in that boundary. `slots.
+-- session_id` stays the seat's HOME: where it lives, whose workspace it
+-- holds, who owns it. Each row here is one extra team it also answers in.
+--
+-- Deliberately not a flag on the slot. Who may open the hole matters as much
+-- as that it is open: it takes reach over BOTH teams, so only the operator
+-- or a superorchestrator can -- and `added_by` records which.
+CREATE TABLE IF NOT EXISTS slot_sessions (
+  slot_id     TEXT NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  added_at_ms INTEGER NOT NULL,
+  -- `operator`, or `seat <name> (<slot>)`. A seat reaching into another team
+  -- is exactly the thing somebody will need to account for afterwards.
+  added_by    TEXT NOT NULL DEFAULT 'operator',
+  PRIMARY KEY (slot_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS slot_sessions_by_session ON slot_sessions(session_id);
+
+-- ---------------------------------------------------------- approvals ----
+--
+-- A decision only the OPERATOR can make, waiting for them.
+--
+-- An agent CLI stops and asks before it runs a command, writes a file or
+-- calls a tool. When somebody is attached to its terminal that question is
+-- theirs to answer and this table is not involved. When nobody is, the node
+-- used to answer the narrowest affirmative itself -- which keeps the fleet
+-- moving and quietly means nobody authorised anything.
+--
+-- So the question comes HERE instead: into the operator's chat, with the
+-- choices the CLI offered as buttons, and a notification, and it waits. A
+-- pending approval is a stopped agent, which is the honest state: it is
+-- waiting for a person. Nothing times out into "allowed" -- a timeout that
+-- grants permission is the behaviour this replaces.
+--
+-- `fingerprint` is the shape of the screen that asked, so one dialog is
+-- raised once however many idle ticks see it. A terminal shows ONE question,
+-- so there is at most one pending row per slot: a report whose choices match
+-- a waiting one refreshes it in place, a genuinely different question retires
+-- it, and a request whose agent has gone is retired too -- its buttons could
+-- only fail.
+CREATE TABLE IF NOT EXISTS approvals (
+  id             TEXT PRIMARY KEY,
+  session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  slot_id        TEXT NOT NULL,
+  agent_id       TEXT,
+  node_id        TEXT,
+  -- How the question reached us, because answering it differs: `pty_prompt`
+  -- is a dialog on a terminal, answered by typing the keys the CLI listed.
+  -- Structured kinds (a CLI that asks over its own protocol) answer through
+  -- that protocol instead.
+  kind           TEXT NOT NULL DEFAULT 'pty_prompt',
+  -- What the agent is being asked, in the CLI's own words, and the choices
+  -- it offered: [{"key":"1","label":"Yes","keys":"1"}, ...]. The buttons the
+  -- operator is shown are these, not a guess at them -- a menu whose
+  -- affirmative is "Yes, and don't ask again" must not be presented as "Yes".
+  question       TEXT NOT NULL,
+  options        TEXT NOT NULL DEFAULT '[]',
+  fingerprint    TEXT,
+  status         TEXT NOT NULL DEFAULT 'pending',  -- pending|decided|withdrawn
+  -- Which option was chosen, who chose it, and how: `operator` when a person
+  -- clicked, `auto:agent` or `auto:session` when a standing auto-approval
+  -- answered, `attached` when somebody answered at the terminal instead.
+  decision       TEXT,
+  -- `operator`, `auto:agent`, `auto:session`, `attached` (answered at its own
+  -- terminal, or the prompt went away), `superseded` (the seat is on a
+  -- different question now) or `gone` (the agent that asked is not there any
+  -- more).
+  decided_by     TEXT,
+  asked_at_ms    INTEGER NOT NULL,
+  decided_at_ms  INTEGER,
+  -- The chat line that carries this, so the buttons can be retired in place
+  -- once it is answered rather than leaving a live-looking prompt behind.
+  message_id     INTEGER
+);
+CREATE INDEX IF NOT EXISTS approvals_pending_idx ON approvals(status, asked_at_ms);
+CREATE INDEX IF NOT EXISTS approvals_slot_idx ON approvals(slot_id, status);
+
+-- --------------------------------------------------------------- folds ----
+--
+-- Context that outlives the window it was learned in.
+--
+-- A long-lived agent spends its context twice: once working, and then again
+-- carrying what it did. A CLI's own compaction answers the second cost by
+-- summarising everything into its own context, where the next compaction
+-- summarises the summary; the fourth generation of that remembers the shape
+-- of the work and none of its facts, and none of it survives a restart on a
+-- CLI that cannot resume.
+--
+-- A fold is the alternative: the agent writes down what a stretch of work
+-- established, the detail is kept HERE rather than in its context, and it is
+-- handed back in full whenever anything asks. Folds fold into folds, so a
+-- month of work is a handful of summaries over a tree of detail, read
+-- downwards only where a question needs it. An LSM tree over prose, which is
+-- billion-context's design, reimplemented rather than imported -- see
+-- `folds.rs` for what nexmesh does differently and why it needs no proxy.
+--
+-- Scoped like `memory`, and read the same way: nearest first.
+CREATE TABLE IF NOT EXISTS folds (
+  id             TEXT PRIMARY KEY,
+  scope          TEXT NOT NULL,                    -- agent|group|session|global
+  scope_ref      TEXT NOT NULL DEFAULT '',         -- slot, group name, session, ''
+  -- 1 folds the agent's own work; 2 folds tier-1 folds; and so on up.
+  tier           INTEGER NOT NULL DEFAULT 1,
+  topic          TEXT NOT NULL,
+  -- What survives in context. Short on purpose.
+  summary        TEXT NOT NULL,
+  -- What was taken OUT of context, verbatim. Kept rather than pointed at: a
+  -- transcript rotates and a conversation file is rewritten by its own CLI,
+  -- so a pointer would be a promise this table could not keep.
+  detail         TEXT NOT NULL DEFAULT '',
+  -- The folds this one replaced: ["fd-...", ...]. Their lineage, so a
+  -- question can walk down from a summary to the detail underneath it.
+  covers         TEXT NOT NULL DEFAULT '[]',
+  author_slot    TEXT,
+  agent_id       TEXT,
+  -- What it stood for, and what it costs to carry. Estimated at four
+  -- characters to a token unless the caller counted properly.
+  tokens_before  INTEGER NOT NULL DEFAULT 0,
+  tokens_after   INTEGER NOT NULL DEFAULT 0,
+  -- 0 once something folded this one: reachable through its parent, and kept
+  -- out of the map so a stretch of work is never counted twice.
+  active         INTEGER NOT NULL DEFAULT 1,
+  unfolded_count INTEGER NOT NULL DEFAULT 0,
+  unfolded_at_ms INTEGER,
+  created_at_ms  INTEGER NOT NULL,
+  retired_at_ms  INTEGER,
+  retired_why    TEXT
+);
+CREATE INDEX IF NOT EXISTS folds_scope_idx ON folds(scope, scope_ref, active);
+CREATE INDEX IF NOT EXISTS folds_author_idx ON folds(author_slot, created_at_ms);
+
 -- --------------------------------------------------------- code graph ----
 --
 -- One workspace's parsed structure, kept so a codebase is read once rather
@@ -180,7 +353,37 @@ CREATE TABLE IF NOT EXISTS code_graph_meta (
   files        INTEGER NOT NULL,
   skipped      TEXT NOT NULL DEFAULT '[]',
   truncated    INTEGER NOT NULL DEFAULT 0,
-  communities  INTEGER NOT NULL DEFAULT 0
+  communities  INTEGER NOT NULL DEFAULT 0,
+  -- WHEN THE TREE MOVED UNDER IT.
+  --
+  -- The graph was built on demand and never again, so every team that asked
+  -- it a structural question after the first day got an answer about a
+  -- codebase that no longer existed -- and an agent cannot tell a stale
+  -- answer from a wrong one. Set when work is published into the workspace,
+  -- cleared by the rebuild. NULL means the graph matches what was last
+  -- shared.
+  stale_at_ms  INTEGER,
+  -- Why the last automatic rebuild did not happen, if it did not: no node
+  -- holding the workspace, the node refused, parsing timed out. Shown with
+  -- the graph, because silently serving a stale graph is the failure.
+  stale_reason TEXT,
+  -- WHAT THE TREE LOOKED LIKE WHEN WE LAST ASKED.
+  --
+  -- Publishing work is not the only way a tree moves, and on a `node_local`
+  -- workspace it never happens at all -- which left every graph on a real
+  -- fleet built once and never again. The hub now asks the node that holds
+  -- the files for a fingerprint (file count, total size, newest mtime): a
+  -- walk with the parsing taken out. When it differs from the one here the
+  -- graph is marked stale and the ordinary rebuild picks it up.
+  --
+  -- `fp_asked_at_ms` is set when the question goes out and `fp_at_ms` when
+  -- an answer arrives, so a node too old to know the frame is visible as a
+  -- question that was never answered -- and those workspaces fall back to
+  -- rebuilding on age instead.
+  tree_fingerprint TEXT,
+  fp_at_ms     INTEGER,
+  fp_asked_at_ms INTEGER,
+  fp_files     INTEGER
 );
 
 -- ------------------------------------------------------------- memory ----
@@ -217,6 +420,25 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE INDEX IF NOT EXISTS memory_scope_idx ON memory(scope, scope_ref);
 CREATE INDEX IF NOT EXISTS memory_expiry_idx ON memory(expires_at_ms)
   WHERE expires_at_ms IS NOT NULL;
+
+-- Skill enablement, scoped like memory. A seat's carried skills begin with
+-- its role template's own list; a row here turns one skill ON or OFF at a
+-- given breadth, and a nearer scope wins over a wider one (seat over session
+-- over global), the same shadowing memory uses. This is NOT a column on
+-- slots because a single skill's state is set at three different breadths by
+-- different people at different times -- a team-wide default the operator
+-- sets once, a per-seat exception another sets later -- and flattening that
+-- onto the seat row would lose which breadth each decision was made at, so a
+-- team default could never be changed without re-deciding every seat.
+-- scope: global | session | seat.  scope_ref: '' | session_id | slot_id.
+CREATE TABLE IF NOT EXISTS skill_prefs (
+  scope      TEXT NOT NULL,
+  scope_ref  TEXT NOT NULL DEFAULT '',
+  skill      TEXT NOT NULL,
+  enabled    INTEGER NOT NULL,
+  at_ms      INTEGER NOT NULL,
+  PRIMARY KEY (scope, scope_ref, skill)
+);
 
 -- Who may read a group scope. Membership is explicit: a group is a named
 -- subset of a team, not something inferred from a role, so moving an agent
@@ -359,6 +581,15 @@ CREATE TABLE IF NOT EXISTS participant_tokens (
   token_sha256  TEXT PRIMARY KEY,
   label         TEXT NOT NULL,
   session_id    TEXT,
+  -- What a seat taken with this token is allowed to do: NULL for an ordinary
+  -- agent, or `observer` for one that can only read.
+  --
+  -- ON THE TOKEN, not asked for by the client. An observer seat exists so
+  -- that somebody outside the team -- a browser session, a dashboard of
+  -- their own -- can watch without being able to steer, and a restriction
+  -- the watcher chooses for itself is not a restriction. Whoever holds this
+  -- token cannot be anything else.
+  authority     TEXT,
   issued_at_ms  INTEGER NOT NULL,
   revoked_at_ms INTEGER
 );
@@ -376,7 +607,51 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_active_ms INTEGER NOT NULL,
   -- Total tokens this session may spend before it is paused. NULL = no cap.
   token_budget     INTEGER,
-  budget_hit_at_ms INTEGER
+  budget_hit_at_ms INTEGER,
+  -- Answer every seat's permission prompts in this team without asking. The
+  -- whole-team switch, for a session whose work is understood and whose
+  -- blast radius is known; a single seat has its own flag in `slots`.
+  auto_approve     INTEGER NOT NULL DEFAULT 0,
+  -- How full a seat's context may get in this team before the hub types the
+  -- CLI's own compaction command at it. Percent of that CLI's window.
+  --
+  -- NULL means "whatever the fleet is set to" -- the hub's own default --
+  -- and 0 means off for this team however the fleet is set. Three states
+  -- rather than two, because "inherit" and "deliberately off" are different
+  -- answers and a single integer with 0 for both cannot express a team that
+  -- opts out of a fleet-wide setting.
+  compact_at_pct   INTEGER,
+  -- How many times a seat in this team may repeat the same turn before the
+  -- hub stops it. Same three states: NULL inherits, 0 is off.
+  loop_guard_repeats INTEGER,
+  -- THE TEAM'S STANDING RULES: what every seat in this session is told, over
+  -- and above its own brief.
+  --
+  -- On the SESSION, because this is the part that is true of the work rather
+  -- than of one seat -- the conventions, the things not to touch, the way
+  -- this team does releases. Written once instead of into fourteen seats'
+  -- prompts, where it drifts the moment one is edited.
+  --
+  -- Who may write it: the operator, and a seat holding orchestrator or
+  -- superorchestrator authority. Deliberately not an ordinary agent: rules
+  -- an agent can rewrite are not rules, and the first thing a confused
+  -- agent would do is edit them.
+  --
+  -- Every seat gets it in its first prompt, and a change is said in the
+  -- chat -- otherwise the agents already running would keep working to the
+  -- old rules with nothing to tell them apart.
+  instructions     TEXT,
+  -- FLOOD PROTECTION. How many messages one seat here may send a minute,
+  -- and how many may go back and forth between the SAME TWO seats in ten.
+  -- NULL inherits the fleet's, 0 is off, and off is what both ship as.
+  --
+  -- Two numbers because there are two failures. A seat sending thirty
+  -- messages a minute is one agent spending everybody's turns; two seats
+  -- answering each other forty times is a pair that has stopped working and
+  -- is now just talking, which no per-seat rate would ever catch -- each of
+  -- them is sending perfectly reasonably.
+  msg_rate_per_min INTEGER,
+  msg_pair_limit   INTEGER
 );
 
 -- A workspace is WHERE work happens. This single table is what lets per-host
@@ -435,7 +710,9 @@ CREATE TABLE IF NOT EXISTS slots (
   paused_at         INTEGER,
   restarts          INTEGER NOT NULL DEFAULT 0,
   last_crash_ms     INTEGER,
-  resume_handle     TEXT,                            -- CLI-specific resume id
+  -- The most recent conversation id, for display. What a SPAWN uses comes
+  -- from `slot_conversations`, which remembers one per machine -- see there.
+  resume_handle     TEXT,
   -- For an ADOPTED slot: the tmux target (session, window or pane) whose
   -- terminal this slot mirrors.
   tmux_target       TEXT,
@@ -444,6 +721,75 @@ CREATE TABLE IF NOT EXISTS slots (
   -- address it can answer: the operator channel has no read tool for seats,
   -- and a channel you can only shout into is not a channel.
   supervisor        INTEGER NOT NULL DEFAULT 0,
+  -- WHAT THIS SEAT IS ALLOWED TO DO to the fleet: agent | orchestrator | super.
+  --
+  -- Distinct from `role` above, which is the seat's JOB ("Dev", "Reviewer") and
+  -- carries no authority at all. This is the authority, and it lives here --
+  -- on the seat, in the hub -- for one reason: it used to live in whichever
+  -- MCP config happened to hold an operator token. A user-scoped install of
+  -- the orchestrator server therefore made EVERY CLI that user started a
+  -- fleet operator, indistinguishable from the person running it, because
+  -- possession of the token WAS the authority. Authority has to be a property
+  -- of an identity the hub knows, which is the seat.
+  --
+  -- Reach follows the level: `orchestrator` reaches its own session, `super`
+  -- reaches the fleet -- the same two scopes `operator_tokens.session_id`
+  -- already described. An orchestrator may elect other orchestrators inside
+  -- its own session; it can never mint a `super`, because a privilege that
+  -- can widen itself is not a boundary.
+  authority         TEXT NOT NULL DEFAULT 'agent',
+  -- Answer this seat's permission prompts without asking the operator.
+  -- Deliberately per-seat: a seat doing something routine in a sandbox is a
+  -- different risk from one with a shell on a live box, and "approve
+  -- everything" as a global switch is how the operator stops reading them.
+  auto_approve      INTEGER NOT NULL DEFAULT 0,
+  -- Bring this seat back by itself when whatever is filling it exits.
+  --
+  -- On by default, which is what the hub has always done for a managed
+  -- seat -- but it is now a DECISION rather than a rule, because not every
+  -- seat should come back: one kept for a job that is over, or one being
+  -- deliberately stopped to look at something, used to be respawned out
+  -- from under the operator every few seconds.
+  --
+  -- A respawn PREPARES the seat: the process is there and can be attached
+  -- to. It never reattaches anybody's terminal, because whose terminal that
+  -- would be is not the hub's to decide.
+  autorespawn       INTEGER NOT NULL DEFAULT 1,
+  -- This seat's own compaction threshold, overriding its team's and the
+  -- fleet's. Percent of its CLI's context window; NULL inherits, 0 is off.
+  --
+  -- Per seat because the right answer is not uniform: a seat doing long
+  -- mechanical work wants compacting early and often, and a seat holding a
+  -- design discussion loses the whole point of itself every time it is
+  -- compacted. The operator who made the seat is the one who knows which.
+  compact_at_pct    INTEGER,
+  -- How many times this seat may repeat the same turn before the hub stops
+  -- it. NULL inherits its team's, then the fleet's; 0 is off.
+  --
+  -- Per seat for the same reason: a seat polling something until it changes
+  -- is SUPPOSED to repeat itself, and a seat writing code is not.
+  loop_guard_repeats INTEGER,
+  -- This seat's own flood limits, overriding its team's. See `sessions`.
+  -- A coordinator legitimately sends more than anybody else; a seat that
+  -- only ever answers should never be sending thirty a minute.
+  msg_rate_per_min  INTEGER,
+  msg_pair_limit    INTEGER,
+  -- WHICH ROLE TEMPLATE this seat's system prompt was rendered from, and
+  -- which of that template's skills it carries (a JSON array of names).
+  --
+  -- The prompt itself is stored RENDERED, in `system_prompt`, and that does
+  -- not change: what a seat tells its agent should be readable and editable
+  -- in one place, and a running team must not change under itself because
+  -- somebody improved a template. But storing only the rendered text threw
+  -- away the CHOICE, so there was nothing to select or deselect against --
+  -- an operator wanting one skill off had to restate the template and the
+  -- whole list from memory.
+  --
+  -- NULL means the prompt was written by hand. Writing `system_prompt`
+  -- directly clears both, deliberately: once somebody has edited the text,
+  -- re-rendering it from a template would throw their edit away.
+  prompt_template   TEXT,
+  prompt_skills     TEXT,
   created_at_ms     INTEGER NOT NULL
 );
 
@@ -485,11 +831,76 @@ CREATE TABLE IF NOT EXISTS agents (
   -- participant API, swept like a node lease.
   lease_expires_ms  INTEGER,
   kind_hint         TEXT,                      -- free-form: "hermes", "python", ...
+  -- Where an EXTERNAL participant runs, as it reports itself. A node has a
+  -- row in `nodes` and `node_id` points at it; a bridge, a bot or a service
+  -- has neither, so without this the fleet knows only that it is "not a
+  -- machine" -- which reads as nowhere, when in fact it is on a particular
+  -- host doing particular work. Per agent rather than per seat, because a
+  -- bridge can be moved and the next run should say so.
+  host_hint         TEXT,
   summary           TEXT NOT NULL DEFAULT '',
   cwd               TEXT,
   input_tokens      INTEGER NOT NULL DEFAULT 0,
   output_tokens     INTEGER NOT NULL DEFAULT 0,
   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  -- HOW FULL THIS CONVERSATION IS RIGHT NOW, as the node last measured it.
+  --
+  -- Emphatically not the three columns above. Those are what this agent has
+  -- SPENT -- cumulative, monotonic, and the right number for a budget. This
+  -- is what it is CARRYING: the size of the prompt its next turn will send,
+  -- which goes up as the conversation grows and drops to almost nothing when
+  -- it is compacted. Summing spend to guess occupancy says a seat is twelve
+  -- windows deep when it is in fact a third full.
+  --
+  -- `context_limit_tokens` is the window that number is a fraction of, as
+  -- the CLI's descriptor declares it, because the hub cannot know the window
+  -- of every model every CLI might be running. Both nullable: a seat whose
+  -- CLI says nothing about either is simply not measured, and is never
+  -- compacted on a guess.
+  context_used_tokens  INTEGER,
+  context_limit_tokens INTEGER,
+  -- Where the number came from, for an operator wondering why a seat was
+  -- compacted -- the transcript file that was read, or the driver stream.
+  context_source       TEXT,
+  context_at_ms        INTEGER,
+  -- When the hub last told this agent to compact itself because its context
+  -- was over the threshold. Per AGENT, not per seat: a respawn starts a new
+  -- process on a conversation whose occupancy is measured afresh, and the
+  -- previous process's compaction says nothing about this one.
+  compact_asked_at_ms  INTEGER,
+  -- WHEN THIS SEAT WAS LAST ASKED TO FOLD, and how full it was when it was
+  -- asked. The pair makes the nudge growth-gated rather than a reminder
+  -- every second: a seat is asked again only once it has taken on another
+  -- quarter of a window, and a compaction waits briefly for the fold it
+  -- asked for before going ahead anyway -- a full context is worse than a
+  -- fold nobody wrote. See `folds` and `watchdog.rs`.
+  fold_asked_at_ms     INTEGER,
+  fold_baseline_tokens INTEGER,
+  -- THE SAME TURN, OVER AND OVER. `loop_period` is how many turns the
+  -- repeating unit is and `loop_repeats` how many times it has repeated
+  -- back to back; both as the node last measured them, and both cleared
+  -- when the agent does something else.
+  --
+  -- An agent in a loop is not a stuck process -- it is a busy one. It
+  -- answers heartbeats, it burns tokens, and from the outside it looks
+  -- exactly like an agent working hard. These two numbers are the
+  -- difference.
+  loop_period          INTEGER,
+  loop_repeats         INTEGER,
+  -- When the hub stopped this agent for looping. Set once per agent: the
+  -- seat is paused, so there is nothing to do again, and an operator who
+  -- releases it has made a decision that must not be overridden on the next
+  -- reading.
+  loop_stopped_at_ms   INTEGER,
+  -- Was this start given a conversation to resume by the hub?
+  --
+  -- A start that dies seconds after being handed a resume died on OUR
+  -- argument, not on its own account, and that is a defect to correct
+  -- rather than a state to respect: it is retried fresh even when the seat
+  -- is set not to respawn, because otherwise a bad handle leaves the
+  -- operator with a seat that cannot be opened at all. The retry carries no
+  -- resume, so this cannot loop.
+  resumed           INTEGER NOT NULL DEFAULT 0,
   started_at_ms     INTEGER NOT NULL,
   last_seen_ms      INTEGER NOT NULL,
   exited_at_ms      INTEGER
@@ -567,7 +978,15 @@ CREATE TABLE IF NOT EXISTS messages (
   -- to a seat whose process has died, or whose machine has gone, waits for
   -- ever and silently: the sender believes it was heard. Reported once, which
   -- is what this records.
-  stalled_at_ms    INTEGER
+  stalled_at_ms    INTEGER,
+  -- Withdrawn by the operator before anyone saw it. A message to a seat that
+  -- has gone, or one sent in error, otherwise waits for ever: nothing
+  -- expires it and nothing but delivery clears it. Cancelling is not
+  -- claiming -- claiming says a person has dealt with it, this says it must
+  -- never arrive -- and it is not acking, which would record that a model
+  -- read something it never saw.
+  cancelled_at_ms  INTEGER,
+  cancelled_by     TEXT
 );
 -- Who has had a given message, one row per SEAT.
 --
@@ -593,6 +1012,11 @@ CREATE TABLE IF NOT EXISTS message_recipients (
 );
 
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, to_slot) WHERE acked_at_ms IS NULL;
+-- For flood protection, which counts what one seat has sent recently on
+-- every single send. Without this that count is a full scan of the table,
+-- and this table is the biggest one here -- so the protection would cost
+-- more than the flood.
+CREATE INDEX IF NOT EXISTS messages_from_recent ON messages(from_slot, sent_at_ms);
 
 -- --------------------------------------------------- file coordination ----
 

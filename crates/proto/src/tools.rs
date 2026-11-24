@@ -69,18 +69,57 @@ pub fn team_instructions(who: &str, slot: &str) -> String {
          WHAT THE TEAM KNOWS: the memory and the code graph are the team's. Read before \
          deciding (query_knowledge, query_code_graph) and write back what you learn \
          (store_knowledge), as you learn it rather than at the end. Contradicting a \
-         teammate's memory is a conversation, not an overwrite.\n\n\
+         teammate's memory is a conversation, not an overwrite. Everything you remember \
+         has a SCOPE, and it decides who is affected when you are wrong: 'agent' is \
+         yours alone and the place for anything provisional, 'session' is this team and \
+         is where most of it belongs, 'global' is the whole fleet for ever and is for \
+         what is true of the MACHINES rather than this job -- which host has the GPU, \
+         what a service is managed by. The test is whether the next team on a different \
+         task would still need it. A nearer scope shadows a wider one for the same key, \
+         so a team can override a fleet-wide default without touching it. The code graph \
+         has scopes for a different reason: it is parsed per workspace, so 'session' or \
+         'global' is how you see past your own checkout -- neither parses anything, they \
+         answer from what is already there.\n\n\
          THE CHAT: teammate and operator messages arrive prefixed [PENDING MESSAGES] on \
-         any tool result. A message whose sender is 'operator' is the PERSON running the \
-         fleet, reading the room on a dashboard, in a terminal console or on a phone -- \
-         answer it with send_message addressed to 'operator', never by replying to a \
-         teammate. send_message is for one teammate and broadcast is for the whole room; \
-         prefer one teammate, because a room of models reading a message meant for one \
-         is how a budget goes. Reading a message does not deal with it: check_messages \
-         shows what is waiting, claim_messages is what says you have handled it, and \
-         anything unclaimed stays on the board for whoever is watching the fleet. If you \
-         are stuck on something the team cannot settle -- a credential, a decision that \
-         is not yours -- call notify_operator."
+         any tool result, each with its own number. ANSWER ONE WITH `reply(to: <number>, \
+         text: ...)`: it goes back to whoever sent it, wherever they are. A message whose \
+         sender is the OPERATOR is from the PERSON running the fleet, reading the room on \
+         a dashboard, in a terminal console or on a phone, and `reply` puts your answer \
+         in front of them without sending it to your teammates. send_message starts \
+         something with one teammate; broadcast goes to the whole room and is for \
+         something they all need -- using it to answer one person is how six models come \
+         to read a note meant for one, and is how a budget goes. Reading a message does \
+         not deal with it: check_messages shows what is waiting, claim_messages is what \
+         says you have handled it, and anything unclaimed stays on the board for whoever \
+         is watching the fleet. If you are stuck on something the team cannot settle -- a \
+         credential, a decision that is not yours -- call notify_operator.\n\n\
+         YOUR CONTEXT IS NOT WHERE WORK IS KEPT: fold_context writes down what a stretch \
+         of this job established -- the decision and the reason for it, the paths with \
+         their line numbers, the exact error -- and hands the raw material over as \
+         `detail`, which nexmesh keeps OUT of your context and gives back in full \
+         whenever you ask. Do it when the step you are on has finished with that stretch, \
+         and before your CLI compacts you: a compaction replaces your context with a \
+         summary of itself, and the next one summarises the summary. A fold survives the \
+         compaction, your restart, and even a move to another CLI. search_context finds \
+         one by its words, unfold_context gives the detail back, context_map says how \
+         full you are and what you have put away, and fold_context with `covers` puts one \
+         summary above a group of earlier folds -- which is what keeps a month of work \
+         down to a handful of them. If you are handed a list of folds when you start, \
+         that is what you did before: read the summaries, and unfold only what the work \
+         in front of you actually needs.\n\n\
+         A STALE GRAPH: query_code_graph is DERIVED from the files and can lag them. If \
+         what it says disagrees with what you read on disk, the files win -- and say so \
+         in the chat, because a graph nobody trusts is worse than no graph. What you \
+         CONCLUDE about the code goes in store_knowledge, which is attributed and does \
+         not get regenerated away.\n\n\
+         PERMISSION: if your CLI stops to ask permission for something and nobody is \
+         watching your terminal, that question goes to the operator with the choices you \
+         were offered, and you wait for them. That is normal and not a failure. Say what \
+         you are waiting on if you get the chance, and never work around it.\n\n\
+         SERVICES: some seats are services rather than teammates -- OCR, transcription, \
+         images, embeddings, review -- and may be visiting from another team, which \
+         list_peers says. Ask them rather than hand-rolling what they do, and rather than \
+         installing a tool to do it yourself."
     )
 }
 
@@ -181,16 +220,30 @@ pub fn team_tools() -> Vec<ToolDef> {
         tool("view_file_locks",
             "See active locks and ownership zones for your workspace.", json!({}), &[]),
         tool("store_knowledge",
-            "Record a decision, convention, discovery, blocker or context for this session. \
-             Shorthand for store_memory at session scope.",
+            "Record a decision, convention, discovery, blocker or context. Defaults to this \
+             team; 'global' is for what holds across every team on this fleet and 'agent' for \
+             a note only you keep. Shorthand for store_memory.",
             json!({ "key": s("Short stable key"), "value": s("The content"),
                     "category": json!({ "type": "string",
-                        "enum": ["decision", "convention", "discovery", "blocker", "context"] }) }),
+                        "enum": ["decision", "convention", "discovery", "blocker", "context"] }),
+                    "scope": json!({ "type": "string",
+                        "enum": ["agent", "group", "session", "global"],
+                        "description": "Who may see it. Defaults to this session (the team). \
+                                        'global' holds for every team and needs the \
+                                        'memory-writer' capability." }),
+                    "group": s("Group name, required when scope is 'group'") }),
             &["key", "value"]),
         tool("query_knowledge",
-            "Read shared knowledge for this session. Call this when you start. \
-             Shorthand for recall.",
-            json!({ "key": s("Exact key"), "category": s("Filter by category") }), &[]),
+            "Read what is known: your own notes, your groups, this team, and what holds \
+             fleet-wide, nearest first. Call this when you start. Name a scope to read only \
+             that one. Shorthand for recall.",
+            json!({ "key": s("Exact key"),
+                    "search": s("Words to look for anywhere in a key or value"),
+                    "category": s("Filter by category"),
+                    "scope": json!({ "type": "string",
+                        "enum": ["agent", "group", "session", "global"],
+                        "description": "Read only this scope. Omitted means everything you \
+                                        can see." }) }), &[]),
         tool("store_memory",
             "Remember something, choosing who should be able to see it. 'session' (the \
              default) is this team; 'agent' is private to you; 'group' is a named subset you \
@@ -235,6 +288,45 @@ pub fn team_tools() -> Vec<ToolDef> {
              you were doing. Keep it current and keep it brief.",
             json!({ "summary": s("A few sentences: where you are, what matters, what is next") }),
             &["summary"]),
+        // A long-lived agent spends its context twice: once working, and
+        // then again carrying what it did. These four are the second cost:
+        // what the work established is written down once, kept out of
+        // context, and read back only where a question needs it.
+        tool("fold_context",
+            "Fold a stretch of your own context into something that outlives it. Write what              that stretch ESTABLISHED, and hand over the raw material as `detail` -- nexmesh              keeps the detail out of your context and gives it back, in full, whenever you or              a teammate asks. Do this BEFORE you are compacted: a compaction summarises your              summary, and the fourth generation of that remembers the shape of the work and              none of its facts.              
+
+When to fold, and what to keep: fold a stretch when, and only when, the step              you are on no longer needs it. KEEP, verbatim, in the summary: paths with their              line numbers, signatures and the lines that carry the logic, exact error text,              decisions together with the reason they were taken, exact values and names, and              how the goal has changed. DROP: the output of a command once you have taken the              result out of it, a file you read twice, the route you took to a conclusion, and              a dead end -- but keep what the dead end taught.              
+
+Folds fold into folds: pass `covers` with the ids of earlier folds to replace              them with one summary above them. They stay underneath it, in full.",
+            json!({
+                "topic": s("One line saying what this stretch of work was"),
+                "summary": s("What it established -- the part you will carry from now on"),
+                "detail": s("The raw material, verbatim: kept out of your context, never lost"),
+                "covers": json!({ "type": "array", "items": { "type": "string" },
+                    "description": "Fold ids this one replaces, to build a tier above them" }),
+                "scope": json!({ "type": "string",
+                    "enum": ["agent", "group", "session", "global"],
+                    "description": "Who may see it. Defaults to 'agent' -- your own working                                     context. Use 'session' for what the team should know." }),
+                "group": s("Group name, when scope is 'group'"),
+                "tokens_before": json!({ "type": "integer",
+                    "description": "The real token count of what you folded, if you know                                     it. Otherwise it is estimated from the detail, which                                     only affects the arithmetic you are shown." })
+            }), &["topic", "summary"]),
+        tool("unfold_context",
+            "Read back what a fold put away: the detail, verbatim, exactly as it was handed              over. Call this the moment you need an exact value again rather than working              from the summary -- that is what folding is for, and re-deriving what you              already know is the cost it exists to avoid. A fold that covers other folds              answers with those, so a question walks down the tree only as far as it has to.",
+            json!({ "id": s("The fold id, as context_map or search_context gave it") }),
+            &["id"]),
+        tool("search_context",
+            "Find a fold by words, in its topic, its summary OR the detail it put away. This              is how something you are no longer carrying is found again -- search first,              unfold second, and only then go and read the files.",
+            json!({
+                "search": s("Words to look for"),
+                "scope": json!({ "type": "string",
+                    "enum": ["agent", "group", "session", "global"],
+                    "description": "Look only here. Omitted means everything you can see." }),
+                "limit": json!({ "type": "integer", "description": "Most folds to return" })
+            }), &["search"]),
+        tool("context_map",
+            "How full your context is, what you have folded so far, and what is worth folding              next. Read it when you are told you are filling up, and whenever you are picking              up work you do not remember starting.",
+            json!({}), &[]),
         tool("memory_history",
             "What a key used to say, and who changed it. Two teammates writing one key is \
              normal; this is how you see it happened.",
@@ -293,7 +385,16 @@ pub fn team_tools() -> Vec<ToolDef> {
                 "to": s("The other end, for what='path'"),
                 "rebuild": json!({ "type": "boolean",
                     "description": "Re-parse the workspace first. Needed after large changes; \
-                                    it is built automatically the first time." })
+                                    it is built automatically the first time. One workspace \
+                                    only, so not with a wider scope." }),
+                "scope": json!({ "type": "string",
+                    "enum": ["workspace", "session", "global"],
+                    "description": "How far to look. 'workspace' (the default) is your own \
+                                    directory, and the only scope that parses on demand. \
+                                    'session' is every workspace this team has already \
+                                    parsed -- use it when teammates have their own checkouts \
+                                    of the same code. 'global' is every parsed workspace on \
+                                    the fleet, for finding where something lives at all." })
             }), &["what"]),
         tool("publish_work",
             "Share what you have done with the rest of the team. Commits your changes in the \
@@ -309,10 +410,190 @@ pub fn team_tools() -> Vec<ToolDef> {
             "What is in your workspace that has not been shared, and what others have shared \
              that you have not taken. Changes nothing.",
             json!({}), &[]),
+        tool("team_rules",
+            "Read this team's standing rules: what the operator or your orchestrator has \
+             set for everybody working on this session, over and above your own brief. \
+             You were given them in your first prompt; read them again if you have been \
+             running a long time, after a compaction, or whenever you are told they have \
+             changed. They outrank your own preferences about how to work.",
+            json!({}), &[]),
         tool("get_history",
             "Query the session's message history.",
             json!({ "limit": json!({ "type": "integer", "description": "Most recent N messages" }) }), &[]),
     ]
+}
+
+/// The fleet-management surface, shown only to a seat that holds the
+/// authority to use it.
+///
+/// Advertised conditionally rather than merely refused on call. A tool a
+/// model can see is a tool it will try, and an agent refused by `elect` will
+/// reword the arguments and try again -- several times -- before it believes
+/// the answer. Not listing it is the honest signal.
+///
+/// These used to live in a SEPARATE MCP SERVER holding an operator token,
+/// which meant authority travelled with whichever MCP config named that
+/// server: install it user-scoped and every CLI that user started was a
+/// fleet operator. They are here now, decided per caller by
+/// `slots.authority`, because the hub already knows which seat is calling.
+pub fn orchestrator_tools() -> Vec<ToolDef> {
+    vec![
+        tool("elect",
+            "Change what a seat is ALLOWED TO DO: 'agent' (no fleet tools), \
+             'orchestrator' (runs one team -- its own session), or 'super' \
+             (runs the fleet). This is authority, not the seat's job -- for the job \
+             description, which confers nothing, there is nothing to elect. An \
+             orchestrator can elect other orchestrators inside its own session only, \
+             and can never make a superorchestrator.",
+            json!({ "agent": s("The seat's name, or its slot id"),
+                    "authority": s("'agent', 'orchestrator' or 'super'") }),
+            &["agent", "authority"]),
+        tool("set_team_rules",
+            "Set this team's standing rules: the conventions, the things not to touch, \
+             the way this team works -- what is true of the WORK rather than of one \
+             seat. Every seat gets them in its first prompt, and everybody already \
+             running is told in the chat that they have changed.\n\n\
+             This REPLACES whatever is there, so read `team_rules` first and send the \
+             whole text back with your change in it. Short and specific: rules nobody \
+             can hold in their head are rules nobody follows. Send an empty string to \
+             clear them.",
+            json!({ "text": s("The rules, in full. Empty clears them.") }),
+            &["text"]),
+        tool("add_agent",
+            "Add a seat to a team. It starts empty and disconnected; `spawn` or the \
+             operator fills it. An orchestrator adds to its own session only.",
+            json!({ "name": s("What teammates will call it"),
+                    "role": s("Its job, e.g. 'Dev' -- confers no authority"),
+                    "cli": s("Which CLI should fill it, e.g. 'claude', 'codex', 'opencode'"),
+                    "model": s("The model to ask for (optional)"),
+                    "session": s("Which team, by name or id. Defaults to your own.") }),
+            &["name"]),
+        tool("remove_agent",
+            "Take a seat out of a team for good, stopping whatever fills it. Its \
+             history stays in the session log. An orchestrator removes from its own \
+             session only.",
+            json!({ "agent": s("The seat's name, or its slot id") }),
+            &["agent"]),
+        tool("rename_agent",
+            "Rename a seat. Nothing else changes: same seat, same agent, same history, \
+             same inbox. An orchestrator renames within its own session only.",
+            json!({ "agent": s("The seat's current name, or its slot id"),
+                    "name": s("The new name, 64 characters or fewer, unique in its session") }),
+            &["agent", "name"]),
+        tool("move_agent",
+            "Move a seat to another team. Needs reach over BOTH the team it is in and \
+             the one it is going to, so in practice this is a superorchestrator's tool: \
+             an orchestrator reaches one session, and moving a seat from it to itself is \
+             not a move.",
+            json!({ "agent": s("The seat's name, or its slot id"),
+                    "session": s("The team to move it to, by name or id") }),
+            &["agent", "session"]),
+        tool("invite_agent",
+            "Have a seat from ANOTHER team also answer in one of yours, without moving it \
+             or giving that team a copy of its own. For a service every team needs -- a \
+             capability bridge, a reviewer -- so that one process, one model and one set \
+             of warm context serves all of them. Needs reach over both teams, so this is \
+             a superorchestrator's tool. Pass leave=true to take it out again; a seat \
+             cannot be removed from the team it LIVES in this way.",
+            json!({ "agent": s("The seat's name, or its slot id"),
+                    "session": s("The team it should also answer in, by name or id"),
+                    "leave": json!({ "type": "boolean",
+                                     "description": "Take it out of that team instead" }) }),
+            &["agent", "session"]),
+        tool("list_seats",
+            "Every seat you have reach over -- its team, name, job, authority, what is \
+             filling it and where. An orchestrator sees its own session; a \
+             superorchestrator sees the fleet.",
+            json!({}), &[]),
+    ]
+}
+
+/// What this caller is shown, which is what this caller may call.
+/// What an OBSERVER may call: read the state, answer whoever asked, and ask
+/// a seat how it is getting on. Nothing else.
+///
+/// A subset of `team_tools`, by name, rather than its own list of
+/// definitions: one description per tool, so the observer is told the same
+/// thing about `recall` as everybody else, and a tool whose wording improves
+/// improves here too.
+///
+/// `ask_progress` is the exception and is an observer's only way to put
+/// anything in front of a teammate. It takes NO free text on purpose --
+/// see its description.
+pub fn observer_tools() -> Vec<ToolDef> {
+    let allowed = OBSERVER_READS;
+    let mut v: Vec<ToolDef> =
+        team_tools().into_iter().filter(|t| allowed.contains(&t.name.as_str())).collect();
+    v.push(tool("ask_progress",
+        "Ask one teammate how it is getting on. This is the ONLY thing an observer can          put in front of a teammate, and it carries no words of yours: the question is          fixed, so that watching a team cannot turn into steering it.\n\n         Ask for `progress` (what state the work is in), `tests` (the result of the last          build or test run) or `eta` (when they expect to be done). Once per thing per          seat: a seat answering an observer is a seat not doing its work.",
+        json!({ "agent": s("The teammate's name, role or seat id"),
+                "want": s("'progress', 'tests' or 'eta'") }),
+        &["agent"]));
+    v
+}
+
+/// The tools an observer may READ with. Everything here is a question about
+/// state, or an answer to somebody who asked the observer something.
+const OBSERVER_READS: &[&str] = &[
+    // Who is here and what they are doing.
+    "list_peers",
+    "check_team_status",
+    "get_plan",
+    "get_history",
+    "workspace_status",
+    "view_file_locks",
+    "who_owns",
+    // What the team knows. Reading the memory is most of the point: somebody
+    // outside wants the team's own account of the work, not a summary of a
+    // summary.
+    "query_knowledge",
+    "recall",
+    "memory_history",
+    // The folds, and the detail underneath them. An observer that can read
+    // the team's memory but not what it put away would be reading the
+    // summaries of summaries it was created to see past.
+    "search_context",
+    "unfold_context",
+    "context_map",
+    "query_code_graph",
+    "team_rules",
+    "pending_asks",
+    // Its own mail, and answering it. `reply` goes back to whoever asked --
+    // which for an observer is usually the operator, and that conversation
+    // is the reason the seat exists.
+    "check_messages",
+    "claim_messages",
+    "reply",
+    "notify_operator",
+    // Its own status line, so the fleet can see what it is watching.
+    "set_summary",
+];
+
+pub fn team_tools_for(authority: crate::authority::Authority) -> Vec<ToolDef> {
+    if authority.is_read_only() {
+        return observer_tools();
+    }
+    let mut v = team_tools();
+    if authority.is_orchestrating() {
+        v.extend(orchestrator_tools());
+    }
+    v
+}
+
+/// May a seat at this level call this tool?
+///
+/// THE GATE, checked on every call in `hub::tools::dispatch`. Advertising is
+/// not authorising: a model that has seen a tool once will call it again from
+/// memory after being demoted, and a model told in a prompt not to do
+/// something will route around that the moment it believes it is helping.
+pub fn allowed_for(authority: crate::authority::Authority, name: &str) -> bool {
+    if authority.is_read_only() {
+        return observer_tools().iter().any(|t| t.name == name);
+    }
+    if needs_authority(name) {
+        return authority.is_orchestrating();
+    }
+    team_tools().iter().any(|t| t.name == name)
 }
 
 pub fn tool_names() -> Vec<String> {
@@ -321,11 +602,132 @@ pub fn tool_names() -> Vec<String> {
 
 pub fn is_known_tool(name: &str) -> bool {
     team_tools().iter().any(|t| t.name == name)
+        || orchestrator_tools().iter().any(|t| t.name == name)
+        // An observer's list is a subset of the team's plus one tool of its
+        // own, and "is this a tool at all" must know about that one too --
+        // otherwise a shim refuses it before the hub ever sees it.
+        || observer_tools().iter().any(|t| t.name == name)
+}
+
+/// Is this one of the tools that authority gates?
+pub fn needs_authority(name: &str) -> bool {
+    orchestrator_tools().iter().any(|t| t.name == name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::authority::Authority;
+
+    #[test]
+    fn an_observer_cannot_say_anything_of_its_own_to_a_teammate() {
+        // The whole point of the level. `send_message` and `broadcast` carry
+        // the caller's own words, which is how watching becomes steering.
+        for banned in ["send_message", "broadcast", "escalate"] {
+            assert!(
+                !allowed_for(Authority::Observer, banned),
+                "an observer must not be able to call {banned}"
+            );
+            assert!(
+                !observer_tools().iter().any(|t| t.name == banned),
+                "{banned} must not even be advertised to an observer"
+            );
+        }
+    }
+
+    #[test]
+    fn an_observer_cannot_change_anything() {
+        for banned in [
+            "store_knowledge", "store_memory", "forget", "save_context", "update_plan",
+            "fold_context",
+            "signal_done", "acquire_file", "release_file", "approve", "answer_ask",
+            "publish_work", "sync_workspace", "submit_feedback", "set_team_rules",
+            "elect", "add_agent", "remove_agent", "rename_agent", "move_agent",
+            "invite_agent", "list_seats",
+        ] {
+            assert!(!allowed_for(Authority::Observer, banned), "observer can call {banned}");
+        }
+    }
+
+    #[test]
+    fn an_observer_can_read_the_state_and_the_teams_memory() {
+        // Reading the memory is most of why the seat exists: somebody
+        // outside wants the team's own account of the work.
+        for ok in [
+            "list_peers", "check_team_status", "get_plan", "query_knowledge", "recall",
+            "memory_history", "get_history", "team_rules", "check_messages", "reply",
+            "search_context", "unfold_context", "context_map",
+            "notify_operator", "ask_progress", "set_summary",
+        ] {
+            assert!(allowed_for(Authority::Observer, ok), "observer cannot call {ok}");
+        }
+    }
+
+    #[test]
+    fn asking_for_progress_carries_no_words_of_the_observers_own() {
+        // If it took a `text`, it would be `send_message` with extra steps.
+        let t = observer_tools().into_iter().find(|t| t.name == "ask_progress").unwrap();
+        let props = t.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("agent") && props.contains_key("want"));
+        assert_eq!(props.len(), 2, "no free-text field: {props:?}");
+    }
+
+    #[test]
+    fn an_ordinary_agent_is_unaffected_by_the_observer_level_existing() {
+        for ok in ["send_message", "broadcast", "store_knowledge", "signal_done"] {
+            assert!(allowed_for(Authority::Agent, ok));
+        }
+        assert!(!allowed_for(Authority::Agent, "list_seats"));
+        assert!(!allowed_for(Authority::Agent, "ask_progress"),
+                "ask_progress is an observer's substitute for send_message, not an extra");
+    }
+
+    #[test]
+    fn an_orchestrator_keeps_everything_it_had() {
+        for ok in ["send_message", "list_seats", "elect", "set_team_rules"] {
+            assert!(allowed_for(Authority::Orchestrator, ok), "{ok}");
+            assert!(allowed_for(Authority::Super, ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn an_observers_list_is_strictly_smaller_than_an_agents() {
+        let obs = team_tools_for(Authority::Observer).len();
+        let agent = team_tools_for(Authority::Agent).len();
+        assert!(obs < agent, "{obs} vs {agent}");
+    }
+
+    #[test]
+    fn an_observers_own_tool_is_not_given_to_anybody_else() {
+        // It is the restricted substitute for `send_message`, not an extra,
+        // and a seat that has `send_message` has no business with it. The
+        // hub refuses it for the same reason it refuses the other direction:
+        // a gate with a hole is one somebody adds a tool behind.
+        for a in [Authority::Agent, Authority::Orchestrator, Authority::Super] {
+            assert!(!allowed_for(a, "ask_progress"), "{a:?}");
+            assert!(!team_tools_for(a).iter().any(|t| t.name == "ask_progress"));
+        }
+        assert!(allowed_for(Authority::Observer, "ask_progress"));
+    }
+
+    #[test]
+    fn an_unknown_tool_is_allowed_to_nobody() {
+        for a in [Authority::Observer, Authority::Agent, Authority::Orchestrator,
+                  Authority::Super] {
+            assert!(!allowed_for(a, "rm_minus_rf"));
+            assert!(!allowed_for(a, ""));
+        }
+    }
+
+    #[test]
+    fn every_tool_an_observer_is_shown_is_one_it_may_call() {
+        // Otherwise the seat is advertised something that refuses, which is
+        // the exact failure the authority work was done to stop.
+        for t in observer_tools() {
+            assert!(allowed_for(Authority::Observer, &t.name), "{}", t.name);
+        }
+    }
 
     #[test]
     fn tool_names_are_unique() {

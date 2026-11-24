@@ -46,12 +46,21 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_files: 4000,
+            // Raised from 4,000 once two of a real fleet's five graphs came
+            // back marked "the walk reached its limit of files to parse".
+            // A graph that stops at an arbitrary point is not a small graph,
+            // it is a graph with a hole in it, and the hole is wherever the
+            // alphabet put the walk when it ran out.
+            //
+            // The honest guard is the clock below, not this: a tree larger
+            // than this is a tree where a partial answer has to be labelled
+            // partial, which is what `truncated_reason` is for.
+            max_files: 12_000,
             max_file_bytes: 1_500_000,
             max_entries: 400_000,
-            // Comfortably inside the five minutes the hub waits, with room
+            // Comfortably inside the seven minutes the hub waits, with room
             // for handing a large graph over and storing it at the far end.
-            budget: std::time::Duration::from_secs(150),
+            budget: std::time::Duration::from_secs(240),
         }
     }
 }
@@ -548,6 +557,66 @@ fn import_target(text: String) -> Option<String> {
 }
 
 /// Note that a limit stopped the scan, and say which one.
+/// What the tree looks like, without parsing any of it.
+///
+/// The hub cannot rebuild a code graph on a timer: parsing a workspace is
+/// minutes of this machine's CPU, and most ticks would find nothing had
+/// changed. So it asks this instead -- the same walk, with the parsing taken
+/// out -- and only rebuilds when the answer differs from the one the graph
+/// was built from.
+///
+/// The fingerprint is deliberately coarse and deliberately cheap: how many
+/// source files the walk found, their total size, and the newest mtime among
+/// them. An edit changes the mtime; a new or deleted file changes the count;
+/// a rewrite that happens to keep the same length still changes the mtime.
+/// What it cannot see is a change that keeps all three the same, which in
+/// practice means a file touched backwards in time.
+///
+/// Returns the fingerprint, how many files it counted, and whether a limit
+/// stopped the walk -- because an unchanged fingerprint from a walk that did
+/// not finish is not evidence of anything.
+pub fn fingerprint(root: &Path, limits: &Limits) -> (String, u64, bool) {
+    let started = std::time::Instant::now();
+    // A walk with no parsing after it does not need the parse budget; a
+    // quarter of it is still far longer than any tree worth fingerprinting
+    // takes to walk, and it bounds a pathological one.
+    let deadline = started + limits.budget / 4;
+    let mut scratch = CodeGraph::default();
+    let files = walk(root, limits, deadline, &mut scratch);
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    // Nanoseconds where the filesystem keeps them: two edits of the same
+    // length a moment apart are what an agent working on one file actually
+    // does, and a whole-second clock cannot tell them apart. On a filesystem
+    // with second granularity this degrades to exactly that, which is the
+    // blind spot named above rather than a bug here.
+    let mut newest = 0u128;
+    for path in &files {
+        let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
+        count += 1;
+        bytes += meta.len();
+        if let Ok(t) = meta.modified() {
+            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                // Milliseconds, not seconds: two edits of the same length
+                // within one second are what an agent working on a file
+                // actually does, and a whole-second clock cannot tell them
+                // apart.
+                newest = newest.max(d.as_nanos());
+            }
+        }
+    }
+    let partial = scratch.truncated;
+    tracing::info!(
+        files = count,
+        bytes,
+        newest,
+        partial,
+        walk_ms = started.elapsed().as_millis() as u64,
+        "fingerprinted a workspace"
+    );
+    (format!("{count}:{bytes}:{newest}"), count, partial)
+}
+
 fn stop_short(graph: &mut CodeGraph, why: &str) {
     graph.truncated = true;
     if graph.truncated_reason.is_none() {
@@ -647,6 +716,47 @@ mod tests {
 
     fn has_edge(g: &CodeGraph, from: &str, to: &str, kind: EdgeKind) -> bool {
         g.edges.iter().any(|e| e.from == from && e.to == to && e.kind == kind)
+    }
+
+    #[test]
+    fn a_fingerprint_changes_when_the_tree_does_and_not_otherwise() {
+        let d = scratch(&[("src/lib.rs", "pub fn a() {}"), ("README.md", "not code")]);
+        let lim = Limits::default();
+        let (one, files, partial) = fingerprint(d.path(), &lim);
+        assert_eq!(files, 1, "only files with a grammar are counted");
+        assert!(!partial);
+        // Asked twice with nothing touched: the same answer, or a graph
+        // would be reparsed every ten minutes for ever.
+        let (two, _, _) = fingerprint(d.path(), &lim);
+        assert_eq!(one, two);
+        // A file added is a tree that moved.
+        std::fs::write(d.path().join("src/more.rs"), "pub fn b() {}").unwrap();
+        let (three, files, _) = fingerprint(d.path(), &lim);
+        assert_ne!(one, three);
+        assert_eq!(files, 2);
+        // And so is an edit that keeps the length the same, because the
+        // mtime is in there too. The pause is the FILESYSTEM's timestamp
+        // granularity -- a few milliseconds on ext4 -- not this code's: two
+        // writes inside one tick genuinely are indistinguishable, and a test
+        // that writes twice in a microsecond is testing the clock.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(d.path().join("src/more.rs"), "pub fn c() {}").unwrap();
+        let (four, _, _) = fingerprint(d.path(), &lim);
+        assert_ne!(three, four);
+    }
+
+    #[test]
+    fn a_fingerprint_says_when_it_could_not_see_the_whole_tree() {
+        let files: Vec<(String, String)> = (0..6)
+            .map(|n| (format!("src/f{n}.rs"), format!("pub fn f{n}() {{}}")))
+            .collect();
+        let refs: Vec<(&str, &str)> =
+            files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let d = scratch(&refs);
+        let lim = Limits { max_files: 3, ..Limits::default() };
+        let (_, counted, partial) = fingerprint(d.path(), &lim);
+        assert!(partial, "a walk stopped by a limit must say so");
+        assert_eq!(counted, 3);
     }
 
     #[test]

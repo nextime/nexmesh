@@ -50,6 +50,17 @@ fn header() -> String { String::new() }
     "tools/report.py": """
 import requests
 
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
+
 class Report:
     def build(self):
         return summarise()
@@ -107,11 +118,12 @@ def hub_cli(*a):
     return subprocess.run([f"{BIN}/nexmesh-hub", "--db", DB, *a], capture_output=True, text=True)
 
 PT = [None]
-def ask(agent, what, target="", to="", rebuild=False):
+def ask(agent, what, target="", to="", rebuild=False, scope=None):
     args = {"what": what}
     if target: args["target"] = target
     if to: args["to"] = to
     if rebuild: args["rebuild"] = True
+    if scope: args["scope"] = scope
     s, j = http("POST", "/v1/participant/tool",
                 {"agent_id": agent, "tool": "query_code_graph", "args": args}, token=PT[0])
     return j
@@ -119,9 +131,14 @@ def ask(agent, what, target="", to="", rebuild=False):
 def main():
     tok = hub_cli("enrol", "machine-b").stdout
     tok = [l.split()[1] for l in tok.splitlines() if l.startswith("token:")][0]
+    # The hub asks one workspace what its tree looks like every ten minutes,
+    # which is right for a fleet and impossible for a suite: these two knobs
+    # make the same question come round in seconds. Real knobs, not test
+    # ones -- how often to walk somebody else's disk is a fleet's choice.
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
         f"127.0.0.1:{PORT}", "serve"], stdout=open(f"{T}/hub.log","w"),
-        stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
+        stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1",
+            NEXMESH_FINGERPRINT_EVERY_MS="4000", NEXMESH_FINGERPRINT_WAIT_MS="3000")))
     until(lambda: http("GET", "/healthz")[1].get("ok"))
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",
         "--name", "machine-b", "--clis", CLIS, "--sock", SOCK, "--mcpd", f"{BIN}/nexmesh-mcpd"],
@@ -229,6 +246,47 @@ def main():
           q("SELECT files FROM code_graph_meta")[0]["files"] == 5,
           str(q("SELECT files FROM code_graph_meta")))
 
+    print("\n=== the hub notices the tree moving, without parsing it ===")
+    # A graph used to go stale only when work was PUBLISHED into a workspace
+    # -- a git sync, which a node_local workspace never has -- so on a real
+    # fleet every graph was built the day its seat was made and never again:
+    # five of them between eight and ten days old while the trees under them
+    # changed every hour. The hub asks for a fingerprint instead: the same
+    # walk with the parsing taken out.
+    fp = until(lambda: (q("SELECT tree_fingerprint FROM code_graph_meta") or [{}])[0]
+                        .get("tree_fingerprint"), seconds=40)
+    check("the node answers what the tree looks like now", bool(fp), str(fp))
+    check("which is a count, a size and a timestamp, not a parse",
+          bool(fp) and fp.count(":") == 2, str(fp))
+    check("and the first answer is a baseline, not a reason to reparse",
+          (q("SELECT stale_at_ms FROM code_graph_meta") or [{}])[0]["stale_at_ms"] is None,
+          str(q("SELECT stale_at_ms, stale_reason FROM code_graph_meta")))
+    parses_before = open(f"{T}/node.log").read().count("parsed a workspace")
+    # Nothing touched: asked again and again, and still nothing is reparsed.
+    fingerprints = until(lambda: open(f"{T}/node.log").read()
+                         .count("fingerprinted a workspace") >= 2, seconds=40)
+    check("it is asked again a little later", bool(fingerprints),
+          open(f"{T}/node.log").read()[-300:])
+    check("and an untouched tree is never reparsed, however often it is asked",
+          open(f"{T}/node.log").read().count("parsed a workspace") == parses_before)
+    # And now the tree moves.
+    time.sleep(1.1)
+    open(os.path.join(WS, "src/moved.rs"), "w").write("pub fn moved_here() {}\n")
+    check("a tree that moved makes the graph stale",
+          until(lambda: (q("SELECT stale_at_ms FROM code_graph_meta") or [{}])[0]["stale_at_ms"],
+                seconds=60),
+          str(q("SELECT stale_at_ms, stale_reason, tree_fingerprint FROM code_graph_meta")))
+    check("saying that is what happened",
+          (q("SELECT stale_reason FROM code_graph_meta") or [{}])[0]["stale_reason"]
+            == "the files changed",
+          str(q("SELECT stale_reason FROM code_graph_meta")))
+    # The rebuild that follows is the ordinary one, and it carries the new
+    # symbol -- which is the whole point of noticing.
+    check("and the rebuild that follows has the new symbol in it",
+          until(lambda: "moved_here" in ask(agent, "find", "moved_here").get("text", ""),
+                seconds=180),
+          ask(agent, "find", "moved_here").get("text"))
+
     print("\n=== it is the hub's, so every teammate shares it ===")
     s, j2 = http("POST", "/v1/participant/join",
         {"session": sid, "name": "Second", "role": "engineer",
@@ -239,6 +297,67 @@ def main():
     check("and the node parsed only twice in total",
           open(f"{T}/node.log").read().count("parsed a workspace") == 2,
           str(open(f"{T}/node.log").read().count("parsed a workspace")))
+
+    print("\n=== how far the question reaches ===")
+    # A graph is parsed from the files in ONE directory on ONE machine. That
+    # was the whole story until a seat got a workspace of its own: a team of
+    # four in one repository is now four workspaces, and "where is this
+    # function" asked in one of them could not see the other three.
+    #
+    # A second team with its own workspace, parsed, so there is something for
+    # a wider question to find that a narrower one must not.
+    os.makedirs(f"{T}/ws2/src", exist_ok=True)
+    open(f"{T}/ws2/src/other.rs", "w").write("pub fn only_over_there() {}\n")
+    sid2 = http("POST", "/v1/sessions", {"name": "othergraph", "workspaces": [
+        {"name": "theirs", "kind": "node_local", "node": "machine-b",
+         "mounts": {"machine-b": f"{T}/ws2"}}]})[1]["session_id"]
+    out2 = hub_cli("participant-token", "reader2", "--session", sid2).stdout
+    pt2 = [l.split()[1] for l in out2.splitlines() if l.startswith("token:")][0]
+    s, j2 = http("POST", "/v1/participant/join",
+        {"session": sid2, "name": "Other", "role": "engineer",
+         "workspace": "theirs", "kind_hint": "test"}, token=pt2)
+    other = j2["agent_id"]
+    s, jj = http("POST", "/v1/participant/tool",
+        {"agent_id": other, "tool": "query_code_graph",
+         "args": {"what": "overview"}}, token=pt2)
+    check("the other team's workspace parses too", jj.get("ok"), str(jj)[:300])
+
+    # The default is unchanged: your own checkout, and nothing else.
+    j = ask(agent, "find", "only_over_there")
+    check("your own workspace does not see another team's",
+          "Nothing in this workspace" in j.get("text", ""), j.get("text", "")[:300])
+    # The fleet does.
+    j = ask(agent, "find", "only_over_there", scope="global")
+    check("a fleet-wide question finds it", "only_over_there" in j.get("text", ""),
+          j.get("text", "")[:400])
+    check("and says which workspace it is in", "theirs" in j.get("text", ""),
+          j.get("text", "")[:400])
+    # And a team-wide question does not: it is another team's code.
+    j = ask(agent, "find", "only_over_there", scope="session")
+    text = j.get("text", "")
+    check("a team-wide question stays inside the team",
+          text.strip().startswith("Nothing") and "theirs" not in text, text[:300])
+    j = ask(agent, "find", "brand_new", scope="session")
+    check("but does find this team's own", "brand_new" in j.get("text", ""),
+          j.get("text", "")[:300])
+
+    # A wider question must not parse anything: that is minutes of somebody
+    # else's machine, decided by an agent that is not running there.
+    before = open(f"{T}/node.log").read().count("parsed a workspace")
+    j = ask(agent, "find", "nothing_like_this", scope="global")
+    check("a fleet-wide question parses nothing",
+          open(f"{T}/node.log").read().count("parsed a workspace") == before,
+          f"{before} -> {open(f'{T}/node.log').read().count('parsed a workspace')}")
+    j = ask(agent, "overview", scope="global", rebuild=True)
+    check("and asking it to rebuild is refused, with what to do instead",
+          "ask it of your own" in str(j), str(j)[:300])
+    # A route between two symbols is a walk through ONE parsed tree.
+    j = ask(agent, "path", "main", to="helper", scope="global")
+    check("a path across workspaces is refused rather than invented",
+          "ONE parsed tree" in str(j), str(j)[:300])
+    j = ask(agent, "find", "x", scope="everything")
+    check("an unknown scope says what the three are", "workspace" in str(j)
+          and "global" in str(j), str(j)[:300])
 
     print("\n=== and a person can see it, not only an agent ===")
     # Until the dashboard carried this, an agent could see the shape of a

@@ -80,6 +80,69 @@ already read.
 If you want a code knowledge graph on its own, use graphify. It is the more
 capable tool at that one job, and it is where this idea comes from.
 
+## Folds come from billion-context
+
+Keeping an agent's own context bounded without losing what it learned is
+[billion-context](https://github.com/ranxianglei/billion-context)'s problem
+and its answer, by ranxianglei, with the kernel published separately as
+[acp-kernel](https://github.com/ranxianglei/acp-kernel). What nexmesh took is
+the mechanism:
+
+- **An LSM tree over prose.** Summary blocks over a range of the
+  conversation, blocks folding into blocks, each one carrying the lineage of
+  what it replaced, so a question walks down from a summary only as far as it
+  has to. nexmesh calls one a *fold*; the tiers, the lineage and the read path
+  are the same idea.
+- **The model does the summarising.** No extractive heuristic and no second
+  model: the agent writing the context is the only thing that knows which
+  stretch of it the current step has finished with. That is the project's
+  central claim and it is the right one.
+- **A written doctrine rather than a prompt to "summarise".** One rule for
+  when, and two lists for what to keep and what to drop. A summary written
+  without them keeps the narrative and loses the facts, which is the failure
+  mode of every CLI's own compaction.
+- **A growth gate, not an overflow alarm.** A seat is asked once it has taken
+  on another quarter of a window since it was last asked, and the ordinary ask
+  does not mention how full it is. Its measurements are the reason: this reads
+  as an efficiency habit rather than a warning, and a model told it is nearly
+  out of room folds in a hurry and keeps the wrong things.
+- **Retrieval is half the win.** Its own controlled pilot found that an arm
+  executing *no* compressions reproduced most of the drop in re-fetching, from
+  the doctrine and the layout alone. `search_context` and `unfold_context` are
+  not an afterthought to the folding; they are the reason it is safe to fold.
+
+What nexmesh does differently is where it sits. billion-context is a proxy in
+front of the model API: it intercepts each request, rewrites the history into
+summary blocks plus a raw recent zone, injects its tools and its nudges, and
+executes the compression itself. For a single agent against an API key that is
+the better architecture, and it is the tool to use for that.
+
+nexmesh is not in that position. It drives CLIs that hold their own
+conversations and talk to the model themselves, and several of the ones that
+matter most on a real fleet sign in with a personal subscription rather than
+an API key -- there is no request for a proxy to rewrite, and no base URL that
+could carry them. So the three jobs a proxy does are split:
+
+- **injecting** -- nexmesh is already the MCP server inside every seat, so the
+  tools, the doctrine and the nudge need no interception;
+- **retrieving** -- `search_context` and `unfold_context` over a store that
+  outlives the seat, the session and the CLI;
+- **evicting** -- each CLI's own compaction, which nexmesh already asks for by
+  the CLI's own command. The fold is written first, so what the agent chose to
+  keep survives the compaction that throws its context away.
+
+The consequence is a real difference in kind, not just in plumbing: nexmesh
+cannot rewrite a live context mid-turn, so a fold costs the agent a tool call
+and the raw material has to be handed over rather than excised behind its
+back. In exchange, folds are scoped and shared -- a teammate, an observer, or
+the same seat on a different CLI next week can read what was put away.
+
+Its licence is MIT with an additional term requiring visible attribution on a
+product surface. Nothing here is derived from its code, prompts or on-disk
+format -- the doctrine text, the schema, the tools and the kernel were written
+from the paper's description of the mechanism -- and it is credited in the
+README, in this file, and in the module that implements it regardless.
+
 ## The capability bridge, and the service behind it
 
 `nexmesh-coderai` is the bridge that lets a team ask for things a language
@@ -111,4 +174,8 @@ and declares MIT in its `package.json` and README (that repository carries no
 schema, wire protocol and every line here were written from scratch. The same
 goes for [graphify](https://github.com/Graphify-Labs/graphify), which is
 Apache-2.0 (also offered under MIT) and whose permissive licence was
-deliberately not relied on to vendor anything.
+deliberately not relied on to vendor anything, and for
+[billion-context](https://github.com/ranxianglei/billion-context), which is
+MIT with an attribution term: no code, prompt text or file format of its was
+copied, adapted or translated, and the attribution it asks for is here, in the
+README and in `crates/hub/src/folds.rs`.

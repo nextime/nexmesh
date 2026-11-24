@@ -120,6 +120,82 @@ impl MouseReports {
     }
 }
 
+/// DROP THE RIGHT BUTTON, so tmux cannot offer a way out of the agent.
+///
+/// tmux's own right-click menu -- the one it draws when the program in the
+/// pane has not asked for the mouse -- offers "Horizontal Split" and
+/// "Vertical Split", and a new pane in a held session is a SHELL on that
+/// machine. The prefix key can be taken away per session (the node does
+/// that), but tmux key bindings are per-SERVER: unbinding the mouse menu
+/// there would change the operator's own tmux, which is not this program's
+/// to do.
+///
+/// So the report never reaches tmux. Only when the agent itself has not
+/// asked for the mouse -- an agent that has is being given its clicks, and
+/// tmux shows no menu while that is true.
+///
+/// SGR reports only (`ESC [ < b ; x ; y M|m`), which is what every terminal
+/// still in use sends once an application asks for the mouse at all. A
+/// half-arrived report is held rather than passed on, for the same reason
+/// the wheel reader holds one: `[<2` typed into somebody's prompt is worse
+/// than a click that does nothing.
+#[derive(Debug, Default)]
+pub struct RightClicks {
+    pending: Vec<u8>,
+}
+
+impl RightClicks {
+    pub fn pass(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(data);
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i] != 0x1b {
+                out.push(buf[i]);
+                i += 1;
+                continue;
+            }
+            if i + 2 >= buf.len() {
+                self.pending = buf[i..].to_vec();
+                return out;
+            }
+            if buf[i + 1] != b'[' || buf[i + 2] != b'<' {
+                out.push(buf[i]);
+                i += 1;
+                continue;
+            }
+            let mut j = i + 3;
+            while j < buf.len() && buf[j] != b'M' && buf[j] != b'm' {
+                j += 1;
+            }
+            if j >= buf.len() {
+                // Not a mouse report at all, just a long escape sequence:
+                // the wheel reader draws the same line in the same place.
+                if buf.len() - i > 32 {
+                    out.extend_from_slice(&buf[i..]);
+                    return out;
+                }
+                self.pending = buf[i..].to_vec();
+                return out;
+            }
+            let button = std::str::from_utf8(&buf[i + 3..j])
+                .ok()
+                .and_then(|p| p.split(';').next().and_then(|b| b.trim().parse::<u32>().ok()));
+            // The low two bits are which button; 64 and up are the wheel and
+            // motion, which are nobody's menu. Modifiers live in the bits
+            // between, so a Meta-right-click is still a right-click -- which
+            // matters, because tmux binds that one to the same menu.
+            let is_right = button.is_some_and(|b| b < 64 && b & 0b11 == 2);
+            if !is_right {
+                out.extend_from_slice(&buf[i..=j]);
+            }
+            i = j + 1;
+        }
+        out
+    }
+}
+
 impl NoAltScroll {
     /// Hand on what the viewer should write, having taken out what it must
     /// not. `pending` keeps a half-arrived sequence for the next call.
@@ -194,6 +270,32 @@ impl NoAltScroll {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_right_click_never_reaches_tmux_and_everything_else_does() {
+        let mut r = RightClicks::default();
+        // Left press and release, pass through.
+        assert_eq!(r.pass(b"\x1b[<0;10;5M\x1b[<0;10;5m"), b"\x1b[<0;10;5M\x1b[<0;10;5m");
+        // Right press: gone, menu and all.
+        assert_eq!(r.pass(b"\x1b[<2;10;5M"), b"");
+        // Meta-right-click is the same menu, so it goes too.
+        assert_eq!(r.pass(b"\x1b[<10;10;5M"), b"");
+        // The wheel is not a button.
+        assert_eq!(r.pass(b"\x1b[<64;1;1M"), b"\x1b[<64;1;1M");
+        // And ordinary keys are untouched.
+        assert_eq!(r.pass(b"hello\r"), b"hello\r");
+    }
+
+    #[test]
+    fn a_report_split_across_two_reads_is_not_typed_into_the_prompt() {
+        let mut r = RightClicks::default();
+        assert_eq!(r.pass(b"\x1b[<2;10"), b"");
+        assert_eq!(r.pass(b";5M"), b"", "the rest of it goes with it");
+        assert_eq!(r.pass(b"\x1b[<0;1"), b"");
+        assert_eq!(r.pass(b";1M"), b"\x1b[<0;1;1M", "and a left click still arrives whole");
+    }
+
     use super::*;
 
     fn through(chunks: &[&[u8]]) -> Vec<u8> {

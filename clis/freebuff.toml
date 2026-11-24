@@ -1,0 +1,136 @@
+# Freebuff -- the free coding agent built on the Codebuff platform.
+#
+# Verified against freebuff 0.2.36 installed here, by reading `--help` and
+# the compiled binary itself rather than its website:
+#
+#   * There is NO headless mode. The only positional argument is `login` or
+#     `doctor`; there is no -p/--print and no --prompt, so a one-shot run is
+#     not possible. Interactive only, like hermes.
+#   * The model is chosen with `/model` inside the TUI and is priced in
+#     hours, so there is no model flag to declare and nothing here picks one.
+#   * MCP servers come from `mcp.json` in the `.agents` directories it
+#     scans -- `<cwd>/.agents`, `<cwd>/../.agents`, `~/.agents` -- under
+#     `mcpServers`, with environment under `env`. An entry holding `command`
+#     is taken as a stdio server, so no `type` field is needed. A value
+#     beginning with `$` is looked up in the environment and is an error if
+#     unset; nothing nexmesh writes starts with one.
+#   * It will not load that file until the directory has been TRUSTED, and
+#     it decides by asking a y/n question. A seat runs on a pty, so the
+#     question would be asked and nobody would be there to answer it; the
+#     seat would then run with no team tools at all and no visible reason
+#     why. `--trust-agents` is therefore not optional here -- the operator
+#     chose the directory when they made the seat, which is the decision.
+[cli]
+id = "freebuff"
+display_name = "Freebuff"
+command = "freebuff"
+version_args = ["--version"]
+# Installed via npm here, like codex and qwen. The npm wrapper downloads a
+# ~130MB binary into ~/.config/manicode the first time it runs, and keeps it
+# there whatever FREEBUFF_CONFIG_DIR says -- see [session_store].
+extra_paths = ["~/.npm-global/bin", "~/.local/bin"]
+
+[mcp]
+# A relative path, so this is a project file inside the seat's workspace and
+# the user's own ~/.agents/mcp.json is left alone.
+#
+# MIND THE MERGE ORDER. freebuff reads all three of its `.agents` directories
+# and lets a LATER one overwrite an earlier one for the same server name, in
+# the order <cwd>, <cwd>/.., ~ -- so the HOME file wins over this one. Every
+# other CLI here either takes a config file on the command line or merges
+# into one shared file where the seat's entry simply replaces the
+# orchestrator's; freebuff is the one where a server of the same name in the
+# user's home config would quietly take a SEAT's place. So on a machine that
+# both runs freebuff seats and drives the fleet from a freebuff session of
+# its own, install the orchestrator under another name:
+#
+#   nexmesh install-orchestrator --cli freebuff --name nexmesh-orch ...
+#
+# Left as a documented edge rather than worked around by renaming the seat's
+# server, because then a globally installed orchestrator would be loaded
+# INTO every seat alongside its own shim -- operator tools in a seat, which
+# is worse than a name clash.
+style = "json_file"
+path = ".agents/mcp.json"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { command = "{mcpd}", args = [] }
+
+[modes.interactive]
+args = ["--trust-agents"]
+# `--continue` with no id is "the last conversation", which is only
+# unambiguous because this seat has a store of its own; see [session_store].
+# There is no resume_args: freebuff publishes no conversation id to its MCP
+# children and names its chat directories by start time, so there is never a
+# handle to hand back to it.
+resume_latest_args = ["--continue"]
+# In the binary's own command table, beside /init and /export.
+compact_command = "/compact"
+# Its help screen, verbatim: Esc = "Close help / stop", Ctrl+C = "Clear /
+# stop / quit". Esc is the one that stops the turn without also being the
+# key that clears the conversation or ends the process.
+interrupt_keys = "\u001b"
+attachable = true
+# Typing a line at this prompt is a message to the agent, not a command
+# to a shell -- so a seat the fleet put in a terminal can be reached by
+# keyboard even with no driver to push to. `tmux` does not say this: what
+# is at ITS prompt is a shell.
+typed_delivery = true
+
+[driver]
+kind = "mcp_only"
+
+[user_install]
+# It has no `mcp add` command of any kind, so write the file it reads. The
+# home `.agents` directory is the last of the three it scans, which is the
+# right place for something meant to be there every time.
+style = "json_file"
+path = "~/.agents/mcp.json"
+pointer = "/mcpServers/{name}"
+env_key = "env"
+entry = { command = "{command}", args = [] }
+
+[skill]
+# It loads skills from <cwd>/.agents/skills, <cwd>/.claude/skills,
+# ~/.agents/skills and ~/.claude/skills, each as <name>/SKILL.md. Its own
+# namespace is the one to write into -- it would read a skill out of
+# ~/.claude/skills as well, but that directory belongs to another CLI.
+dir = "~/.agents/skills"
+
+[session_store]
+# A data directory per SEAT, so a freebuff seat can be resumed at all.
+#
+# freebuff keeps every conversation under `projects/<dir name>/chats/` in one
+# store, names each chat directory by its start time, and publishes no
+# conversation id to its MCP children. Two seats in the same directory would
+# therefore share a chat list that nothing outside freebuff can divide, and
+# `--continue` would hand one of them the other's conversation -- which is
+# worse than starting a fresh one.
+#
+# Given its own FREEBUFF_CONFIG_DIR, "the last conversation" is this seat's.
+# The variable IS the store, so there is no store_rel, and the binary
+# requires it to be absolute, which the node's own path is.
+#
+# What is shared is the login, the settings, and the downloaded binaries:
+# the npm wrapper keeps its 130MB binary in the real directory regardless of
+# this variable, but the agent itself reads credentials, settings and its
+# ripgrep and tree-sitter payloads through it, so an isolated seat without
+# these would be logged out and unable to search. Checked rather than
+# assumed, by pointing FREEBUFF_CONFIG_DIR at an empty directory: `freebuff
+# doctor` then reports "Not signed in" and writes a fresh settings.json
+# there, while still running the binary out of the real store. The
+# conversations (`projects/<name>/chats`) are under this variable too, which
+# is what makes `--continue` this seat's. Only they are per seat, which is
+# the point. An entry that does not exist is skipped.
+env = "FREEBUFF_CONFIG_DIR"
+root = "~/.config/manicode"
+share = ["credentials.json", "device-key.json", "settings.json",
+         "analytics-id.json", "recent-projects.json", "freebuff",
+         "freebuff-metadata.json", "rg", "tree-sitter.wasm"]
+
+# No [context] section: freebuff's chat directory holds a pino debug log,
+# not a usage-stamped transcript, so there is no occupancy to read -- and it
+# compacts on its own at a threshold of its own (`compactContext`). A seat of
+# it is never compacted automatically by nexmesh, which is the honest default
+# for a CLI whose fullness we cannot see. `/compact <agent>` still works,
+# because the command above is real.

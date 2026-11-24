@@ -4,7 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>nexmesh · the room</title>
-<link rel="manifest" href="/manifest.webmanifest">
+<!-- Its OWN manifest: an app installed from the dashboard's manifest starts
+     at the dashboard, and an installed app has no address bar to type a path
+     into, so the room would be unreachable from inside it. -->
+<link rel="manifest" href="/manifest-xr.webmanifest">
 <meta name="theme-color" content="#08090d">
 <style>
   :root { color-scheme: dark; }

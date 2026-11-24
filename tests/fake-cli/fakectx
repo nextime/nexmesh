@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""An 'agent' that writes a conversation file the way claude does.
+
+This exists because the two things the node measures -- how full a context
+is, and whether an agent is going round in circles -- are both read out of
+the CLI's own conversation file. A fake that does not write one can only
+prove the plumbing; this one writes real records, so a test can fill a
+context to a known number of tokens and watch what the fleet does about it.
+
+Typed at:
+    fill <tokens>   append a turn whose prompt was that big
+    loop <n>        append n IDENTICAL turns: the same tool, same arguments
+    work <n>        append n DIFFERENT turns, which is not a loop
+    anything else   logged, so a test can see what was typed at it
+
+Every keystroke goes to $FAKECTX_LOG, Escape included, which is how a test
+sees an interrupt arrive: an interrupt is a keystroke at a busy CLI, not a
+line at a prompt.
+"""
+import json, os, sys, time, uuid
+
+if "--version" in sys.argv:
+    print("fakectx 1.0.0")
+    sys.exit(0)
+
+LOG = os.environ.get("FAKECTX_LOG", "/dev/null")
+# Where conversations go: the same layout claude uses -- one directory per
+# working directory, named after it with the slashes turned into dashes.
+PROJECTS = os.environ.get("FAKECTX_PROJECTS", "/tmp")
+MODEL = os.environ.get("FAKECTX_MODEL", "claude-opus-5")
+
+
+def note(what):
+    with open(LOG, "a") as f:
+        f.write(f"{time.time():.3f} {what}\n")
+        f.flush()
+
+
+def arg_after(flag):
+    a = sys.argv[1:]
+    return a[a.index(flag) + 1] if flag in a and len(a) > a.index(flag) + 1 else None
+
+
+SESSION = arg_after("--resume") or arg_after("--session-id") or str(uuid.uuid4())
+SLUG = os.getcwd().replace("/", "-")
+DIR = os.path.join(PROJECTS, SLUG)
+os.makedirs(DIR, exist_ok=True)
+CONV = os.path.join(DIR, f"{SESSION}.jsonl")
+
+note("argv: " + " ".join(sys.argv[1:]))
+note("conversation: " + CONV)
+
+
+def append(record):
+    """One line, flushed. The node reads this file while it is being written
+    to, so a half-written line is the normal case and not an error."""
+    with open(CONV, "a") as f:
+        f.write(json.dumps(record) + "\n")
+        f.flush()
+
+
+def turn(content, usage=None):
+    rec = {"type": "assistant", "isSidechain": False,
+           "message": {"role": "assistant", "model": MODEL, "content": content}}
+    if usage is not None:
+        rec["message"]["usage"] = usage
+    return rec
+
+
+def fill(tokens):
+    """A turn whose prompt was `tokens` big.
+
+    The text is unique, so a conversation that is merely GROWING is never
+    read as one that is repeating itself.
+    """
+    n = int(tokens)
+    append(turn(
+        [{"type": "text", "text": f"turn {time.time():.4f} of a growing conversation"}],
+        {"input_tokens": 10, "cache_creation_input_tokens": 0,
+         "cache_read_input_tokens": max(n - 10, 0), "output_tokens": 0},
+    ))
+
+
+def loop(n):
+    """The same turn, n times: one tool, one set of arguments."""
+    for _ in range(int(n)):
+        append(turn([{"type": "tool_use", "name": "Bash",
+                      "input": {"command": "make", "timeout": 30}}]))
+        time.sleep(0.02)
+
+
+def work(n):
+    """n turns of actual progress: the same tool, different arguments."""
+    for i in range(int(n)):
+        append(turn([{"type": "tool_use", "name": "Read",
+                      "input": {"path": f"src/file{i}.rs"}}]))
+        time.sleep(0.02)
+
+
+# RAW MODE, as every real TUI does.
+#
+# Not decoration: in the default canonical mode the terminal driver buffers
+# input by LINE, so a bare Escape with no newline after it never reaches the
+# reader at all. An interrupt is exactly that -- one key, at a CLI that is
+# busy and not sitting at a prompt -- so a fake that does not read raw cannot
+# see one, and the node writing it looks like the node losing it.
+RAW = False
+if sys.stdin.isatty():
+    try:
+        import termios, tty
+        tty.setraw(sys.stdin.fileno())
+        RAW = True
+    except Exception as e:  # not fatal: the rest of this fake still works
+        note(f"could not set raw mode: {e}")
+
+print(f"FAKECTX READY tty={sys.stdin.isatty()} raw={RAW} conv={SESSION}", flush=True)
+
+line = ""
+while True:
+    try:
+        b = os.read(0, 1)
+    except OSError:
+        break
+    if not b:
+        break
+    # An interrupt is a bare Escape at a CLI that is busy, with no newline
+    # after it. Logged the moment it arrives, because what a test has to
+    # prove is that it arrived at all.
+    if b == b"\x1b":
+        note("ESC")
+        print("[interrupted]", flush=True)
+        line = ""
+        continue
+    if b in (b"\r", b"\n"):
+        text = line.strip()
+        line = ""
+        if not text:
+            continue
+        note("typed: " + text)
+        parts = text.split()
+        try:
+            if parts[0] == "fill" and len(parts) > 1:
+                fill(parts[1])
+                print(f"[filled to {parts[1]}]", flush=True)
+            elif parts[0] == "loop" and len(parts) > 1:
+                loop(parts[1])
+                print(f"[looped {parts[1]}]", flush=True)
+            elif parts[0] == "work" and len(parts) > 1:
+                work(parts[1])
+                print(f"[worked {parts[1]}]", flush=True)
+            else:
+                print(f"[said: {text}]", flush=True)
+        except Exception as e:  # a fake must not die on a typo
+            note(f"error: {e}")
+        continue
+    try:
+        line += b.decode()
+    except UnicodeDecodeError:
+        pass

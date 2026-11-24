@@ -10,6 +10,17 @@ is also what the README's pictures are made from.
 """
 import importlib.util, json, os, shutil, signal, socket, subprocess, sys, tempfile, time
 
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("xrshots", os.path.join(ROOT, "tests", "xr-shots.py"))
 xrshots = importlib.util.module_from_spec(spec)
@@ -111,7 +122,7 @@ def main():
             fails.append("something is still mounted on a wrist")
 
         # Whoever drives the fleet is in the room, and belongs to no team.
-        if a["drivers"] != ["nextime"]:
+        if a["drivers"] != ["dev"]:
             fails.append(f"the orchestrator is not in the room: {a['drivers']}")
 
         # A channel sign for every team, pointable, whether shown or not.
@@ -127,7 +138,7 @@ def main():
             fails.append(f"pressing the sign set only={b['only']}")
         if b["seats"] != 3:
             fails.append(f"#docs-site is 3 seats, the room kept {b['seats']}")
-        if b["drivers"] != ["nextime"]:
+        if b["drivers"] != ["dev"]:
             fails.append("choosing one team removed the orchestrator from the room")
         marked = {s["name"]: (s["only"], s["dimmed"]) for s in b["signs"]}
         if marked.get("docs-site") != (True, False):

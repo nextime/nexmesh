@@ -24,20 +24,81 @@ args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
 prompt_on_stdin = true
 resume_args = ["--resume", "{resume}"]
 attachable = false   # stream-json is a protocol, not a terminal
+# What a SEAT tells its agent, over and above this file. The hub holds the
+# text; these say how to hand it to claude. Verified against 2.1.322: both
+# take the prompt inline as one argument -- there is no --...-file variant,
+# so a prompt here is an argv entry and Linux caps one of those at 128 KiB.
+system_prompt_args = ["--system-prompt", "{prompt}"]
+append_system_prompt_args = ["--append-system-prompt", "{prompt}"]
 
 [modes.interactive]
 args = ["--mcp-config", "{mcp_config}"]
 resume_args = ["--resume", "{resume}"]
+# What a SEAT tells its agent, over and above this file. The hub holds the
+# text; these say how to hand it to claude. Verified against 2.1.322: both
+# take the prompt inline as one argument -- there is no --...-file variant,
+# so a prompt here is an argv entry and Linux caps one of those at 128 KiB.
+system_prompt_args = ["--system-prompt", "{prompt}"]
+append_system_prompt_args = ["--append-system-prompt", "{prompt}"]
 # A TUI never tells anyone its conversation id, so nexmesh names it here and
 # resumes that name after a restart. Without this an interactive seat lost its
 # whole conversation whenever its process was replaced.
 session_id_args = ["--session-id", "{session_uuid}"]
+# Compaction is a slash command inside the TUI -- claude takes no flag for it
+# (`--autocompact` sets the automatic threshold, it does not compact now) --
+# so this is literally what a person would type. `/compact` is Claude Code's
+# own command for it.
+compact_command = "/compact"
+# Escape, which is what a person presses to stop claude mid-turn. Raw keys
+# rather than a slash command on purpose: this has to work while the CLI is
+# working and not reading a line at all, which is the only time it is needed.
+interrupt_keys = "\u001b"
+# Where a named conversation actually lands, so a handle is checked before it
+# is used. claude keeps one per project directory, named after the cwd with
+# the slashes turned into dashes -- and `--resume` only finds a conversation
+# in the directory it is launched in, so a handle from elsewhere is not
+# resumable even though it is a real conversation somewhere.
+session_path = "~/.claude/projects/{cwd_slug}/{id}.jsonl"
 attachable = true
 # Typing a line at this prompt is a message to the agent, not a command
 # to a shell -- so a seat the fleet put in a terminal can be reached by
 # keyboard even with no driver to push to. `tmux` does not say this: what
 # is at ITS prompt is a shell.
 typed_delivery = true
+
+[context]
+# HOW FULL A CONVERSATION IS, and how full it may get.
+#
+# `source` says where the node reads occupancy: claude stamps every assistant
+# message in its conversation file with the usage of the API call that
+# produced it, and the prompt of the newest such call IS the conversation as
+# it stands. So the number is read, never estimated, and it is the same one
+# the CLI shows its own user. `session_path` above is the file.
+#
+# `limit_tokens` is the window that number is a fraction of. It cannot be
+# read anywhere: claude reports no window, to its MCP servers or in its
+# conversation file, so it is declared here where it can be corrected
+# without a new binary.
+#
+# The values below were MEASURED, not assumed. claude records its own
+# compactions in the transcript with `compactMetadata.preTokens` and
+# `trigger: "auto"` -- the size it had reached when its own threshold fired,
+# which is a little under the window. Across real conversations on this
+# fleet: haiku triggered at 204k and 207k, and opus and fable at 967k, 969k
+# and 998k. Hence 200k and 1M, and hence a map: the window belongs to the
+# MODEL, and one claude binary runs several that do not agree. A seat whose
+# entitlement differs -- these are an account's windows as much as a model's
+# -- is a line in this file.
+source = "claude_transcript"
+limit_tokens = 200000
+
+[context.models]
+# Matched against the model the agent REPORTS, longest prefix wins, so a
+# point release needs no entry of its own.
+"claude-opus" = 1000000
+"claude-sonnet" = 1000000
+"claude-fable" = 1000000
+"claude-haiku" = 200000
 
 [driver]
 kind = "stream_json"
@@ -50,3 +111,43 @@ replay_user_messages = true
 style = "command"
 argv = ["mcp", "add", "--scope", "user", "{name}", "--", "{command}"]
 env_flag = "-e"
+
+[skill]
+# Registering the MCP server gives a seat the tools; it does not tell it how a
+# team works, and that is not derivable from a tool list. Claude Code reads
+# skills from here, so the installer writes one.
+#
+# A profile that points CLAUDE_CONFIG_DIR somewhere else needs its own [skill]
+# dir to match -- see clis/profiles. A CLI with no skill mechanism gets the
+# same ground rules through the MCP `instructions` field instead, which every
+# client is given at initialize.
+dir = "~/.claude/skills"
+name = "nexmesh"
+
+[supervise]
+# Hold the CLI in tmux so it survives a NODE restart.
+#
+# Without this the CLI is the node's own child on a pty the node owns, which
+# makes the node's lifetime the conversation's: stop the node and the pty
+# master closes, the slave sends SIGHUP, and the conversation dies. Deploying
+# a node binary ended every conversation on that machine.
+#
+# The tmux server owns the real pty instead and outlives the node; the node
+# attaches a second, grouped client under a pty of its own, so attach,
+# injection, the prompt reader and resize are all unchanged. On restart the
+# node finds the session and attaches again.
+#
+# Needs tmux on the machine. Without it the seat starts the ordinary way and
+# says so, rather than failing to start.
+kind = "tmux"
+
+[trust]
+# claude asks "do you trust the files in this folder?" as a modal question
+# and will not start until it is answered. Nothing automated can answer it,
+# so the seat just sits there looking like a CLI that refuses to run.
+#
+# The operator chose the directory when they made the seat, so running an
+# agent there IS the decision; this records it where claude looks. It is
+# announced in the chat the first time it changes anything.
+file = "~/.claude.json"
+pointer = "/projects/{cwd}/hasTrustDialogAccepted"

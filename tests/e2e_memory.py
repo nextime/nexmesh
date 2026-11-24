@@ -15,6 +15,17 @@ import urllib.request, urllib.error
 # shim here the same identity and make them all claim a single seat -- which
 # looks like a bug in the hub and is not. The tests choose their own.
 import os as _os
+
+# This seat's OWN nexmesh identity, and the CLI conversation id a parent CLI
+# exports. Inherited when the suite is run from inside a nexmesh seat -- and
+# then every test's shim registers as an agent the test's own node has never
+# heard of ("agent 'ag-...' is not known to this node"), or claims one seat
+# for all of them. The tests set what they need themselves.
+for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
+    os.environ.pop(_v, None)
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
            "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
     _os.environ.pop(_v, None)
@@ -206,6 +217,58 @@ def main():
     j = tool(plain, b_tok, "forget", {"key": "style", "scope": "global"})
     check("but not a global one without the capability", not j.get("ok"), str(j))
 
+    print("\n=== the operator's own view of it, across every scope ===")
+    # The dashboard used to read memory through a session's snapshot, which
+    # shows what that TEAM can see -- so a fleet whose seats had only ever
+    # written session-scoped notes looked as though session scope was the
+    # only one there is, and nothing could write a global convention by hand.
+    s, j = http("GET", "/v1/memory")
+    rows = j.get("memory", [])
+    check("the operator can read everything remembered", s == 200 and bool(rows), str(j)[:300])
+    check("including one seat's own private note, which no teammate may read",
+          any(r["scope"] == "agent" and r["key"] == "scratch" for r in rows),
+          str([(r["scope"], r["key"]) for r in rows]))
+    check("and each row says what its scope points at, in names not ids",
+          any(r["scope"] == "agent" and r["scope_label"] == "Scribe" for r in rows),
+          str([(r["scope"], r.get("scope_label")) for r in rows]))
+    check("with a count per scope, so an empty scope can say it is empty",
+          {c["scope"] for c in j.get("counts", [])} >= {"session", "agent"}, str(j.get("counts")))
+    s, j = http("GET", "/v1/memory?scope=agent")
+    check("one scope can be asked for on its own",
+          s == 200 and all(r["scope"] == "agent" for r in j.get("memory", [])), str(j)[:200])
+    s, j = http("GET", "/v1/memory?q=argon2id")
+    check("and a value is findable without knowing the key",
+          any(r["key"] == "auth-choice" for r in j.get("memory", [])), str(j)[:200])
+
+    print("\n=== and the operator can write one by hand ===")
+    # The capability gate on global memory exists to stop an AGENT giving
+    # itself fleet-wide reach. The person who grants that capability is the
+    # person at the dashboard, and without this the global scope stayed
+    # permanently empty on a real fleet.
+    s, j = http("POST", "/v1/memory", {"scope": "global", "key": "working-hours",
+        "value": "nothing destructive after 23:00", "category": "convention"})
+    check("a global convention can be typed in", s == 200 and j.get("ok"), str(j))
+    check("attributed to the operator, not to a model",
+          bool(q("SELECT 1 FROM memory WHERE key='working-hours' AND author_slot='operator'")),
+          str(q("SELECT key,author_slot FROM memory WHERE key='working-hours'")))
+    j2 = tool(plain, b_tok, "recall", {"key": "working-hours"})
+    check("and every seat on the fleet can read it",
+          "23:00" in j2.get("text", ""), str(j2))
+    s, j = http("POST", "/v1/memory", {"scope": "global", "key": "working-hours",
+        "value": "nothing destructive after 22:00", "category": "convention"})
+    check("changing it keeps the earlier value", s == 200 and "revision 2" in str(j), str(j))
+    s, j = http("GET", "/v1/memory/history?scope=global&key=working-hours")
+    check("which the operator can read back",
+          any("23:00" in h.get("value", "") for h in j.get("history", [])), str(j)[:300])
+    s, j = http("POST", "/v1/memory", {"scope": "session", "key": "no-such-scope-ref",
+        "value": "x"})
+    check("a team memory without a team is refused rather than guessed at",
+          s != 200 or not j.get("ok"), str(j))
+    s, j = http("POST", "/v1/memory", {"scope": "global", "key": "working-hours",
+        "forget": True})
+    check("and it can be forgotten again", s == 200 and j.get("ok"), str(j))
+    check("really gone", not q("SELECT 1 FROM memory WHERE key='working-hours'"))
+
     print("\n=== the original two tools still work ===")
     j = tool(plain, b_tok, "store_knowledge", {"key": "old", "value": "still fine",
                                                "category": "context"})
@@ -215,6 +278,37 @@ def main():
     check("and it landed in the session scope",
           bool(q("SELECT 1 FROM memory WHERE key='old' AND scope='session'")),
           str(q("SELECT key,scope FROM memory")))
+
+    print("\n=== and they take the scope too ===")
+    # They were session-only, which meant an agent told by the skill to call
+    # query_knowledge on arrival could not see a fleet-wide convention or its
+    # own notes from its last run, and had no way to know they were there.
+    j = tool(plain, b_tok, "store_knowledge", {"key": "mine-only", "value": "a private note",
+                                               "scope": "agent"})
+    check("store_knowledge can write the agent's own scope", j.get("ok"), str(j))
+    check("and it landed there, not in the session",
+          bool(q("SELECT 1 FROM memory WHERE key='mine-only' AND scope='agent'")),
+          str(q("SELECT key,scope FROM memory WHERE key='mine-only'")))
+    j = tool(plain, b_tok, "store_knowledge", {"key": "gpu-host", "value": "workstation",
+                                               "scope": "global"})
+    check("but global still needs the capability", not j.get("ok"), str(j))
+    j = tool(scribe, a_tok, "store_knowledge", {"key": "gpu-host", "value": "the big one",
+                                                "scope": "global"})
+    check("a memory-writer can write it", j.get("ok"), str(j))
+    # Reading with no scope now reads EVERYTHING the seat can see, nearest
+    # first -- which is the point: one call on arrival.
+    j = tool(plain, b_tok, "query_knowledge", {})
+    text = j.get("text", "")
+    check("query_knowledge with no scope reads the fleet-wide one too",
+          "the big one" in text, text[:400])
+    check("and the agent's own", "a private note" in text, text[:400])
+    j = tool(plain, b_tok, "query_knowledge", {"scope": "global"})
+    check("naming a scope reads only that one",
+          "the big one" in j.get("text", "") and "a private note" not in j.get("text", ""),
+          j.get("text", "")[:400])
+    # The scope travels with the answer: a fleet convention and one
+    # teammate's note deserve different weight, and this is what says which.
+    check("the scope is shown beside each entry", "(global)" in text, text[:400])
 
     print("\n=== continuity: a seat restarted later knows what it was doing ===")
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-node", "--hub", f"ws://127.0.0.1:{PORT}",

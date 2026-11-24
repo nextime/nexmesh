@@ -202,12 +202,111 @@ async fn register(
     cli_session: Option<String>,
     cli_session_is_own: bool,
 ) -> Result<NodeToMcpd> {
-    let tools = proto::tools::team_tools();
+    // THE TOOL LIST IS BUILT PER SEAT, because authority decides it.
+    //
+    // This was `team_tools()` for every shim on every path, so a seat holding
+    // orchestrator or superorchestrator authority was advertised the
+    // plain-agent list and its model never learnt that `list_seats`,
+    // `invite_agent` or `move_agent` existed. The hub's own MCP front door
+    // had been doing this correctly all along, which is why it was never
+    // noticed: every seat a node spawns -- which is every seat on the fleet
+    // -- came up without them.
+    //
+    // Advertising is not authorising: the hub re-checks authority from the
+    // calling slot on every one of these calls. What this decides is only
+    // whether the model is told the tool is there, and a tool an MCP client
+    // was not told about is one it cannot call at all.
+    //
+    // Resolved per path below: a managed seat's level came down in its
+    // SpawnSpec, a self-joined one's comes back in the hub's grant.
 
     // A managed agent was told its ids at spawn time.
     if let Some(hint) = agent_hint {
-        if let Some(rec) = ctx.agent(&hint) {
-            tracing::info!(agent = %hint, slot = %rec.slot_id, "managed shim registered");
+        // The seat this shim belongs to, found either by the id it was given
+        // or -- after a reattach, when the hub has minted a new one and the
+        // shim cannot know it -- by the process it is running inside.
+        let found = ctx.agent(&hint).or_else(|| {
+            let rec = ctx.agent_of_process(pid)?;
+            tracing::info!(
+                stale = %hint, agent = %rec.agent_id, slot = %rec.slot_id, shim_pid = pid,
+                "this shim belongs to a seat this node reattached; registering it under the \
+                 seat's current agent instead of refusing it"
+            );
+            Some(rec)
+        });
+        if let Some(rec) = found {
+            if ctx.agent(&hint).is_some() {
+                tracing::info!(agent = %hint, slot = %rec.slot_id, "managed shim registered");
+            }
+            let tools = proto::tools::team_tools_for(rec.authority);
+            if rec.authority.is_orchestrating() {
+                tracing::info!(
+                    slot = %rec.slot_id, authority = %rec.authority.as_str(),
+                    tools = tools.len(),
+                    "this seat holds fleet authority, so its shim is advertised the \
+                     orchestrator tools as well"
+                );
+            }
+            // WHICH CONVERSATION IS IN THERE NOW.
+            //
+            // A managed seat is started on a named conversation and the hub
+            // remembers it, so the seat can be put back as it was. Then the
+            // operator types `/clear` or `/new`, the CLI starts a FRESH
+            // conversation, and nothing tells the hub: the next respawn
+            // resumes the one that was deliberately left, and the real one
+            // is orphaned with nothing pointing at it.
+            //
+            // The CLI itself is the only thing that knows, and it says so:
+            // claude puts CLAUDE_CODE_SESSION_ID into the environment of
+            // every MCP server it starts, so a shim started after the change
+            // carries the new id. This was read only when a HAND-RUN CLI
+            // joined; a managed one returned without looking at it.
+            //
+            // On BOTH paths above, deliberately. A seat that has been
+            // reattached is exactly a seat whose node has restarted, which
+            // is when its recorded conversation is most likely to be stale.
+            //
+            // Sent every time rather than only on a change: the node does
+            // not keep the handle, the hub's update is idempotent, and
+            // guessing what the hub already knows is how this went wrong.
+            if let Some(handle) = cli_session.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+                // Only the CLI's OWN id. A NEXMESH_CLI_SESSION value is a
+                // label somebody chose, and resuming from a label asks the
+                // CLI to continue a conversation that never existed.
+                //
+                // AND ONLY FROM A SHIM THAT IS REALLY IN THERE. The claimed
+                // agent id is text in an env var; the ancestry is not. A
+                // shim registering on a borrowed id would otherwise rewrite
+                // the seat's conversation to whatever its own environment
+                // happened to carry -- which is how a hand-run diagnostic
+                // repointed a seat at an unrelated thread and left the next
+                // respawn trying to resume it.
+                if cli_session_is_own {
+                    if ctx.shim_is_inside(pid, &rec) {
+                        // The node's own copy, for finding this
+                        // conversation on disk to measure it. Same evidence,
+                        // same gate: a shim that is not inside this CLI does
+                        // not get to say which conversation it is in, here
+                        // or at the hub.
+                        ctx.note_conversation(&rec.agent_id, handle);
+                        let _ = ctx
+                            .send_hub(&proto::NodeToHub::ResumeHandle {
+                                slot_id: rec.slot_id.clone(),
+                                handle: handle.to_string(),
+                                agent_id: rec.agent_id.clone(),
+                            })
+                            .await;
+                    } else {
+                        tracing::warn!(
+                            slot = %rec.slot_id, agent = %rec.agent_id, shim_pid = pid,
+                            cli_pid = rec.proc.pid,
+                            "a shim claiming this seat is not running inside its CLI; \
+                             registering it but NOT taking its word for which \
+                             conversation the seat is in"
+                        );
+                    }
+                }
+            }
             return Ok(NodeToMcpd::Registered {
                 agent_id: rec.agent_id,
                 slot_id: rec.slot_id,
@@ -217,8 +316,9 @@ async fn register(
                 tools,
             });
         }
-        // The node restarted and lost the agent. Do NOT silently create a
-        // second slot for it: that would duplicate a team member.
+        // The node restarted and lost the agent, and nothing it is watching
+        // is this process. Do NOT silently create a second slot for it: that
+        // would duplicate a team member.
         anyhow::bail!(
             "agent '{hint}' is not known to this node (it may have restarted); \
              restart the agent so it can be re-placed"
@@ -226,6 +326,12 @@ async fn register(
     }
 
     // Nobody spawned this: a human ran the CLI by hand. Ask the hub for a seat.
+    //
+    // Kept before the id is handed to the join request, because the record
+    // this node makes of the agent needs it too: the descriptor is what says
+    // how to read this CLI's context, how to compact it and how to interrupt
+    // it, and none of that can be looked up from an empty string.
+    let joined_cli = cli_id.clone();
     let req_id = ctx.next_seq();
     let rx = ctx.register_join_waiter(req_id);
     let start_ticks = crate::proc::start_ticks(pid).unwrap_or(0);
@@ -235,13 +341,13 @@ async fn register(
         cli_id: Some(cli_id),
         role: role.clone(),
         name: name.clone(),
-        cwd: Some(cwd),
+        cwd: Some(cwd.clone()),
         proc: Some(proto::ProcIdentity {
             node_id: ctx.node_name.clone(),
             pid,
             start_ticks,
         }),
-        cli_session,
+        cli_session: cli_session.clone(),
         cli_session_is_own,
     })
     .await?;
@@ -252,14 +358,35 @@ async fn register(
         .map_err(|_| anyhow::anyhow!("hub connection dropped during join"))?;
 
     match outcome.granted {
-        Ok((slot_id, session_id, agent_id, display_name, role)) => {
+        Ok(g) => {
+            let crate::ctx::Granted {
+                slot_id, session_id, agent_id, display_name, role, authority,
+            } = g;
+            // What the hub says this seat is. Unknown or absent text parses
+            // to `Agent`, so a hub from before this grant carries authority
+            // -- or one that later learns a level this build does not --
+            // advertises the plain-agent list rather than guessing upward.
+            let authority = authority
+                .as_deref()
+                .map(nexmesh_proto::authority::Authority::parse)
+                .unwrap_or_default();
+            let tools = proto::tools::team_tools_for(authority);
             ctx.agents.lock().unwrap().insert(
                 agent_id.clone(),
                 crate::ctx::AgentRec {
                     agent_id: agent_id.clone(),
                     slot_id: slot_id.clone(),
                     session_id: session_id.clone(),
-                    cli_id: String::new(),
+                    // WHICH CLI THIS IS, as it told us.
+                    //
+                    // Left empty until now, which cost such a seat anything
+                    // that is decided from its descriptor -- on the live
+                    // fleet, a hand-run claude holding a seat was the one
+                    // seat whose context could not be measured, because an
+                    // empty id matches no descriptor. The value was already
+                    // in hand: it is what this shim registered with and what
+                    // the hub was told in the join request.
+                    cli_id: joined_cli.clone(),
                     proc: proto::ProcIdentity {
                         node_id: ctx.node_name.clone(),
                         pid,
@@ -272,6 +399,15 @@ async fn register(
                     // for next.
                     driver: nexmesh_proto::cli_descriptor::DriverSpec::McpOnly,
                     tmux_view: None,
+                    authority,
+                    // The shim reported both, and for a CLI nobody spawned
+                    // they are the only source there is.
+                    cwd: cwd.clone(),
+                    conversation: cli_session
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty() && cli_session_is_own)
+                        .map(str::to_string),
                 },
             );
             tracing::info!(%agent_id, %slot_id, "attached agent joined the team");
@@ -279,5 +415,65 @@ async fn register(
             Ok(NodeToMcpd::Registered { agent_id, slot_id, session_id, display_name, role, tools })
         }
         Err(reason) => anyhow::bail!("the hub refused the join: {reason}"),
+    }
+}
+
+/// THE TOOL LIST A SHIM IS GIVEN.
+///
+/// It was `team_tools()` on every path, so a seat holding fleet authority was
+/// advertised the plain-agent list and its model could not call a fleet tool
+/// at all -- an MCP client will not call a tool it was never told about,
+/// whatever the hub would have allowed.
+#[cfg(test)]
+mod tool_list_tests {
+    use nexmesh_proto::authority::Authority;
+    use nexmesh_proto::tools::{team_tools, team_tools_for};
+
+    fn names(a: Authority) -> Vec<String> {
+        team_tools_for(a).into_iter().map(|t| t.name).collect()
+    }
+
+    #[test]
+    fn a_plain_seat_is_advertised_no_fleet_tools() {
+        let n = names(Authority::Agent);
+        assert_eq!(n.len(), team_tools().len(), "a plain seat's list must not change");
+        for gated in ["list_seats", "elect", "invite_agent", "move_agent"] {
+            assert!(!n.iter().any(|t| t == gated), "{gated} must not be offered: {n:?}");
+        }
+    }
+
+    #[test]
+    fn an_orchestrating_seat_is_advertised_the_fleet_tools() {
+        for a in [Authority::Orchestrator, Authority::Super] {
+            let n = names(a);
+            for gated in
+                ["list_seats", "elect", "invite_agent", "add_agent", "remove_agent",
+                 "rename_agent", "move_agent"]
+            {
+                assert!(n.iter().any(|t| t == gated),
+                        "{} must be offered {gated}: {n:?}", a.as_str());
+            }
+            // And it keeps everything a plain seat has.
+            for t in names(Authority::Agent) {
+                assert!(n.contains(&t), "{} lost {t}", a.as_str());
+            }
+        }
+    }
+
+    /// Authority has to fail CLOSED: a hub from before it sends no level at
+    /// all, and an unknown level must not be read as a higher one.
+    #[test]
+    fn an_absent_or_unknown_level_is_a_plain_agent() {
+        let plain = names(Authority::Agent);
+        for text in ["", "agent", "nonsense", "SUPERUSER", "root"] {
+            assert_eq!(names(Authority::parse(text)), plain, "'{text}' must not widen anything");
+        }
+        // What the hub actually sends, round-tripped.
+        assert_eq!(Authority::parse(Authority::Super.as_str()), Authority::Super);
+        assert_eq!(
+            Option::<&str>::None.map(Authority::parse).unwrap_or_default(),
+            Authority::Agent,
+            "a missing field is a plain agent"
+        );
     }
 }

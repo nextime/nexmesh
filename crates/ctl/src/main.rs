@@ -11,6 +11,7 @@
 //! HTTP, so it works from any machine, whether or not that machine hosts anything.
 
 mod camera;
+mod editor;
 mod camui;
 mod install;
 mod replies;
@@ -33,43 +34,103 @@ use std::time::Duration;
     name = "nexmesh",
     version,
     about = "nexmesh fleet control \u{2014} agent CLIs as one team, across machines",
-    // clap sorts subcommands alphabetically, which puts `budget` above
-    // `health` and tells a newcomer nothing. The grouped list below is the
-    // same commands in the order somebody actually meets them.
-    after_help = "\
-COMMANDS, BY WHAT YOU ARE DOING
+    // clap's own command list is dropped from the template below, because
+    // this one replaces it: 38 commands sorted alphabetically, each with as
+    // much prose as it takes to wrap, told a newcomer nothing and buried the
+    // grouped list under the options. One listing, grouped by what you are
+    // doing, with a gloss short enough to stay on its line.
+    //
+    // `nexmesh help <command>` is where the long version lives.
+    help_template = "\
+{about}
 
-  looking        health  nodes  sessions  status  log  transcript  certs
-  teams          new-session  rename-session  remove-session  budget
-                 add-workspace  sync
-  seats          add-agent  spawn  run  move-agent  rename-agent  set-role
-                 remove-agent  release  pause  resume
-  terminals      attach  seat  adopt
-  talking        send
-  setup          pair  install-seat  install-orchestrator  revoke
+USAGE
+  nexmesh [OPTIONS] <COMMAND>
+  nexmesh                     with no command: the operator console{after-help}
+OPTIONS
+{options}
+",
+    after_help = "LOOKING
+  health              hub health and version
+  nodes               machines, their CLIs, and whether they are connected
+  sessions            which teams exist
+  status              who is in a team, and what they are doing
+  log                 what the agents said to each other
+  transcript          what one agent's process actually printed
+  certs               certificates the fleet CA has issued
+
+STARTING AGENTS
+  run                 start a CLI here, attachable from the first keystroke
+  spawn               start an agent in a seat that already exists
+  attach              that agent's real terminal, from anywhere
+  seat                give a conversation you already have a keyboard
+  adopt               take over a tmux session that is already running
+
+TEAMS
+  new-session         make a team
+  rename-session      rename one
+  remove-session      remove one, and everything that belonged to it
+  add-workspace       mount a directory into a team
+  upload              put a file where a team's agents can read it
+  sync                publish, pull or report on a shared workspace
+  budget              set, raise or clear a team's token budget
+  team-rules          read or set the rules everybody in a team is told
+
+SEATS
+  add-agent           add a seat to a team
+  rename-agent        rename one
+  move-agent          move a seat, and whoever is in it, to another team
+  remove-agent        remove a seat and its history
+  set-role            change what a seat is for
+  set-owns            say which parts of the workspace a seat answers for
+  invite              have a seat from another team also answer in this one
+  seat-respawn        whether the hub brings a seat back when it exits
+  seat-approve        answer a seat's permission prompts without asking you
+  seat-prompt         what a seat tells its agent: system prompt, instruction
+  roles               the ready-made role briefs, to use as a seat's prompt
+  compact-at          compact a seat by itself when its context fills up
+  loop-guard          stop a seat that repeats the same turn over and over
+  flood               refuse messages from a seat that is flooding the team
+
+WORK
+  send                say something to the team, or to one agent
+  pause               stop sending work to an agent, or to everyone
+  resume              start sending work again
+  release             accept an agent's work and let it stop
+  cancel              withdraw a message nobody has seen yet
+  camera              take a photo or clip for an agent to look at
+
+SETUP
+  pair                join a fleet as an operator, with a code from the dashboard
+  install-seat        make a CLI you already use a member of a team
+  install-orchestrator
+                      let a CLI spin up teams from whatever session it is in
+  revoke              cut off a machine or operator, at the TLS handshake
 
 EXAMPLES
-
-  nexmesh                                  the operator console: the whole fleet,
-                                           one screen, j/k and Enter
-  nexmesh run claude                       start a CLI here, on a terminal the
-                                           fleet owns, attachable at once
+  nexmesh
+      the operator console: the whole fleet on one screen, j/k and Enter
+  nexmesh run
+      start claude here, on a terminal the fleet owns, attachable at once
+  nexmesh run codex --role reviewer
+      another CLI, in a seat of its own, with a role
+  nexmesh status payments
+      who is in that team, and what they are doing
+  nexmesh attach payments Dev
+      that agent's real terminal, from here
+  nexmesh send payments 'staging is back'
+      say something to the whole team
   nexmesh install-seat --cli claude --role engineer
-                                           make the CLI you already use a member
-                                           of the team
-  nexmesh sessions                         which teams exist
-  nexmesh status payments                  who is in one, and what they are doing
-  nexmesh attach payments Dev              that agent's real terminal, from here
-  nexmesh send payments 'staging is back'  say something to the team
-  nexmesh log payments                     what they said to each other
+      make the CLI you already use a member of the team
 
-Every command takes --hub, and --token where the hub wants one; `nexmesh pair`
-writes both into ~/.nexmesh so you do not have to pass them again.
+Every command takes --hub, and --token where the hub wants one. `nexmesh pair`
+writes both into ~/.nexmesh so you need not pass them again.
 
-  nexmesh help <command>                   the long version, with examples
-  man nexmesh                              every argument, at the terminal"
+  nexmesh help <command>    the long version of any command, with examples
+  man nexmesh               every argument, at the terminal\n"
 )]
 struct Args {
+    /// The hub to talk to.
     #[arg(long, global = true, env = "NEXMESH_HUB_HTTP", default_value = "http://127.0.0.1:7870")]
     hub: String,
     /// Operator token. Mint one with `nexmesh-hub operator-token <label>`.
@@ -246,7 +307,7 @@ installed app have the same thing as a button.")]
     #[command(after_help = "\
 EXAMPLES
   nexmesh set-owns sl-1a2b3c4d 'verti/**' ombia      # these, and nothing else
-  nexmesh set-owns Max --session payments --add digesta
+  nexmesh set-owns Max --session payments --add team
   nexmesh set-owns Max --session payments --none     # owns nothing again
 
 A zone is a pattern over the workspace: a plain name like `ombia` covers
@@ -356,6 +417,59 @@ EXAMPLES
 
 Changing it re-arms the guard, so a team paused on budget can be given more
 and carry on.")]
+    #[command(after_help = "\
+A template is a ready-made brief for a role: what that seat is for, what it
+must not do, and how to do it well. Apply one with:
+
+  nexmesh seat-prompt <team> <seat> --template reviewer
+
+It is rendered and STORED on the seat, so it can be read and edited
+afterwards and does not change under a running team because somebody
+improved a template.
+
+A fleet can keep its own in the hub's --prompts-dir: a file there replaces
+the built-in of the same name, and a new name adds a role.")]
+    #[command(long_about = "\
+A team's STANDING RULES: what everybody working on this session is told, over
+and above their own brief.
+
+For what is true of the WORK rather than of one seat -- the conventions, the
+things not to touch, how this team does releases. Written once here instead of
+into every seat's prompt, where it drifts the moment one is edited.
+
+Every seat started from now on gets them in its first prompt, and everybody
+already running is told in the chat, so a change does not wait for a respawn.
+
+The operator sets them here. A seat holding orchestrator authority can set
+them with its own `set_team_rules` tool; an ordinary agent cannot, because
+rules an agent can rewrite are not rules.")]
+    #[command(after_help = "\
+  nexmesh team-rules payments                      # read them
+  nexmesh team-rules payments --from rules.md      # set them from a file
+  cat rules.md | nexmesh team-rules payments --from -
+  nexmesh team-rules payments --clear
+
+Keep them short: rules nobody can hold in their head are rules nobody
+follows. The detail belongs in the team's knowledge, not here.")]
+    /// Read or set a team's standing rules.
+    TeamRules {
+        /// The team, by name or id.
+        session: String,
+        /// Read the rules from a markdown file, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        from: Option<String>,
+        /// Remove them.
+        #[arg(long, conflicts_with = "from")]
+        clear: bool,
+    },
+    /// The ready-made role briefs this fleet has.
+    Roles {
+        /// Show one in full, as it would be given to a seat.
+        role: Option<String>,
+        /// With a role: preview it carrying these skills instead.
+        #[arg(long, value_name = "A,B")]
+        skills: Option<String>,
+    },
     /// Set, raise or clear a session's token budget. 
     ///
     /// Changing it re-arms the guard, so a session paused on budget can be
@@ -673,7 +787,11 @@ read or write it. This makes the terminal on the other side of the fence.")]
     Run {
         /// Which CLI: claude, codex, opencode, qwen -- whatever `nexmesh nodes`
         /// lists for this machine.
-        #[arg(value_name = "CLI")]
+        ///
+        /// Left out, claude: `nexmesh run` is meant to be what you type
+        /// instead of the CLI's own name, and having to name it every time
+        /// made the common case longer than the thing it replaces.
+        #[arg(value_name = "CLI", default_value = "claude")]
         cli: String,
         /// Join this session instead of the one that owns this directory.
         #[arg(long)]
@@ -690,6 +808,15 @@ read or write it. This makes the terminal on the other side of the fence.")]
         /// Work here instead of the current directory.
         #[arg(long)]
         cwd: Option<String>,
+        /// Take the seat of this name back, with the conversation it was
+        /// last on, instead of starting a new agent beside it.
+        ///
+        /// Without this, `run` starts a NEW agent every time: two people
+        /// running it in one directory get two agents with two
+        /// conversations, rather than the second quietly inheriting the
+        /// first one's history.
+        #[arg(long)]
+        reuse: bool,
         /// Start it and say where it is, without taking over this terminal.
         #[arg(long)]
         no_attach: bool,
@@ -760,7 +887,8 @@ them about. Scope the token with --session to limit it to one team.")]
     /// Register the orchestrator as an MCP server in one of your agent CLIs,
     /// so you can spin up teams from whatever session you are in.
     InstallOrchestrator {
-        /// CLI to install into: claude, opencode, qwen, codex, gemini.
+        /// CLI to install into: any whose descriptor says how, which is
+        /// claude, codex, opencode, qwen, gemini, cursor or freebuff today.
         #[arg(long = "cli")]
         cli_id: String,
         /// Directory of CLI descriptors.
@@ -852,6 +980,244 @@ same chat is what the dashboard and the console show.")]
         text: String,
         #[arg(long)]
         to: Option<String>,
+    },
+    #[command(after_help = "\
+A seat usually belongs to one team, because a session is the boundary agents
+never see across. Some seats are SERVICES rather than teammates, though -- a
+capability bridge offering OCR and transcription, a reviewer every team sends
+work to -- and one copy per team means one process, one model and one set of
+warm context per team for a single job.
+
+  nexmesh invite app CoderAI        # CoderAI also answers in 'app'
+  nexmesh invite app CoderAI --out  # and stops again
+
+It does not MOVE: its own team, workspace and owner are unchanged. It becomes
+addressable in the invited team by name, hears that team's messages, and keeps
+ONE conversation across all of them -- which is the point, and also means
+anything it is told in one room it knows in the others.")]
+    #[command(after_help = "\
+A seat that comes back by itself is PREPARED for you: the process is there and
+`nexmesh attach <agent>` reaches it. It never reattaches your terminal -- whose
+terminal that would be is not the hub's to decide.
+
+  nexmesh seat-respawn team alice        # comes back by itself
+  nexmesh seat-respawn team alice --off  # stays down until you start it
+
+Turn it off for a seat whose work is over, or one you are deliberately stopping
+to look at: those used to be respawned out from under you every few seconds.")]
+    /// Whether the hub brings a seat back by itself when its process exits.
+    SeatRespawn {
+        /// The team the seat is in, by name or id.
+        session: String,
+        /// The seat, by name or slot id.
+        agent: String,
+        /// Leave it down instead.
+        #[arg(long)]
+        off: bool,
+    },
+    #[command(after_help = "\
+Compacting an agent throws away context it may still need, so this is OFF for
+every seat until somebody sets it. Three levels: a seat's own setting wins,
+then its team's, then the fleet's (`nexmesh-hub --compact-at-pct`).
+
+  nexmesh compact-at payments Dev 85        # this seat, at 85% of its window
+  nexmesh compact-at payments session 80         # everyone in the team who has not set their own
+  nexmesh compact-at payments Dev off       # never, whatever the team says
+  nexmesh compact-at payments Dev default   # follow the team, then the fleet
+
+The window is the model\'s, not a guess: see `[context]` in the CLI\'s
+descriptor. `nexmesh status <session>` shows how full each seat is now.")]
+    /// Compact a seat by itself once its context passes a percentage of its window.
+    CompactAt {
+        /// The team the seat is in, by name or id.
+        session: String,
+        /// The seat, by name or slot id -- or `session` for the whole team.
+        agent: String,
+        /// A percentage (1-100), `off`, or `default` to inherit.
+        pct: String,
+    },
+    #[command(after_help = "\
+An agent in a loop is not a stuck process -- it is a busy one: it answers
+heartbeats, it burns tokens, and from outside it looks like an agent working
+hard. What gives it away is doing the SAME thing over and over, which is what
+this counts: the same tool with the same arguments, or the same answer, back to
+back. Different arguments are different work and are never counted.
+
+Over the threshold the seat is interrupted, PAUSED, and reported to you. Its
+conversation is left intact, because whatever drove it into a loop is in there.
+
+  nexmesh loop-guard payments Dev 5       # five identical turns is a loop
+  nexmesh loop-guard payments session 8
+  nexmesh loop-guard payments poller off       # a seat that polls is meant to repeat itself
+
+OFF for every seat until somebody sets it. Minimum 2.")]
+    /// Stop a seat that repeats the same turn over and over.
+    LoopGuard {
+        /// The team the seat is in, by name or id.
+        session: String,
+        /// The seat, by name or slot id -- or `session` for the whole team.
+        agent: String,
+        /// How many identical turns in a row, `off`, or `default` to inherit.
+        repeats: String,
+    },
+    #[command(after_help = "\
+Two different failures, two numbers:
+
+  --per-min   one seat sending too much, to anybody. A runaway reaches 30 in
+              seconds; a team doing real work never does.
+  --per-pair  two seats talking only to EACH OTHER. A ping-pong is not fast,
+              it is relentless: two agents answering each other every twenty
+              seconds never trip a per-minute rate, and between them burn two
+              turns a minute for as long as nobody looks. 20 is generous.
+
+  nexmesh flood payments session --per-min 30 --per-pair 20
+  nexmesh flood payments coordinator --per-min 90     # it legitimately sends more
+  nexmesh flood payments alice off
+
+Over the limit the message is REFUSED and the agent is told what to do
+instead -- its work is not stopped, only its messages -- and you are told
+once. OFF for every seat until somebody sets it.")]
+    /// Refuse messages from a seat that is flooding the team.
+    Flood {
+        /// The team, by name or id.
+        session: String,
+        /// The seat, by name or slot id -- or `session` for the whole team.
+        agent: String,
+        /// Messages a minute. `off` or `default` also accepted here.
+        #[arg(long, value_name = "N")]
+        per_min: Option<String>,
+        /// Messages exchanged with any ONE other seat in ten minutes.
+        #[arg(long, value_name = "N")]
+        per_pair: Option<String>,
+        /// Turn both off for this seat.
+        #[arg(long, conflicts_with_all = ["per_min", "per_pair"])]
+        off: bool,
+    },
+    /// Answer a seat's own permission prompts without asking the operator.
+    SeatApprove {
+        session: String,
+        agent: String,
+        /// Bring the prompts back to the operator instead.
+        #[arg(long)]
+        off: bool,
+    },
+    #[command(long_about = "\
+What a seat tells its agent, on top of whatever the CLI says by itself.
+
+Two separate things:
+
+  * A SYSTEM PROMPT -- who the agent in this seat is. It goes to the CLI as a
+    system prompt, added to the CLI's own or used instead of it, and it lasts:
+    every agent that ever fills this seat gets it, including a respawn at 4am
+    that nobody watched.
+
+  * An INSTRUCTION -- what it should do on arrival. It is said to each NEW
+    occupant as the first thing it hears. The agent already sitting in the
+    seat does not get it again.
+
+Both are markdown, read from a file or piped in, because a prompt worth having
+is longer than a shell line.")]
+    #[command(after_help = "\
+  nexmesh seat-prompt team alice                         # show what is set
+  nexmesh seat-prompt team alice --system role.md        # from a file
+  cat role.md | nexmesh seat-prompt team alice --system -
+  nexmesh seat-prompt team alice --system role.md --replace
+  nexmesh seat-prompt team alice --instructions today.md
+  nexmesh seat-prompt team alice --clear-instructions
+  nexmesh seat-prompt payments Iris --template reviewer
+  nexmesh seat-prompt payments Iris --template sysadmin --skills live-systems
+  nexmesh seat-prompt payments Iris --skill secrets-hygiene    # one more, for this seat
+  nexmesh seat-prompt payments Iris --no-skill handover        # one fewer
+  nexmesh roles                                                # what there is
+
+A seat remembers the template it was built from and which of its skills it
+carries, so --skill and --no-skill change one thing and leave the rest; the
+brief is re-rendered from the template each time. Writing --system yourself
+drops the link, because re-rendering would then throw your words away.
+
+--replace throws away the CLI's own system prompt, which is right for a seat
+that is not meant to behave like that CLI at all and a trap otherwise. The
+default, --append, keeps it.
+
+Neither reaches the agent now sitting there: the system prompt applies to the
+next process started in the seat, and the instruction to the next occupant.")]
+    /// What this seat tells its agent: a standing system prompt, and an
+    /// instruction for each new occupant.
+    SeatPrompt {
+        /// The team the seat is in, by name or id.
+        session: String,
+        /// The seat, by name or slot id.
+        agent: String,
+        /// Read the system prompt from a markdown file, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        system: Option<String>,
+        /// Use the ready-made brief for this role instead of writing one:
+        /// `coder`, `reviewer`, `sysadmin`, ... (`nexmesh roles` lists them).
+        #[arg(long, value_name = "ROLE", conflicts_with = "system")]
+        template: Option<String>,
+        /// Which skill sections the brief carries, comma-separated,
+        /// replacing whatever it carries now. `--skills ''` for none.
+        #[arg(long, value_name = "A,B")]
+        skills: Option<String>,
+        /// Select one more skill for THIS seat, leaving the rest alone.
+        /// Repeatable: `--skill secrets-hygiene --skill handover`.
+        #[arg(long = "skill", value_name = "NAME")]
+        skills_on: Vec<String>,
+        /// Deselect one, leaving the rest alone. Repeatable.
+        #[arg(long = "no-skill", value_name = "NAME")]
+        skills_off: Vec<String>,
+        /// Read the arrival instruction from a markdown file, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        instructions: Option<String>,
+        /// Add the seat's system prompt to the CLI's own (the default).
+        #[arg(long, conflicts_with = "replace")]
+        append: bool,
+        /// Use the seat's system prompt INSTEAD of the CLI's own.
+        #[arg(long)]
+        replace: bool,
+        /// Forget the system prompt.
+        #[arg(long, conflicts_with = "system")]
+        clear_system: bool,
+        /// Forget the arrival instruction.
+        #[arg(long, conflicts_with = "instructions")]
+        clear_instructions: bool,
+    },
+    #[command(long_about = "\
+Withdraw a message nobody has seen, so it is never delivered.
+
+A message waits until it is delivered, and nothing expires it. Addressed to a
+seat that has gone, or sent in error, it sits there: the sender believes it
+was heard, and the next process to take that seat is handed something stale
+the moment it starts.
+
+This is not `clear`, which marks what a person has dealt with and still
+delivers the message. A message an agent has ALREADY seen cannot be unsent,
+and is refused -- the log is read later to work out what an agent knew.")]
+    #[command(after_help = "\
+  nexmesh cancel team --id 4821    # one message, by the id the log shows
+  nexmesh cancel team --unseen     # everything nobody has seen yet
+
+`nexmesh log <team>` prints the ids.")]
+    /// Withdraw a message nobody has seen yet.
+    Cancel {
+        /// The team it was sent in, by name or id.
+        session: String,
+        /// One message, by the id the log and the dashboard show.
+        #[arg(long)]
+        id: Option<i64>,
+        /// Or every message in this team that nobody has seen yet.
+        #[arg(long, conflicts_with = "id")]
+        unseen: bool,
+    },
+    /// Have a seat from another team also answer in this one.
+    Invite {
+        /// The team it should also answer in, by name or id.
+        session: String,
+        /// The seat, by name or slot id.
+        agent: String,
+        /// Take it out of that team again instead.
+        #[arg(long)]
+        out: bool,
     },
 }
 
@@ -1000,6 +1366,25 @@ async fn body_or_error(r: reqwest::Response, what: &str) -> Result<Value> {
 /// Every command that acts on one agent needs the same thing, and a person
 /// reading the dashboard has the NAME, not the id. Making them look it up
 /// first is a step a computer can take.
+/// The seat's own row from the session listing: slot id, provenance, status.
+///
+/// `resolve` answers about the AGENT and says nothing about whether the seat
+/// is one the hub may start, which is the question attach has to ask before
+/// starting anything.
+async fn seat_row(
+    c: &reqwest::Client,
+    base: &str,
+    session: &str,
+    who: &str,
+) -> Option<Value> {
+    let v = get(c, format!("{base}/v1/sessions/{session}/status")).await.ok()?;
+    let agents = v["agents"].as_array()?.clone();
+    agents.into_iter().find(|a| {
+        a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(who))
+            || a["slot_id"].as_str() == Some(who)
+    })
+}
+
 async fn resolve_seat(
     c: &reqwest::Client,
     base: &str,
@@ -1250,6 +1635,24 @@ impl Keyboard {
             }
         }
     }
+}
+
+/// Whitespace to single spaces, and no line breaks at all.
+///
+/// What a transcription service answers with is a transcript, not a line: it
+/// breaks on utterances, and those breaks are Enter when they are typed at a
+/// CLI prompt. See the dictation path for what that did.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// Fit something into a row of a status bar without lying about its length.
+fn clipped(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
 }
 
 /// One row at the bottom of the screen that is ours, not the agent's.
@@ -1570,6 +1973,22 @@ impl StatusBar {
     /// somebody else's screen and should read as a frame around it, not as a
     /// second thing competing for attention. (Reverse video did the latter.)
     fn paint(&self) -> Vec<u8> {
+        let mut out = b"\x1b7".to_vec();
+        out.extend_from_slice(&self.paint_body());
+        out.extend_from_slice(b"\x1b8");
+        out
+    }
+
+    /// The bar itself, with NO save or restore around it.
+    ///
+    /// Split out because DECSC IS NOT A STACK: a terminal has one saved
+    /// cursor, so a save inside a save overwrites the outer one. `refresh`
+    /// wrapped `paint`, which saved again -- and because the scroll region
+    /// in between had just homed the cursor, the inner save stored 1,1 and
+    /// both restores put the cursor there. Four times a second the agent's
+    /// real cursor position was destroyed: it sat in the top-left corner and
+    /// typing appeared there. One pair, around everything, or none.
+    fn paint_body(&self) -> Vec<u8> {
         let mut line = self.line();
         let w = self.cols as usize;
         if line.chars().count() > w {
@@ -1591,9 +2010,40 @@ impl StatusBar {
         } else if self.command {
             "\x1b[45m\x1b[97m\x1b[1m"
         } else {
-            "\x1b[40m\x1b[37m"
+            // The pale pink of the transgender flag (#f7a8b8), with near
+            // black on it so the text stays readable on a light ground.
+            //
+            // Truecolor, because the 256-colour pinks are either too
+            // magenta (218) or too salmon (217) to read as that flag; a
+            // terminal without it falls back to its own nearest pink.
+            "\x1b[48;2;247;168;184m\x1b[38;2;26;22;24m"
         };
-        format!("\x1b7\x1b[{};1H{}{}\x1b[0m\x1b8", self.rows, colour, line).into_bytes()
+        format!("\x1b[{};1H{}{}\x1b[0m", self.rows, colour, line).into_bytes()
+    }
+
+    /// The scroll region AND the bar, in one go.
+    ///
+    /// THE BAR USED TO SCROLL INTO THE CONTENT. The modes were re-asserted
+    /// four times a second but the scroll region was not -- it was set once
+    /// at the start and again only on a resize. Anything in the agent's
+    /// output that resets it (`\x1b[r`, which a full-screen program emits on
+    /// its way out, and tmux in several situations) therefore left the
+    /// region reset until the next resize: plain output then scrolled over
+    /// this row, carrying the bar up into the text, where the next repaint
+    /// drew another one. Which is exactly what it looked like -- a bar
+    /// appearing "under" the terminal in various places while scrolling.
+    ///
+    /// The region cannot simply be re-sent on the timer on its own, because
+    /// DECSTBM homes the cursor on some terminals and that would move the
+    /// agent's. Inside the save/restore pair it is harmless.
+    fn refresh(&self) -> Vec<u8> {
+        // ONE save/restore pair around all of it: the region, which homes the
+        // cursor, and the bar. `paint_body` deliberately adds none of its own.
+        let mut out = b"\x1b7".to_vec();
+        out.extend_from_slice(&self.scroll_region());
+        out.extend_from_slice(&self.paint_body());
+        out.extend_from_slice(b"\x1b8");
+        out
     }
 
     /// Keep the agent's output from scrolling over the bar. A full-screen app
@@ -1646,6 +2096,117 @@ async fn get_ticket(c: &reqwest::Client, base: &str, agent: &str) -> Result<Stri
         .context("the hub did not return a ticket")
 }
 
+/// Adopt this agent's pane again, when the adoption died but the CLI did not.
+///
+/// The CLI is alive in a tmux pane; what died was the ADOPTION -- the node
+/// owned that tmux client, the CLI in the pane did not, so a node restart
+/// takes it. Before this, attach dead-ended with "its CLI was started by
+/// hand, so only its own shim reaches it" and advised `nexmesh seat`, which
+/// would have started a SECOND CLI on the same conversation. Spawning was
+/// refused too, rightly, because the seat was occupied. The only way out was
+/// to know that a `term-*` seat existed and to start it by hand.
+///
+/// This is not the same as filling an empty seat: nothing new is started, an
+/// existing pane is given its keyboard back.
+async fn readopt_terminal(
+    base: &str,
+    c: &reqwest::Client,
+    session: &str,
+    who: &str,
+    name: &str,
+    term: &str,
+    term_name: &str,
+) -> Result<Value> {
+    eprintln!("({name} is in a terminal whose adoption has gone; adopting it again)");
+    let v = post(c, format!("{base}/v1/slots/{term}/spawn"), json!({})).await?;
+    bail_on_error(&v)?;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let again = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
+        // Wait for the LINK, not merely for the terminal to exist: the node
+        // re-proves through /proc that this seat's CLI is the process inside
+        // that pane, and until it has, attaching would reach nothing.
+        if !again["error"].is_string()
+            && again["io_kind"].as_str().is_some_and(|k| !k.is_empty())
+        {
+            return Ok(again);
+        }
+    }
+    anyhow::bail!(
+        "adopted {term_name} again, but {name} is still not reachable through it. \
+         Check the pane is still there:  nexmesh status {session} --terminals"
+    )
+}
+
+/// Put something in the seat, because somebody is trying to attach to it.
+///
+/// Being told "put something in the seat with: nexmesh spawn ..." is an
+/// instruction to type the obvious next command, and it came up every time a
+/// node restarted. It also led somewhere bad: a seat that WAS coming back by
+/// itself got spawned a second time, and because a conversation is resumed by
+/// id, two CLIs ended up appending to one transcript.
+///
+/// Only for a seat the hub is entitled to fill: one it has been running, or
+/// one nothing has ever filled. A seat whose last process was ATTACHED
+/// belongs to whoever started it -- the hub does not know how they launched
+/// it and has no business inventing a replacement -- and an EXTERNAL
+/// participant is not ours to run at all.
+async fn start_for_attach(
+    base: &str,
+    c: &reqwest::Client,
+    session: &str,
+    who: &str,
+    was: &Value,
+) -> Result<Value> {
+    let seat = seat_row(c, base, session, who).await;
+    let provenance =
+        seat.as_ref().and_then(|s| s["provenance"].as_str()).unwrap_or("-").to_string();
+    let slot = seat.as_ref().and_then(|s| s["slot_id"].as_str()).map(str::to_string);
+    let name = seat
+        .as_ref()
+        .and_then(|s| s["name"].as_str())
+        .or_else(|| was["name"].as_str())
+        .unwrap_or(who)
+        .to_string();
+
+    // `-` is a seat nothing has ever filled, which IS ours to fill.
+    let ours = matches!(provenance.as_str(), "managed" | "-" | "");
+    let Some(slot) = slot.filter(|_| ours) else {
+        anyhow::bail!(
+            "{name} has no process to attach to, and is not a seat this fleet starts ({}).\n\
+             Read what it said with:  nexmesh transcript {session} {who}",
+            match provenance.as_str() {
+                "attached" => "it was started by hand, so start it the same way again",
+                "external" => "it is an external participant, which this fleet does not run",
+                _ => "there is no such seat here",
+            }
+        );
+    };
+
+    eprintln!("({name} has no process; starting one)");
+    // No mode override: the seat's own mode stands. Attaching is not a
+    // reason to turn a team that was declared headless into an interactive
+    // one for ever.
+    let v = post(c, format!("{base}/v1/slots/{slot}/spawn"), json!({})).await?;
+    bail_on_error(&v)?;
+    // Wait for something worth attaching to, rather than racing the
+    // websocket upgrade against the spawn.
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let again = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
+        if !again["error"].is_string()
+            && again["exited"].as_bool() != Some(true)
+            && again["status"].as_str() != Some("disconnected")
+        {
+            return Ok(again);
+        }
+    }
+    anyhow::bail!(
+        "{name} was started but did not come up within 30s. What it printed is in:\n\
+         nexmesh transcript {session} {who}"
+    )
+}
+
 async fn attach(
     base: &str,
     c: &reqwest::Client,
@@ -1654,24 +2215,58 @@ async fn attach(
     replay: usize,
     ca_cert: Option<&str>,
     identity: Option<(&str, &str)>,
-) -> Result<String> {
+) -> Result<AttachEnd> {
     use tokio::io::AsyncWriteExt;
 
-    let r = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await?;
+    // Resolve can fail outright for a seat nothing has ever filled, and
+    // succeed-but-report-exited for one whose process is gone. Both mean the
+    // same thing to somebody attaching: there is nothing to attach to yet.
+    // A seat nothing has ever filled makes resolve answer 400, not a JSON
+    // body with an error in it -- so the first attempt must be allowed to
+    // fail without taking the command down with it. Both outcomes, the 400
+    // and a body reporting `exited`, mean the same thing to somebody trying
+    // to attach: nothing is there yet.
+    let first = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await;
+    let mut r = match &first {
+        Ok(v)
+            if !v["error"].is_string()
+                && v["exited"].as_bool() != Some(true)
+                && v["status"].as_str() != Some("disconnected") =>
+        {
+            v.clone()
+        }
+        // Either way: try to put something in the seat. If that is not ours
+        // to do, `start_for_attach` says why -- and if resolving failed for
+        // some OTHER reason, that error is what the operator should see, so
+        // it is carried through.
+        _ => {
+            let was = first.as_ref().cloned().unwrap_or_else(|_| json!({}));
+            match start_for_attach(base, c, session, who, &was).await {
+                Ok(v) => v,
+                Err(e) => match first {
+                    // A real failure to reach the hub beats our guess at
+                    // what the operator should do about an empty seat.
+                    Err(orig) if !format!("{orig}").contains("no process behind it") => {
+                        return Err(orig)
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+    };
     bail_on_error(&r)?;
+    // Alive, but with no terminal of its own and a dead adoption on record.
+    // The node would reject this attach ("only its own shim reaches it"), so
+    // give the pane its keyboard back first.
+    if r["io_kind"].as_str().unwrap_or("").is_empty() {
+        if let Some(term) = r["terminal_slot"].as_str().filter(|s| !s.is_empty()) {
+            let term_name = r["terminal_name"].as_str().unwrap_or(term).to_string();
+            let nm = r["name"].as_str().unwrap_or(who).to_string();
+            r = readopt_terminal(base, c, session, who, &nm, term, &term_name).await?;
+        }
+    }
     let agent = r["agent_id"].as_str().context("no agent id returned")?.to_string();
     let name = r["name"].as_str().unwrap_or(who).to_string();
-    // There is a terminal to attach to only while there is a process. Saying
-    // so here beats failing inside the websocket upgrade, where the reason
-    // reads like a transport problem.
-    if r["exited"].as_bool() == Some(true) || r["status"].as_str() == Some("disconnected") {
-        anyhow::bail!(
-            "{name} has no process to attach to right now (its last agent is {}).\n\
-             Read what it said with:  nexmesh transcript {session} {who}\n\
-             Put something in the seat with:  nexmesh spawn {session} {who}",
-            r["status"].as_str().unwrap_or("gone")
-        );
-    }
 
     // A terminal with no size at all is not a terminal: run under `script`
     // into a file, or any pty nobody sized, and `size()` answers 0x0 -- which
@@ -1801,6 +2396,9 @@ async fn attach(
     }
 
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<String>(4);
+    // Set when the NODE went away rather than the agent: the caller then
+    // waits for it and attaches again instead of ending the session.
+    let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Whether the agent has taken the mouse for itself. While it has, the
     // viewer stops translating the wheel.
@@ -1809,7 +2407,12 @@ async fn attach(
     // What the agent has said, split into replies -- everything printed
     // since the operator last pressed Enter is its answer to that. Shared
     // with the key loop, which is where one of them is chosen to be read.
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(replies::Replies::default()));
+    // Whose screen this is: the CLI's own furniture -- its box, its spinner,
+    // its status row -- is not part of anything it said, and which glyphs
+    // those are depends on the CLI.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(replies::Replies::watching(
+        r["cli_id"].as_str().unwrap_or_default(),
+    )));
     // When the last byte arrived, so "it has stopped talking" can be noticed
     // without polling the process.
     let quiet = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
@@ -1817,6 +2420,7 @@ async fn attach(
     // The agent's terminal -> ours, whichever way the bytes came.
     let reader = {
         let quit_tx = quit_tx.clone();
+        let paused_flag = paused.clone();
         let heard = heard.clone();
         let quiet = quiet.clone();
         let agent_mouse = agent_mouse.clone();
@@ -1841,7 +2445,10 @@ async fn attach(
                         // A copy of what went past, as words, so a reply can
                         // be read back or read out as it arrives.
                         if let Ok(mut seen) = heard.lock() {
-                            seen.saw(&voice::plain(&data));
+                            // A line at a time, with the escape sequences
+                            // out: what a person SAW, which is the only
+                            // thing a reply can be told from furniture by.
+                            seen.saw_lines(&voice::plain_lines(&data));
                         }
                         if let Ok(mut q) = quiet.lock() {
                             *q = std::time::Instant::now();
@@ -1859,6 +2466,13 @@ async fn attach(
                         }
                     }
                     wire::In::Ended(why) => {
+                        let _ = quit_tx.send(why).await;
+                        break;
+                    }
+                    wire::In::Paused(why) => {
+                        // Marked so the caller waits for the node and
+                        // attaches again, rather than ending the session.
+                        paused_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = quit_tx.send(why).await;
                         break;
                     }
@@ -1913,6 +2527,8 @@ async fn attach(
     let playing: voice::Playing = Default::default();
     // Mouse reports arrive in the keyboard stream and are not keystrokes.
     let mut mouse = termmode::MouseReports::default();
+    // And the right button is tmux's way out of the agent: see `RightClicks`.
+    let mut rclicks = termmode::RightClicks::default();
     // Reading every new reply out as it settles, rather than on request.
     let mut aloud = false;
     // Command mode: one key in, one key out, and three keys that are ours
@@ -1949,7 +2565,8 @@ async fn attach(
                     // terminal by another route is undone within a quarter
                     // of a second rather than lasting until `reset`.
                     let _ = out.write_all(TERMINAL_PREPARE).await;
-                    let _ = out.write_all(&b.paint()).await;
+                    // The region as well as the modes: see `refresh`.
+                    let _ = out.write_all(&b.refresh()).await;
                     let _ = out.flush().await;
                 }
             }
@@ -2058,12 +2675,32 @@ async fn attach(
                         let _ = out.flush().await;
                     }
                     Ok(text) if !text.trim().is_empty() => {
-                        if wire.tx.send(wire::Out::Data(text.into_bytes())).await.is_err() {
+                        // ONE LINE, ALWAYS.
+                        //
+                        // A transcription of more than one sentence comes
+                        // back with NEWLINES in it -- the fleet's own
+                        // transcriber answers a line per utterance -- and a
+                        // newline typed at a CLI prompt is Enter. So the
+                        // first sentence was submitted on its own, the rest
+                        // arrived as separate turns, and what went in was
+                        // never what was said. Enter stays the operator's,
+                        // which is what this has always claimed to do.
+                        let said = one_line(&text);
+                        if wire.tx.send(wire::Out::Data(said.clone().into_bytes()))
+                            .await
+                            .is_err()
+                        {
                             break "connection lost".to_string();
                         }
-                        // Hands-free is still on: the next sentence is
-                        // already being recorded, so the row stays red.
+                        // AND SAID BACK. Dictation whose only evidence is
+                        // whatever the CLI happens to echo is dictation you
+                        // cannot tell from a microphone that is not working
+                        // -- and a CLI drawing its prompt off the bottom of
+                        // a phone screen echoes it where nobody can see.
                         if let Some(b) = &mut bar {
+                            b.say_mark("heard", format!("heard: {}", clipped(&said, 48)));
+                            // Hands-free is still on: the next sentence is
+                            // already being recorded, so the row stays red.
                             if !b.hands_free {
                                 b.recording = None;
                             }
@@ -2090,7 +2727,18 @@ async fn attach(
                 let bytes: Vec<u8> =
                     if !mouse_ours
                         || agent_mouse.load(std::sync::atomic::Ordering::Relaxed) {
-                        buf[..n].to_vec()
+                        // tmux has the mouse. Everything goes through
+                        // EXCEPT the right button, whose menu offers to
+                        // split the pane -- and a new pane in a held
+                        // session is a shell on that machine. An agent that
+                        // has asked for the mouse gets its own clicks: tmux
+                        // shows no menu while that is true, so there is
+                        // nothing to take away.
+                        if in_tmux && !agent_mouse.load(std::sync::atomic::Ordering::Relaxed) {
+                            rclicks.pass(&buf[..n])
+                        } else {
+                            buf[..n].to_vec()
+                        }
                     } else {
                         let (keys, wheels) = mouse.read(&buf[..n]);
                         for w in wheels {
@@ -2573,7 +3221,73 @@ async fn attach(
     // line, and read as nonsense. The reassurance belongs only to a detach
     // the viewer chose: if the agent has gone, saying it is running is the
     // opposite of true.
-    Ok(end_line(&reason))
+    if paused.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(AttachEnd::Paused(reason));
+    }
+    Ok(AttachEnd::Ended(end_line(&reason)))
+}
+
+/// How an attach finished.
+pub enum AttachEnd {
+    /// Over: the agent exited, or the viewer detached.
+    Ended(String),
+    /// The NODE went away. The agent is very likely still running, so this
+    /// is a pause and the viewer should come back when the node does.
+    Paused(String),
+}
+
+/// Attach, and keep attaching across node restarts.
+///
+/// The operator asked for exactly this: "when we restart the hub, can we not
+/// disconnect the agents attached to a terminal? (we can pause it showing in
+/// terminal they are paused until the node comes back)".
+///
+/// Being dropped instead is not just an inconvenience -- it is what made a
+/// seat get spawned a second time after a node restart, which put two CLIs
+/// in one conversation.
+pub(crate) async fn attach_until_ended(
+    base: &str,
+    c: &reqwest::Client,
+    session: &str,
+    who: &str,
+    replay: usize,
+    ca_cert: Option<&str>,
+    identity: Option<(&str, &str)>,
+) -> Result<String> {
+    loop {
+        match attach(base, c, session, who, replay, ca_cert, identity).await? {
+            AttachEnd::Ended(line) => return Ok(line),
+            AttachEnd::Paused(why) => {
+                eprintln!("\r\n[nexmesh] paused: {why}.");
+                eprintln!("[nexmesh] the agent keeps running; this will reattach by itself. \
+                           Ctrl-C to stop waiting.");
+                // Wait for the node to come back AND for the seat to have a
+                // process again -- attaching the instant the node registers
+                // would race the respawn that follows it.
+                let mut said = false;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let v = get(c, format!("{base}/v1/sessions/{session}/resolve/{who}")).await;
+                    let live = v
+                        .as_ref()
+                        .map(|v| {
+                            !v["error"].is_string()
+                                && v["exited"].as_bool() != Some(true)
+                                && v["status"].as_str() != Some("disconnected")
+                        })
+                        .unwrap_or(false);
+                    if live {
+                        eprintln!("[nexmesh] the node is back; reattaching.");
+                        break;
+                    }
+                    if !said {
+                        said = true;
+                        eprintln!("[nexmesh] still waiting for the node...");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What to say about an attach that has ended. Returned rather than printed,
@@ -2931,6 +3645,128 @@ async fn main() -> Result<()> {
             println!("session {} created", v["session_id"].as_str().unwrap_or("?"));
         }
 
+        Cmd::TeamRules { session, from, clear } => {
+            let text = if clear {
+                Some(String::new())
+            } else if let Some(path) = from.as_deref() {
+                if path == "-" {
+                    use std::io::{IsTerminal, Read};
+                    if std::io::stdin().is_terminal() {
+                        anyhow::bail!(
+                            "`-` means read them from stdin, and stdin is your terminal. \
+                             Pipe a file in, or pass its path instead."
+                        );
+                    }
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf).context("reading stdin")?;
+                    Some(buf)
+                } else {
+                    Some(
+                        std::fs::read_to_string(path)
+                            .with_context(|| format!("reading {path}"))?,
+                    )
+                }
+            } else {
+                None
+            };
+            match text {
+                // Nothing to set is a question, not a mistake.
+                None => {
+                    let v = get(&c, format!("{base}/v1/sessions/{session}")).await?;
+                    bail_on_error(&v)?;
+                    match v["instructions"].as_str() {
+                        Some(t) if !t.trim().is_empty() => {
+                            println!("{session} rules, told to everybody working here:");
+                            for line in t.lines() {
+                                println!("  {line}");
+                            }
+                        }
+                        _ => println!(
+                            "{session} has no standing rules. Set them with --from <file>."
+                        ),
+                    }
+                }
+                Some(t) => {
+                    let v = post(
+                        &c,
+                        format!("{base}/v1/sessions/{session}/instructions"),
+                        json!({ "instructions": t }),
+                    )
+                    .await?;
+                    bail_on_error(&v)?;
+                    println!("{}", v["detail"].as_str().unwrap_or("done"));
+                }
+            }
+        }
+
+        Cmd::Roles { role, skills } => {
+            match role {
+                None => {
+                    let v = get(&c, format!("{base}/v1/roles")).await?;
+                    bail_on_error(&v)?;
+                    let empty = vec![];
+                    // The skills go on their own line rather than in a
+                    // column. Four of them is 54 characters, which either
+                    // truncates or pushes every summary out of line, and a
+                    // list of named things is no use abbreviated.
+                    println!("{:<14} WHAT IT IS FOR", "ROLE");
+                    for r in v["roles"].as_array().unwrap_or(&empty) {
+                        let carries: Vec<&str> = r["skills"]
+                            .as_array()
+                            .unwrap_or(&empty)
+                            .iter()
+                            .filter_map(|s| s.as_str())
+                            .collect();
+                        println!(
+                            "{:<14} {}",
+                            r["id"].as_str().unwrap_or("?"),
+                            r["summary"].as_str().unwrap_or("")
+                        );
+                        if !carries.is_empty() {
+                            // Plain text: nothing else this tool prints uses
+                            // escapes, and one place that does is one place
+                            // that ignores NO_COLOR and lands in somebody's
+                            // log as `[2m`.
+                            println!("{:<14} carries: {}", "", carries.join(", "));
+                        }
+                    }
+                    if let Some(dir) = v["local"].as_str() {
+                        println!("\n  (this fleet's own templates: {dir})");
+                    } else {
+                        println!(
+                            "\n  (the built-in templates; a fleet can keep its own in the \
+                             hub's --prompts-dir)"
+                        );
+                    }
+                    println!(
+                        "  (apply one: nexmesh seat-prompt <team> <seat> --template <role>)"
+                    );
+                }
+                Some(role) => {
+                    // Skill names are lower-case words and dashes, so the
+                    // only character needing care is the comma. Anything
+                    // else is refused here rather than url-encoded: a skill
+                    // name with a space in it is a typo, not a request.
+                    let q = match &skills {
+                        None => String::new(),
+                        Some(s) => {
+                            if s.chars().any(|c| {
+                                !(c.is_ascii_alphanumeric() || c == '-' || c == ',' || c == '_')
+                            }) {
+                                anyhow::bail!(
+                                    "skill names are words, dashes and commas: {s:?}"
+                                );
+                            }
+                            format!("?skills={}", s.replace(',', "%2C"))
+                        }
+                    };
+                    let v = get(&c, format!("{base}/v1/roles/{role}{q}")).await?;
+                    bail_on_error(&v)?;
+                    println!("{}", v["prompt"].as_str().unwrap_or(""));
+                }
+            }
+        }
+
         Cmd::Budget { session, tokens } => {
             let mut body = json!({});
             if let Some(t) = tokens {
@@ -3083,9 +3919,9 @@ async fn main() -> Result<()> {
             // and a blank means the node never started it -- it connected to
             // the node itself, so only its own shim can reach it.
             println!(
-                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} SUMMARY",
+                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} {:>5} SUMMARY",
                 "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "AGENT", "PID", "IO",
-                "TOKENS"
+                "TOKENS", "CTX"
             );
             for a in &rows {
                 let tin = a["input_tokens"].as_i64().unwrap_or(0);
@@ -3095,8 +3931,21 @@ async fn main() -> Result<()> {
                 } else {
                     format!("{}/{}", human(tin), human(tout))
                 };
+                // HOW FULL, not how much spent -- the column beside it is
+                // the spend. A seat at 90% is a seat about to lose the
+                // middle of its own conversation, which TOKENS cannot tell
+                // you however large it gets.
+                let ctx = match (
+                    a["context_used_tokens"].as_i64(),
+                    a["context_limit_tokens"].as_i64(),
+                ) {
+                    (Some(used), Some(limit)) if limit > 0 => {
+                        format!("{}%", used.saturating_mul(100) / limit)
+                    }
+                    _ => "-".to_string(),
+                };
                 println!(
-                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} {}",
+                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} {:>5} {}",
                     a["name"].as_str().unwrap_or("?"),
                     a["slot_id"].as_str().unwrap_or("-"),
                     // Which program is in the seat. Worth a column of its
@@ -3124,11 +3973,13 @@ async fn main() -> Result<()> {
                     },
                     a["io_kind"].as_str().unwrap_or("-"),
                     tokens,
+                    ctx,
                     a["summary"].as_str().unwrap_or(""),
                 );
             }
             println!(
-                "\n  (TOKENS = input/output; STATE is the work, AGENT the process behind it;\n\
+                "\n  (TOKENS = input/output spent, CTX = how full its context is NOW;\n\
+                 \x20  STATE is the work, AGENT the process behind it;\n\
                  \x20  `waiting` = a CLI that takes this seat once per turn and is due back)"
             );
             if hidden > 0 {
@@ -3269,7 +4120,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Run { cli, session, name, node, role, cwd, no_attach, dry_run } => {
+        Cmd::Run { cli, session, name, node, role, cwd, reuse, no_attach, dry_run } => {
             runcmd::run(
                 &base,
                 &c,
@@ -3280,6 +4131,7 @@ async fn main() -> Result<()> {
                     node: node.as_deref(),
                     role: role.as_deref(),
                     cwd: cwd.as_deref(),
+                    reuse,
                     dry_run,
                     attach: !no_attach,
                 },
@@ -3291,7 +4143,8 @@ async fn main() -> Result<()> {
 
         Cmd::Attach { session, who, replay } => {
             let reason =
-                attach(&base, &c, &session, &who, replay, args.ca_cert.as_deref(), identity)
+                attach_until_ended(&base, &c, &session, &who, replay,
+                                   args.ca_cert.as_deref(), identity)
                     .await?;
             println!("{reason}");
         }
@@ -3376,11 +4229,283 @@ async fn main() -> Result<()> {
             }
         }
 
+        Cmd::SeatRespawn { session, agent, off } => {
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages"),
+                json!({ "text": format!("/autorespawn {agent}{}", if off { " off" } else { "" }) }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+        Cmd::CompactAt { session, agent, pct } => {
+            // Through the chat command, like `seat-respawn`: one
+            // implementation of the setting, one set of words explaining it,
+            // and whatever is typed in the chat and whatever is run here
+            // cannot drift apart.
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages"),
+                json!({ "text": format!("/compact-at {agent} {pct}") }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+
+        Cmd::LoopGuard { session, agent, repeats } => {
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages"),
+                json!({ "text": format!("/loop-guard {agent} {repeats}") }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+
+        Cmd::Flood { session, agent, per_min, per_pair, off } => {
+            if !off && per_min.is_none() && per_pair.is_none() {
+                anyhow::bail!(
+                    "say --per-min, --per-pair, or --off. `nexmesh flood --help` \
+                     explains why there are two numbers."
+                );
+            }
+            // `-` is the chat command's way of saying "leave that one as it
+            // is", which is what an omitted flag means here.
+            let text = if off {
+                "off".to_string()
+            } else {
+                format!(
+                    "{} {}",
+                    per_min.as_deref().unwrap_or("-"),
+                    per_pair.as_deref().unwrap_or("-")
+                )
+            };
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages"),
+                json!({ "text": format!("/flood {agent} {}", text.trim()) }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+
+        Cmd::SeatPrompt {
+            session,
+            agent,
+            system,
+            template,
+            skills,
+            skills_on,
+            skills_off,
+            instructions,
+            append,
+            replace,
+            clear_system,
+            clear_instructions,
+        } => {
+            // A seat id is an answer by itself; a name needs the team to say
+            // which seat it means.
+            let slot = if agent.starts_with("sl-") {
+                agent.clone()
+            } else {
+                resolve_seat(&c, &base, &session, &agent).await?
+            };
+            // Only one of them can be stdin: a pipe is read once, and
+            // silently handing the same text to both would be worse than
+            // refusing.
+            if system.as_deref() == Some("-") && instructions.as_deref() == Some("-") {
+                anyhow::bail!(
+                    "both --system and --instructions read stdin, and a pipe arrives once. \
+                     Pipe one and pass the other as a file."
+                );
+            }
+            let read_md = |arg: Option<&str>| -> Result<Option<String>> {
+                let Some(path) = arg else { return Ok(None) };
+                if path == "-" {
+                    use std::io::{IsTerminal, Read};
+                    if std::io::stdin().is_terminal() {
+                        anyhow::bail!(
+                            "`-` means read it from stdin, and stdin is your terminal. \
+                             Pipe a file in, or pass its path instead."
+                        );
+                    }
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf).context("reading stdin")?;
+                    return Ok(Some(buf));
+                }
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {path}"))?;
+                Ok(Some(text))
+            };
+            let mut body = serde_json::Map::new();
+            let csv = |v: &Option<String>| -> Option<Vec<String>> {
+                v.as_deref().map(|list| {
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+            };
+            if clear_system {
+                body.insert("system_prompt".into(), json!(""));
+            } else if template.is_some() || skills.is_some() || !skills_on.is_empty()
+                || !skills_off.is_empty()
+            {
+                // The hub renders it, not this: it holds the fleet's own
+                // templates, and a brief rendered here would be whatever
+                // THIS machine's copy says. With no --template, it
+                // re-renders from the one the seat already has.
+                if let Some(role) = template.as_deref() {
+                    body.insert("template".into(), json!(role));
+                }
+                if let Some(list) = csv(&skills) {
+                    body.insert("skills".into(), json!(list));
+                }
+                if !skills_on.is_empty() {
+                    body.insert("skills_on".into(), json!(skills_on));
+                }
+                if !skills_off.is_empty() {
+                    body.insert("skills_off".into(), json!(skills_off));
+                }
+            } else if let Some(text) = read_md(system.as_deref())? {
+                body.insert("system_prompt".into(), json!(text));
+            }
+            if clear_instructions {
+                body.insert("instructions".into(), json!(""));
+            } else if let Some(text) = read_md(instructions.as_deref())? {
+                body.insert("instructions".into(), json!(text));
+            }
+            if replace || append {
+                body.insert(
+                    "system_prompt_mode".into(),
+                    json!(if replace { "replace" } else { "append" }),
+                );
+            }
+            // Nothing to set is a question, not a mistake: show what is there.
+            let v = if body.is_empty() {
+                get(&c, format!("{base}/v1/slots/{slot}/prompt")).await?
+            } else {
+                post(&c, format!("{base}/v1/slots/{slot}/prompt"), Value::Object(body)).await?
+            };
+            bail_on_error(&v)?;
+            // WHAT IT IS BUILT FROM, before the text itself: an operator
+            // turning a skill on or off needs to see the selection, and a
+            // dump of 92 lines of prose does not show it.
+            if let Some(tpl) = v["template"].as_str() {
+                let empty = vec![];
+                let names = |k: &str| -> Vec<String> {
+                    v[k].as_array()
+                        .unwrap_or(&empty)
+                        .iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                };
+                let on = names("skills");
+                let suggested = names("template_skills");
+                println!("{agent} is built from the {tpl} template.");
+                println!(
+                    "  carries: {}",
+                    if on.is_empty() { "nothing".to_string() } else { on.join(", ") }
+                );
+                let off: Vec<String> = names("skills_available")
+                    .into_iter()
+                    .filter(|k| !on.contains(k))
+                    .map(|k| {
+                        if suggested.contains(&k) {
+                            format!("{k} (this role suggests it)")
+                        } else {
+                            k
+                        }
+                    })
+                    .collect();
+                if !off.is_empty() {
+                    println!("  not carrying: {}", off.join(", "));
+                }
+                println!("  --skill <name> adds one, --no-skill <name> takes one away.\n");
+            }
+            let mode = v["system_prompt_mode"].as_str().unwrap_or("append");
+            match v["system_prompt"].as_str() {
+                Some(t) => {
+                    let verb = if mode == "replace" { "instead of" } else { "on top of" };
+                    println!(
+                        "{agent} system prompt ({} lines, {verb} the CLI's own):",
+                        t.lines().count()
+                    );
+                    for line in t.lines() {
+                        println!("  {line}");
+                    }
+                }
+                None => println!("{agent} has no system prompt of its own."),
+            }
+            match v["instructions"].as_str() {
+                Some(t) => {
+                    println!("\nTold to each new agent that takes the seat:");
+                    for line in t.lines() {
+                        println!("  {line}");
+                    }
+                }
+                None => println!("\nNothing is said to a new agent on arrival."),
+            }
+            for note in v["takes_effect"].as_array().unwrap_or(&vec![]) {
+                if let Some(s) = note.as_str() {
+                    println!("\n{s}.");
+                }
+            }
+        }
+        Cmd::Cancel { session, id, unseen } => {
+            if id.is_none() && !unseen {
+                anyhow::bail!(
+                    "say what to cancel: --id <n> for one message, or --unseen for every \
+                     message in this team that nobody has seen yet"
+                );
+            }
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages/cancel"),
+                json!({ "id": id, "all_unseen": unseen }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+        Cmd::SeatApprove { session, agent, off } => {
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages"),
+                json!({ "text": format!("/autoapprove {agent}{}", if off { " off" } else { "" }) }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+        Cmd::Invite { session, agent, out } => {
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/guests"),
+                json!({ "agent": agent, "leave": out }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
         Cmd::Send { session, text, to } => {
             let mut body = json!({ "text": text });
             if let Some(t) = to { body["to"] = json!(t); }
             let v = post(&c, format!("{base}/v1/sessions/{session}/messages"), body).await?;
             bail_on_error(&v)?;
+            // A line starting with `/` is a COMMAND, not a message: the hub
+            // ran it and said what happened. Printing "sent, queued for 0
+            // seats" over the top of that -- which is what this did -- reads
+            // as though the command failed when it worked.
+            if v["command"].as_bool() == Some(true) {
+                println!("{}", v["said"].as_str().unwrap_or("done"));
+                return Ok(());
+            }
             // Sent is not heard. Who it is for, and by what route it reaches
             // them -- because a CLI started by hand in a plain terminal
             // cannot be interrupted, and will see this when it next calls a
@@ -3658,5 +4783,139 @@ mod restore_tests {
         assert!(s.contains("\x1b[?7h"));
         assert!(s.contains("\x1b[4l"));
         assert!(s.ends_with("\x1b[0m\x1b(B"), "attributes and charset come last: {s:?}");
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// EVERY COMMAND MUST BE IN THE GROUPED LISTING.
+    ///
+    /// The listing is written by hand, because the useful order is not
+    /// alphabetical -- and a hand-written listing rots. It had: `camera`,
+    /// `invite`, `seat-approve`, `seat-respawn`, `set-owns` and `upload`
+    /// were all missing, so six commands existed and were documented
+    /// nowhere a person would look.
+    ///
+    /// Now that clap's own list is gone from the template, a command missing
+    /// from the listing is a command nobody can find. So this fails until it
+    /// is added.
+    #[test]
+    fn the_grouped_listing_names_every_command() {
+        let cmd = Args::command();
+        let listing = cmd.get_after_help().map(|s| s.to_string()).unwrap_or_default();
+        let missing: Vec<&str> = cmd
+            .get_subcommands()
+            .map(|s| s.get_name())
+            // `help` is clap's own and is mentioned in the footer by name.
+            .filter(|n| *n != "help")
+            .filter(|n| {
+                // A whole word, so `run` does not match `running` and
+                // `resume` does not satisfy `remove-session`.
+                !listing
+                    .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+                    .any(|w| w == *n)
+            })
+            .collect();
+        assert!(missing.is_empty(), "commands missing from the help listing: {missing:?}");
+    }
+
+    /// And the listing must not name commands that do not exist, which is
+    /// the same rot in the other direction: a reader typing one gets an
+    /// error from a tool that advertised it.
+    #[test]
+    fn the_grouped_listing_invents_no_commands() {
+        let cmd = Args::command();
+        let real: Vec<String> =
+            cmd.get_subcommands().map(|s| s.get_name().to_string()).collect();
+        let listing = cmd.get_after_help().map(|s| s.to_string()).unwrap_or_default();
+        // Only the command columns, which all sit above EXAMPLES -- below it
+        // the same shape is a shell line, and `man nexmesh` is a different
+        // program rather than a command this tool invented.
+        let columns = listing.split("EXAMPLES").next().unwrap_or_default();
+        let claimed: Vec<String> = columns
+            .lines()
+            .filter_map(|l| {
+                let t = l.strip_prefix("  ")?;
+                if t.starts_with(' ') {
+                    return None;
+                }
+                let name = t.split_whitespace().next()?;
+                (name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    && name.len() > 2
+                    && !name.starts_with("nexmesh"))
+                    .then(|| name.to_string())
+            })
+            .collect();
+        let invented: Vec<&String> = claimed.iter().filter(|c| !real.contains(c)).collect();
+        assert!(invented.is_empty(), "help lists commands that do not exist: {invented:?}");
+    }
+}
+
+#[cfg(test)]
+mod bar_refresh_tests {
+    use super::*;
+
+    fn b(cols: u16, rows: u16) -> StatusBar {
+        StatusBar::new(
+            "Nexmesh-dev".into(),
+            "laptop".into(),
+            "nexmesh".into(),
+            String::new(),
+            cols,
+            rows,
+        )
+        .unwrap()
+    }
+
+    /// THE BAR USED TO SCROLL INTO THE CONTENT.
+    ///
+    /// The modes were re-asserted four times a second; the scroll region
+    /// was set once at the start and again only on a resize. Anything in the
+    /// agent's output that reset it -- `\x1b[r`, which a full-screen program
+    /// emits on its way out, and tmux in several situations -- left it reset
+    /// until the next resize, so plain output scrolled over this row and
+    /// carried the bar up into the text.
+    #[test]
+    fn a_refresh_reasserts_the_scroll_region() {
+        let out = String::from_utf8(b(80, 24).refresh()).unwrap();
+        assert!(out.contains("\x1b[1;23r"), "the region must be re-sent: {out:?}");
+    }
+
+    /// And it must not move the agent's cursor doing it: DECSTBM homes the
+    /// cursor on some terminals, which is why the region cannot be sent on
+    /// the timer by itself.
+    #[test]
+    fn the_refresh_saves_and_restores_the_cursor_around_it() {
+        let out = String::from_utf8(b(80, 24).refresh()).unwrap();
+        // EXACTLY ONE PAIR. DECSC is not a stack: a terminal keeps one saved
+        // cursor, so a second save inside the first overwrites it. refresh
+        // used to wrap paint, which saved again -- and since the scroll
+        // region between them homes the cursor, the inner save stored 1,1 and
+        // both restores went there. The agent's cursor sat in the top-left
+        // corner and typing appeared there, four times a second.
+        assert_eq!(out.matches('\x07').count(), 0, "no bells: {out:?}");
+        assert_eq!(out.matches("\x1b7").count(), 1, "exactly one cursor save: {out:?}");
+        assert_eq!(out.matches("\x1b8").count(), 1, "exactly one cursor restore: {out:?}");
+        assert!(out.starts_with("\x1b7"), "must open with a cursor save: {out:?}");
+        assert!(out.ends_with("\x1b8"), "must close with a cursor restore: {out:?}");
+        // The region change has to be INSIDE that pair, or restoring is no
+        // use: the home would already have happened outside it.
+        let save = out.find("\x1b7").unwrap();
+        let region = out.find("\x1b[1;23r").unwrap();
+        let restore = out.rfind("\x1b8").unwrap();
+        assert!(save < region && region < restore, "region outside the pair: {out:?}");
+    }
+
+    /// The idle bar is the pale pink of the transgender flag. Stated as a
+    /// test because a colour is the one thing nobody notices has regressed
+    /// until they look at it.
+    #[test]
+    fn the_idle_bar_is_trans_flag_pink() {
+        let out = String::from_utf8(b(80, 24).paint()).unwrap();
+        assert!(out.contains("\x1b[48;2;247;168;184m"), "#f7a8b8 ground: {out:?}");
+        assert!(out.contains("\x1b[38;2;26;22;24m"), "near-black text on it: {out:?}");
     }
 }

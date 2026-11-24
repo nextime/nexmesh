@@ -14,7 +14,12 @@ import urllib.request, urllib.error
 # A CLI exports its conversation id to the MCP servers it starts, and these
 # suites are routinely run FROM inside one. The tests choose their own.
 for _v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID",
-           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION"):
+           "QWEN_SESSION_ID", "GEMINI_SESSION_ID", "NEXMESH_CLI_SESSION",
+           # This seat's OWN identity: inherited when the suite is run
+           # from inside a managed seat, and then every test's shim
+           # registers as an agent the test's node has never heard of.
+           "NEXMESH_AGENT_ID", "NEXMESH_SLOT", "NEXMESH_SESSION",
+           "NEXMESH_CLI", "NEXMESH_ROLE", "NEXMESH_NAME", "NEXMESH_SOCK"):
     os.environ.pop(_v, None)
 
 SCR = os.path.dirname(os.path.abspath(__file__))

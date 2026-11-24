@@ -43,6 +43,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("sessions", "paused_at", "INTEGER"),
         ("slots", "paused_at", "INTEGER"),
         ("agents", "kind_hint", "TEXT"),
+        ("agents", "host_hint", "TEXT"),
         // Whether this agent has a terminal of its own (`pty`), runs on pipes
         // (`pipes`), or is a process the node never started and has no I/O
         // for at all (NULL). It decides whether a message can be TYPED at the
@@ -80,6 +81,59 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("agents", "model", "TEXT"),
         ("sessions", "token_budget", "INTEGER"),
         ("sessions", "budget_hit_at_ms", "INTEGER"),
+        // Looking after a seat that is filling up or going round in circles.
+        // Every one of these is NULL on an existing database, which is what
+        // "inherit" means -- and the fleet default is off, so upgrading a
+        // hub changes nothing about how any existing seat behaves until
+        // somebody sets a number.
+        ("sessions", "compact_at_pct", "INTEGER"),
+        ("sessions", "loop_guard_repeats", "INTEGER"),
+        // The team's standing rules. NULL on every existing session, which
+        // is "this team has none" -- nothing changes for a fleet that is
+        // upgraded and never sets any.
+        ("sessions", "instructions", "TEXT"),
+        // Flood protection: off on every existing session and seat, so an
+        // upgraded hub refuses nothing it used to deliver.
+        ("sessions", "msg_rate_per_min", "INTEGER"),
+        ("sessions", "msg_pair_limit", "INTEGER"),
+        ("slots", "msg_rate_per_min", "INTEGER"),
+        ("slots", "msg_pair_limit", "INTEGER"),
+        // Which template a seat's prompt came from, and which of its skills
+        // that seat carries. NULL on every existing seat, which is what
+        // "written by hand" means -- so nothing about an existing prompt
+        // changes, it simply cannot be edited by skill until it is applied
+        // from a template once.
+        ("slots", "prompt_template", "TEXT"),
+        ("slots", "prompt_skills", "TEXT"),
+        // What a seat taken with a participant token may do. NULL on every
+        // existing token, which means an ordinary agent -- exactly what they
+        // have always been.
+        ("participant_tokens", "authority", "TEXT"),
+        ("slots", "compact_at_pct", "INTEGER"),
+        ("slots", "loop_guard_repeats", "INTEGER"),
+        ("agents", "context_used_tokens", "INTEGER"),
+        ("agents", "context_limit_tokens", "INTEGER"),
+        ("agents", "context_source", "TEXT"),
+        ("agents", "context_at_ms", "INTEGER"),
+        ("agents", "compact_asked_at_ms", "INTEGER"),
+        // When this seat was last asked to fold, and how full it was the
+        // last time it was asked. The pair is what makes the nudge
+        // growth-gated rather than a reminder every second: a seat is asked
+        // again once it has taken on another quarter of a window, and a
+        // compaction waits a little while for the fold it asked for.
+        ("agents", "fold_asked_at_ms", "INTEGER"),
+        ("agents", "fold_baseline_tokens", "INTEGER"),
+        // What the tree looked like when the hub last asked the node that
+        // holds it. NULL on every existing graph, which is what "never
+        // asked" means: the first answer is recorded as the baseline and
+        // nothing is reparsed on the strength of it.
+        ("code_graph_meta", "tree_fingerprint", "TEXT"),
+        ("code_graph_meta", "fp_at_ms", "INTEGER"),
+        ("code_graph_meta", "fp_asked_at_ms", "INTEGER"),
+        ("code_graph_meta", "fp_files", "INTEGER"),
+        ("agents", "loop_period", "INTEGER"),
+        ("agents", "loop_repeats", "INTEGER"),
+        ("agents", "loop_stopped_at_ms", "INTEGER"),
         // How far an operator's reach goes. NULL is the whole fleet -- a
         // SUPER orchestrator -- and a session id confines the token to that
         // one session. Nullable on purpose: every token minted before this
@@ -103,6 +157,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("messages", "reply_to_session", "TEXT"),
         // When the sender was told a message is not getting through.
         ("messages", "stalled_at_ms", "INTEGER"),
+        ("messages", "cancelled_at_ms", "INTEGER"),
+        ("messages", "cancelled_by", "TEXT"),
         // A record for the chat, never a message for an agent. See schema.sql
         // for why this is not just "pre-claimed".
         ("messages", "record", "INTEGER NOT NULL DEFAULT 0"),
@@ -112,6 +168,25 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // operator channel has no read tool for seats, and a channel you can
         // only shout into is not a channel.
         ("slots", "supervisor", "INTEGER NOT NULL DEFAULT 0"),
+        // What a seat may do TO THE FLEET, as opposed to `role`, which is the
+        // job it was given. Everything defaults to 'agent': authority is
+        // granted deliberately, never inherited from an install. See
+        // schema.sql for why this cannot live in an MCP config.
+        ("slots", "authority", "TEXT NOT NULL DEFAULT 'agent'"),
+        // Answer this seat's (or this whole team's) permission prompts without
+        // stopping to ask the operator. Off by default: the point of raising
+        // them is that somebody authorises them.
+        ("slots", "auto_approve", "INTEGER NOT NULL DEFAULT 0"),
+        ("sessions", "auto_approve", "INTEGER NOT NULL DEFAULT 0"),
+        // Whether the hub brings this seat back by itself. On by default --
+        // that is what it has always done for a managed seat -- but a
+        // decision now, because a seat kept for finished work, or stopped on
+        // purpose to look at it, was being respawned every few seconds.
+        ("slots", "autorespawn", "INTEGER NOT NULL DEFAULT 1"),
+        // Whether this start was handed a resume by the hub, so a start that
+        // died on OUR argument can be retried fresh regardless of the
+        // seat's autorespawn setting.
+        ("agents", "resumed", "INTEGER NOT NULL DEFAULT 0"),
         // WHICH limit cut a scan short. "partial" on its own sends you
         // looking for the wrong fix -- a tree of data files that exhausts
         // the walk and one of source files that exhausts the clock want
@@ -121,7 +196,107 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // stored. It was computed per poll, which for a large workspace is
         // half a minute of SQL against a page that asks every few seconds.
         ("code_graph_meta", "summary_json", "TEXT"),
+        // When the tree moved under the graph, and why a rebuild has not
+        // caught up. See schema.sql: a graph built once and never again
+        // answers questions about a codebase that no longer exists.
+        ("code_graph_meta", "stale_at_ms", "INTEGER"),
+        ("code_graph_meta", "stale_reason", "TEXT"),
     ];
+    // Which skills are enabled or disabled, and at which breadth. A seat's
+    // carried skills start from its template's own list; a row here turns one
+    // ON or OFF at one of three scopes -- global (the whole fleet),
+    // session (one team) or seat -- and a nearer scope wins, exactly as a
+    // nearer memory scope shadows a wider one. scope_ref is "" for global,
+    // the session id for session, the slot id for seat. See `roles::resolve_skills`
+    // for the resolution and schema.sql for why this is not a column on slots.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS skill_prefs (
+            scope      TEXT NOT NULL,
+            scope_ref  TEXT NOT NULL DEFAULT '',
+            skill      TEXT NOT NULL,
+            enabled    INTEGER NOT NULL,
+            at_ms      INTEGER NOT NULL,
+            PRIMARY KEY (scope, scope_ref, skill)
+         )",
+    )?;
+    // Which conversation a seat is on, PER MACHINE. A conversation is a
+    // local file and does not follow a seat to another machine; see
+    // schema.sql for why that has to be recorded rather than assumed.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS slot_conversations (
+            slot_id       TEXT NOT NULL,
+            node_id       TEXT NOT NULL,
+            cwd           TEXT NOT NULL,
+            cli_id        TEXT NOT NULL,
+            handle        TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (slot_id, node_id, cwd, cli_id)
+         );
+         CREATE INDEX IF NOT EXISTS slot_conversations_by_slot
+           ON slot_conversations(slot_id)",
+    )?;
+    // A seat that serves more than one team. See schema.sql: a session is
+    // the isolation boundary, and this is the recorded exception to it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS slot_sessions (
+            slot_id     TEXT NOT NULL,
+            session_id  TEXT NOT NULL,
+            added_at_ms INTEGER NOT NULL,
+            added_by    TEXT NOT NULL DEFAULT 'operator',
+            PRIMARY KEY (slot_id, session_id)
+         );
+         CREATE INDEX IF NOT EXISTS slot_sessions_by_session ON slot_sessions(session_id)",
+    )?;
+    // Folds: context that outlives the window it was learned in. See
+    // `folds.rs` for what a fold is and why the detail is kept rather than
+    // thrown away with the context it came from.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS folds (
+            id             TEXT PRIMARY KEY,
+            scope          TEXT NOT NULL,
+            scope_ref      TEXT NOT NULL DEFAULT '',
+            tier           INTEGER NOT NULL DEFAULT 1,
+            topic          TEXT NOT NULL,
+            summary        TEXT NOT NULL,
+            detail         TEXT NOT NULL DEFAULT '',
+            covers         TEXT NOT NULL DEFAULT '[]',
+            author_slot    TEXT,
+            agent_id       TEXT,
+            tokens_before  INTEGER NOT NULL DEFAULT 0,
+            tokens_after   INTEGER NOT NULL DEFAULT 0,
+            active         INTEGER NOT NULL DEFAULT 1,
+            unfolded_count INTEGER NOT NULL DEFAULT 0,
+            unfolded_at_ms INTEGER,
+            created_at_ms  INTEGER NOT NULL,
+            retired_at_ms  INTEGER,
+            retired_why    TEXT
+         );
+         CREATE INDEX IF NOT EXISTS folds_scope_idx ON folds(scope, scope_ref, active);
+         CREATE INDEX IF NOT EXISTS folds_author_idx ON folds(author_slot, created_at_ms)",
+    )?;
+    // Approvals: a permission prompt an agent is stopped on, waiting for the
+    // operator. See schema.sql for why nothing in here times out into "yes".
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS approvals (
+            id             TEXT PRIMARY KEY,
+            session_id     TEXT NOT NULL,
+            slot_id        TEXT NOT NULL,
+            agent_id       TEXT,
+            node_id        TEXT,
+            kind           TEXT NOT NULL DEFAULT 'pty_prompt',
+            question       TEXT NOT NULL,
+            options        TEXT NOT NULL DEFAULT '[]',
+            fingerprint    TEXT,
+            status         TEXT NOT NULL DEFAULT 'pending',
+            decision       TEXT,
+            decided_by     TEXT,
+            asked_at_ms    INTEGER NOT NULL,
+            decided_at_ms  INTEGER,
+            message_id     INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS approvals_pending_idx ON approvals(status, asked_at_ms);
+         CREATE INDEX IF NOT EXISTS approvals_slot_idx ON approvals(slot_id, status)",
+    )?;
     // A table added after the fact: CREATE TABLE IF NOT EXISTS in the schema
     // covers this, but be explicit so an old database is definitely usable.
     conn.execute_batch(
@@ -270,6 +445,33 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // rather than a directory. Added after the fact: an existing hub must
     // keep its slots.
     let _ = conn.execute("ALTER TABLE slots ADD COLUMN cli_session TEXT", []);
+
+    // A SYSTEM PROMPT OF THE SEAT'S OWN.
+    //
+    // What a seat is for is a property of the seat, not of the conversation
+    // that happens to be in it: a reviewer stays a reviewer when its process
+    // is replaced, and saying so in the prompt every time by hand is how it
+    // gets forgotten. Kept here so it survives a respawn, a node restart and
+    // a move to another machine.
+    //
+    // `append` adds to what the CLI already tells the model, which is almost
+    // always what is wanted -- the CLI's own prompt carries how to use its
+    // tools. `replace` is for the case where that is the problem.
+    let _ = conn.execute("ALTER TABLE slots ADD COLUMN system_prompt TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE slots ADD COLUMN system_prompt_mode TEXT NOT NULL DEFAULT 'append'",
+        [],
+    );
+
+    // AND A STANDING INSTRUCTION FOR WHOEVER TAKES THE SEAT.
+    //
+    // Different from the system prompt: this is said TO the agent as its
+    // first turn, every time a new process occupies the seat, so it belongs
+    // in the conversation and the agent can answer it. "Check the queue
+    // before anything else", "this seat does not deploy" -- the things an
+    // operator would otherwise retype into every new process and eventually
+    // forget to.
+    let _ = conn.execute("ALTER TABLE slots ADD COLUMN instructions TEXT", []);
 
     // Rows that say a process is running AND that it exited.
     //
@@ -557,6 +759,30 @@ pub struct AppState {
     /// Empty means none, which is the only safe default: those headers are
     /// exactly what an attacker would set.
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    /// Fleet-wide defaults for looking after a seat: how full its context
+    /// may get before it is compacted, and how many times it may repeat
+    /// itself before it is stopped. 0 is off, and off is what both ship as.
+    ///
+    /// The bottom of three levels -- a seat's own setting, then its team's,
+    /// then this -- and the only one that is not in the database, because it
+    /// is a property of this hub's deployment rather than of anything in it.
+    /// See `watchdog::setting`.
+    watchdog: Arc<(i64, i64)>,
+    /// Where this fleet's OWN role templates and skill fragments live, if it
+    /// has any. `None` means the built-in ones only.
+    ///
+    /// A directory rather than a database table on purpose: a prompt is text
+    /// an operator edits, keeps in version control and reviews a diff of,
+    /// and none of that works in a column. The built-ins are compiled in, so
+    /// a fleet with no such directory still has every role.
+    prompts: Arc<Option<std::path::PathBuf>>,
+    /// Fleet-wide flood limits. See `with_flood`; `(0, 0)` is off, which is
+    /// what ships.
+    flood: Arc<(i64, i64)>,
+    /// A Digital Asset Links file to serve at `/.well-known/assetlinks.json`,
+    /// if this fleet has a headset package that claims this origin. See
+    /// `dashboard::assetlinks` for why the hub cannot invent it.
+    pub assetlinks: Arc<Option<std::path::PathBuf>>,
 }
 
 /// How long a chunk may wait to be written, and how much may pile up first.
@@ -658,6 +884,10 @@ impl AppState {
             kicks: Arc::new(Mutex::new(HashMap::new())),
             bind_identity: Arc::new(true),
             trusted_proxies: Arc::new(Vec::new()),
+            watchdog: Arc::new((0, 0)),
+            prompts: Arc::new(None),
+            assetlinks: Arc::new(None),
+            flood: Arc::new((0, 0)),
         })
     }
 
@@ -684,7 +914,17 @@ impl AppState {
             kicks: Arc::new(Mutex::new(HashMap::new())),
             bind_identity: Arc::new(true),
             trusted_proxies: Arc::new(Vec::new()),
+            watchdog: Arc::new((0, 0)),
+            prompts: Arc::new(None),
+            assetlinks: Arc::new(None),
+            flood: Arc::new((0, 0)),
         })
+    }
+
+    /// A request id for a round trip whose answer comes back as its own
+    /// frame rather than to a waiter: nothing is left holding a channel.
+    pub fn next_req_id(&self) -> u64 {
+        self.sync_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Start a sync request and get the channel its answer will arrive on.
@@ -840,6 +1080,60 @@ impl AppState {
     /// different names, before this check existed.
     pub fn identity_binding(&self) -> bool {
         *self.bind_identity
+    }
+
+    /// How full a seat's context may get before the hub asks its CLI to
+    /// compact, and how many repeated turns count as a loop -- for seats
+    /// and teams that have set neither themselves. 0 for off.
+    pub fn with_watchdog(mut self, compact_at_pct: i64, loop_repeats: i64) -> Self {
+        self.watchdog = Arc::new((compact_at_pct.clamp(0, 100), loop_repeats.max(0)));
+        self
+    }
+
+    /// Where to look for role templates and skills before the built-in ones.
+    /// The Digital Asset Links file a headset package is verified against.
+    pub fn with_assetlinks(mut self, path: Option<String>) -> Self {
+        self.assetlinks = Arc::new(
+            path.map(|p| std::path::PathBuf::from(crate::state::expand(&p))),
+        );
+        self
+    }
+
+    pub fn with_prompts_dir(mut self, dir: Option<String>) -> Self {
+        self.prompts = Arc::new(
+            dir.map(|d| std::path::PathBuf::from(crate::state::expand(&d))),
+        );
+        self
+    }
+
+    /// This fleet's own template directory, if it has one.
+    pub fn prompts_dir(&self) -> Option<&std::path::Path> {
+        self.prompts.as_deref()
+    }
+
+    /// The fleet-wide compaction threshold, as a percentage. 0 is off.
+    pub fn fleet_compact_at_pct(&self) -> i64 {
+        self.watchdog.0
+    }
+
+    /// The fleet-wide loop threshold, in repeats. 0 is off.
+    pub fn fleet_loop_repeats(&self) -> i64 {
+        self.watchdog.1
+    }
+
+    /// Fleet-wide flood limits: messages a seat may send a minute, and
+    /// messages one pair may exchange in ten. Both 0 is off.
+    pub fn with_flood(mut self, per_min: i64, per_pair: i64) -> Self {
+        self.flood = Arc::new((per_min.max(0), per_pair.max(0)));
+        self
+    }
+
+    pub fn fleet_msg_rate(&self) -> i64 {
+        self.flood.0
+    }
+
+    pub fn fleet_msg_pair(&self) -> i64 {
+        self.flood.1
     }
 
     pub fn with_identity_binding(mut self, on: bool) -> Self {
@@ -1235,11 +1529,24 @@ impl AppState {
     }
 
     pub fn mark_node_offline(&self, node_id: &str) {
-        // Attach sessions on a node that has gone are dead; the terminals
-        // holding them must be told rather than left hanging.
+        // A node that has gone takes its relays with it, so these viewers
+        // will never see another byte and must be told. But PAUSED, not
+        // closed: a managed agent on that node is very often still running
+        // -- held in tmux, or simply waiting for the node to come back and
+        // adopt it again -- and a viewer that exits makes the operator
+        // reattach by hand for something that fixes itself in seconds. It
+        // also cost real work: being dropped at a node restart is why a
+        // seat got spawned a second time, and two CLIs ended up appending
+        // to one conversation.
+        //
+        // The viewer stays on the operator's screen saying so, waits for
+        // the node, and attaches again by itself.
         for attach_id in self.attaches_on_node(node_id) {
             if let Some(sink) = self.attaches.lock().unwrap().remove(&attach_id) {
-                let msg = serde_json::json!({ "t": "closed", "reason": "the node disconnected" });
+                let msg = serde_json::json!({
+                    "t": "paused",
+                    "reason": "the node went away; waiting for it to come back"
+                });
                 let _ = sink.tx.try_send(AttachFrame::Control(msg.to_string()));
             }
         }

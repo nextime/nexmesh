@@ -101,6 +101,14 @@ pub struct RenameRequest {
 }
 
 #[derive(Deserialize)]
+pub struct AuthorityRequest {
+    /// agent | orchestrator | super. Anything else is refused rather than
+    /// quietly read as 'agent': setting authority is deliberate, and a typo
+    /// that silently demoted a seat would be found much later.
+    pub authority: String,
+}
+
+#[derive(serde::Deserialize)]
 pub struct RoleRequest {
     pub role: String,
     /// What the role means for this seat, in its own words. Left alone when
@@ -478,6 +486,1155 @@ pub async fn set_role(
     )
     .ok();
     Ok(Json(json!({ "slot_id": id, "role": role, "was": was })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct DecideRequest {
+    /// An option key the prompt offered, or `allow` / `deny` for "whichever
+    /// of its options does that".
+    pub choice: String,
+    /// Also turn on a standing auto-approval: `agent` or `session`. This is
+    /// how "allow, and stop asking me about this one" is a single click.
+    #[serde(default)]
+    pub remember: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AutoApproveRequest {
+    /// Defaults to ON: `POST .../auto-approve` with no body turns it on, and
+    /// turning it off is the deliberate `{"on": false}`.
+    #[serde(default = "yes")]
+    pub on: bool,
+}
+
+/// What is waiting for the operator to decide.
+///
+/// Fleet-wide by default so that nothing can be stopped on a question the
+/// operator never saw because they were looking at another team.
+pub async fn list_approvals(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let db = st.db.lock().unwrap();
+    let session = q.get("session").map(|s| session_ref_to_id(&db, s));
+    let rows = crate::approvals::pending(&db, session.as_deref());
+    Json(json!({ "approvals": rows }))
+}
+
+/// Answer one.
+pub async fn decide_approval(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<DecideRequest>,
+) -> ApiResult {
+    // The node id is read before the decision so that a failure to reach the
+    // node is reported WITH the decision that was recorded: the operator has
+    // answered, and a node that is offline will not have typed it.
+    let node = {
+        let db = st.db.lock().unwrap();
+        db.query_row("SELECT node_id FROM approvals WHERE id = ?", [&id],
+                     |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+    };
+    let (frame, said) =
+        crate::approvals::decide(&st, &id, req.choice.trim(), req.remember.as_deref())
+            .map_err(bad)?;
+    let mut typed = false;
+    if let (Some(frame), Some(node)) = (frame, node) {
+        typed = st.send_to_node(&node, &frame).await.is_ok();
+    }
+    Ok(Json(json!({
+        "ok": true, "said": said,
+        // Whether the keystroke actually went out. A decision recorded
+        // against an offline node is not an answered prompt, and saying so
+        // is the difference between "done" and "the agent is still stuck".
+        "typed": typed,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ResumeHandleRequest {
+    /// The CLI's own id for the conversation this seat should continue.
+    /// Empty or absent clears it, so the next spawn starts fresh.
+    #[serde(default)]
+    pub handle: Option<String>,
+}
+
+/// Pin which of its CLI's conversations a seat continues.
+///
+/// Normally the node reports this itself -- it named the conversation, or
+/// learned the id over the CLI's own protocol. This is the operator's door,
+/// for the cases the node cannot work out: moving an existing conversation
+/// into a seat's new store, or pointing a seat at a conversation that was
+/// started by hand.
+///
+/// It is NOT validated against the CLI, because the hub cannot see the CLI's
+/// store -- a wrong id means the next spawn starts fresh, which is why the
+/// previous value is reported back.
+pub async fn set_resume_handle(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ResumeHandleRequest>,
+) -> ApiResult {
+    let want = req.handle.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let db = st.db.lock().unwrap();
+    let was: Option<Option<String>> = db
+        .query_row("SELECT resume_handle FROM slots WHERE id = ?", [&id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?;
+    let Some(was) = was else {
+        return Err(bad(format!("no seat '{id}'")));
+    };
+    db.execute("UPDATE slots SET resume_handle = ? WHERE id = ?", params![want, id])
+        .map_err(bad)?;
+    // AND the binding for where this seat actually is.
+    //
+    // A spawn reads `slot_conversations` for the machine it is launching on
+    // and only falls back to `slots.resume_handle` for a seat with no
+    // bindings at all. So setting the handle alone works until the node
+    // reports a binding and then silently stops working -- a pin that does
+    // nothing is worse than no pin. Clearing the handle clears the binding
+    // for that place too, for the same reason.
+    let place: Option<(String, String, String)> = db
+        .query_row(
+            "SELECT a.node_id, COALESCE(a.cwd, ''), COALESCE(s.cli_id, '')
+               FROM slots s
+               JOIN agents a ON a.id = (
+                 SELECT id FROM agents WHERE slot_id = s.id AND node_id IS NOT NULL
+                  ORDER BY started_at_ms DESC LIMIT 1)
+              WHERE s.id = ?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(bad)?;
+    let mut bound_at = None;
+    if let Some((node, cwd, cli)) = place {
+        match want {
+            Some(h) => {
+                db.execute(
+                    "INSERT INTO slot_conversations
+                        (slot_id, node_id, cwd, cli_id, handle, updated_at_ms)
+                     VALUES (?,?,?,?,?,?)
+                     ON CONFLICT(slot_id, node_id, cwd, cli_id) DO UPDATE SET
+                        handle = excluded.handle, updated_at_ms = excluded.updated_at_ms",
+                    params![id, node, cwd, cli, h, now_ms()],
+                )
+                .map_err(bad)?;
+            }
+            None => {
+                db.execute(
+                    "DELETE FROM slot_conversations
+                      WHERE slot_id = ? AND node_id = ? AND cwd = ? AND cli_id = ?",
+                    params![id, node, cwd, cli],
+                )
+                .map_err(bad)?;
+            }
+        }
+        bound_at = Some(json!({ "node": node, "cwd": cwd, "cli": cli }));
+    }
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'resume_handle',?)",
+        params![now_ms(), json!({ "slot": id, "from": was, "to": want }).to_string()],
+    )
+    .ok();
+    tracing::info!(slot = %id, from = ?was, to = ?want, "resume handle set by the operator");
+    // `bound_at` says WHERE it was pinned, or null when the seat has never
+    // run anywhere the hub knows about -- in which case only the fallback
+    // handle was set, and the first spawn on any machine will use it.
+    Ok(Json(json!({ "slot_id": id, "resume_handle": want, "was": was,
+                    "bound_at": bound_at })))
+}
+
+/// Whether the hub brings this seat back by itself when its process exits.
+///
+/// A respawn PREPARES the seat -- the process is there and can be attached
+/// to -- and never reattaches anybody's terminal: whose terminal that would
+/// be is not the hub's to decide.
+pub async fn slot_autorespawn(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AutoApproveRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let n = db
+        .execute(
+            "UPDATE slots SET autorespawn = ? WHERE id = ?",
+            params![i64::from(req.on), id],
+        )
+        .map_err(bad)?;
+    if n == 0 {
+        return Err(bad(format!("no seat '{id}'")));
+    }
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'autorespawn',?)",
+        params![now_ms(), json!({ "slot": id, "on": req.on }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "slot_id": id, "autorespawn": req.on })))
+}
+
+/// What a seat tells its agent, over and above the CLI's own prompt.
+///
+/// Two separate things, because they answer different questions:
+///
+///  * `system_prompt` is WHO the agent in this seat is, and goes to the CLI
+///    as a system prompt -- appended to the CLI's own, or replacing it.
+///    It is set once and lasts: every agent that ever fills this seat gets
+///    it, including a respawn at 4am that nobody watched.
+///  * `instructions` is WHAT it should do on arrival, and goes in as the
+///    first thing said to it. A new occupant reads it; the agent already
+///    sitting there does not get it again.
+///
+/// A field left out is left alone. A field present and empty clears it --
+/// which is how "stop doing that" is one call rather than a delete verb.
+#[derive(serde::Deserialize)]
+pub struct SeatPromptRequest {
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Use the template for this role as the system prompt, instead of
+    /// writing one by hand. `GET /v1/roles` lists them.
+    ///
+    /// Rendered and STORED, not referenced: what a seat tells its agent is
+    /// then visible in one place, editable afterwards, and does not change
+    /// under a running team because somebody improved a template.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Which skill fragments the brief carries, overriding the template's
+    /// own list. An empty list means none; absent means the template's.
+    ///
+    /// Without `template`, this re-renders from the template the seat
+    /// already has -- which is how a whole selection is replaced.
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
+    /// Select these, leaving the rest of the seat's selection alone.
+    #[serde(default)]
+    pub skills_on: Option<Vec<String>>,
+    /// Deselect these.
+    ///
+    /// Separate from `skills` because a checkbox is a toggle: a surface that
+    /// has to send the whole list to turn one thing off races every other
+    /// surface looking at the same seat, and loses whatever it had not
+    /// loaded.
+    #[serde(default)]
+    pub skills_off: Option<Vec<String>>,
+    /// `append` (the default) or `replace`. Replacing throws away the CLI's
+    /// own system prompt, which is what you want for a seat that is not
+    /// meant to behave like that CLI at all, and a trap otherwise.
+    #[serde(default)]
+    pub system_prompt_mode: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// A system prompt is handed to the CLI as one argv entry, and Linux caps a
+/// single argument at 128 KiB (MAX_ARG_STRLEN). Refusing at 64 KiB leaves
+/// room for the rest of the command line and fails here, with a sentence,
+/// rather than as E2BIG inside a spawn nobody is watching.
+const PROMPT_MAX: usize = 64 * 1024;
+
+fn prompt_field(
+    name: &str,
+    given: Option<String>,
+    current: Option<String>,
+) -> std::result::Result<(Option<String>, bool), (StatusCode, Json<Value>)> {
+    let Some(text) = given else {
+        return Ok((current, false));
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok((None, current.is_some()));
+    }
+    if text.len() > PROMPT_MAX {
+        return Err(bad(format!(
+            "that {name} is {} KiB; the limit is {} KiB, because it is handed \
+             to the CLI as a single argument",
+            text.len() / 1024,
+            PROMPT_MAX / 1024
+        )));
+    }
+    let changed = current.as_deref() != Some(text);
+    Ok((Some(text.to_string()), changed))
+}
+
+/// One team, in detail: what it is, what it is set to, and its rules.
+///
+/// There was no such endpoint -- only a listing and a delete -- so anything
+/// wanting a single team's settings had to find it in the list. The settings
+/// that now live on a session (a budget, a compaction threshold, a loop
+/// guard, the standing rules) need somewhere to be read from.
+pub async fn session_detail(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let id = session_ref_to_id(&db, &session_ref);
+    let row: Option<(String, String, String, Option<i64>, Option<i64>, Option<i64>,
+                     Option<i64>, Option<String>, i64)> = db
+        .query_row(
+            "SELECT id, name, status, token_budget, budget_hit_at_ms,
+                    compact_at_pct, loop_guard_repeats, instructions, auto_approve
+               FROM sessions WHERE id = ?",
+            [&id],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                    r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(bad)?;
+    let Some((id, name, status, budget, hit, pct, repeats, rules, auto)) = row else {
+        return Err(bad(format!("no team '{session_ref}'")));
+    };
+    Ok(Json(json!({
+        "session_id": id, "name": name, "status": status,
+        "token_budget": budget, "budget_hit_at_ms": hit,
+        // NULL means "inherit": a team that has set neither follows the
+        // fleet. 0 is deliberately off. See `watchdog::setting`.
+        "compact_at_pct": pct,
+        "loop_guard_repeats": repeats,
+        "auto_approve": auto == 1,
+        "instructions": rules,
+    })))
+}
+
+/// Set or clear a team's standing rules.
+///
+/// The operator's way in. A seat holding orchestrator authority does the
+/// same thing through the `set_team_rules` tool, which shares the rule about
+/// who may: nobody else.
+pub async fn set_session_instructions(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    Json(req): Json<SessionRulesRequest>,
+) -> ApiResult {
+    let text = req.instructions.unwrap_or_default();
+    let text = text.trim().to_string();
+    if text.len() > TEAM_RULES_MAX {
+        return Err(bad(format!(
+            "that is {} KiB of rules; the limit is {} KiB. Rules nobody can hold in              their head are rules nobody follows -- keep these short and put the              detail in the team's knowledge.",
+            text.len() / 1024,
+            TEAM_RULES_MAX / 1024
+        )));
+    }
+    let (id, changed) = {
+        let db = st.db.lock().unwrap();
+        let id = session_ref_to_id(&db, &session_ref);
+        let before: Option<String> = db
+            .query_row("SELECT instructions FROM sessions WHERE id = ?", [&id], |r| r.get(0))
+            .optional()
+            .map_err(bad)?
+            .ok_or_else(|| bad(format!("no team '{session_ref}'")))?;
+        let changed = before.as_deref().map(str::trim).unwrap_or("") != text;
+        if changed {
+            db.execute(
+                "UPDATE sessions SET instructions = ? WHERE id = ?",
+                params![if text.is_empty() { None } else { Some(&text) }, id],
+            )
+            .map_err(bad)?;
+            db.execute(
+                "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+                 VALUES (?,'operator',NULL,'team_rules_set',?)",
+                params![now_ms(), json!({ "session": id, "bytes": text.len() }).to_string()],
+            )
+            .ok();
+            // EVERYBODY ALREADY RUNNING IS TOLD. The rules reach a seat's
+            // prompt only when its next process starts, which may be days;
+            // without this the team works to the old ones and nothing
+            // distinguishes the agents that know from the ones that do not.
+            let said = if text.is_empty() {
+                "The operator has cleared this team's standing rules.".to_string()
+            } else {
+                format!(
+                    "The operator has set this team's standing rules. They apply to                      everybody here from now on, and outrank your own preferences about                      how to work -- `team_rules` reads them back at any                      time.\n\n{text}"
+                )
+            };
+            db.execute(
+                "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+                 VALUES (?, NULL, NULL, 'system', ?, ?)",
+                params![id, said, now_ms()],
+            )
+            .ok();
+        }
+        (id, changed)
+    };
+    tracing::info!(session = %id, bytes = text.len(), changed, "the team's standing rules");
+    Ok(Json(json!({
+        "session_id": id, "instructions": if text.is_empty() { None } else { Some(&text) },
+        "changed": changed,
+        "detail": if !changed {
+            "those are already this team's rules".to_string()
+        } else if text.is_empty() {
+            "cleared; everybody here has been told".to_string()
+        } else {
+            format!("set, {} characters; everybody here has been told, and every seat \
+                     started from now on gets them in its first prompt", text.len())
+        },
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SessionRulesRequest {
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// Rules longer than this are not rules. Mirrors `tools::MAX_TEAM_RULES`.
+const TEAM_RULES_MAX: usize = 8 * 1024;
+
+/// The role templates this hub has: what a seat in each role is for.
+///
+/// Listed rather than documented, because a fleet can add its own with
+/// `--prompts-dir` and nothing written down elsewhere would know about them.
+pub async fn roles(State(st): State<AppState>) -> Json<Value> {
+    let dir = st.prompts_dir();
+    let roles: Vec<Value> = nexmesh_proto::roles::all(dir)
+        .into_iter()
+        .map(|t| {
+            json!({
+                "id": t.id, "title": t.title, "summary": t.summary,
+                "skills": t.skills,
+                "source": nexmesh_proto::roles::role_source(dir, &t.id),
+                // The size, not the text: a listing is for choosing, and a
+                // fourteen-role listing with every brief in it is a page
+                // nobody reads. The text comes back when one is applied.
+                "prompt_bytes": t.prompt.len(),
+            })
+        })
+        .collect();
+    Json(json!({
+        "roles": roles,
+        "skills": nexmesh_proto::roles::builtin_skill_names(),
+        "local": dir.map(|d| d.display().to_string()),
+    }))
+}
+
+/// One template's full text, as it would be given to a seat.
+///
+/// So an operator can read what they are about to apply, and so a surface
+/// can offer it as the starting point of an edit.
+pub async fn role(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RoleQuery>,
+) -> ApiResult {
+    let dir = st.prompts_dir();
+    let Some(t) = nexmesh_proto::roles::find(dir, &id) else {
+        return Err(bad(format!("no role template '{id}'")));
+    };
+    // `?skills=a,b` previews a different set, and `?skills=` previews none:
+    // the same choice `POST /v1/slots/:id/prompt` takes, so what is read
+    // here is what would be stored there.
+    let chosen: Option<Vec<String>> = q.skills.as_ref().map(|s| {
+        s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
+    });
+    let text = nexmesh_proto::roles::render(&t, chosen.as_deref(), dir);
+    Ok(Json(json!({
+        "id": t.id, "title": t.title, "summary": t.summary,
+        "skills": chosen.unwrap_or(t.skills), "prompt": text,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RoleQuery {
+    #[serde(default)]
+    pub skills: Option<String>,
+}
+
+// ----------------------------------------------------- editing the library ----
+//
+// Every write below needs somewhere to write: a prompts directory this fleet
+// owns. Built-ins live in the binary and are never touched -- a write creates
+// or replaces a LOCAL file that shadows the built-in of the same name, which
+// is what makes "edit a built-in" and "reset it" the same two operations as
+// "add a local one" and "remove it". With no store configured there is
+// nowhere to put a local file, so these say so rather than failing obscurely.
+fn store_dir(st: &AppState) -> Result<std::path::PathBuf, (StatusCode, Json<Value>)> {
+    st.prompts_dir().map(|d| d.to_path_buf()).ok_or_else(|| {
+        bad("this hub has no editable prompts store. It is normally provisioned at \
+             /var/lib/nexmesh/prompts when the package is installed; set --prompts-dir \
+             (or NEXMESH_PROMPTS_DIR) and restart the hub, or run `nexmesh-hub` with it.")
+    })
+}
+
+/// The whole skill library: every skill, where it comes from, its text, and
+/// its fleet-wide (global) enable state. Session and seat state are read with
+/// the prefs endpoint, which takes a reference.
+pub async fn list_skills(State(st): State<AppState>) -> Json<Value> {
+    let dir = st.prompts_dir();
+    let global = {
+        let db = st.db.lock().unwrap();
+        crate::skills::prefs_at(&db, "global", "")
+    };
+    let skills: Vec<Value> = nexmesh_proto::roles::all_skill_names(dir)
+        .into_iter()
+        .map(|name| {
+            let body = nexmesh_proto::roles::skill(dir, &name).unwrap_or_default();
+            json!({
+                "name": name,
+                "source": nexmesh_proto::roles::skill_source(dir, &name),
+                "body": body,
+                // absent => follows the template/default; true/false => a
+                // fleet-wide dial the operator set.
+                "global": global.get(&name),
+            })
+        })
+        .collect();
+    Json(json!({
+        "skills": skills,
+        "editable": dir.is_some(),
+        "local": dir.map(|d| d.display().to_string()),
+    }))
+}
+
+/// One skill's text, with the built-in underneath it when a local copy is
+/// shadowing one -- so an editor can offer "reset to the built-in".
+pub async fn read_skill(State(st): State<AppState>, Path(name): Path<String>) -> ApiResult {
+    let dir = st.prompts_dir();
+    let Some(body) = nexmesh_proto::roles::skill(dir, &name) else {
+        return Err(bad(format!("no skill '{name}'")));
+    };
+    // The built-in text, shown only when a local file is on top of one.
+    let builtin = nexmesh_proto::roles::builtin_skills()
+        .iter()
+        .find(|(n, _)| *n == name.trim().to_lowercase())
+        .map(|(_, t)| (*t).to_string());
+    let src = nexmesh_proto::roles::skill_source(dir, &name);
+    Ok(Json(json!({
+        "name": name.trim().to_lowercase(),
+        "source": src,
+        "body": body,
+        "builtin": if src == "override" { builtin } else { None },
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillWrite {
+    pub body: String,
+}
+
+pub async fn write_skill(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SkillWrite>,
+) -> ApiResult {
+    let dir = store_dir(&st)?;
+    let saved = nexmesh_proto::roles::write_skill(&dir, &name, &req.body).map_err(bad)?;
+    audit_prompt(&st, "skill_write", json!({ "skill": saved }));
+    Ok(Json(json!({ "name": saved, "source": nexmesh_proto::roles::skill_source(Some(&dir), &saved) })))
+}
+
+pub async fn delete_skill(State(st): State<AppState>, Path(name): Path<String>) -> ApiResult {
+    let dir = store_dir(&st)?;
+    let reverted = nexmesh_proto::roles::delete_skill(&dir, &name).map_err(bad)?;
+    audit_prompt(&st, "skill_delete", json!({ "skill": name, "reverted_to_builtin": reverted }));
+    Ok(Json(json!({
+        "name": name.trim().to_lowercase(),
+        // Said plainly, because the two outcomes differ: a built-in is back
+        // to its shipped text; a local-only skill is gone.
+        "outcome": if reverted { "reverted to the built-in" } else { "removed" },
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RoleWrite {
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    pub prompt: String,
+}
+
+pub async fn write_role(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RoleWrite>,
+) -> ApiResult {
+    let dir = store_dir(&st)?;
+    let t = nexmesh_proto::roles::RoleTemplate {
+        id: id.trim().to_lowercase(),
+        title: req.title,
+        summary: req.summary,
+        skills: req.skills,
+        prompt: req.prompt,
+    };
+    let saved = nexmesh_proto::roles::write_role(&dir, &t).map_err(bad)?;
+    audit_prompt(&st, "role_write", json!({ "role": saved }));
+    Ok(Json(json!({ "id": saved, "source": nexmesh_proto::roles::role_source(Some(&dir), &saved) })))
+}
+
+pub async fn delete_role(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let dir = store_dir(&st)?;
+    let reverted = nexmesh_proto::roles::delete_role(&dir, &id).map_err(bad)?;
+    audit_prompt(&st, "role_delete", json!({ "role": id, "reverted_to_builtin": reverted }));
+    Ok(Json(json!({
+        "id": id.trim().to_lowercase(),
+        "outcome": if reverted { "reverted to the built-in" } else { "removed" },
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillPrefQuery {
+    pub scope: Option<String>,
+    pub reference: Option<String>,
+}
+
+/// The enable/disable dial at one scope, as a map of skill -> bool.
+pub async fn get_skill_prefs(
+    State(st): State<AppState>,
+    Query(q): Query<SkillPrefQuery>,
+) -> ApiResult {
+    let scope = q.scope.as_deref().unwrap_or("global");
+    let (scope, reference) = normalise_scope(scope, q.reference.as_deref())?;
+    let db = st.db.lock().unwrap();
+    let map = crate::skills::prefs_at(&db, &scope, &reference);
+    Ok(Json(json!({ "scope": scope, "reference": reference, "prefs": map })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillPrefSet {
+    pub scope: String,
+    #[serde(default)]
+    pub reference: Option<String>,
+    pub skill: String,
+    /// true/false set the dial; null clears it, reverting to the wider scope.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// Turn one skill on or off at a scope, and bring the seats that were
+/// following their defaults into line so the change is actually visible.
+pub async fn set_skill_pref(
+    State(st): State<AppState>,
+    Json(req): Json<SkillPrefSet>,
+) -> ApiResult {
+    let (scope, reference) = normalise_scope(&req.scope, req.reference.as_deref())?;
+    let skill = nexmesh_proto::roles::valid_name(&req.skill).map_err(bad)?;
+    let dir = st.prompts_dir().map(|d| d.to_path_buf());
+    let db = st.db.lock().unwrap();
+    // The seat scope IS the seat's own stored selection, set through the
+    // prompt endpoint -- there is no row for it here, and routing it through
+    // this dial would be a second source of truth. Say so.
+    if scope == "seat" {
+        return Err(bad(
+            "a seat's own skills are set on the seat, not here: POST /v1/slots/<id>/prompt \
+             with skills_on/skills_off. This endpoint is the global and session dials.",
+        ));
+    }
+    let before = crate::skills::snapshot_defaults(&db, dir.as_deref(), &scope, &reference);
+    crate::skills::set_pref(&db, &scope, &reference, &skill, req.enabled).map_err(bad)?;
+    let moved = crate::skills::propagate(&db, dir.as_deref(), &scope, &reference, &before);
+    drop(db);
+    audit_prompt(&st, "skill_pref",
+        json!({ "scope": scope, "reference": reference, "skill": skill,
+                "enabled": req.enabled, "seats_rerendered": moved }));
+    Ok(Json(json!({
+        "scope": scope, "reference": reference, "skill": skill, "enabled": req.enabled,
+        // What actually happened to running seats, so the surface can say it.
+        "seats_rerendered": moved,
+    })))
+}
+
+/// A scope and its reference, checked together: global takes none, session
+/// needs a session id. (Seat is refused in the prefs endpoint above.)
+fn normalise_scope(
+    scope: &str,
+    reference: Option<&str>,
+) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let scope = scope.trim().to_lowercase();
+    match scope.as_str() {
+        "global" => Ok(("global".into(), String::new())),
+        "session" | "seat" => {
+            let r = reference.map(str::trim).filter(|s| !s.is_empty());
+            match r {
+                Some(r) => Ok((scope, r.to_string())),
+                None => Err(bad(format!("the {scope} scope needs a reference"))),
+            }
+        }
+        other => Err(bad(format!(
+            "'{other}' is not a scope; it is 'global' or 'session'"
+        ))),
+    }
+}
+
+fn audit_prompt(st: &AppState, action: &str, detail: Value) {
+    if let Ok(db) = st.db.lock() {
+        let _ = db.execute(
+            "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,'operator',NULL,?,?)",
+            params![now_ms(), action, detail.to_string()],
+        );
+    }
+}
+
+/// Apply a select/deselect pair to a list of skill names.
+///
+/// Case-folded, de-duplicated and order-preserving, so a surface can send
+/// what a person typed and two surfaces toggling the same seat cannot
+/// produce a list that depends on who asked last.
+fn apply_toggles(
+    base: Vec<String>,
+    on: &Option<Vec<String>>,
+    off: &Option<Vec<String>>,
+) -> Vec<String> {
+    let norm = |s: &str| s.trim().to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for s in base.iter().map(|s| norm(s)).filter(|s| !s.is_empty()) {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    for s in on.iter().flatten().map(|s| norm(s)).filter(|s| !s.is_empty()) {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    if let Some(off) = off {
+        let drop: Vec<String> = off.iter().map(|s| norm(s)).collect();
+        out.retain(|s| !drop.contains(s));
+    }
+    out
+}
+
+/// Set, change or clear what this seat tells its agent.
+pub async fn set_slot_prompt(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SeatPromptRequest>,
+) -> ApiResult {
+    let mode = match req.system_prompt_mode.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(m @ ("append" | "replace")) => Some(m.to_string()),
+        Some(other) => {
+            return Err(bad(format!(
+                "'{other}' is not a system prompt mode; it is 'append' (add to \
+                 the CLI's own prompt) or 'replace' (use this instead of it)"
+            )))
+        }
+    };
+    let db = st.db.lock().unwrap();
+    #[allow(clippy::type_complexity)]
+    let row: Option<(Option<String>, String, Option<String>, Option<String>, Option<String>, String)> = db
+        .query_row(
+            "SELECT system_prompt, COALESCE(system_prompt_mode, 'append'), instructions,
+                    prompt_template, prompt_skills, COALESCE(session_id, '')
+               FROM slots WHERE id = ?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(bad)?;
+    let Some((had_prompt, had_mode, had_instr, had_template, had_skills, session_id)) = row else {
+        return Err(bad(format!("no seat '{id}'")));
+    };
+    let had_skills: Vec<String> = had_skills
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    // A TEMPLATE IS A WAY OF WRITING THE SYSTEM PROMPT, not a third field.
+    //
+    // Rendered here and stored as the prompt, so everything downstream --
+    // the spawn, the dashboard, the byte count, the editor -- sees one
+    // thing. Given both a template and a prompt, this refuses rather than
+    // choosing: two sources for one field is a question for the operator.
+    //
+    // WHICH TEMPLATE, when none is named: the one this seat already has.
+    // That is what makes a skill something an operator can select and
+    // deselect -- without it, turning one off meant restating the template
+    // and the whole list from memory.
+    let wants_skill_change =
+        req.skills.is_some() || req.skills_on.is_some() || req.skills_off.is_some();
+    // Noted before the field is consumed below: whether the operator wrote
+    // the prompt themselves is what decides if this seat keeps a template.
+    let prompt_by_hand = req.system_prompt.is_some();
+    let named_template = req.template.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let template: Option<String> = match named_template {
+        Some(name) => Some(name.to_string()),
+        None if wants_skill_change && req.system_prompt.is_none() => {
+            let Some(t) = had_template.clone() else {
+                return Err(bad(
+                    "this seat's prompt was written by hand, so it has no skills to                      select. Apply a template first and they become editable:                      `--template <role>`, or GET /v1/roles for the list.",
+                ));
+            };
+            Some(t)
+        }
+        None => None,
+    };
+    // The selection this change produces. An explicit list replaces it
+    // outright; the toggles work from whatever the seat already carries --
+    // or, when a template is also named, from THAT template's own defaults,
+    // which is what "this template, without that one skill" means.
+    let chosen: Option<Vec<String>> = if !wants_skill_change {
+        None
+    } else {
+        let base = match (&req.skills, named_template) {
+            (Some(list), _) => list.clone(),
+            // A named template's base is its defaults AS THE DIALS LEAVE
+            // THEM: a skill the fleet or this team has turned on or off is
+            // already reflected, so applying a template gives the same set a
+            // seat already on it carries, not the raw compiled list.
+            (None, Some(name)) => nexmesh_proto::roles::find(st.prompts_dir(), name)
+                .map(|t| crate::skills::effective_defaults(&db, &t.skills, &session_id))
+                .unwrap_or_default(),
+            (None, None) => had_skills.clone(),
+        };
+        Some(apply_toggles(base, &req.skills_on, &req.skills_off))
+    };
+    let from_template = match template.as_deref() {
+        None => None,
+        Some(name) => {
+            if req.system_prompt.is_some() {
+                return Err(bad(
+                    "a template and a system prompt are two ways of filling the same                      field; send one of them",
+                ));
+            }
+            let dir = st.prompts_dir();
+            let Some(t) = nexmesh_proto::roles::find(dir, name) else {
+                let have: Vec<String> =
+                    nexmesh_proto::roles::all(dir).into_iter().map(|t| t.id).collect();
+                return Err(bad(format!(
+                    "no role template '{name}'. There is: {}",
+                    have.join(", ")
+                )));
+            };
+            // A skill this hub does not have is refused rather than
+            // quietly rendering a note about it: a checkbox that silently
+            // does nothing is worse than an error.
+            if let Some(list) = &chosen {
+                for want in list {
+                    if nexmesh_proto::roles::skill(dir, want).is_none() {
+                        return Err(bad(format!(
+                            "no skill '{want}'. This hub has: {}",
+                            nexmesh_proto::roles::builtin_skill_names().join(", ")
+                        )));
+                    }
+                }
+            }
+            // WHAT WAS RENDERED is what gets recorded. Applying a
+            // template without naming any skills renders the template's own
+            // -- so that is the selection, not an empty one. Recording
+            // nothing here showed a seat carrying three sections and
+            // reporting none, which is the sort of disagreement that makes
+            // a checkbox untrustworthy.
+            let effective = chosen
+                .clone()
+                .unwrap_or_else(|| crate::skills::effective_defaults(&db, &t.skills, &session_id));
+            Some((nexmesh_proto::roles::render(&t, Some(&effective), dir), effective))
+        }
+    };
+    let (rendered, effective_skills) = match from_template {
+        Some((text, skills)) => (Some(text), Some(skills)),
+        None => (None, None),
+    };
+    let (prompt, prompt_changed) = prompt_field(
+        "system prompt",
+        rendered.or(req.system_prompt),
+        had_prompt.clone(),
+    )?;
+    let (instr, instr_changed) =
+        prompt_field("instruction", req.instructions, had_instr.clone())?;
+    let mode = mode.unwrap_or_else(|| had_mode.clone());
+    // WHAT IT WAS BUILT FROM, kept beside the text.
+    //
+    // A prompt written by hand keeps no template: once somebody has edited
+    // the words, re-rendering from a template would throw their edit away,
+    // so the link is dropped and the skills stop being editable until a
+    // template is applied again. That is the honest behaviour -- the
+    // alternative is a checkbox that silently discards an operator's
+    // writing.
+    // `system_prompt: ""` is how a prompt is cleared, and it is a hand
+    // edit like any other: both land here.
+    let (store_template, store_skills) = if prompt_by_hand {
+        (None, None)
+    } else if let Some(t) = &template {
+        let list = effective_skills.clone().unwrap_or_default();
+        (Some(t.clone()), Some(serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())))
+    } else {
+        (had_template.clone(), Some(serde_json::to_string(&had_skills).unwrap_or_default()))
+    };
+    db.execute(
+        "UPDATE slots SET system_prompt = ?, system_prompt_mode = ?, instructions = ?,
+                          prompt_template = ?, prompt_skills = ?
+          WHERE id = ?",
+        params![prompt, mode, instr, store_template, store_skills, id],
+    )
+    .map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'seat_prompt',?)",
+        params![
+            now_ms(),
+            json!({ "slot": id, "system_prompt_bytes": prompt.as_deref().map(str::len),
+                    "system_prompt_mode": mode,
+                    "instruction_bytes": instr.as_deref().map(str::len) })
+            .to_string()
+        ],
+    )
+    .ok();
+    // The text itself is not in the audit line or the log: a seat's system
+    // prompt can hold anything the operator wants to tell it privately, and
+    // a byte count says what changed without repeating it everywhere.
+    tracing::info!(slot = %id, mode = %mode,
+                   prompt = prompt.as_deref().map(str::len), instr = instr.as_deref().map(str::len),
+                   "the operator set what this seat tells its agent");
+    // What takes effect WHEN, said plainly, because the two halves differ:
+    // the system prompt needs the next process, the instruction needs the
+    // next occupant, and a running agent gets neither until then.
+    let mut takes_effect = Vec::new();
+    if prompt_changed || (mode != had_mode && prompt.is_some()) {
+        // Said differently for a prompt that is GONE: "applies to the next
+        // agent" reads as though something was added, and clearing one is
+        // the case where an operator most wants to know nothing is left.
+        takes_effect.push(if prompt.is_some() {
+            "the system prompt applies to the next agent started in this seat"
+        } else {
+            "this seat's own system prompt is gone; the next agent starts with \
+             only what its CLI says"
+        });
+    }
+    if instr_changed {
+        takes_effect.push(if instr.is_some() {
+            "the instruction is given to the next agent that fills this seat"
+        } else {
+            "nothing is said to a new agent on arrival any more"
+        });
+    }
+    // The same shape the GET returns, so a surface that just changed
+    // something can redraw from the answer instead of asking again -- and so
+    // `nexmesh seat-prompt --no-skill x` can print the resulting selection
+    // rather than only the prose.
+    let now_template = store_template.clone();
+    let now_skills: Vec<String> = store_skills
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let dir = st.prompts_dir();
+    let suggests: Vec<String> = now_template
+        .as_deref()
+        .and_then(|t| nexmesh_proto::roles::find(dir, t))
+        .map(|t| t.skills)
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "slot_id": id,
+        "system_prompt": prompt,
+        "system_prompt_mode": mode,
+        "instructions": instr,
+        "template": now_template,
+        "skills": now_skills,
+        "template_skills": suggests,
+        "skills_available": nexmesh_proto::roles::all_skill_names(dir),
+        "takes_effect": takes_effect,
+    })))
+}
+
+/// Read back what a seat tells its agent, text and all.
+///
+/// Separate from the seat's status, which carries only whether these are set
+/// and how long they are: a status poll should not drag 64 KiB of prompt
+/// through every surface four times a second.
+pub async fn slot_prompt(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let dir = st.prompts_dir();
+    let db = st.db.lock().unwrap();
+    let row: Option<(Option<String>, String, Option<String>, Option<String>, Option<String>)> =
+        db.query_row(
+            "SELECT system_prompt, COALESCE(system_prompt_mode, 'append'), instructions,
+                    prompt_template, prompt_skills
+               FROM slots WHERE id = ?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(bad)?;
+    let Some((prompt, mode, instr, template, skills)) = row else {
+        return Err(bad(format!("no seat '{id}'")));
+    };
+    let chosen: Vec<String> = skills
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    // Enough for a surface to draw a checkbox per skill without asking
+    // anything else: which are on, which this role suggests, and everything
+    // this hub has to offer. A seat with no template has no skills to
+    // select -- `template` is null and the list is empty, which is what a
+    // UI should show as "apply a template first".
+    let suggests: Vec<String> = template
+        .as_deref()
+        .and_then(|t| nexmesh_proto::roles::find(dir, t))
+        .map(|t| t.skills)
+        .unwrap_or_default();
+    let available: Vec<String> = nexmesh_proto::roles::all_skill_names(dir);
+    Ok(Json(json!({
+        "slot_id": id,
+        "system_prompt": prompt,
+        "system_prompt_mode": mode,
+        "instructions": instr,
+        "template": template,
+        "skills": chosen,
+        "template_skills": suggests,
+        "skills_available": available,
+    })))
+}
+
+/// Turn a standing auto-approval on or off for one seat.
+pub async fn slot_auto_approve(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AutoApproveRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    crate::approvals::set_auto(&db, "agent", &id, req.on).map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'auto_approve',?)",
+        params![now_ms(), json!({ "slot": id, "on": req.on }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "slot_id": id, "auto_approve": req.on })))
+}
+
+/// ...or a whole team.
+pub async fn session_auto_approve(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AutoApproveRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let sid = session_ref_to_id(&db, &id);
+    crate::approvals::set_auto(&db, "session", &sid, req.on).map_err(bad)?;
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'auto_approve',?)",
+        params![now_ms(), json!({ "session": sid, "on": req.on }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "session_id": sid, "auto_approve": req.on })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct GuestRequest {
+    /// The seat, by slot id or by name.
+    pub agent: String,
+    /// Take it out again instead of putting it in.
+    #[serde(default)]
+    pub leave: bool,
+}
+
+/// Put a seat in this team as well as its own, or take it out again.
+///
+/// The operator's door. A seat serving several teams is a hole in the session
+/// boundary, and opening one needs reach over both teams -- so by a seat it
+/// is a superorchestrator's tool, and here it is the person running the
+/// fleet, who outranks both.
+pub async fn session_guest(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<GuestRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let sid = session_ref_to_id(&db, &id);
+    // By slot id, or by name anywhere in the fleet -- the operator is not
+    // confined to one team, and the seat being invited is by definition
+    // somewhere else.
+    let slot: String = db
+        .query_row(
+            "SELECT id FROM slots WHERE id = ?1 OR display_name = ?1 LIMIT 1",
+            [req.agent.trim()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no seat '{}'", req.agent)))?;
+    let said = if req.leave {
+        crate::guests::leave(&db, &slot, &sid, "operator").map_err(bad)?
+    } else {
+        crate::guests::join(&db, &slot, &sid, "operator").map_err(bad)?
+    };
+    Ok(Json(json!({ "ok": true, "said": said, "slot_id": slot, "session_id": sid })))
+}
+
+/// Which teams a seat answers in, and which guests a team has.
+pub async fn session_guests(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    let db = st.db.lock().unwrap();
+    let sid = session_ref_to_id(&db, &id);
+    Json(json!({ "session_id": sid, "guests": crate::guests::guests_of(&db, &sid) }))
+}
+
+/// Set what a seat is allowed to do to the fleet.
+///
+/// This is the operator's door -- the dashboard and `/authority` in the chat
+/// -- so it is not itself subject to the election rules in
+/// `proto::authority`: the person running the fleet outranks every level in
+/// it. A seat electing another seat goes through the `elect` TOOL, which does
+/// apply them.
+///
+/// `role` is next door and is a different thing entirely: that is the seat's
+/// JOB and confers nothing. This is the authority.
+pub async fn set_authority(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AuthorityRequest>,
+) -> ApiResult {
+    use nexmesh_proto::authority::Authority;
+    // Refused rather than parsed loosely: `parse` fails closed to `agent`,
+    // which is right when READING a column and wrong when a person is
+    // trying to grant something.
+    let want = match req.authority.trim().to_lowercase().as_str() {
+        // Below `agent`: a seat that reads and reports and cannot steer. See
+        // `Authority::Observer`.
+        "observer" | "watcher" | "readonly" | "read-only" => Authority::Observer,
+        "agent" => Authority::Agent,
+        "orchestrator" | "orch" => Authority::Orchestrator,
+        "super" | "superorchestrator" | "super-orchestrator" | "superorch" => Authority::Super,
+        other => {
+            return Err(bad(format!(
+                "'{other}' is not an authority. Use 'observer', 'agent', \
+                 'orchestrator' or 'super'."
+            )))
+        }
+    };
+    let db = st.db.lock().unwrap();
+    let was: Option<String> = db
+        .query_row("SELECT authority FROM slots WHERE id = ?", [&id], |r| r.get(0))
+        .optional()
+        .map_err(bad)?
+        .ok_or_else(|| bad(format!("no seat '{id}'")))?;
+    db.execute(
+        "UPDATE slots SET authority = ? WHERE id = ?",
+        params![want.as_str(), id],
+    )
+    .map_err(bad)?;
+    // Audited, always. A change in who can command the fleet is the one
+    // thing a log has to be able to answer afterwards.
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,?,NULL,'authority_changed',?)",
+        params![now_ms(), "operator",
+                json!({ "slot": id, "from": was, "to": want.as_str() }).to_string()],
+    )
+    .ok();
+    tracing::info!(slot = %id, from = ?was, to = %want.as_str(), "authority changed by operator");
+    // The grant is in force at once, but the seat's MCP client fixed its tool
+    // list when the CLI started, so the model is not yet SHOWN the fleet
+    // tools -- and a tool a model was not shown is one it cannot call. Say
+    // so here, or granting authority looks like it did nothing.
+    let note = if want.is_orchestrating() && was.as_deref() != Some(want.as_str()) {
+        Some(
+            "In force from the next call. Restart this seat for its CLI to be offered \
+             the fleet tools: an MCP client asks for the tool list once, at startup.",
+        )
+    } else {
+        None
+    };
+    Ok(Json(json!({ "slot_id": id, "authority": want.as_str(), "was": was, "note": note })))
 }
 
 /// Rename a seat.
@@ -1321,6 +2478,13 @@ pub struct SpawnRequest {
     /// not become interactive because something restarted it.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Start one anyway, with something already in the seat.
+    ///
+    /// Only for the case where the hub's record is wrong -- a process it
+    /// believes is alive and is not. It is not a way to run two agents in
+    /// one seat: see the guard in `spawn_slot` for what that costs.
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub async fn spawn_slot(
@@ -1329,6 +2493,41 @@ pub async fn spawn_slot(
     body: Option<Json<SpawnRequest>>,
 ) -> ApiResult {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    // ONE AGENT PER SEAT.
+    //
+    // Spawning into an occupied seat gives two processes the same identity
+    // and -- because a seat's conversation is resumed by id -- the SAME
+    // CONVERSATION. Two CLIs then append to one transcript file. That is
+    // what happened on the live fleet: recovery brought a seat back, the
+    // operator spawned it again a few seconds later because the first one
+    // could not be attached to, and two claudes spent four minutes writing
+    // the same 123MB conversation.
+    //
+    // So it is refused, and the message says what to do instead. `force`
+    // exists for the one honest case: the hub believes something is alive
+    // that is not.
+    if !req.force {
+        let live: Option<(String, Option<i64>)> = {
+            let db = st.db.lock().unwrap();
+            db.query_row(
+                "SELECT id, pid FROM agents
+                  WHERE slot_id = ? AND exited_at_ms IS NULL
+                  ORDER BY started_at_ms DESC LIMIT 1",
+                [&slot_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(bad)?
+        };
+        if let Some((agent, pid)) = live {
+            return Err(bad(format!(
+                "that seat already has {agent}{} in it. Two agents in one seat resume the \
+                 same conversation and write over each other -- attach to it instead, or \
+                 stop it first. Pass force=true only if you know the hub's record is stale.",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            )));
+        }
+    }
     if let Some(cli) = req.cli.as_deref().filter(|c| !c.trim().is_empty()) {
         let known: bool = {
             let db = st.db.lock().unwrap();
@@ -1666,6 +2865,198 @@ pub async fn set_group(
     Ok(Json(json!({
         "ok": true, "group": req.group.trim().to_lowercase(), "slot": slot,
         "member": req.member
+    })))
+}
+
+/// WHAT THE AGENT JUST SAID, out of the screen it also draws itself on.
+///
+/// "Read that back to me" is a question about one reply, and a terminal is
+/// not a list of replies: it is a screen, with the reply somewhere between
+/// an input box, a status row, a spinner and a list of files the agent read.
+/// The dashboard used to read all of it, line by line, with a full stop
+/// inserted between every line -- so a wrapped paragraph came out as a dozen
+/// one-word sentences and then recited the input box.
+///
+/// The screen is in the BROWSER (the terminal is drawn there), and the rule
+/// for what is furniture is in `nexmesh_proto::screenread`, shared with the
+/// console. So the page sends the screen and gets the reply back, rather
+/// than there being two implementations of the same judgement -- one of
+/// which would quietly rot.
+#[derive(Deserialize)]
+pub struct ScreenRead {
+    /// The terminal as a person sees it: lines, no escape sequences.
+    pub screen: String,
+    /// The descriptor id of whatever is drawing it. Unknown is fine: the
+    /// generic rules still take the boxes and the status rows out.
+    #[serde(default)]
+    pub cli: Option<String>,
+}
+
+pub async fn screen_reply(Json(req): Json<ScreenRead>) -> ApiResult {
+    let cli = req.cli.unwrap_or_default();
+    let text = nexmesh_proto::screenread::last_reply(&req.screen, &cli);
+    Ok(Json(json!({
+        "text": text,
+        // Said plainly, so a caller can offer the whole screen instead
+        // rather than going silent on a screen with nothing on it.
+        "found": !text.is_empty(),
+    })))
+}
+
+/// WHAT THE FLEET REMEMBERS, ALL OF IT.
+///
+/// The dashboard only ever saw memory through a session's snapshot, which
+/// shows what that team can see -- so on a fleet whose seats had only ever
+/// written session-scoped notes the page looked as though session scope was
+/// the only one there was. This answers the operator's question instead:
+/// every scope, labelled, nothing shadowed, with the counts so an empty
+/// scope says it is empty.
+#[derive(Deserialize)]
+pub struct MemoryQuery {
+    /// global, session, group, agent -- or absent for all of them.
+    pub scope: Option<String>,
+    /// One session id, group name or slot id.
+    #[serde(alias = "ref")]
+    pub reference: Option<String>,
+    /// Matches a key or a value, case-insensitively.
+    #[serde(alias = "search")]
+    pub q: Option<String>,
+    pub limit: Option<i64>,
+}
+
+pub async fn list_memory(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryQuery>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let rows = crate::memory::all(
+        &db,
+        q.scope.as_deref(),
+        q.reference.as_deref(),
+        q.q.as_deref(),
+        q.limit.unwrap_or(500),
+    )
+    .map_err(|e| bad(format!("{e:#}")))?;
+    let counts = crate::memory::counts(&db).unwrap_or_default();
+    Ok(Json(json!({
+        "memory": rows.iter().map(|r| json!({
+            "scope": r.scope, "scope_ref": r.scope_ref, "scope_label": r.scope_label,
+            "key": r.key, "category": r.category, "value": r.value, "who": r.author,
+            "revision": r.revision, "created_at_ms": r.created_at_ms,
+            "at_ms": r.updated_at_ms, "expires_at_ms": r.expires_at_ms,
+            "revisions_kept": r.revisions_kept,
+        })).collect::<Vec<Value>>(),
+        "counts": counts.iter().map(|(s, n)| json!({ "scope": s, "n": n }))
+                        .collect::<Vec<Value>>(),
+        "categories": crate::memory::CATEGORIES,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MemoryWrite {
+    /// global, session, group or agent. A session or agent scope needs its
+    /// reference; global needs none.
+    pub scope: String,
+    #[serde(alias = "ref")]
+    pub reference: Option<String>,
+    pub key: String,
+    pub value: Option<String>,
+    pub category: Option<String>,
+    /// Seconds. Absent or zero means it does not expire.
+    pub ttl_seconds: Option<i64>,
+    /// True to remove it instead of writing it.
+    #[serde(default)]
+    pub forget: bool,
+}
+
+/// The operator writing, or removing, a memory by hand.
+///
+/// Global memory is capability-gated for AGENTS -- one seat must not be able
+/// to give itself fleet-wide reach -- and the person who grants that
+/// capability is the person calling this. Attributed to `operator`, so a
+/// convention somebody typed is never mistaken for something a model
+/// concluded.
+pub async fn write_memory(
+    State(st): State<AppState>,
+    Json(req): Json<MemoryWrite>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let scope = match req.scope.trim() {
+        "global" => crate::memory::Scope::Global,
+        "session" => {
+            let r = req
+                .reference
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| bad("a session memory needs the session it belongs to"))?;
+            crate::memory::Scope::Session(session_ref_to_id(&db, r))
+        }
+        "group" => crate::memory::Scope::Group(
+            req.reference
+                .as_deref()
+                .map(|g| g.trim().to_lowercase())
+                .filter(|g| !g.is_empty())
+                .ok_or_else(|| bad("a group memory needs the group's name"))?,
+        ),
+        "agent" | "private" => crate::memory::Scope::Agent(
+            req.reference
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| bad("an agent memory needs the seat it belongs to"))?
+                .to_string(),
+        ),
+        other => return Err(bad(format!(
+            "unknown scope '{other}'; use agent, group, session or global"
+        ))),
+    };
+    let said = if req.forget {
+        crate::memory::operator_forget(&db, &scope, &req.key)
+            .map_err(|e| bad(format!("{e:#}")))?
+    } else {
+        crate::memory::operator_store(
+            &db,
+            &scope,
+            &req.key,
+            req.value.as_deref().unwrap_or(""),
+            req.category.as_deref().unwrap_or("context"),
+            req.ttl_seconds,
+        )
+        .map_err(|e| bad(format!("{e:#}")))?
+    };
+    Ok(Json(json!({ "ok": true, "said": said })))
+}
+
+/// What a key used to say, newest first. One key's argument history is the
+/// part a flat table threw away.
+#[derive(Deserialize)]
+pub struct MemoryHistoryQuery {
+    pub scope: String,
+    #[serde(alias = "ref")]
+    pub reference: Option<String>,
+    pub key: String,
+}
+
+pub async fn memory_history(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryHistoryQuery>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let reference = q.reference.clone().unwrap_or_default();
+    let scope = match q.scope.trim() {
+        "global" => crate::memory::Scope::Global,
+        "session" => crate::memory::Scope::Session(session_ref_to_id(&db, &reference)),
+        "group" => crate::memory::Scope::Group(reference.trim().to_lowercase()),
+        "agent" | "private" => crate::memory::Scope::Agent(reference.trim().to_string()),
+        other => return Err(bad(format!("unknown scope '{other}'"))),
+    };
+    let rows = crate::memory::history(&db, &scope, &q.key).map_err(|e| bad(format!("{e:#}")))?;
+    Ok(Json(json!({
+        "key": q.key,
+        "history": rows.iter().map(|(rev, value, who, at)| json!({
+            "revision": rev, "value": value, "who": who, "at_ms": at,
+        })).collect::<Vec<Value>>(),
     })))
 }
 
@@ -2265,7 +3656,11 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
         "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
                 s.participant_kind, COALESCE(s.cli_id, '-'), s.task_state,
                 s.summary, COALESCE(a.provenance, '-'), {word},
-                COALESCE(n.name, CASE WHEN a.provenance='external' THEN 'external' ELSE '-' END),
+                -- An external participant has no node row, but it may have
+                -- said where it runs. Naming the host beats the bare word
+                -- external, which reads as nowhere.
+                COALESCE(n.name, a.host_hint,
+                         CASE WHEN a.provenance='external' THEN 'external' ELSE '-' END),
                 COALESCE(a.input_tokens,0), COALESCE(a.output_tokens,0), s.paused,
                 a.pid, COALESCE(a.io_kind, CASE WHEN s.terminal_via IS NOT NULL
                                                 THEN 'tmux' END),
@@ -2281,14 +3676,40 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                     CASE WHEN a.io_kind IS NULL THEN
                         (SELECT v.id FROM agents v
                           WHERE v.id = s.terminal_via AND v.exited_at_ms IS NULL)
-                    END, a.id)
+                    END, a.id),
+                -- What this seat may do TO THE FLEET, which the dashboard
+                -- shows and sets. Not `role` above: that is its job.
+                COALESCE(s.authority, 'agent'), COALESCE(s.supervisor, 0),
+                COALESCE(s.autorespawn, 1), COALESCE(s.auto_approve, 0),
+                -- A guest: a seat whose home is another team and that also
+                -- answers here. Flagged rather than hidden, because what it
+                -- is told in this room it knows in the others.
+                s.session_id <> ?1, COALESCE(hs.name, s.session_id),
+                -- What this seat tells its agent, as sizes rather than text:
+                -- a status poll should not carry 64 KiB of prompt. The text
+                -- itself is at /v1/slots/<id>/prompt.
+                LENGTH(COALESCE(s.system_prompt, '')),
+                COALESCE(s.system_prompt_mode, 'append'),
+                LENGTH(COALESCE(s.instructions, '')),
+                -- HOW FULL this seat's context is now, and the window it
+                -- has to fit in. Not the token columns above, which are
+                -- what it has SPENT: a seat can spend twelve windows and be
+                -- a third full, and it is this pair that says whether it is
+                -- about to lose the middle of its own conversation.
+                a.context_used_tokens, a.context_limit_tokens,
+                -- What it is set to do about that, and about repeating
+                -- itself, with NULL meaning it follows its team.
+                s.compact_at_pct, s.loop_guard_repeats,
+                a.loop_period, a.loop_repeats
          FROM slots s
+         LEFT JOIN sessions hs ON hs.id = s.session_id
          LEFT JOIN agents a ON a.id = (
              SELECT id FROM agents WHERE slot_id = s.id
              ORDER BY (exited_at_ms IS NULL) DESC, (io_kind IS NOT NULL) DESC, started_at_ms DESC LIMIT 1)
          LEFT JOIN nodes n ON n.id = a.node_id
-         WHERE s.session_id = ? ORDER BY 2",
+         WHERE {here} ORDER BY 2",
         word = crate::seat::agent_word("s", "a"),
+        here = crate::guests::in_session("s", "?1"),
     )) else {
         return Json(json!({ "agents": [] }));
     };
@@ -2326,6 +3747,33 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 "cwd": r.get::<_, Option<String>>(20)?,
                 "tmux_target": r.get::<_, Option<String>>(21)?,
                 "attach_agent_id": r.get::<_, Option<String>>(22)?,
+                // Authority, and the label to show for it. `role` is the
+                // job; this is what the seat is allowed to do.
+                "authority": r.get::<_, String>(23)?,
+                "authority_label": nexmesh_proto::authority::Authority::parse(
+                    &r.get::<_, String>(23)?).label(),
+                "supervisor": r.get::<_, i64>(24)? == 1,
+                // The two per-seat switches the operator sets from any
+                // surface: whether it comes back by itself, and whether its
+                // permission prompts are answered without asking.
+                "autorespawn": r.get::<_, i64>(25)? == 1,
+                "auto_approve": r.get::<_, i64>(26)? == 1,
+                "visiting": r.get::<_, bool>(27)?,
+                "home": r.get::<_, String>(28)?,
+                // Set-or-not and how big, so a surface can show the badge and
+                // only fetch the text when somebody opens the editor.
+                "system_prompt_bytes": r.get::<_, i64>(29)?,
+                "system_prompt_mode": r.get::<_, String>(30)?,
+                "instruction_bytes": r.get::<_, i64>(31)?,
+                // How full, and what is set about it. A surface shows the
+                // percentage; the threshold is what it needs to offer to
+                // change it.
+                "context_used_tokens": r.get::<_, Option<i64>>(32)?,
+                "context_limit_tokens": r.get::<_, Option<i64>>(33)?,
+                "compact_at_pct": r.get::<_, Option<i64>>(34)?,
+                "loop_guard_repeats": r.get::<_, Option<i64>>(35)?,
+                "loop_period": r.get::<_, Option<i64>>(36)?,
+                "loop_repeats": r.get::<_, Option<i64>>(37)?,
             }))
         })
         .and_then(|m| m.collect())
@@ -2444,9 +3892,10 @@ pub async fn resolve_agent(
     // screen a second earlier.
     let session_id = session_ref_to_id(&st.db.lock().unwrap(), &session_ref);
     let db = st.db.lock().unwrap();
-    let found: Option<(String, String)> = db
+    #[allow(clippy::type_complexity)]
+    let found: Option<(String, String, String, Option<String>)> = db
         .query_row(
-            "SELECT a.id, COALESCE(s.display_name, s.role, s.id)
+            "SELECT a.id, COALESCE(s.display_name, s.role, s.id), s.id, s.cli_id
              FROM slots s JOIN agents a ON a.slot_id = s.id
              WHERE s.session_id = ?1
                AND (s.id = ?2 OR a.id = ?2
@@ -2454,14 +3903,14 @@ pub async fn resolve_agent(
                     OR LOWER(COALESCE(s.role,'')) = LOWER(?2))
              ORDER BY (a.exited_at_ms IS NULL) DESC, a.started_at_ms DESC LIMIT 1",
             params![session_id, who],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(bad)?;
     // "No agent matching" is true of a seat nobody is sitting in, and
     // unhelpful: the seat is in every listing, so the operator is left
     // doubting the name they just read. Say which of the two it is.
-    let (agent_id, name) = match found {
+    let (agent_id, name, slot_id, cli_id) = match found {
         Some(v) => v,
         None => {
             let seat: Option<(String, String)> = db
@@ -2536,6 +3985,35 @@ pub async fn resolve_agent(
         None
     };
 
+    // THE TERMINAL THAT WENT AWAY.
+    //
+    // The link above counts only a terminal that is still running. When a
+    // node restart kills the adoption -- the node owned that tmux client,
+    // the CLI in the pane did not -- the CLI is still sitting there with its
+    // conversation, and `attach` dead-ended: "its CLI was started by hand,
+    // so only its own shim reaches it", advising `nexmesh seat`, which would
+    // start a SECOND CLI on that conversation. Spawning was refused too,
+    // rightly, because the seat was occupied. There was no way out but to
+    // know a `term-*` seat existed and start it by hand.
+    //
+    // So the seat of that dead terminal is reported, and a viewer can adopt
+    // the pane again, which is all that was missing.
+    let dead_via: Option<(String, String)> = if io_kind.is_none() && via.is_none() {
+        db.query_row(
+            "SELECT vs.id, COALESCE(vs.display_name, vs.role, vs.id)
+               FROM slots s
+               JOIN agents v ON v.id = s.terminal_via
+               JOIN slots vs ON vs.id = v.slot_id
+              WHERE s.id = (SELECT slot_id FROM agents WHERE id = ?1)",
+            [&agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(bad)?
+    } else {
+        None
+    };
+
     match via {
         Some((via_id, via_name, via_io)) => Ok(Json(json!({
             // The agent to attach to is the terminal's; the NAME stays the
@@ -2545,6 +4023,11 @@ pub async fn resolve_agent(
             "host": host, "io_kind": via_io,
             // Said plainly, so a viewer can tell you whose screen this is.
             "via": via_name, "seat_agent_id": agent_id,
+            // WHAT IS DRAWING THAT SCREEN. The CLI of the SEAT, not of the
+            // terminal it sits in: a viewer asked to read the last reply
+            // aloud has to know whose furniture to leave out, and the
+            // furniture belongs to claude, not to tmux.
+            "slot_id": slot_id, "cli_id": cli_id,
         }))),
         None => Ok(Json(json!({
             "agent_id": agent_id, "name": name,
@@ -2552,6 +4035,13 @@ pub async fn resolve_agent(
             // Which machine, and what kind of terminal -- so a viewer can say
             // whose screen you are looking at before it draws a byte of it.
             "host": host, "io_kind": io_kind,
+            // The seat of a terminal this one WAS reachable through, whose
+            // own process has gone. Adopting that pane again is what gives
+            // this agent a keyboard back.
+            "terminal_slot": dead_via.as_ref().map(|(s, _)| s.clone()),
+            "terminal_name": dead_via.as_ref().map(|(_, n)| n.clone()),
+            // See above: whose furniture is on this screen.
+            "slot_id": slot_id, "cli_id": cli_id,
         }))),
     }
 }
@@ -2895,6 +4385,327 @@ async fn run_command(
                 format!("{name} no longer supervises the fleet")
             })
         }
+        // The operator's own door, so the election rules in
+        // `proto::authority` do not apply: the person running the fleet
+        // outranks every level in them. A SEAT electing another seat goes
+        // through the `elect` tool, which does apply them.
+        Cmd::Authority { who, level } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let Json(v) = set_authority(
+                State(st.clone()),
+                Path(slot),
+                Json(AuthorityRequest { authority: level.clone() }),
+            )
+            .await?;
+            let now = v["authority"].as_str().unwrap_or("agent");
+            let was = v["was"].as_str().unwrap_or("agent");
+            if now == was {
+                return Ok(format!(
+                    "{name} is already {}",
+                    nexmesh_proto::authority::Authority::parse(now).label()
+                ));
+            }
+            Ok(format!(
+                "{name} is now {} (was {}). In force immediately -- the hub checks a \
+                 seat's authority on every call -- though its CLI may not list the \
+                 fleet tools until it reconnects.",
+                nexmesh_proto::authority::Authority::parse(now).label(),
+                nexmesh_proto::authority::Authority::parse(was).label()
+            ))
+        }
+        Cmd::Guest { who, join } => {
+            // Named fleet-wide, not within this room: the seat being invited
+            // is by definition somewhere else, so `seat_by_ref` -- which
+            // looks in this session -- would never find it.
+            let db = st.db.lock().unwrap();
+            let slot: String = db
+                .query_row(
+                    "SELECT id FROM slots WHERE id = ?1 OR display_name = ?1 LIMIT 1",
+                    [who.trim()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(bad)?
+                .ok_or_else(|| bad(format!("no seat '{who}' anywhere in the fleet")))?;
+            if *join {
+                crate::guests::join(&db, &slot, session_id, "operator").map_err(bad)
+            } else {
+                crate::guests::leave(&db, &slot, session_id, "operator").map_err(bad)
+            }
+        }
+        // Ask a seat to fold what it no longer needs.
+        //
+        // A message rather than a keystroke, so it works on every CLI
+        // whatever its compaction command is -- and so the judgement stays
+        // with the only thing that can make it: the agent knows which part
+        // of its own context the step it is on has finished with, and the
+        // hub does not.
+        Cmd::Fold { who } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let found: Option<String> = {
+                let db = st.db.lock().unwrap();
+                db.query_row(
+                    "SELECT a.id FROM agents a
+                      WHERE a.slot_id = ? AND a.exited_at_ms IS NULL
+                      ORDER BY a.started_at_ms DESC LIMIT 1",
+                    [&slot],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(bad)?
+            };
+            let Some(agent_id) = found else {
+                return Ok(format!("{name} has nothing running in it to ask."));
+            };
+            let folds = {
+                let db = st.db.lock().unwrap();
+                crate::folds::folded_since(&db, &slot, 0).unwrap_or(0)
+            };
+            crate::watchdog::nudge(
+                st,
+                crate::watchdog::Nudge {
+                    agent_id,
+                    slot_id: slot.clone(),
+                    session_id: session_id.to_string(),
+                    name: name.clone(),
+                    // Not framed as an emergency: the operator asked, and
+                    // nothing is waiting on the answer.
+                    urgent: false,
+                    folds,
+                },
+            )
+            .await;
+            Ok(format!(
+                "Asked {name} to fold what it no longer needs. It decides what that is \u{2014} \
+                 the summaries will appear in the memory tab, and the detail stays \
+                 reachable with unfold_context."
+            ))
+        }
+
+        Cmd::Compact { who } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            // The agent currently in that seat, and the node holding it. A
+            // seat with nothing in it has no context to compact.
+            let found: Option<(String, Option<String>)> = {
+                let db = st.db.lock().unwrap();
+                db.query_row(
+                    "SELECT a.id, a.node_id FROM agents a
+                      WHERE a.slot_id = ? AND a.exited_at_ms IS NULL
+                      ORDER BY a.started_at_ms DESC LIMIT 1",
+                    [&slot],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(bad)?
+            };
+            let Some((agent_id, node)) = found else {
+                return Ok(format!("{name} has nothing running in it to compact."));
+            };
+            let Some(node) = node else {
+                return Ok(format!(
+                    "{name} is not on a node this hub can reach, so nothing can be typed at it."
+                ));
+            };
+            st.send_to_node(
+                &node,
+                &nexmesh_proto::HubToNode::Compact { agent_id, by: "the operator".into() },
+            )
+            .await
+            .map_err(bad)?;
+            // What was typed, and whether it was refused, comes back as a
+            // note in the chat from the node -- it is the only thing that
+            // can see the screen.
+            Ok(format!(
+                "Asked {name} to compact its context. Its CLI's own compaction command is \
+                 typed at it, and the result appears here \u{2014} including a refusal, if its \
+                 terminal is waiting for an answer."
+            ))
+        }
+        // How full a seat may get before the hub compacts it, and how many
+        // times it may repeat itself before the hub stops it. Both are the
+        // same shape -- per seat, per team, or inherited -- so they are
+        // written the same way.
+        Cmd::CompactAt { who, pct } => {
+            let said = match pct {
+                None => "follows its team's setting, then the fleet's".to_string(),
+                Some(0) => "is never compacted automatically".to_string(),
+                Some(n) => format!("is compacted once its context passes {n}% of its window"),
+            };
+            let scope = set_policy(st, session_id, who, "compact_at_pct", *pct)?;
+            Ok(format!("{scope} {said}."))
+        }
+        Cmd::LoopGuard { who, repeats } => {
+            let said = match repeats {
+                None => "follows its team's setting, then the fleet's".to_string(),
+                Some(0) => "is never stopped for repeating itself".to_string(),
+                Some(n) => format!(
+                    "is interrupted and paused after repeating the same turn {n} times in a row, \
+                     with its conversation left intact and a note to you"
+                ),
+            };
+            let scope = set_policy(st, session_id, who, "loop_guard_repeats", *repeats)?;
+            Ok(format!("{scope} {said}."))
+        }
+        Cmd::Rules { text } => {
+            // The same handler the operator's own endpoint uses, so what is
+            // said in the chat and what is said over HTTP cannot drift --
+            // including who is told about the change.
+            match text {
+                None => {
+                    let db = st.db.lock().unwrap();
+                    let have: Option<String> = db
+                        .query_row(
+                            "SELECT instructions FROM sessions WHERE id = ?",
+                            [session_id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(bad)?
+                        .flatten();
+                    Ok(match have.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                        None => "This team has no standing rules. `/rules <text>` sets \
+                                 them, and everybody here is told."
+                            .to_string(),
+                        Some(t) => format!("This team's rules:\n\n{t}"),
+                    })
+                }
+                Some(t) => {
+                    let said = set_session_instructions(
+                        State(st.clone()),
+                        Path(session_id.to_string()),
+                        Json(SessionRulesRequest { instructions: Some(t.clone()) }),
+                    )
+                    .await?;
+                    Ok(said.0["detail"].as_str().unwrap_or("done").to_string())
+                }
+            }
+        }
+        Cmd::Flood { who, per_min, per_pair } => {
+            let mut said: Vec<String> = Vec::new();
+            let mut scope = String::new();
+            if let Some(v) = per_min {
+                scope = set_policy(st, session_id, who, "msg_rate_per_min", Some(*v))?;
+                said.push(match v {
+                    0 => "sends as much as it likes".to_string(),
+                    n => format!("is refused messages past {n} a minute"),
+                });
+            }
+            if let Some(v) = per_pair {
+                scope = set_policy(st, session_id, who, "msg_pair_limit", Some(*v))?;
+                said.push(match v {
+                    0 => "may talk to one teammate as much as it likes".to_string(),
+                    n => format!(
+                        "is refused messages to any ONE teammate past {n} exchanged in \
+                         ten minutes"
+                    ),
+                });
+            }
+            if said.is_empty() {
+                return Ok("Nothing to set: say a number of messages a minute, a pair \
+                           limit, or `off`."
+                    .to_string());
+            }
+            Ok(format!(
+                "{scope} {}. The refusal goes to the agent and says what to do instead; \
+                 its work is not stopped, only its messages.",
+                said.join(", and ")
+            ))
+        }
+        Cmd::AutoRespawn { who, on } => {
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            {
+                let db = st.db.lock().unwrap();
+                db.execute(
+                    "UPDATE slots SET autorespawn = ? WHERE id = ?",
+                    params![i64::from(*on), slot],
+                )
+                .map_err(bad)?;
+            }
+            Ok(if *on {
+                format!(
+                    "{name} comes back by itself when its process exits. That prepares the \
+                     seat so you can attach to it; it does not reattach your terminal."
+                )
+            } else {
+                format!(
+                    "{name} stays down when its process exits, until you start it again \
+                     (/start {name})."
+                )
+            })
+        }
+        Cmd::AutoApprove { who, on } => {
+            // `session` or `team` means the room this was typed in, which is
+            // the only session a chat line belongs to.
+            if matches!(who.to_lowercase().as_str(), "session" | "team" | "room" | "all") {
+                let db = st.db.lock().unwrap();
+                crate::approvals::set_auto(&db, "session", session_id, *on).map_err(bad)?;
+                return Ok(if *on {
+                    "Every seat in this room will answer its own permission prompts from now \
+                     on, taking the narrowest affirmative on offer -- never an option that \
+                     also stops it asking next time. /autoapprove session off to stop."
+                        .to_string()
+                } else {
+                    "This room's permission prompts come back to you again.".to_string()
+                });
+            }
+            let (slot, name) = seat_by_ref(st, session_id, who)?;
+            let db = st.db.lock().unwrap();
+            crate::approvals::set_auto(&db, "agent", &slot, *on).map_err(bad)?;
+            Ok(if *on {
+                format!(
+                    "{name} will answer its own permission prompts from now on, taking the \
+                     narrowest affirmative on offer -- never an option that also stops it \
+                     asking next time. /autoapprove {name} off to stop."
+                )
+            } else {
+                format!("{name}'s permission prompts come back to you again.")
+            })
+        }
+        Cmd::Decide { who, allow } => {
+            // The oldest first: if two agents are stopped, the one that has
+            // been waiting longest is the one to answer.
+            let want_slot = match who {
+                Some(w) => Some(seat_by_ref(st, session_id, w)?.0),
+                None => None,
+            };
+            let (id, node, agent) = {
+                let db = st.db.lock().unwrap();
+                let rows = crate::approvals::pending(&db, Some(session_id));
+                let found = rows.into_iter().find(|r| match &want_slot {
+                    Some(s) => r["slot_id"].as_str() == Some(s.as_str()),
+                    None => true,
+                });
+                let Some(r) = found else {
+                    return Ok(match who {
+                        Some(w) => format!("{w} is not waiting on a permission prompt."),
+                        None => "Nothing in this room is waiting on a permission prompt."
+                            .to_string(),
+                    });
+                };
+                let id = r["id"].as_str().unwrap_or_default().to_string();
+                let agent = r["agent"].as_str().unwrap_or_default().to_string();
+                let node: Option<String> = db
+                    .query_row("SELECT node_id FROM approvals WHERE id = ?", [&id],
+                               |x| x.get(0))
+                    .optional()
+                    .ok()
+                    .flatten();
+                (id, node, agent)
+            };
+            let (frame, said) = crate::approvals::decide(
+                st, &id, if *allow { "allow" } else { "deny" }, None)
+                .map_err(bad)?;
+            let mut typed = false;
+            if let (Some(frame), Some(node)) = (frame, node) {
+                typed = st.send_to_node(&node, &frame).await.is_ok();
+            }
+            Ok(if typed {
+                said
+            } else {
+                format!("{said} -- but {agent}'s node could not be reached, so nothing \
+                         has been typed at it yet.")
+            })
+        }
         Cmd::Move { who, session } => {
             let (slot, name) = seat_by_ref(st, session_id, who)?;
             let Json(v) = move_slot(
@@ -2931,7 +4742,9 @@ async fn run_command(
             let Json(v) = spawn_slot(
                 State(st.clone()),
                 Path(slot),
-                Some(Json(SpawnRequest { cli: None, mode: mode.clone() })),
+                // Not forced: `/start` on an occupied seat should say so
+                // rather than put a second agent in it.
+                Some(Json(SpawnRequest { cli: None, mode: mode.clone(), force: false })),
             )
             .await?;
             Ok(format!(
@@ -2985,6 +4798,9 @@ async fn run_command(
                 Some(Json(SpawnRequest {
                     cli: None,
                     mode: Some(mode.clone().unwrap_or_else(|| "interactive".into())),
+                    // A seat just created has nothing in it; if it somehow
+                    // does, saying so beats doubling it up.
+                    force: false,
                 })),
             )
             .await?;
@@ -3001,6 +4817,39 @@ async fn run_command(
 ///
 /// The same resolution the chat's `to:` already uses, and the same answer an
 /// operator reads on the dashboard -- a person types "Dev", not "sl-4f1c".
+/// Set one of the three-state seat policies, on a seat or on a whole team.
+///
+/// `column` must exist on both `slots` and `sessions`; NULL there means
+/// "inherit from the next level up", which is what `value: None` writes.
+/// Returns what to call the thing that was set, for the answer.
+fn set_policy(
+    st: &AppState,
+    session_id: &str,
+    who: &str,
+    column: &str,
+    value: Option<i64>,
+) -> std::result::Result<String, (StatusCode, Json<Value>)> {
+    // `session`/`team` means the room this was typed in, which is the only
+    // session a chat line belongs to.
+    if matches!(who.to_lowercase().as_str(), "session" | "team" | "room" | "all") {
+        let db = st.db.lock().unwrap();
+        db.execute(
+            &format!("UPDATE sessions SET {column} = ? WHERE id = ?"),
+            params![value, session_id],
+        )
+        .map_err(bad)?;
+        return Ok("Every seat in this team that has not set its own".to_string());
+    }
+    let (slot, name) = seat_by_ref(st, session_id, who)?;
+    let db = st.db.lock().unwrap();
+    db.execute(
+        &format!("UPDATE slots SET {column} = ? WHERE id = ?"),
+        params![value, slot],
+    )
+    .map_err(bad)?;
+    Ok(name)
+}
+
 fn seat_by_ref(
     st: &AppState,
     session_id: &str,
@@ -3046,10 +4895,24 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Authenticate a participant token and return the session it is scoped to, if
-/// any. A participant token can call team tools for its own slot and nothing
-/// else -- it can never cause a process to be spawned on anyone's machine.
-pub(crate) fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::result::Result<Option<String>, (StatusCode, Json<Value>)> {
+/// What a participant token is, once authenticated.
+pub(crate) struct Participant {
+    /// The one session it may join, or None for any.
+    pub session: Option<String>,
+    /// What a seat taken with it may do. `Agent` unless the token says
+    /// otherwise -- it is read with `Authority::parse`, which fails closed.
+    pub authority: nexmesh_proto::authority::Authority,
+}
+
+/// Authenticate a participant token: which session it is scoped to, and what
+/// a seat taken with it may do.
+///
+/// A participant token can call team tools for its own slot and nothing else
+/// -- it can never cause a process to be spawned on anyone's machine.
+pub(crate) fn auth_participant(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<Participant, (StatusCode, Json<Value>)> {
     let token = bearer(headers).ok_or_else(|| {
         err(
             StatusCode::UNAUTHORIZED,
@@ -3058,16 +4921,24 @@ pub(crate) fn auth_participant(st: &AppState, headers: &HeaderMap) -> std::resul
         )
     })?;
     let db = st.db.lock().unwrap();
-    let row: Option<Option<String>> = db
+    let row: Option<(Option<String>, Option<String>)> = db
         .query_row(
-            "SELECT session_id FROM participant_tokens
+            "SELECT session_id, authority FROM participant_tokens
              WHERE token_sha256 = ? AND revoked_at_ms IS NULL",
             [crate::state::sha256_hex(&token)],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    row.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or revoked participant token"))
+    let (session, authority) = row
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or revoked participant token"))?;
+    Ok(Participant {
+        session,
+        authority: authority
+            .as_deref()
+            .map(nexmesh_proto::authority::Authority::parse)
+            .unwrap_or_default(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -3096,6 +4967,18 @@ pub struct ParticipantJoin {
     /// discovers these at startup and declares them here.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// WHERE THIS RUNS, as it calls itself -- usually its hostname.
+    ///
+    /// An external participant has no node row and no process the hub can
+    /// see, so the fleet could say only that it was not a machine. On this
+    /// fleet that put a service running on a known host under "participants
+    /// with no machine", which is true of what the hub knew and wrong about
+    /// the world: it has a machine, it is just not an agent CLI on a node.
+    ///
+    /// A claim, not a fact: nothing verifies it, exactly as `kind_hint` is
+    /// whatever the participant says it is.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 pub async fn participant_join(
@@ -3103,9 +4986,10 @@ pub async fn participant_join(
     headers: HeaderMap,
     Json(mut req): Json<ParticipantJoin>,
 ) -> ApiResult {
-    let scoped = auth_participant(&st, &headers)?;
+    let who = auth_participant(&st, &headers)?;
+    let scoped = who.session.clone();
     let Some(asked) = req.sessions.take().filter(|v| !v.is_empty()) else {
-        return Ok(Json(join_participant(&st, req, scoped)?));
+        return Ok(Json(join_participant_as(&st, req, scoped, who.authority)?));
     };
 
     // Which sessions. A scoped token gets its own and no more, whatever it
@@ -3141,8 +5025,10 @@ pub async fn participant_join(
             kind_hint: req.kind_hint.clone(),
             workspace: req.workspace.clone(),
             capabilities: req.capabilities.clone(),
+            // The same claim in every room it joins: one process, one host.
+            host: req.host.clone(),
         };
-        match join_participant(&st, one, scoped.clone()) {
+        match join_participant_as(&st, one, scoped.clone(), who.authority) {
             Ok(v) => {
                 if tools.is_none() {
                     tools = v.get("tools").cloned();
@@ -3188,6 +5074,22 @@ pub(crate) fn join_participant(
     st: &AppState,
     req: ParticipantJoin,
     scoped: Option<String>,
+) -> std::result::Result<Value, (StatusCode, Json<Value>)> {
+    join_participant_as(st, req, scoped, Default::default())
+}
+
+/// The same, with WHAT THE SEAT MAY DO carried by the token.
+///
+/// Separate so the ordinary call sites -- and every test -- keep their
+/// shape, while the two doors that authenticate a token can pass on the
+/// restriction it carries. An `observer` token can only ever seat an
+/// observer: the client does not get a say, which is the whole point of
+/// putting it on the token.
+pub(crate) fn join_participant_as(
+    st: &AppState,
+    req: ParticipantJoin,
+    scoped: Option<String>,
+    authority: nexmesh_proto::authority::Authority,
 ) -> std::result::Result<Value, (StatusCode, Json<Value>)> {
     if req.name.trim().is_empty() {
         return Err(bad("name must not be empty"));
@@ -3299,6 +5201,16 @@ pub(crate) fn join_participant(
                 params![caps, req.role, req.role_description, ws_id, id],
             )
             .map_err(bad)?;
+            // A token that has since been restricted takes effect here: the
+            // seat it returns to is brought down to what the token now
+            // allows. Never UP -- an observer token cannot re-promote a seat
+            // somebody demoted.
+            if authority.is_read_only() {
+                let _ = db.execute(
+                    "UPDATE slots SET authority = ? WHERE id = ?",
+                    params![authority.as_str(), id],
+                );
+            }
             tracing::info!(slot_id = %id, name = %req.name,
                 "an external participant returned to its seat");
             id
@@ -3308,10 +5220,11 @@ pub(crate) fn join_participant(
             db.execute(
                 "INSERT INTO slots (id, session_id, workspace_id, cli_id, participant_kind, mode,
                                     display_name, role, role_description, capabilities, status,
-                                    created_at_ms)
-                 VALUES (?,?,?, NULL, 'external', 'headless', ?,?,?,?, 'connected', ?)",
+                                    authority, created_at_ms)
+                 VALUES (?,?,?, NULL, 'external', 'headless', ?,?,?,?, 'connected', ?, ?)",
                 params![
-                    id, session_id, ws_id, req.name, req.role, req.role_description, caps, now
+                    id, session_id, ws_id, req.name, req.role, req.role_description, caps,
+                    authority.as_str(), now
                 ],
             )
             .map_err(bad)?;
@@ -3320,10 +5233,12 @@ pub(crate) fn join_participant(
     };
     let agent_id = format!("ag-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     db.execute(
-        "INSERT INTO agents (id, slot_id, node_id, provenance, status, kind_hint,
+        "INSERT INTO agents (id, slot_id, node_id, provenance, status, kind_hint, host_hint,
                              lease_expires_ms, started_at_ms, last_seen_ms)
-         VALUES (?,?, NULL, 'external', 'running', ?, ?, ?, ?)",
-        params![agent_id, slot_id, req.kind_hint, now + proto::NODE_LEASE_MS as i64, now, now],
+         VALUES (?,?, NULL, 'external', 'running', ?, ?, ?, ?, ?)",
+        params![agent_id, slot_id, req.kind_hint,
+                req.host.as_deref().map(str::trim).filter(|h| !h.is_empty()),
+                now + proto::NODE_LEASE_MS as i64, now, now],
     )
     .map_err(bad)?;
     db.execute(
@@ -3338,7 +5253,9 @@ pub(crate) fn join_participant(
         "slot_id": slot_id,
         "session_id": session_id,
         "heartbeat_ms": proto::HEARTBEAT_INTERVAL_MS,
-        "tools": proto::tools::team_tools(),
+        // Per seat, like every other tool list: an external participant can
+        // hold authority too, and the hub knows its level right here.
+        "tools": proto::tools::team_tools_for(crate::fleet::authority_of(&db, &slot_id)),
     }))
 }
 
@@ -3358,7 +5275,7 @@ pub async fn participant_tool(
     headers: HeaderMap,
     Json(req): Json<ParticipantTool>,
 ) -> ApiResult {
-    let scoped = auth_participant(&st, &headers)?;
+    let scoped = auth_participant(&st, &headers)?.session;
     verify_agent_scope(&st, &req.agent_id, &scoped)?;
     touch_participant(&st, &req.agent_id);
     match crate::nodes::run_tool_async(&st, &req.agent_id, &req.tool, &req.args).await {
@@ -3378,7 +5295,7 @@ pub async fn participant_ack(
     headers: HeaderMap,
     Json(req): Json<ParticipantAck>,
 ) -> ApiResult {
-    let scoped = auth_participant(&st, &headers)?;
+    let scoped = auth_participant(&st, &headers)?.session;
     verify_agent_scope(&st, &req.agent_id, &scoped)?;
     let db = st.db.lock().unwrap();
     tools::ack_messages(&db, &req.agent_id, &req.message_ids).map_err(bad)?;
@@ -3397,7 +5314,7 @@ pub async fn participant_messages(
     headers: HeaderMap,
     Query(q): Query<AgentQuery>,
 ) -> ApiResult {
-    let scoped = auth_participant(&st, &headers)?;
+    let scoped = auth_participant(&st, &headers)?.session;
     verify_agent_scope(&st, &q.agent_id, &scoped)?;
     touch_participant(&st, &q.agent_id);
     let db = st.db.lock().unwrap();
@@ -3421,7 +5338,7 @@ pub async fn participant_heartbeat(
     headers: HeaderMap,
     Json(q): Json<AgentQuery>,
 ) -> ApiResult {
-    let scoped = auth_participant(&st, &headers)?;
+    let scoped = auth_participant(&st, &headers)?.session;
     verify_agent_scope(&st, &q.agent_id, &scoped)?;
     touch_participant(&st, &q.agent_id);
     Ok(Json(json!({ "ok": true })))
@@ -3462,4 +5379,470 @@ pub(crate) fn verify_agent_scope(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod spawn_guard_tests {
+    use super::*;
+    use crate::state::AppState;
+
+    fn seat_with(live: bool) -> AppState {
+        let st = AppState::in_memory().unwrap();
+        {
+            let db = st.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO sessions (id,name,created_at_ms,last_active_ms)
+                 VALUES ('s1','T',1,1)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                 VALUES ('sl-1','s1','Dev','claude',1)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO agents (id,slot_id,provenance,status,pid,started_at_ms,
+                                     last_seen_ms,exited_at_ms)
+                 VALUES ('ag-1','sl-1','managed','running',4242,1,1,?)",
+                rusqlite::params![if live { None } else { Some(2i64) }],
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    /// ONE AGENT PER SEAT.
+    ///
+    /// Spawning into an occupied seat gives two processes the same identity
+    /// and, because a conversation is resumed by id, the same CONVERSATION.
+    /// On the live fleet that put two claudes into one 123MB transcript for
+    /// four minutes: recovery brought the seat back, and the operator -- who
+    /// could not attach to it -- spawned it again.
+    #[tokio::test]
+    async fn spawning_into_an_occupied_seat_is_refused() {
+        let st = seat_with(true);
+        let out = spawn_slot(
+            State(st.clone()),
+            Path("sl-1".to_string()),
+            Some(Json(SpawnRequest { cli: None, mode: None, force: false })),
+        )
+        .await;
+        let err = format!("{:?}", out.err().expect("an occupied seat must refuse"));
+        assert!(err.contains("already has"), "{err}");
+        // The message has to say what to do instead, and name the process,
+        // because "refused" alone sends somebody looking for a bug.
+        assert!(err.contains("pid 4242"), "{err}");
+        assert!(err.contains("attach to it instead"), "{err}");
+    }
+
+    /// And an empty seat is not blocked. The guard must not make a seat
+    /// unstartable because something exited without being tidied up.
+    #[tokio::test]
+    async fn an_empty_seat_is_not_blocked_by_the_guard() {
+        let st = seat_with(false);
+        let out = spawn_slot(
+            State(st.clone()),
+            Path("sl-1".to_string()),
+            Some(Json(SpawnRequest { cli: None, mode: None, force: false })),
+        )
+        .await;
+        // It gets past the guard and fails later for want of a node, which
+        // is a different error -- the point is that it is not the guard's.
+        let err = format!("{:?}", out.err().expect("no node in this fixture"));
+        assert!(!err.contains("already has"), "the guard blocked an empty seat: {err}");
+    }
+}
+
+/// What a seat tells its agent: setting it, clearing it, and the limits.
+#[cfg(test)]
+mod seat_prompt_tests {
+    use super::*;
+    use crate::state::AppState;
+
+    fn seat() -> AppState {
+        let st = AppState::in_memory().unwrap();
+        {
+            let db = st.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO sessions (id,name,created_at_ms,last_active_ms)
+                 VALUES ('s1','T',1,1)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                 VALUES ('sl-1','s1','Dev','claude',1)",
+                [],
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    async fn set(st: &AppState, body: Value) -> Value {
+        set_slot_prompt(
+            State(st.clone()),
+            Path("sl-1".to_string()),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .map(|Json(v)| v)
+        .unwrap_or_else(|(_, Json(v))| v)
+    }
+
+    /// A field left out is left alone. Setting the instruction must not wipe
+    /// the system prompt, which is the whole reason one endpoint carries
+    /// both: an operator who writes today's instruction has not changed who
+    /// the agent is.
+    #[tokio::test]
+    async fn a_field_left_out_is_left_alone() {
+        let st = seat();
+        set(&st, json!({ "system_prompt": "you are the reviewer", "system_prompt_mode": "replace" }))
+            .await;
+        let v = set(&st, json!({ "instructions": "start with crates/node" })).await;
+        assert_eq!(v["system_prompt"], "you are the reviewer");
+        assert_eq!(v["system_prompt_mode"], "replace");
+        assert_eq!(v["instructions"], "start with crates/node");
+    }
+
+    /// And a field present and empty clears it, which is how "stop doing
+    /// that" is the same call rather than a delete verb.
+    #[tokio::test]
+    async fn present_and_empty_clears_it() {
+        let st = seat();
+        set(&st, json!({ "system_prompt": "x", "instructions": "y" })).await;
+        let v = set(&st, json!({ "system_prompt": "" })).await;
+        assert!(v["system_prompt"].is_null(), "{v}");
+        assert_eq!(v["instructions"], "y", "clearing one must not clear the other");
+    }
+
+    /// The mode is only those two words. Anything else is a typo that would
+    /// otherwise be stored and then quietly treated as `append` at spawn.
+    #[tokio::test]
+    async fn only_append_and_replace_are_modes() {
+        let st = seat();
+        let v = set(&st, json!({ "system_prompt_mode": "overwrite" })).await;
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("not a system prompt mode"),
+            "{v}"
+        );
+    }
+
+    /// A prompt goes to the CLI as ONE argv entry, and Linux caps one at
+    /// 128 KiB. Refusing here is a sentence; not refusing is E2BIG inside a
+    /// spawn nobody is watching.
+    #[tokio::test]
+    async fn an_argv_sized_prompt_is_refused_here_not_at_spawn() {
+        let st = seat();
+        let v = set(&st, json!({ "system_prompt": "x".repeat(PROMPT_MAX + 1) })).await;
+        assert!(v["error"].as_str().unwrap_or_default().contains("single argument"), "{v}");
+        // And nothing was stored.
+        let Json(now) = slot_prompt(State(st.clone()), Path("sl-1".to_string())).await.unwrap();
+        assert!(now["system_prompt"].is_null());
+    }
+
+    /// Changing it says WHEN it applies, separately for the two halves: the
+    /// system prompt needs the next process, the instruction the next
+    /// occupant, and the agent sitting there gets neither.
+    #[tokio::test]
+    async fn it_says_when_each_half_takes_effect() {
+        let st = seat();
+        let v = set(&st, json!({ "system_prompt": "a" })).await;
+        let notes = v["takes_effect"].as_array().cloned().unwrap_or_default();
+        assert_eq!(notes.len(), 1, "{v}");
+        assert!(notes[0].as_str().unwrap().contains("next agent started"), "{v}");
+        // Setting it to the same text again changes nothing, and must not
+        // claim it did.
+        let v = set(&st, json!({ "system_prompt": "a" })).await;
+        assert!(v["takes_effect"].as_array().unwrap().is_empty(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_seat_that_does_not_exist_is_said_so() {
+        let st = seat();
+        let out = set_slot_prompt(
+            State(st.clone()),
+            Path("sl-nope".to_string()),
+            Json(serde_json::from_value(json!({ "system_prompt": "x" })).unwrap()),
+        )
+        .await;
+        assert!(format!("{:?}", out.err().unwrap()).contains("no seat"));
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CancelRequest {
+    /// One message, by the id the log and the dashboard show.
+    pub id: Option<i64>,
+    /// Or every message in this team that nobody has seen yet.
+    #[serde(default)]
+    pub all_unseen: bool,
+}
+
+/// Withdraw a message nobody has seen.
+///
+/// A message waits until it is delivered, and nothing expires it. Addressed
+/// to a seat that has gone, or sent in error, it sits there for ever: the
+/// sender believes it was heard, the tile counts it, and the next process to
+/// take that seat is handed something stale the moment it starts.
+///
+/// Distinct from the two things that already existed, which an operator kept
+/// reaching for and which do not do this:
+///
+///  * CLAIMING says a person has dealt with it. The message is still
+///    delivered -- claiming is about the board, not the queue.
+///  * ACKING says a model has seen it, and setting that to hide a message
+///    would record that somebody read something they never saw. The log is
+///    read later to work out what an agent knew.
+///
+/// So this is its own state, and a cancelled message is excluded at the one
+/// gate every delivery route passes through.
+pub async fn cancel_messages(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
+    Json(req): Json<CancelRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let session_id = session_ref_to_id(&db, &session_ref);
+    let who = format!("operator:{}", op.label);
+    let now = now_ms();
+
+    // ONLY WHAT NOBODY HAS SEEN. A message that reached a model cannot be
+    // unsent, and saying it was cancelled afterwards would make the log lie
+    // about what that agent knew when it acted.
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (req.id, req.all_unseen) {
+        (Some(id), _) => (
+            "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
+              WHERE id = ?3 AND session_id = ?4
+                AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
+            vec![Box::new(now), Box::new(who.clone()), Box::new(id), Box::new(session_id.clone())],
+        ),
+        (None, true) => (
+            "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
+              WHERE session_id = ?3
+                AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
+            vec![Box::new(now), Box::new(who.clone()), Box::new(session_id.clone())],
+        ),
+        (None, false) => {
+            return Err(bad(
+                "say which message to cancel: an `id`, or `all_unseen: true` for every \
+                 message in this team that nobody has seen yet",
+            ))
+        }
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let n = db.execute(sql, refs.as_slice()).map_err(bad)?;
+    if n > 0 {
+        db.execute(
+            "INSERT INTO audit (at_ms, actor, node_id, action, detail) VALUES (?,?,NULL,?,?)",
+            params![now, who, "messages_cancelled",
+                    json!({ "session": session_id, "count": n, "id": req.id }).to_string()],
+        )
+        .ok();
+        tracing::info!(session = %session_id, count = n, by = %who, "messages withdrawn");
+    }
+    // An id that matched nothing is worth saying out loud rather than
+    // answering 0 and looking like success: it is almost always a message
+    // somebody has already seen.
+    let said = match (req.id, n) {
+        (Some(id), 0) => format!(
+            "nothing was cancelled: message {id} is not in this team, or an agent has \
+             already seen it. A message that reached a model cannot be unsent."
+        ),
+        (Some(_), _) => "cancelled; it will not be delivered".to_string(),
+        (None, 0) => "nothing was waiting to be seen".to_string(),
+        (None, _) => format!("cancelled {n} message(s) nobody had seen"),
+    };
+    Ok(Json(json!({ "cancelled": n, "session_id": session_id, "said": said })))
+}
+
+/// Withdrawing a message nobody has seen.
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::state::AppState;
+
+    fn fleet() -> AppState {
+        let st = AppState::in_memory().unwrap();
+        {
+            let db = st.db.lock().unwrap();
+            db.execute_batch(
+                "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1);
+                 INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                   VALUES ('sl-1','s1','Dev','claude',1);
+                 INSERT INTO messages (session_id,from_slot,to_slot,kind,body,sent_at_ms)
+                   VALUES ('s1',NULL,'sl-1','system','never mind this',1);
+                 INSERT INTO messages (session_id,from_slot,to_slot,kind,body,sent_at_ms,acked_at_ms)
+                   VALUES ('s1',NULL,'sl-1','system','already read',1,2);",
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    async fn cancel(st: &AppState, body: Value) -> Value {
+        cancel_messages(
+            State(st.clone()),
+            Path("s1".to_string()),
+            Extension(std::sync::Arc::new(crate::state::Operator::super_as("tester"))),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .map(|Json(v)| v)
+        .unwrap_or_else(|(_, Json(v))| v)
+    }
+
+    /// THE POINT: a cancelled message is never handed to an agent. Checked
+    /// through `pending_for_slot`, which is the one gate every delivery
+    /// route goes through -- the push tick, the typed tick, the interactive
+    /// tick, a shim asking and the participant endpoint all call it.
+    #[tokio::test]
+    async fn a_cancelled_message_is_never_delivered() {
+        let st = fleet();
+        let before = {
+            let db = st.db.lock().unwrap();
+            crate::tools::pending_for_slot(&db, "s1", "sl-1").unwrap().len()
+        };
+        assert_eq!(before, 1, "the unacked one is waiting");
+        let v = cancel(&st, json!({ "id": 1 })).await;
+        assert_eq!(v["cancelled"], 1, "{v}");
+        let after = {
+            let db = st.db.lock().unwrap();
+            crate::tools::pending_for_slot(&db, "s1", "sl-1").unwrap().len()
+        };
+        assert_eq!(after, 0, "a withdrawn message must not be deliverable");
+    }
+
+    /// A message a model has SEEN cannot be unsent, and saying otherwise
+    /// would make the log lie about what that agent knew when it acted.
+    #[tokio::test]
+    async fn a_message_already_seen_is_refused() {
+        let st = fleet();
+        let v = cancel(&st, json!({ "id": 2 })).await;
+        assert_eq!(v["cancelled"], 0, "{v}");
+        assert!(
+            v["said"].as_str().unwrap_or_default().contains("cannot be unsent"),
+            "it has to say why, or 0 reads as success: {v}"
+        );
+    }
+
+    /// Cancelling everything unseen leaves the seen ones alone.
+    #[tokio::test]
+    async fn all_unseen_spares_what_was_seen() {
+        let st = fleet();
+        let v = cancel(&st, json!({ "all_unseen": true })).await;
+        assert_eq!(v["cancelled"], 1, "only the unseen one: {v}");
+        let db = st.db.lock().unwrap();
+        let still: i64 = db
+            .query_row("SELECT COUNT(*) FROM messages WHERE cancelled_at_ms IS NULL", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(still, 1, "the one that was read is untouched");
+    }
+
+    /// Asking for nothing in particular is a mistake worth naming, not a
+    /// silent no-op that reads as success.
+    #[tokio::test]
+    async fn it_refuses_to_guess_what_to_cancel() {
+        let st = fleet();
+        let out = cancel_messages(
+            State(st.clone()),
+            Path("s1".to_string()),
+            Extension(std::sync::Arc::new(crate::state::Operator::super_as("tester"))),
+            Json(serde_json::from_value(json!({})).unwrap()),
+        )
+        .await;
+        assert!(format!("{:?}", out.err().unwrap()).contains("say which message"));
+    }
+
+    /// Cancelling twice is not an error, and does not double-count.
+    #[tokio::test]
+    async fn cancelling_twice_changes_nothing() {
+        let st = fleet();
+        assert_eq!(cancel(&st, json!({ "id": 1 })).await["cancelled"], 1);
+        assert_eq!(cancel(&st, json!({ "id": 1 })).await["cancelled"], 0);
+    }
+}
+
+/// Where a participant that is not a CLI says it runs.
+#[cfg(test)]
+mod participant_host_tests {
+    use super::*;
+    use crate::state::AppState;
+
+    fn fleet() -> AppState {
+        let st = AppState::in_memory().unwrap();
+        st.db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sessions (id,name,created_at_ms,last_active_ms) VALUES ('s1','T',1,1);",
+            )
+            .unwrap();
+        st
+    }
+
+    fn join(st: &AppState, name: &str, host: Option<&str>) -> Value {
+        join_participant(
+            st,
+            ParticipantJoin {
+                session: Some("s1".into()),
+                sessions: None,
+                name: name.into(),
+                role: Some("services".into()),
+                role_description: None,
+                kind_hint: Some("test bridge".into()),
+                workspace: None,
+                capabilities: vec!["ocr".into()],
+                host: host.map(str::to_string),
+            },
+            None,
+        )
+        .expect("join")
+    }
+
+    /// THE POINT: a service on a known host is somewhere, and the fleet
+    /// should say where. It was filed under "no machine", which is true of
+    /// a node row and wrong about the world.
+    #[tokio::test]
+    async fn a_service_that_says_where_it_runs_is_recorded_there() {
+        let st = fleet();
+        join(&st, "CoderAI", Some("workstation"));
+        let Json(v) = session_status(State(st.clone()), Path("s1".to_string())).await;
+        let row = v["agents"].as_array().unwrap().iter().find(|a| a["name"] == "CoderAI").unwrap();
+        assert_eq!(row["host"], "workstation", "{row}");
+    }
+
+    /// One that says nothing still reads as external rather than claiming a
+    /// machine it never named.
+    #[tokio::test]
+    async fn one_that_says_nothing_is_not_given_a_machine() {
+        let st = fleet();
+        join(&st, "Quiet", None);
+        let Json(v) = session_status(State(st.clone()), Path("s1".to_string())).await;
+        let row = v["agents"].as_array().unwrap().iter().find(|a| a["name"] == "Quiet").unwrap();
+        assert_eq!(row["host"], "external", "{row}");
+    }
+
+    /// Blank is the same as not saying, so a bridge that cannot work out its
+    /// own hostname does not record an empty machine name.
+    #[tokio::test]
+    async fn a_blank_host_is_not_a_machine_name() {
+        let st = fleet();
+        join(&st, "Blank", Some("   "));
+        let db = st.db.lock().unwrap();
+        let h: Option<String> = db
+            .query_row(
+                "SELECT host_hint FROM agents a JOIN slots s ON s.id = a.slot_id
+                  WHERE s.display_name = 'Blank'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(h.is_none(), "a blank claim is no claim: {h:?}");
+    }
 }
