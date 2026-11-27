@@ -383,6 +383,10 @@ pub async fn recovery_tick(st: &AppState) {
             "SELECT s.id, s.session_id, s.restarts, s.last_crash_ms, s.display_name
              FROM slots s
              WHERE s.status != 'flapping'
+               -- A seat held because its account cannot reach the model is
+               -- not respawned into the same wall: it comes back when the
+               -- hold lifts, through the queue like everything else.
+               AND s.hold_reason IS NULL
                -- Per seat, and the operator's to set from anywhere that can
                -- reach the hub. A seat whose work is over, or that is being
                -- stopped deliberately to look at it, must not be brought

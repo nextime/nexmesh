@@ -401,6 +401,46 @@ pub async fn launch_slot(
     // driver, typed at a terminal, or waiting for the agent to ask. Delivery
     // already knows which, and already knows to wait until the CLI is ready
     // to be typed at -- which a write at spawn time does not.
+    // A POINTER TO THE SEAT'S OWN MEMORY, for whoever is in it now.
+    //
+    // Only a pointer -- how much there is and how to pull it -- never the
+    // memory itself: replaying every entry on every restart would fill the
+    // seat's context before it had done anything. Delivered by the same
+    // message route as the standing instruction, for the same reason:
+    // interactive claude never sees the first prompt. Queued before the
+    // instruction, so it arrives first.
+    //
+    // A pointer from an earlier start that never got delivered -- a seat that
+    // flapped before it was ready to be typed at -- is withdrawn first, or a
+    // seat restarted five times is told five times.
+    {
+        let db = st.db.lock().unwrap();
+        match crate::memory::agent_brief(&db, slot_id) {
+            Ok(Some(brief)) => {
+                let _ = db.execute(
+                    "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = 'system:superseded'
+                      WHERE to_slot = ?2 AND kind IN ('system', 'nudge') AND acked_at_ms IS NULL
+                        AND cancelled_at_ms IS NULL AND body LIKE ?3",
+                    params![now_ms(), slot_id,
+                            format!("{}%", crate::memory::AGENT_BRIEF_MARKER)],
+                );
+                match db.execute(
+                    "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+                     VALUES (?, NULL, ?, 'nudge', ?, ?)",
+                    params![session_id, slot_id, brief, now_ms()],
+                ) {
+                    Ok(_) => tracing::info!(slot = %slot_id, bytes = brief.len(),
+                        "told the new occupant where its own memory is"),
+                    Err(e) => tracing::error!(slot = %slot_id, error = %e,
+                        "could not queue this seat's own memory"),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(slot = %slot_id, error = %e,
+                "could not read this seat's own memory for its start"),
+        }
+    }
+
     if let Some(i) = row.instructions.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let db = st.db.lock().unwrap();
         let r = db.execute(

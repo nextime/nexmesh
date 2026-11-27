@@ -120,6 +120,18 @@ pub fn readable(db: &Connection, slot_id: &str, session_id: &str) -> Result<Vec<
 pub fn may_write(db: &Connection, slot_id: &str, scope: &Scope) -> Result<()> {
     match scope {
         Scope::Global => {
+            // GLOBAL MEMORY IS THE ORCHESTRATOR'S TO KEEP. A seat that runs a
+            // team -- or the fleet -- is the one placed to judge what is true
+            // beyond the job in hand, so it writes here without a grant. Any
+            // other seat still needs the capability, deliberately: a global
+            // note is read by teams nobody has thought of yet.
+            use nexmesh_proto::authority::Authority;
+            if matches!(
+                crate::fleet::authority_of(db, slot_id),
+                Authority::Orchestrator | Authority::Super
+            ) {
+                return Ok(());
+            }
             let caps: Option<String> = db
                 .query_row("SELECT capabilities FROM slots WHERE id = ?", [slot_id], |r| r.get(0))
                 .optional()?;
@@ -129,9 +141,10 @@ pub fn may_write(db: &Connection, slot_id: &str, scope: &Scope) -> Result<()> {
                 Ok(())
             } else {
                 bail!(
-                    "writing global memory needs the '{GLOBAL_WRITE_CAPABILITY}' capability, \
-                     because it outlives every session. Store it in the session scope, or ask \
-                     an operator to grant it."
+                    "global memory is kept by the orchestrator: writing it needs orchestrator \
+                     authority or the '{GLOBAL_WRITE_CAPABILITY}' capability, because it \
+                     outlives every session. Store it in the session scope, or tell your \
+                     orchestrator it holds beyond this job and let it decide."
                 )
             }
         }
@@ -493,6 +506,43 @@ pub fn all(
     Ok(rows)
 }
 
+/// The marker a seat's own-memory pointer opens with. Also how a pointer that
+/// was never delivered is found and replaced by the next one.
+pub const AGENT_BRIEF_MARKER: &str = "[YOUR OWN MEMORY]";
+
+/// A POINTER to a seat's own memory, handed to it when it starts -- never the
+/// memory itself.
+///
+/// Agent-scoped memory stands in for a CLI's built-in memory, and what a CLI
+/// loads at start is an INDEX of its memory, not the contents. Replaying every
+/// entry on every restart would spend the seat's context before it has done
+/// anything, and spend it again at the next restart. So this says only that
+/// the memory exists, how much of it and of what kind, and how to pull what
+/// the work in front of it needs. `None` when the seat has kept nothing.
+pub fn agent_brief(db: &Connection, slot_id: &str) -> Result<Option<String>> {
+    let rows = all(db, Some("agent"), Some(slot_id), None, 2000)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut cats: std::collections::BTreeMap<&str, usize> = Default::default();
+    for r in &rows {
+        *cats.entry(r.category.as_str()).or_default() += 1;
+    }
+    let kinds = cats
+        .iter()
+        .map(|(c, n)| format!("{n} {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Some(format!(
+        "{AGENT_BRIEF_MARKER} You have {} entr{} in your own memory (scope 'agent': {kinds}). \
+         It is NOT loaded here: pull what the task in front of you needs with \
+         recall(scope: 'agent', search: '<topic>') before you rely on something you may \
+         already have worked out.",
+        rows.len(),
+        if rows.len() == 1 { "y" } else { "ies" },
+    )))
+}
+
 /// How much is remembered in each scope, whether or not anything matches a
 /// filter: a page that shows nothing for `global` should say the scope is
 /// empty rather than leave the operator wondering what it is not showing.
@@ -578,6 +628,64 @@ mod tests {
     }
 
     fn sess() -> Scope { Scope::Session("s1".into()) }
+
+    /// Global memory is the orchestrator's to keep: a seat with orchestrator
+    /// (or super) authority writes it without being granted the capability,
+    /// and a plain seat still cannot.
+    #[test]
+    fn an_orchestrator_keeps_global_memory_without_a_grant() {
+        let db = db();
+        for (id, auth) in [("sl-orch", "orchestrator"), ("sl-super", "super")] {
+            db.execute(
+                "INSERT INTO slots (id,session_id,capabilities,authority,created_at_ms)
+                 VALUES (?,'s1','[]',?,1)",
+                params![id, auth],
+            )
+            .unwrap();
+            store(&db, id, &Scope::Global, &format!("k-{id}"), "v", "convention", None)
+                .unwrap_or_else(|e| panic!("{auth} must write global: {e}"));
+        }
+        let err = store(&db, "sl-b", &Scope::Global, "k", "v", "context", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("orchestrator"), "it must say whose this is: {err}");
+    }
+
+    /// A seat is told its own memory EXISTS at start, and how to pull it --
+    /// never handed the contents, which would fill its context on every
+    /// restart before it had done anything.
+    #[test]
+    fn the_start_pointer_names_the_memory_without_loading_it() {
+        let db = db();
+        assert!(agent_brief(&db, "sl-a").unwrap().is_none(), "nothing kept, nothing said");
+        let mine = Scope::Agent("sl-a".into());
+        store(&db, "sl-a", &mine, "tried", "the obvious fix does not work", "discovery", None)
+            .unwrap();
+        store(&db, "sl-a", &mine, "style", "she wants short replies", "convention", None).unwrap();
+        store(&db, "sl-b", &Scope::Agent("sl-b".into()), "theirs", "x", "context", None).unwrap();
+
+        let b = agent_brief(&db, "sl-a").unwrap().expect("sl-a kept something");
+        assert!(b.starts_with(AGENT_BRIEF_MARKER), "{b}");
+        assert!(b.contains("2 entries"), "{b}");
+        assert!(b.contains("1 convention") && b.contains("1 discovery"), "{b}");
+        assert!(b.contains("recall(scope: 'agent'"), "it says how to pull it: {b}");
+        assert!(!b.contains("obvious fix") && !b.contains("short replies"),
+                "the contents must not be loaded: {b}");
+    }
+
+    /// However much a seat keeps, the pointer stays a line.
+    #[test]
+    fn the_start_pointer_does_not_grow_with_the_memory() {
+        let db = db();
+        let mine = Scope::Agent("sl-a".into());
+        for i in 0..300 {
+            store(&db, "sl-a", &mine, &format!("k{i}"), &"x".repeat(400), "context", None)
+                .unwrap();
+        }
+        let b = agent_brief(&db, "sl-a").unwrap().unwrap();
+        assert!(b.len() < 400, "a pointer, not a dump: {} bytes", b.len());
+        assert!(b.contains("300 entries"), "{b}");
+    }
 
     #[test]
     fn a_session_memory_is_readable_by_the_whole_team() {

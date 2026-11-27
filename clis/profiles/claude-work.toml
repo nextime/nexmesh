@@ -6,6 +6,12 @@ id = "claude-work"
 # CLI at credentials, it does not create them:
 #   CLAUDE_CONFIG_DIR=~/.claude-work claude
 env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+# The account this login is, for when its allowance runs out. Every seat whose
+# descriptor names the same account is held together -- on any machine --
+# when one of them is told the allowance is used up, and resumed together
+# when it resets. Leave it out and each machine's copy of this descriptor is
+# its own login, which is what one config directory means.
+# account = "anthropic:work"
 display_name = "Claude Code"
 command = "claude"
 version_args = ["--version"]

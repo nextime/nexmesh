@@ -1016,6 +1016,21 @@ to look at: those used to be respawned out from under you every few seconds.")]
         off: bool,
     },
     #[command(after_help = "\
+EXAMPLES
+  nexmesh compact payments Dev
+
+Done the way the seat's CLI does it: typed at a terminal, sent as a command to
+a headless claude, or through codex's own protocol. A terminal waiting on a
+question refuses, and says so in the team's chat. `nexmesh status <session>`
+shows how full each seat is (CTX).")]
+    /// Compact a seat's context now.
+    Compact {
+        /// The team the seat is in, by name or id.
+        session: String,
+        /// The seat, by name or slot id.
+        agent: String,
+    },
+    #[command(after_help = "\
 Compacting an agent throws away context it may still need, so this is OFF for
 every seat until somebody sets it. Three levels: a seat's own setting wins,
 then its team's, then the fleet's (`nexmesh-hub --compact-at-pct`).
@@ -3919,8 +3934,8 @@ async fn main() -> Result<()> {
             // and a blank means the node never started it -- it connected to
             // the node itself, so only its own shim can reach it.
             println!(
-                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} {:>5} SUMMARY",
-                "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "AGENT", "PID", "IO",
+                "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<11} {:<13} {:>7} {:<5} {:>8} {:>5} SUMMARY",
+                "NAME", "SEAT", "CLI", "ROLE", "HOST", "KIND", "STATE", "NOW", "AGENT", "PID", "IO",
                 "TOKENS", "CTX"
             );
             for a in &rows {
@@ -3944,8 +3959,19 @@ async fn main() -> Result<()> {
                     }
                     _ => "-".to_string(),
                 };
+                // WHAT ITS MODEL IS DOING NOW, beside the work it is on: a
+                // turn running, idle, stopped on a question -- or held,
+                // because its account cannot reach the model.
+                let now = match (a["hold_reason"].as_str(), a["activity"].as_str()) {
+                    (Some("quota"), _) => "HELD:quota".to_string(),
+                    (Some(r), _) => format!("HELD:{r}"),
+                    (None, Some("active")) => "thinking".to_string(),
+                    (None, Some("blocked")) => "needs-you".to_string(),
+                    (None, Some("idle")) => "idle".to_string(),
+                    _ => "-".to_string(),
+                };
                 println!(
-                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<13} {:>7} {:<5} {:>8} {:>5} {}",
+                    "{:<16} {:<14} {:<16} {:<11} {:<9} {:<9} {:<14} {:<11} {:<13} {:>7} {:<5} {:>8} {:>5} {}",
                     a["name"].as_str().unwrap_or("?"),
                     a["slot_id"].as_str().unwrap_or("-"),
                     // Which program is in the seat. Worth a column of its
@@ -3961,6 +3987,7 @@ async fn main() -> Result<()> {
                     } else {
                         a["task_state"].as_str().unwrap_or("-").to_string()
                     },
+                    now,
                     a["status"].as_str().unwrap_or("-"),
                     // The pid of a process that has ENDED is not a pid, it
                     // is a number somebody will go looking for on the wrong
@@ -3979,7 +4006,9 @@ async fn main() -> Result<()> {
             }
             println!(
                 "\n  (TOKENS = input/output spent, CTX = how full its context is NOW;\n\
-                 \x20  STATE is the work, AGENT the process behind it;\n\
+                 \x20  STATE is the work, NOW what its model is doing this moment\n\
+                 \x20  (thinking = a turn is running; HELD = its account cannot reach\n\
+                 \x20  the model), AGENT the process behind it;\n\
                  \x20  `waiting` = a CLI that takes this seat once per turn and is due back)"
             );
             if hidden > 0 {
@@ -4239,6 +4268,18 @@ async fn main() -> Result<()> {
             bail_on_error(&v)?;
             println!("{}", v["said"].as_str().unwrap_or("done"));
         }
+        Cmd::Compact { session, agent } => {
+            // Through the chat command, like `compact-at`: one implementation.
+            let v = post(
+                &c,
+                format!("{base}/v1/sessions/{session}/messages"),
+                json!({ "text": format!("/compact {agent}") }),
+            )
+            .await?;
+            bail_on_error(&v)?;
+            println!("{}", v["said"].as_str().unwrap_or("done"));
+        }
+
         Cmd::CompactAt { session, agent, pct } => {
             // Through the chat command, like `seat-respawn`: one
             // implementation of the setting, one set of words explaining it,

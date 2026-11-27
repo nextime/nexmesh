@@ -1375,6 +1375,12 @@ async fn spawn_on_pty(
         let io = io.clone();
         tokio::spawn(async move {
             let mut seq = 0u64;
+            // WHAT THE MODEL IS DOING, read from the screen at most once a
+            // second -- during output as well as in the pauses, because a
+            // working CLI redraws its spinner without a break and the quiet
+            // tick below never fires while it works.
+            let mut looked = std::time::Instant::now();
+            let mut known = false;
             loop {
                 // A pause in the output is the only moment a screen can be
                 // read for what it is: mid-burst it is half-drawn, and a
@@ -1384,6 +1390,15 @@ async fn spawn_on_pty(
                     out_rx.recv(),
                 )
                 .await;
+                let quiet = next.is_err();
+                if quiet || looked.elapsed() >= std::time::Duration::from_secs(1) {
+                    looked = std::time::Instant::now();
+                    let screen = String::from_utf8_lossy(&io.scrollback(8192)).to_string();
+                    if let Some(state) = crate::driver::screen_activity(&screen, io.idle_ms(), known) {
+                        known |= state == proto::ActivityState::Active;
+                        ctx.report_activity(&agent_id, &io, state).await;
+                    }
+                }
                 match next {
                     Ok(Some(chunk)) => {
                         seq += 1;
@@ -1879,6 +1894,7 @@ pub(crate) async fn emit_output(
     seq: u64,
 ) {
     io.push_output(data);
+    io.note_output();
     // What the CLI has asked of its terminal, which changes how a message
     // must be typed at it.
     io.note_modes(data);

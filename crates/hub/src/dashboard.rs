@@ -394,6 +394,8 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
     let nodes = st.nodes_json();
     let pair_listen = st.pair_listen();
     let pki_ready = st.pki_ready();
+    let fleet_compact = st.fleet_compact_at_pct();
+    let fleet_remind = st.fleet_reminders();
     let db = st.db.lock().unwrap();
 
     // Outstanding pairing codes, never the codes themselves.
@@ -549,6 +551,29 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
     let detail = match &sid {
         None => Value::Null,
         Some(sid) => {
+            // WHETHER EACH SEAT USES WHAT THE TEAM KEEPS: the code graph and
+            // the memory, counted per seat at the one door every tool call
+            // goes through. Read once here rather than once per row.
+            let mut uses: std::collections::HashMap<String, Value> = Default::default();
+            if let Ok(mut q) = db.prepare(
+                "SELECT slot_id,
+                        SUM(CASE WHEN tool = 'query_code_graph' THEN n ELSE 0 END),
+                        SUM(CASE WHEN tool IN ('recall', 'query_knowledge') THEN n ELSE 0 END),
+                        SUM(CASE WHEN tool IN ('store_memory', 'store_knowledge') THEN n ELSE 0 END),
+                        MAX(CASE WHEN tool = 'query_code_graph' THEN last_ms END)
+                   FROM tool_counts GROUP BY slot_id",
+            ) {
+                let rows = q.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, json!({
+                        "graph": r.get::<_, i64>(1)?, "recall": r.get::<_, i64>(2)?,
+                        "stored": r.get::<_, i64>(3)?,
+                        "graph_last_ms": r.get::<_, Option<i64>>(4)?,
+                    })))
+                });
+                if let Ok(rows) = rows {
+                    uses.extend(rows.flatten());
+                }
+            }
             let agents: Vec<Value> = db
                 .prepare(&format!(
                     "SELECT s.id, COALESCE(s.display_name, s.role, 'slot-' || s.id),
@@ -611,7 +636,20 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             -- repeating itself. NULL means it follows its
                             -- team, which is what most seats do.
                             s.compact_at_pct, s.loop_guard_repeats,
-                            a.loop_repeats
+                            a.loop_repeats,
+                            -- WHAT ITS MODEL IS DOING NOW: active, idle or
+                            -- blocked, and since when. Only for a process that
+                            -- is still there -- a dead one's last state is not
+                            -- a state.
+                            CASE WHEN a.exited_at_ms IS NULL THEN a.activity END,
+                            CASE WHEN a.exited_at_ms IS NULL THEN a.activity_at_ms END,
+                            -- Held because its account cannot reach the model.
+                            s.hold_reason, s.hold_until_ms, s.hold_text,
+                            COALESCE(s.quota_auto_resume, 1),
+                            -- The three switches, seat then team: NULL at
+                            -- both means the fleet's own setting.
+                            sx.compact_at_pct, s.remind_memory, sx.remind_memory,
+                            s.remind_graph, sx.remind_graph
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
@@ -636,7 +674,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 ))
                 .and_then(|mut stmt| {
                     stmt.query_map([sid], |r| {
-                        Ok(json!({
+                        let mut v = json!({
                             "slot_id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
                             "role": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
                             "cli": r.get::<_, String>(4)?, "task_state": r.get::<_, String>(5)?,
@@ -681,7 +719,51 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             "compact_at_pct": r.get::<_, Option<i64>>(35)?,
                             "loop_guard_repeats": r.get::<_, Option<i64>>(36)?,
                             "loop_repeats": r.get::<_, Option<i64>>(37)?,
-                        }))
+                        });
+                        // After the literal: the json! macro's recursion
+                        // limit is one key away.
+                        v["activity"] = json!(r.get::<_, Option<String>>(38)?);
+                        v["activity_at_ms"] = json!(r.get::<_, Option<i64>>(39)?);
+                        v["hold_reason"] = json!(r.get::<_, Option<String>>(40)?);
+                        v["hold_until_ms"] = json!(r.get::<_, Option<i64>>(41)?);
+                        v["hold_text"] = json!(r.get::<_, Option<String>>(42)?);
+                        v["quota_auto_resume"] = json!(r.get::<_, i64>(43)? == 1);
+                        // EFFECTIVE, resolved seat -> team -> fleet, with
+                        // where the answer came from, so a switch can say
+                        // "on (team)" rather than leave the reader to work
+                        // it out. See `watchdog::setting`.
+                        let pick = |seat: Option<i64>, team: Option<i64>, fleet: i64| {
+                            match (seat, team) {
+                                (Some(v), _) => (v, "seat"),
+                                (None, Some(v)) => (v, "team"),
+                                _ => (fleet, "fleet"),
+                            }
+                        };
+                        let (cp, cp_from) = pick(
+                            r.get::<_, Option<i64>>(35)?,
+                            r.get::<_, Option<i64>>(44)?,
+                            fleet_compact,
+                        );
+                        let (rm, rm_from) = pick(
+                            r.get::<_, Option<i64>>(45)?,
+                            r.get::<_, Option<i64>>(46)?,
+                            i64::from(fleet_remind.0),
+                        );
+                        let (rg, rg_from) = pick(
+                            r.get::<_, Option<i64>>(47)?,
+                            r.get::<_, Option<i64>>(48)?,
+                            i64::from(fleet_remind.1),
+                        );
+                        v["switches"] = json!({
+                            "compact": { "on": cp > 0, "pct": cp, "from": cp_from },
+                            "remind_memory": { "on": rm > 0, "from": rm_from },
+                            "remind_graph": { "on": rg > 0, "from": rg_from },
+                        });
+                        v["uses"] = uses
+                            .get(&r.get::<_, String>(0)?)
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "graph": 0, "recall": 0, "stored": 0 }));
+                        Ok(v)
                     })
                     .and_then(|m| m.collect())
                 })
@@ -693,7 +775,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
             let messages: Vec<Value> = db
                 .prepare(
                     "SELECT m.id, m.sent_at_ms, m.kind, m.body,
-                            COALESCE(sf.display_name, sf.role, 'operator'),
+                            -- The hub's own automatic notes are not the
+                            -- operator's words, so they are not signed so.
+                            CASE WHEN m.from_slot IS NULL AND m.kind = 'nudge' THEN 'nexmesh'
+                                 ELSE COALESCE(sf.display_name, sf.role, 'operator') END,
                             CASE WHEN m.to_slot IS NULL THEN '(team)'
                                  ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
                             m.acked_at_ms IS NOT NULL, m.inflight_at_ms IS NOT NULL,
@@ -1072,8 +1157,35 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                 })
                 .collect();
 
+            // The TEAM's three switches, resolved against the fleet, for the
+            // row of them above the roster. Not on the all-sessions view,
+            // which is not a team.
+            let team_switches: Value = db
+                .query_row(
+                    "SELECT compact_at_pct, remind_memory, remind_graph FROM sessions WHERE id = ?",
+                    [&sid],
+                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<i64>>(2)?)),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .map(|(c, m, g)| {
+                    let one = |v: Option<i64>, fleet: i64| {
+                        json!({ "on": v.unwrap_or(fleet) > 0, "pct": v.unwrap_or(fleet),
+                                "from": if v.is_some() { "team" } else { "fleet" } })
+                    };
+                    json!({
+                        "compact": one(c, fleet_compact),
+                        "remind_memory": one(m, i64::from(fleet_remind.0)),
+                        "remind_graph": one(g, i64::from(fleet_remind.1)),
+                    })
+                })
+                .unwrap_or(Value::Null);
+
             json!({
                 "session": session,
+                "team_switches": team_switches,
                 "agents": agents,
                 "messages": messages,
                 "plan": plan,

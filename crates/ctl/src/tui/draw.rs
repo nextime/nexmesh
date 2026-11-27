@@ -585,8 +585,24 @@ fn table(
 /// One list for the header, the cells and the sort key, so the three cannot
 /// drift apart: a table sorted by a column other than the one with the arrow
 /// on it is worse than one that cannot be sorted at all.
-pub(crate) const AGENT_COLS: [&str; 10] =
-    ["name", "session", "seat", "cli", "role", "where", "state", "agent", "pid", "io"];
+pub(crate) const AGENT_COLS: [&str; 11] =
+    ["name", "session", "seat", "cli", "role", "where", "state", "now", "agent", "pid", "io"];
+
+/// What a seat's model is doing this moment, beside the work it is on: a
+/// turn running, idle, stopped on a question -- or held, because its account
+/// cannot reach the model.
+fn now_cell(a: &Value) -> String {
+    match (
+        a.get("hold_reason").and_then(|x| x.as_str()),
+        a.get("activity").and_then(|x| x.as_str()),
+    ) {
+        (Some(r), _) => format!("HELD:{r}"),
+        (None, Some("active")) => "thinking".into(),
+        (None, Some("blocked")) => "needs-you".into(),
+        (None, Some("idle")) => "idle".into(),
+        _ => "-".into(),
+    }
+}
 
 pub(crate) fn agent_cell(a: &Value, col: usize) -> String {
     match col {
@@ -597,8 +613,9 @@ pub(crate) fn agent_cell(a: &Value, col: usize) -> String {
         4 => s(a, "role"),
         5 => s(a, "host"),
         6 => s(a, "task_state"),
-        7 => s(a, "status"),
-        8 => match a.get("pid").and_then(|p| p.as_i64()) {
+        7 => now_cell(a),
+        8 => s(a, "status"),
+        9 => match a.get("pid").and_then(|p| p.as_i64()) {
             Some(p) => p.to_string(),
             None => "-".into(),
         },
@@ -672,8 +689,8 @@ fn agents(f: &mut Frame, area: Rect, app: &App) {
         vec![
             Constraint::Length(17), Constraint::Length(13), Constraint::Length(12),
             Constraint::Length(10), Constraint::Length(15), Constraint::Length(12),
-            Constraint::Length(14), Constraint::Length(13), Constraint::Length(6),
-            Constraint::Min(5),
+            Constraint::Length(14), Constraint::Length(11), Constraint::Length(13),
+            Constraint::Length(6), Constraint::Min(5),
         ],
         rows,
     );
@@ -1571,9 +1588,10 @@ mod tests {
         assert_eq!(rows(&v), ["a", "c", "b"]);
         // By pid: as numbers, so 9 is before 100 -- and the row with no
         // process at all is last whichever way round the rest is.
-        sort_agents(&mut v, 8, false);
+        let pid = AGENT_COLS.iter().position(|c| *c == "pid").unwrap();
+        sort_agents(&mut v, pid, false);
         assert_eq!(rows(&v), ["b", "a", "c"]);
-        sort_agents(&mut v, 8, true);
+        sort_agents(&mut v, pid, true);
         assert_eq!(rows(&v), ["a", "b", "c"]);
     }
 

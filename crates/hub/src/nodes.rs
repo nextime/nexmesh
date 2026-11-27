@@ -226,6 +226,18 @@ async fn handle(
                          WHERE id = ?",
                         params![now_ms(), a.agent_id],
                     )?;
+                    // A lost `Activity` frame is repaired here, a heartbeat
+                    // later. The time is kept when the state has not moved.
+                    if let Some(act) = a.activity {
+                        note_turn(st, &db, &a.agent_id, act.as_str());
+                        db.execute(
+                            "UPDATE agents SET activity = ?1,
+                                    activity_at_ms = CASE WHEN activity IS ?1
+                                                          THEN activity_at_ms ELSE ?2 END
+                              WHERE id = ?3",
+                            params![act.as_str(), now_ms(), a.agent_id],
+                        )?;
+                    }
                 } else {
                     db.execute(
                         "UPDATE agents SET status = 'disconnected' WHERE id = ? AND exited_at_ms IS NULL",
@@ -556,6 +568,31 @@ async fn handle(
             st.complete_sync(req_id, v);
         }
 
+        // WHAT THE MODEL IS DOING. The node's clock says when; it is capped at
+        // ours so a node running fast cannot date it in the future.
+        NodeToHub::Activity { agent_id, state, since_ms } => {
+            let db = st.db.lock().unwrap();
+            note_turn(st, &db, &agent_id, state.as_str());
+            db.execute(
+                "UPDATE agents SET activity = ?, activity_at_ms = ? WHERE id = ?",
+                params![state.as_str(), since_ms.min(now_ms()), agent_id],
+            )?;
+        }
+
+        // The agent cannot reach its model, or can again.
+        NodeToHub::UsageLimited { agent_id, block } => {
+            crate::quota::report(st, &agent_id, block);
+        }
+
+        NodeToHub::FileReads { agent_id, n } => {
+            let db = st.db.lock().unwrap();
+            let (_, graph) = st.fleet_reminders();
+            crate::reminders::deliver(
+                &db,
+                crate::reminders::files_read(&db, &agent_id, n as i64, graph),
+            );
+        }
+
         // HOW FULL this agent's context is -- not what it has spent. See
         // `agents.context_used_tokens` for why those are different numbers.
         NodeToHub::ContextUsage { agent_id, used, limit, source } => {
@@ -805,6 +842,81 @@ fn is_workspace_tool(tool: &str) -> bool {
     )
 }
 
+/// The longest a `pending_asks` call may be held, asked for or not.
+const ASKS_WAIT_MAX_S: i64 = 30;
+
+/// How long a PROGRAM's `pending_asks` is held when it did not say.
+///
+/// A capability bridge is a program that asks "anything for me?" in a loop,
+/// and on the live fleet one did so 50,000 times in thirty hours -- twice a
+/// second, every answer "nothing". Holding an empty answer for a few seconds
+/// and returning the moment a request lands cuts that tenfold without making
+/// any request wait longer. Only for an external participant: a model seat
+/// that calls it wants its answer now, and gets the hold only by asking for
+/// it with `wait_seconds`. Short, so a client with a short timeout of its own
+/// does not see its calls fail.
+const ASKS_HOLD_PROGRAM_S: i64 = 4;
+
+/// Wait, if this call should, until a request is waiting or the time is up.
+/// The call itself runs afterwards as usual, so it is counted once.
+async fn hold_for_asks(st: &AppState, agent_id: &str, args: &serde_json::Value) {
+    let (slot, session, external) = {
+        let db = st.db.lock().unwrap();
+        match db
+            .query_row(
+                "SELECT s.id, s.session_id, COALESCE(s.participant_kind, '') = 'external'
+                   FROM agents a JOIN slots s ON s.id = a.slot_id WHERE a.id = ?",
+                [agent_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)),
+            )
+            .optional()
+        {
+            Ok(Some(row)) => row,
+            _ => return,
+        }
+    };
+    let wait = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(if external { ASKS_HOLD_PROGRAM_S } else { 0 })
+        .clamp(0, ASKS_WAIT_MAX_S);
+    let until = now_ms() + wait * 1000;
+    while now_ms() < until {
+        let waiting = {
+            let db = st.db.lock().unwrap();
+            !crate::asks::pending_for(&db, &slot).map(|v| v.is_empty()).unwrap_or(true)
+                // A message for it is a reason to answer too: it rides back
+                // with the result, and should not wait out the hold.
+                || tools::pending_for_slot(&db, &session, &slot)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+        };
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+}
+
+/// A turn ENDED when an agent goes from active to idle. Read before the
+/// activity is written, from either the Activity frame or the heartbeat that
+/// repairs a lost one -- whichever arrives first sees the transition, and the
+/// other finds it already idle.
+fn note_turn(st: &AppState, db: &rusqlite::Connection, agent_id: &str, new: &str) {
+    if new != "idle" {
+        return;
+    }
+    let was: Option<String> = db
+        .query_row("SELECT activity FROM agents WHERE id = ?", [agent_id], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten();
+    if was.as_deref() == Some("active") {
+        let (memory, _) = st.fleet_reminders();
+        crate::reminders::deliver(db, crate::reminders::turn_ended(db, agent_id, memory));
+    }
+}
+
 /// Run a tool, including the ones that need a round trip to a machine.
 pub async fn run_tool_async(
     st: &AppState,
@@ -812,13 +924,47 @@ pub async fn run_tool_async(
     tool: &str,
     args: &serde_json::Value,
 ) -> Result<(String, Vec<proto::Envelope>)> {
-    if tool == "ask_capability" {
-        return ask_capability_tool(st, agent_id, args).await.map(|t| (t, vec![]));
+    // Counted here for the tools that never reach `tools::dispatch` (which
+    // counts the rest): without this, every code-graph query on the fleet
+    // went unrecorded and the dashboard said no seat had ever used it.
+    if tool == "ask_capability" || is_workspace_tool(tool) {
+        let db = st.db.lock().unwrap();
+        if let Ok(slot) = db.query_row(
+            "SELECT slot_id FROM agents WHERE id = ?",
+            [agent_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            let _ = db.execute(
+                "INSERT INTO tool_counts (slot_id, tool, n, last_ms) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(slot_id, tool) DO UPDATE SET n = n + 1, last_ms = ?3",
+                params![slot, tool, now_ms()],
+            );
+        }
     }
-    if is_workspace_tool(tool) {
-        return workspace_tool(st, agent_id, tool, args).await;
+    if tool == "pending_asks" {
+        hold_for_asks(st, agent_id, args).await;
     }
-    let out = run_tool(st, agent_id, tool, args)?;
+    let out = if tool == "ask_capability" {
+        ask_capability_tool(st, agent_id, args).await.map(|t| (t, vec![]))
+    } else if is_workspace_tool(tool) {
+        workspace_tool(st, agent_id, tool, args).await
+    } else {
+        run_tool(st, agent_id, tool, args)
+    };
+    // What a successful call answers, for the reminders: keeping something
+    // resets the turn count, a graph query the read count.
+    if out.is_ok() {
+        let db = st.db.lock().unwrap();
+        let _ = crate::reminders::tool_called(&db, agent_id, tool);
+        if tool == "signal_done" {
+            let (memory, _) = st.fleet_reminders();
+            crate::reminders::deliver(&db, crate::reminders::work_done(&db, agent_id, memory));
+        }
+    }
+    let out = out?;
+    if is_workspace_tool(tool) || tool == "ask_capability" {
+        return Ok(out);
+    }
     // Finishing a piece of work is exactly the moment teammates need to see
     // it, so do not make the agent remember a second call.
     if tool == "signal_done" {

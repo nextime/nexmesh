@@ -268,6 +268,14 @@ pub struct CliMeta {
     /// node: those are applied afterwards and win.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The account this CLI signs in as, for grouping seats that share one
+    /// allowance: `anthropic:work`, `openai:team`. Free text; seats whose
+    /// descriptors name the same account are held together when it runs out,
+    /// on whatever machine they run. Absent, every seat of this descriptor on
+    /// one machine is taken to share one login -- which is what one config
+    /// directory means.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Environment variables to CLEAR for this CLI. A node started from inside
     /// tmux inherits `$TMUX`, and a tmux client that sees it refuses to run
     /// ("sessions should be nested with care"), so adoption would fail

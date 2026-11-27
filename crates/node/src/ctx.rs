@@ -32,6 +32,37 @@ pub struct Injected {
     pub message_ids: Vec<i64>,
 }
 
+/// A request to a driver that is not a message: something only the CLI's own
+/// protocol can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverControl {
+    /// Compact the conversation now.
+    Compact,
+}
+
+/// What a human attached to a seat is in the middle of typing.
+///
+/// A message injected while someone is composing at the input box lands in
+/// the MIDDLE of their line -- their half-written sentence and a teammate's
+/// message become one garbled submit. So the node tracks, from the keystrokes
+/// it forwards, roughly how much unsent text is in the box and when the last
+/// key arrived, and holds an injection back while that is non-empty.
+#[derive(Default)]
+struct Compose {
+    /// Roughly how many characters sit in the human's unsent input line.
+    /// Approximate on purpose: enough to tell "empty" from "mid-sentence".
+    chars: usize,
+    /// When the last human keystroke arrived (ms since epoch); 0 if none.
+    last_ms: i64,
+}
+
+/// How long a human's half-typed input holds an injected message back before
+/// it is delivered anyway. Long, because the cost of waiting is a late
+/// message and the cost of not waiting is a message typed into the middle of
+/// what somebody is writing -- but not unbounded, so a message is never stuck
+/// behind input that was abandoned.
+const COMPOSE_GRACE_MS: i64 = 45_000;
+
 /// The live I/O of one running agent, and whoever is watching it.
 pub struct AgentIo {
     /// Keystrokes in. `None` for a pipe-run (headless) agent: there is no
@@ -101,6 +132,18 @@ pub struct AgentIo {
     mode_tail: Mutex<Vec<u8>>,
     /// Injections written to the CLI but not yet echoed back, oldest first.
     pending: Mutex<VecDeque<Injected>>,
+    /// What a human attached to this seat is in the middle of typing, so an
+    /// injection does not land in the middle of their input line.
+    compose: Mutex<Compose>,
+    /// Whether the model is working right now, and since when. `None` until
+    /// something that can see a turn has said: a seat whose state is unknown
+    /// is shown as unknown, never as idle.
+    activity: Mutex<Option<(proto::ActivityState, i64)>>,
+    /// When the CLI last produced output (ms since epoch), 0 if never.
+    last_output_ms: std::sync::atomic::AtomicI64,
+    /// Where a protocol driver takes requests that are not messages. Set by
+    /// the driver once it can act on them.
+    control: Mutex<Option<mpsc::Sender<DriverControl>>>,
 }
 
 impl AgentIo {
@@ -138,6 +181,10 @@ impl AgentIo {
             modes: Mutex::new(Default::default()),
             mode_tail: Mutex::new(Vec::new()),
             pending: Mutex::new(VecDeque::new()),
+            compose: Mutex::new(Compose::default()),
+            activity: Mutex::new(None),
+            last_output_ms: std::sync::atomic::AtomicI64::new(0),
+            control: Mutex::new(None),
         })
     }
 
@@ -161,12 +208,117 @@ impl AgentIo {
             modes: Mutex::new(self.modes.lock().unwrap().clone()),
             mode_tail: Mutex::new(Vec::new()),
             pending: Mutex::new(Default::default()),
+            compose: Mutex::new(Compose::default()),
+            activity: Mutex::new(*self.activity.lock().unwrap()),
+            last_output_ms: std::sync::atomic::AtomicI64::new(
+                self.last_output_ms.load(Ordering::Relaxed),
+            ),
+            // A view without input cannot be asked to do anything either.
+            control: Mutex::new(None),
         })
+    }
+
+    /// Record what the model is doing. True when that is a CHANGE, which is
+    /// when the hub is told.
+    pub fn set_activity(&self, state: proto::ActivityState) -> bool {
+        let mut a = self.activity.lock().unwrap();
+        if a.map(|(s, _)| s) == Some(state) {
+            return false;
+        }
+        *a = Some((state, proto::now_ms()));
+        true
+    }
+
+    /// What the model is doing, and since when; `None` if nothing has said.
+    pub fn activity(&self) -> Option<(proto::ActivityState, i64)> {
+        *self.activity.lock().unwrap()
+    }
+
+    /// A driver saying it takes control requests.
+    pub fn set_control(&self, tx: mpsc::Sender<DriverControl>) {
+        *self.control.lock().unwrap() = Some(tx);
+    }
+
+    /// Where to send a control request, if this agent's driver takes them.
+    pub fn control(&self) -> Option<mpsc::Sender<DriverControl>> {
+        self.control.lock().unwrap().clone()
+    }
+
+    /// The CLI wrote something.
+    pub fn note_output(&self) {
+        self.last_output_ms.store(proto::now_ms(), Ordering::Relaxed);
+    }
+
+    /// How long since the CLI last wrote anything; 0 if it never has.
+    pub fn idle_ms(&self) -> u64 {
+        match self.last_output_ms.load(Ordering::Relaxed) {
+            0 => 0,
+            at => proto::now_ms().saturating_sub(at).max(0) as u64,
+        }
     }
 
     /// Has the CLI asked for bracketed paste?
     pub fn bracketed(&self) -> bool {
         self.modes.lock().unwrap().get(&2004).copied().unwrap_or(false)
+    }
+
+    /// Note keystrokes a HUMAN (an attached viewer) sent to this seat.
+    ///
+    /// Only ever the person's own keys: the node writes its injections
+    /// straight to the pty, not through here, so what this sees is exactly
+    /// what someone is typing at the box. The model is deliberately rough --
+    /// a running count of characters in the unsent line, cleared on Enter and
+    /// on the keys that clear a line -- because all `human_composing` needs
+    /// from it is "empty" versus "mid-sentence".
+    pub fn note_human_input(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let mut c = self.compose.lock().unwrap();
+        let mut i = 0;
+        while i < data.len() {
+            match data[i] {
+                // Enter submits the line; the box is empty again.
+                b'\r' | b'\n' => c.chars = 0,
+                // Ctrl-C and Ctrl-U clear the whole line at once.
+                0x03 | 0x15 => c.chars = 0,
+                // Backspace / delete takes a character back.
+                0x08 | 0x7f => c.chars = c.chars.saturating_sub(1),
+                // An escape sequence -- arrows, function keys, a
+                // bracketed-paste marker -- is not typed text. Skip it
+                // whole: CSI (`\x1b[`) and SS3 (`\x1b O`) run to a final
+                // byte in 0x40..=0x7e. A lone ESC falls through and counts
+                // for nothing.
+                0x1b => {
+                    i += 1;
+                    if i < data.len() && (data[i] == b'[' || data[i] == b'O') {
+                        i += 1;
+                        while i < data.len() && !(0x40..=0x7e).contains(&data[i]) {
+                            i += 1;
+                        }
+                    }
+                }
+                // Any other control byte: not worth modelling.
+                b if b < 0x20 => {}
+                // A printable byte or the LEAD of a UTF-8 character counts as
+                // one; continuation bytes (0x80..=0xbf) were counted by their
+                // lead, so they add nothing.
+                b if b < 0x80 || b >= 0xc0 => c.chars += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        c.last_ms = proto::now_ms();
+    }
+
+    /// True while a human has an unsent input line and was typing recently
+    /// enough that an injection now would land in the middle of it.
+    ///
+    /// After `COMPOSE_GRACE_MS` of quiet it goes back to false: a message
+    /// must not be stuck for ever behind input somebody walked away from.
+    pub fn human_composing(&self) -> bool {
+        let c = self.compose.lock().unwrap();
+        c.chars > 0 && proto::now_ms().saturating_sub(c.last_ms) < COMPOSE_GRACE_MS
     }
 
     /// The DEC private modes worth remembering for a viewer.
@@ -672,6 +824,30 @@ impl NodeCtx {
     /// empties is a leak either way.
     pub fn forget_notes(&self, agent_id: &str) {
         self.pending_notes.lock().unwrap().remove(agent_id);
+    }
+
+    /// Record what an agent's model is doing and, when that CHANGED, tell the
+    /// hub at once -- the heartbeat repeats it, but a heartbeat is seconds and
+    /// "it has started working" is worth knowing now.
+    pub async fn report_activity(&self, agent_id: &str, io: &AgentIo, state: proto::ActivityState) {
+        if io.set_activity(state) {
+            let since_ms = io.activity().map(|(_, t)| t).unwrap_or_else(proto::now_ms);
+            tracing::debug!(%agent_id, state = state.as_str(), "activity");
+            let _ = self
+                .send_hub(&proto::NodeToHub::Activity {
+                    agent_id: agent_id.to_string(),
+                    state,
+                    since_ms,
+                })
+                .await;
+        }
+    }
+
+    /// The same, for a caller that has only the agent's id.
+    pub async fn report_activity_of(&self, agent_id: &str, state: proto::ActivityState) {
+        if let Some(io) = self.agent_io(agent_id) {
+            self.report_activity(agent_id, &io, state).await;
+        }
     }
 
     pub async fn send_hub(&self, frame: &proto::NodeToHub) -> anyhow::Result<()> {

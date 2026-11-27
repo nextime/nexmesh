@@ -504,16 +504,30 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
                 tokio::select! {
                     _ = tick.tick() => {
                         seq += 1;
-                        let agents: Vec<AgentHealth> = {
+                        // Read the agent table, LET IT GO, then read each one's
+                        // I/O: holding one lock while taking another is how
+                        // two tasks that take them in the other order hang.
+                        let live: Vec<(String, bool)> = {
                             let map = ctx.agents.lock().unwrap();
                             map.values()
-                                .map(|a| AgentHealth {
-                                    agent_id: a.agent_id.clone(),
-                                    alive: proc::is_same_process(a.proc.pid, a.proc.start_ticks),
-                                    idle_ms: 0,
-                                })
+                                .map(|a| (
+                                    a.agent_id.clone(),
+                                    proc::is_same_process(a.proc.pid, a.proc.start_ticks),
+                                ))
                                 .collect()
                         };
+                        let agents: Vec<AgentHealth> = live
+                            .into_iter()
+                            .map(|(agent_id, alive)| {
+                                let io = ctx.agent_io(&agent_id);
+                                AgentHealth {
+                                    idle_ms: io.as_ref().map(|io| io.idle_ms()).unwrap_or(0),
+                                    activity: io.as_ref().and_then(|io| io.activity().map(|(s, _)| s)),
+                                    agent_id,
+                                    alive,
+                                }
+                            })
+                            .collect();
                         let frame = NodeToHub::Heartbeat { seq, agents };
                         if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
                             break;
@@ -531,6 +545,21 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
                         })
                         .await;
                         let Ok(found) = found else { continue };
+                        for (agent_id, n) in found.reads {
+                            let frame = NodeToHub::FileReads { agent_id, n };
+                            if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
+                                break;
+                            }
+                        }
+                        for (agent_id, block) in found.blocks {
+                            tracing::info!(agent = %agent_id, blocked = block.is_some(),
+                                kind = block.as_ref().map(|b| b.kind.as_str()).unwrap_or("-"),
+                                "model access changed");
+                            let frame = NodeToHub::UsageLimited { agent_id, block };
+                            if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
+                                break;
+                            }
+                        }
                         for (agent_id, r) in found.usage {
                             tracing::debug!(agent = %agent_id, used = r.used, limit = r.limit,
                                 "context");
@@ -952,6 +981,25 @@ async fn handle(ctx: &Arc<NodeCtx>, frame: HubToNode, out_tx: &tokio::sync::mpsc
                 tracing::warn!(%agent_id, "compact for an agent this node does not have");
                 return;
             };
+            // A PROTOCOL DRIVER compacts through its own protocol: codex has
+            // `thread/compact/start`, and typing a slash command at a JSON-RPC
+            // pipe would be a line of garbage in its input.
+            if let Some(ctl) = io.control() {
+                let ok = ctl.send(crate::ctx::DriverControl::Compact).await.is_ok();
+                tracing::info!(%agent_id, %by, ok, "asked the driver to compact");
+                return;
+            }
+            // A HEADLESS claude reads stream-json on stdin and takes a slash
+            // command as a user message, the way the Agent SDK sends one. It
+            // has no terminal, which is why typing it failed before.
+            if io.kind == crate::ctx::IoKind::Pipes {
+                if let Some(tx) = &io.input {
+                    let line = format!("{}\n", crate::driver::user_message("/compact"));
+                    let ok = tx.send(line.into_bytes()).await.is_ok();
+                    tracing::info!(%agent_id, %by, ok, "sent /compact as a stream-json message");
+                    return;
+                }
+            }
             // The agent's CLI, then that CLI's interactive mode, then what it
             // says to type. Any of the three being absent means "this CLI
             // does not declare one", which is reported rather than guessed.

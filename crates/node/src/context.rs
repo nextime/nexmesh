@@ -32,6 +32,7 @@
 //! -- are asked of exactly the same bytes.
 
 use crate::ctx::{AgentRec, NodeCtx};
+use nexmesh_proto as proto;
 use nexmesh_proto::cli_descriptor::{ContextSource, ContextSpec};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,12 @@ struct Watch {
     last: Option<Record>,
     /// The reading last REPORTED, so an unchanged one is not sent again.
     reported: Option<Reading>,
+    /// What the newest API call in the file came to: refused for want of
+    /// allowance or a login (`Some(Some(block))`), or answered
+    /// (`Some(None)`). `None` until a call has been seen.
+    outcome: Option<Option<proto::UsageBlock>>,
+    /// What the hub was last told about it, so it is told once.
+    told_block: Option<proto::UsageBlock>,
     /// What this agent's recent turns DID, oldest first. Capped: a loop is
     /// visible in the last few dozen turns or it is not a loop.
     sigs: Vec<u64>,
@@ -90,6 +97,10 @@ struct Watch {
     /// for a number on a dashboard and not for deciding what a respawn
     /// resumes. See `locate`.
     evidenced: bool,
+    /// Files read in turns appended since the last report. Never counted
+    /// from a file's first look, which reads its tail -- that is history,
+    /// not what the seat is doing now.
+    reads: u32,
     /// The conversation the seat recorded when this file was chosen.
     ///
     /// Deciding WHICH file is a seat's can mean opening the head of two
@@ -129,6 +140,8 @@ pub struct Poll {
     /// whether it matters: how many repeats are too many is the operator's
     /// setting, and it lives with the rest of them in the hub.
     pub loops: Vec<(String, crate::loopguard::Cycle)>,
+    /// Agents that can no longer reach their model, or (`None`) can again.
+    pub blocks: Vec<(String, Option<proto::UsageBlock>)>,
     /// Seats whose recorded conversation is not the one they are in.
     ///
     /// `(agent, slot, the conversation it is really in)`. This is the half of
@@ -140,6 +153,8 @@ pub struct Poll {
     /// Sent only for an EVIDENCED choice: a file carrying the seat's own
     /// handshake, or the one the seat itself named. Never for a guess.
     pub conversations: Vec<(String, String, String)>,
+    /// Files each agent has read since the last pass. See `file_reads`.
+    pub reads: Vec<(String, u32)>,
 }
 
 impl Watcher {
@@ -207,6 +222,29 @@ impl Watcher {
                 }
             }
 
+            // WHETHER IT CAN STILL REACH ITS MODEL. Told once when it cannot,
+            // and once when a call goes through again. A refusal whose reset
+            // has already passed is history, not news -- the first look at a
+            // file reads its tail, which can hold one from days ago.
+            let now_blocked = match &watch.outcome {
+                Some(Some(b)) if b.reset_at_ms.map_or(true, |at| at > proto::now_ms()) => {
+                    Some(b.clone())
+                }
+                _ => None,
+            };
+            if now_blocked != watch.told_block {
+                match (&now_blocked, &watch.told_block) {
+                    (Some(b), _) => out.blocks.push((rec.agent_id.clone(), Some(b.clone()))),
+                    (None, Some(_)) => out.blocks.push((rec.agent_id.clone(), None)),
+                    (None, None) => {}
+                }
+                watch.told_block = now_blocked;
+            }
+
+            if watch.reads > 0 {
+                out.reads.push((rec.agent_id.clone(), std::mem::take(&mut watch.reads)));
+            }
+
             // Whether it is getting anywhere. `2` is the floor at which a
             // cycle exists at all, not a threshold: the hub holds that.
             let cycle = crate::loopguard::detect(&watch.sigs, 2);
@@ -264,10 +302,13 @@ impl Watcher {
                         offset: 0,
                         last: None,
                         reported: None,
+                        outcome: None,
+                        told_block: None,
                         sigs: Vec::new(),
                         reported_loop: None,
                         told_hub: None,
                         evidenced,
+                        reads: 0,
                         resolved_for: rec.conversation.clone(),
                     },
                 );
@@ -307,7 +348,13 @@ impl Watcher {
                 if let Some(r) = scanned.newest {
                     watch.last = Some(r);
                 }
+                if let Some(o) = scanned.outcome {
+                    watch.outcome = Some(o);
+                }
                 watch.sigs.extend(scanned.signatures);
+                if watch.offset > 0 {
+                    watch.reads = watch.reads.saturating_add(scanned.reads);
+                }
                 let overflow = watch.sigs.len().saturating_sub(crate::loopguard::RING);
                 watch.sigs.drain(..overflow);
                 // STOP AT THE LAST COMPLETE LINE. The file is being appended
@@ -517,8 +564,12 @@ fn read_from(path: &Path, from: u64, to: u64) -> Option<Vec<u8>> {
 struct Scan {
     /// The newest usage record in it, if any.
     newest: Option<Record>,
+    /// How the newest API call in it ended: see `Watch::outcome`.
+    outcome: Option<Option<proto::UsageBlock>>,
     /// What each turn in it DID, oldest first. See `loopguard`.
     signatures: Vec<u64>,
+    /// Files the seat read in it: see `file_reads`.
+    reads: u32,
     /// How many bytes of the chunk were COMPLETE lines. The rest is a record
     /// still being written, and the next pass must start at the beginning of
     /// it rather than after it.
@@ -532,7 +583,8 @@ struct Scan {
 /// pattern in the order the turns happened. Reading backwards and reversing
 /// would be the same work and one more thing to get wrong.
 fn scan(chunk: &[u8], drop_first_line: bool) -> Scan {
-    let mut out = Scan { newest: None, signatures: Vec::new(), consumed: 0 };
+    let mut out =
+        Scan { newest: None, outcome: None, signatures: Vec::new(), reads: 0, consumed: 0 };
     let text = String::from_utf8_lossy(chunk);
     let mut at = 0usize;
     let mut first = true;
@@ -563,11 +615,108 @@ fn scan(chunk: &[u8], drop_first_line: bool) -> Scan {
         if let Some(sig) = crate::loopguard::signature(&v) {
             out.signatures.push(sig);
         }
-        if let Some(r) = usage_of(&v) {
+        out.reads = out.reads.saturating_add(file_reads(&v));
+        if let Some(b) = api_block(&v) {
+            out.outcome = Some(Some(b));
+        } else if let Some(r) = usage_of(&v) {
             out.newest = Some(r);
+            out.outcome = Some(None);
         }
     }
     out
+}
+
+/// Whether one record is claude saying it could not reach its model, and why.
+///
+/// From claude's own error class and its `quotaLimits`, never its wording,
+/// which is written for a person and changes. Real records, from this
+/// fleet's transcripts:
+///   - `error: "rate_limit"`, `quotaLimits.status: "rejected"`, `resetsAt`
+///     (seconds), `rateLimitType: "five_hour"` -- "You've hit your session
+///     limit · resets 6:50pm"; the weekly one is the same with its own type.
+///   - `error: "oauth_org_not_allowed"` -- a payment past due, or the
+///     organisation has switched subscription access off.
+///   - `error: "authentication_failed"` -- "Login expired · Please run /login".
+/// A transient failure -- 529 overloaded, a dropped stream -- is not here:
+/// claude retries those itself and they say nothing about the account.
+fn api_block(v: &serde_json::Value) -> Option<proto::UsageBlock> {
+    if v.get("isApiErrorMessage").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    if v.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let text = match &v["message"]["content"] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let q = &v["quotaLimits"];
+    let (kind, reset, window) = match v["error"].as_str()? {
+        "rate_limit" => {
+            // A per-minute throttle is a rate_limit too, and claude says
+            // which with the quota's own status: only a REJECTED allowance
+            // holds a seat.
+            if q.is_object() && q["status"].as_str() != Some("rejected") {
+                return None;
+            }
+            (
+                "quota",
+                q["resetsAt"].as_i64().map(|s| if s < 100_000_000_000 { s * 1000 } else { s }),
+                q["rateLimitType"].as_str().map(str::to_string),
+            )
+        }
+        "oauth_org_not_allowed" => ("billing", None, None),
+        "authentication_failed" => ("auth", None, None),
+        _ => return None,
+    };
+    Some(proto::UsageBlock { kind: kind.into(), reset_at_ms: reset, window, text })
+}
+
+/// How many files one record shows the seat reading.
+///
+/// claude's own file tools -- Read, Grep, Glob -- and a shell command that
+/// is a read by its first word (`cat`, `rg`, `grep`, `find`, ...). A
+/// subagent's turn is left out: it has its own context and, usually, no
+/// nexmesh tools to have asked instead. What this is for is a comparison
+/// against the seat's code-graph queries, so a rough count is enough.
+fn file_reads(v: &serde_json::Value) -> u32 {
+    if v.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true) {
+        return 0;
+    }
+    if v["type"].as_str() != Some("assistant") {
+        return 0;
+    }
+    let Some(blocks) = v["message"]["content"].as_array() else { return 0 };
+    let mut n = 0;
+    for b in blocks {
+        if b["type"].as_str() != Some("tool_use") {
+            continue;
+        }
+        match b["name"].as_str().unwrap_or("") {
+            "Read" | "Grep" | "Glob" | "NotebookRead" => n += 1,
+            "Bash" => {
+                let cmd = b["input"]["command"].as_str().unwrap_or("").trim_start();
+                let first = cmd
+                    .split_whitespace()
+                    .find(|w| !w.contains('=') && *w != "sudo" && *w != "cd")
+                    .unwrap_or("");
+                if matches!(
+                    first.rsplit('/').next().unwrap_or(first),
+                    "cat" | "head" | "tail" | "less" | "grep" | "rg" | "find" | "fd" | "ag"
+                        | "sed" | "awk" | "wc" | "tree" | "ls" | "bat"
+                ) {
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    n
 }
 
 /// What one record says about occupancy, if it says anything.
@@ -623,6 +772,102 @@ mod tests {
         })
         .to_string()
             + "\n"
+    }
+
+    /// A refusal as claude writes it into the transcript: a synthetic
+    /// assistant message, the error class, and -- for the allowance -- the
+    /// quota it ran into. Shape copied from this fleet's own transcripts.
+    fn refusal_line(error: &str, text: &str, quota: Option<serde_json::Value>) -> String {
+        let mut v = serde_json::json!({
+            "type": "assistant",
+            "isSidechain": false,
+            "isApiErrorMessage": true,
+            "apiErrorStatus": 429,
+            "error": error,
+            "message": { "model": "<synthetic>", "role": "assistant",
+                         "content": [{ "type": "text", "text": text }],
+                         "usage": { "input_tokens": 0, "output_tokens": 0 } },
+        });
+        if let Some(q) = quota {
+            v["quotaLimits"] = q;
+        }
+        v.to_string() + "\n"
+    }
+
+    #[test]
+    fn file_reads_are_counted_from_the_seats_own_tool_calls() {
+        let line = |name: &str, input: serde_json::Value, side: bool| {
+            serde_json::json!({
+                "type": "assistant", "isSidechain": side,
+                "message": { "content": [
+                    { "type": "text", "text": "looking" },
+                    { "type": "tool_use", "name": name, "input": input }
+                ]}
+            })
+        };
+        assert_eq!(file_reads(&line("Read", serde_json::json!({"file_path": "/a"}), false)), 1);
+        assert_eq!(file_reads(&line("Grep", serde_json::json!({}), false)), 1);
+        assert_eq!(
+            file_reads(&line("Bash", serde_json::json!({"command": "cd x && rg foo"}), false)),
+            0,
+            "only the first command is read, and `cd` is skipped, not `&&`"
+        );
+        assert_eq!(file_reads(&line("Bash", serde_json::json!({"command": "cat a.rs"}), false)), 1);
+        assert_eq!(file_reads(&line("Bash", serde_json::json!({"command": "cargo build"}), false)), 0);
+        assert_eq!(file_reads(&line("Edit", serde_json::json!({}), false)), 0);
+        assert_eq!(file_reads(&line("Read", serde_json::json!({}), true)), 0, "a subagent's");
+        let mut chunk = String::new();
+        for _ in 0..3 {
+            chunk.push_str(&line("Read", serde_json::json!({}), false).to_string());
+            chunk.push('\n');
+        }
+        assert_eq!(scan(chunk.as_bytes(), false).reads, 3);
+    }
+
+    #[test]
+    fn a_used_up_allowance_is_read_with_its_reset_and_window() {
+        let line = refusal_line(
+            "rate_limit",
+            "You've hit your weekly limit \u{b7} resets 10pm (UTC)",
+            Some(serde_json::json!({ "status": "rejected", "resetsAt": 1_791_046_200,
+                                     "rateLimitType": "seven_day" })),
+        );
+        let s = scan(line.as_bytes(), false);
+        let b = s.outcome.expect("a call was seen").expect("it was refused");
+        assert_eq!(b.kind, "quota");
+        assert_eq!(b.reset_at_ms, Some(1_791_046_200_000));
+        assert_eq!(b.window.as_deref(), Some("seven_day"));
+        assert!(b.text.contains("weekly limit"), "{}", b.text);
+        assert!(s.newest.is_none(), "a refusal is not a context reading");
+    }
+
+    #[test]
+    fn a_throttle_that_is_not_a_rejected_allowance_holds_nothing() {
+        let line = refusal_line("rate_limit", "slow down",
+                                Some(serde_json::json!({ "status": "allowed_warning" })));
+        assert!(scan(line.as_bytes(), false).outcome.is_none());
+        for transient in ["server_error", "invalid_request", "unknown"] {
+            let line = refusal_line(transient, "API Error: 529 Overloaded", None);
+            assert!(scan(line.as_bytes(), false).outcome.is_none(), "{transient}");
+        }
+    }
+
+    #[test]
+    fn a_lost_login_and_a_billing_stop_are_told_apart() {
+        let auth = refusal_line("authentication_failed", "Login expired \u{b7} Please run /login", None);
+        assert_eq!(scan(auth.as_bytes(), false).outcome.unwrap().unwrap().kind, "auth");
+        let bill = refusal_line("oauth_org_not_allowed", "a payment is past due", None);
+        assert_eq!(scan(bill.as_bytes(), false).outcome.unwrap().unwrap().kind, "billing");
+    }
+
+    /// The NEWEST call decides: a refusal followed by an answered call is a
+    /// seat whose allowance came back.
+    #[test]
+    fn an_answered_call_after_a_refusal_clears_it() {
+        let chunk = refusal_line("rate_limit", "hit your session limit",
+                                 Some(serde_json::json!({ "status": "rejected", "resetsAt": 1 })))
+            + &usage_line("claude-opus-4", 1000, 0, 10, false);
+        assert_eq!(scan(chunk.as_bytes(), false).outcome, Some(None));
     }
 
     #[test]

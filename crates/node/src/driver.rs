@@ -97,6 +97,8 @@ pub fn render_injection_line(messages: &[Envelope], newlines_safe: bool) -> Stri
         // same thing, or the one route that arrives in seconds is the one
         // that gets answered to the wrong place.
         let who = match (&m.from_slot, &m.from_name) {
+            // See `proto::render_pending`: the hub's own notes are not a person.
+            (None, _) if m.kind == proto::MessageKind::Nudge => proto::AUTOMATIC.to_string(),
             (None, _) => {
                 from_operator = true;
                 "the OPERATOR".to_string()
@@ -233,6 +235,40 @@ pub fn awaiting_answer(screen: &str) -> Option<String> {
     None
 }
 
+/// What a terminal seat's model is doing, read from the bottom of its screen.
+///
+/// `None` when the screen says nothing either way -- which, for a terminal
+/// whose CLI has never been seen working, is everything short of a question:
+/// a shell, or a CLI whose furniture this does not know, is shown as unknown
+/// rather than as idle. `known` is whether this seat has been seen working.
+///
+/// ACTIVE needs two things: the CLI's own "esc to interrupt" in the last few
+/// lines, AND output in the last few seconds. Scrollback is append-only, so a
+/// turn that has just ended can leave its last spinner frame at the tail; a
+/// running turn redraws that spinner several times a second, so a quiet one
+/// is over.
+pub fn screen_activity(screen: &str, idle_ms: u64, known: bool) -> Option<proto::ActivityState> {
+    if awaiting_answer(screen).is_some() {
+        return Some(proto::ActivityState::Blocked);
+    }
+    let lines = meaningful(&strip_ansi(screen));
+    let busy = lines.iter().rev().take(8).any(|l| {
+        let l = l.to_lowercase();
+        l.contains("esc to interrupt") || l.contains("ctrl+c to interrupt")
+    });
+    if busy && idle_ms < ACTIVE_QUIET_MS {
+        Some(proto::ActivityState::Active)
+    } else if known {
+        Some(proto::ActivityState::Idle)
+    } else {
+        None
+    }
+}
+
+/// How long a terminal may be silent and still be mid-turn. See
+/// [`screen_activity`].
+const ACTIVE_QUIET_MS: u64 = 3_000;
+
 /// Write a batch to the CLI's stdin, or type it at the CLI's terminal.
 ///
 /// Returns the ids that are delivered as far as anything will ever say so.
@@ -265,6 +301,14 @@ pub async fn inject(io: &Arc<AgentIo>, messages: &[Envelope]) -> anyhow::Result<
     if io.kind == IoKind::Pty {
         if let Some(why) = awaiting_answer(&String::from_utf8_lossy(&io.scrollback(4096))) {
             anyhow::bail!("the terminal is waiting for an answer ({why})");
+        }
+        // Someone is typing at this terminal. Typing the message now would
+        // splice it into the middle of their half-written line. Hold it back
+        // and let the hub requeue it -- the human will send or clear what
+        // they are writing, or go quiet long enough (COMPOSE_GRACE_MS) that
+        // the message is delivered anyway.
+        if io.human_composing() {
+            anyhow::bail!("a human is typing at this terminal");
         }
         // A burst of bytes IS a paste as far as a TUI is concerned, and a
         // TUI that has asked for bracketed paste expects to be told where
@@ -350,6 +394,8 @@ pub async fn run_stream_json<R>(
         };
         match v["type"].as_str().unwrap_or("") {
             "system" if v["subtype"] == "init" => {
+                // A query is starting: the model is about to work.
+                ctx.report_activity(&agent_id, &io, proto::ActivityState::Active).await;
                 // The init event names the model. It used to be dropped here,
                 // which left the token counts beside it meaningless.
                 if let Some(model) = v["model"].as_str() {
@@ -378,6 +424,8 @@ pub async fn run_stream_json<R>(
 
             // The echo of something we wrote: proof it reached the model.
             "user" if v["isReplay"].as_bool() == Some(true) => {
+                // It has the message: a turn is running from here.
+                ctx.report_activity(&agent_id, &io, proto::ActivityState::Active).await;
                 let text = v["message"]["content"]
                     .as_array()
                     .map(|blocks| {
@@ -402,6 +450,7 @@ pub async fn run_stream_json<R>(
 
             // Per-API-call metering.
             "assistant" => {
+                ctx.report_activity(&agent_id, &io, proto::ActivityState::Active).await;
                 let u = &v["message"]["usage"];
                 usage.input += u["input_tokens"].as_i64().unwrap_or(0);
                 usage.cache_read += u["cache_read_input_tokens"].as_i64().unwrap_or(0);
@@ -417,6 +466,8 @@ pub async fn run_stream_json<R>(
 
             // End of a turn: authoritative output count.
             "result" => {
+                // The turn is over, however it ended.
+                ctx.report_activity(&agent_id, &io, proto::ActivityState::Idle).await;
                 usage.output += v["usage"]["output_tokens"].as_i64().unwrap_or(0);
                 let _ = ctx
                     .send_hub(&proto::NodeToHub::TokenUsage {
@@ -521,6 +572,22 @@ mod tests {
         assert!(line.contains("from the OPERATOR: are you connected?"), "{line}");
         assert!(line.contains("broadcast"), "{line}");
         assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+    }
+
+    #[test]
+    fn the_hubs_own_note_is_not_the_operator_and_asks_for_no_answer() {
+        // A reminder labelled "the OPERATOR", with the line telling the agent
+        // to `reply` to them, made every reminded seat write to the person.
+        let mut e = env(1, "x", "a good moment to keep what you learned");
+        e.from_slot = None;
+        e.from_name = None;
+        e.kind = proto::MessageKind::Nudge;
+        for safe in [true, false] {
+            let line = render_injection_line(&[e.clone()], safe);
+            assert!(!line.contains("OPERATOR"), "{line}");
+            assert!(!line.contains("`reply`"), "{line}");
+            assert!(line.contains("automatic, not a person"), "{line}");
+        }
     }
 
     #[test]
@@ -652,6 +719,84 @@ mod tests {
     fn io() -> Arc<AgentIo> {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         AgentIo::new(crate::ctx::IoKind::Pipes, Some(tx), None)
+    }
+
+    #[test]
+    fn a_running_turn_is_active_while_its_spinner_moves() {
+        let screen = "\u{23fa} Reading the parser\n\n\u{2733} Thinking\u{2026} (12s \u{b7} esc to interrupt)\n";
+        assert_eq!(screen_activity(screen, 200, false), Some(proto::ActivityState::Active));
+    }
+
+    #[test]
+    fn a_spinner_left_at_the_tail_of_a_quiet_screen_is_not_a_turn() {
+        // The last frame of a finished turn, still in append-only scrollback.
+        let screen = "\u{2733} Thinking\u{2026} (12s \u{b7} esc to interrupt)\n";
+        assert_eq!(screen_activity(screen, 10_000, true), Some(proto::ActivityState::Idle));
+    }
+
+    #[test]
+    fn a_question_on_screen_is_blocked_not_idle() {
+        let screen = "\u{2502} Do you want to make this edit?\n\u{2502} \u{276f} 1. Yes\n\u{2502}   2. No\n";
+        assert_eq!(screen_activity(screen, 10_000, true), Some(proto::ActivityState::Blocked));
+    }
+
+    #[test]
+    fn a_terminal_never_seen_working_is_unknown_not_idle() {
+        // A shell, or a CLI whose furniture this does not know.
+        assert_eq!(screen_activity("$ ls\nREADME.md\n$ ", 10_000, false), None);
+    }
+
+    #[test]
+    fn typing_then_sending_empties_the_box() {
+        let io = io();
+        io.note_human_input(b"what about this one");
+        assert!(io.human_composing(), "mid-sentence is composing");
+        io.note_human_input(b"\r");
+        assert!(!io.human_composing(), "Enter submits the line, so the box is empty");
+    }
+
+    #[test]
+    fn backspacing_to_empty_stops_composing() {
+        let io = io();
+        io.note_human_input(b"ab");
+        io.note_human_input(&[0x7f, 0x7f]); // two deletes
+        assert!(!io.human_composing());
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_c_clear_the_line() {
+        for clear in [0x15u8, 0x03] {
+            let io = io();
+            io.note_human_input(b"a long half-written thing");
+            io.note_human_input(&[clear]);
+            assert!(!io.human_composing(), "{clear:#x} clears the line");
+        }
+    }
+
+    #[test]
+    fn moving_the_cursor_is_not_typing() {
+        let io = io();
+        // Up/Down/Left/Right: CSI sequences with no printable text in them.
+        io.note_human_input(b"\x1b[A\x1b[B\x1b[C\x1b[D");
+        assert!(!io.human_composing());
+    }
+
+    #[tokio::test]
+    async fn inject_waits_while_a_human_is_typing() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let io = AgentIo::new(crate::ctx::IoKind::Pty, Some(tx), None);
+        io.note_human_input(b"half a sentence");
+        let err = inject(&io, &[env(1, "Ada", "ping")]).await.unwrap_err();
+        assert!(err.to_string().contains("typing"), "should defer: {err}");
+    }
+
+    #[tokio::test]
+    async fn inject_proceeds_once_the_line_is_sent() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let io = AgentIo::new(crate::ctx::IoKind::Pty, Some(tx), None);
+        io.note_human_input(b"half a sentence\r"); // typed, then Enter
+        let acked = inject(&io, &[env(1, "Ada", "ping")]).await.unwrap();
+        assert_eq!(acked, vec![1], "an empty box does not hold the message back");
     }
 
     #[test]

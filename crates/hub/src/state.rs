@@ -131,6 +131,44 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("code_graph_meta", "fp_at_ms", "INTEGER"),
         ("code_graph_meta", "fp_asked_at_ms", "INTEGER"),
         ("code_graph_meta", "fp_files", "INTEGER"),
+        // How long the last successful build took, so rebuilds are paced by
+        // what they actually cost; and when the last one FAILED, which used
+        // to be written into built_at_ms and so held off every rebuild --
+        // successful ones included -- for ten minutes.
+        ("code_graph_meta", "build_ms", "INTEGER"),
+        // WHAT THE MODEL IS DOING: active (a turn is running), idle, or
+        // blocked on a question. NULL until the node has said -- unknown,
+        // never assumed idle.
+        ("agents", "activity", "TEXT"),
+        ("agents", "activity_at_ms", "INTEGER"),
+        // A SEAT HELD BECAUSE IT CANNOT REACH ITS MODEL. `hold_reason` is
+        // quota | auth | billing; NULL is "not held", and a seat that is
+        // paused with no hold reason was paused by a person, which no
+        // automatic release ever undoes. `hold_until_ms` is when a quota hold
+        // lifts itself; NULL for one that needs a person.
+        ("slots", "hold_reason", "TEXT"),
+        ("slots", "hold_until_ms", "INTEGER"),
+        ("slots", "hold_text", "TEXT"),
+        ("slots", "hold_since_ms", "INTEGER"),
+        ("slots", "hold_account", "TEXT"),
+        // Consecutive holds with no reset time, for the retry backoff.
+        ("slots", "hold_tries", "INTEGER"),
+        // 0 keeps a held seat paused when its allowance comes back, until a
+        // person resumes it. NULL is the default: resume on its own.
+        ("slots", "quota_auto_resume", "INTEGER"),
+        // Reminders to keep what a seat learns and to use the code graph.
+        // NULL inherits (the fleet default is on); 0 is off. See reminders.rs.
+        ("sessions", "remind_memory", "INTEGER"),
+        ("sessions", "remind_graph", "INTEGER"),
+        ("slots", "remind_memory", "INTEGER"),
+        ("slots", "remind_graph", "INTEGER"),
+        ("agents", "turns_unkept", "INTEGER NOT NULL DEFAULT 0"),
+        ("agents", "memory_reminded_at_ms", "INTEGER"),
+        ("agents", "reads_unguided", "INTEGER NOT NULL DEFAULT 0"),
+        ("agents", "graph_reminded_at_ms", "INTEGER"),
+        // The account a node's CLI signs in as, when its descriptor names one.
+        ("node_clis", "account", "TEXT"),
+        ("code_graph_meta", "failed_at_ms", "INTEGER"),
         ("agents", "loop_period", "INTEGER"),
         ("agents", "loop_repeats", "INTEGER"),
         ("agents", "loop_stopped_at_ms", "INTEGER"),
@@ -768,6 +806,8 @@ pub struct AppState {
     /// is a property of this hub's deployment rather than of anything in it.
     /// See `watchdog::setting`.
     watchdog: Arc<(i64, i64)>,
+    /// See `reminders`: (keep what you learn, use the code graph).
+    reminders: Arc<(bool, bool)>,
     /// Where this fleet's OWN role templates and skill fragments live, if it
     /// has any. `None` means the built-in ones only.
     ///
@@ -885,6 +925,7 @@ impl AppState {
             bind_identity: Arc::new(true),
             trusted_proxies: Arc::new(Vec::new()),
             watchdog: Arc::new((0, 0)),
+            reminders: Arc::new((true, true)),
             prompts: Arc::new(None),
             assetlinks: Arc::new(None),
             flood: Arc::new((0, 0)),
@@ -915,6 +956,7 @@ impl AppState {
             bind_identity: Arc::new(true),
             trusted_proxies: Arc::new(Vec::new()),
             watchdog: Arc::new((0, 0)),
+            reminders: Arc::new((true, true)),
             prompts: Arc::new(None),
             assetlinks: Arc::new(None),
             flood: Arc::new((0, 0)),
@@ -1114,6 +1156,17 @@ impl AppState {
     /// The fleet-wide compaction threshold, as a percentage. 0 is off.
     pub fn fleet_compact_at_pct(&self) -> i64 {
         self.watchdog.0
+    }
+
+    /// Whether seats are reminded, fleet-wide, to keep what they learn and to
+    /// use the code graph -- for seats and teams that have set neither.
+    pub fn with_reminders(mut self, memory: bool, graph: bool) -> Self {
+        self.reminders = Arc::new((memory, graph));
+        self
+    }
+
+    pub fn fleet_reminders(&self) -> (bool, bool) {
+        *self.reminders
     }
 
     /// The fleet-wide loop threshold, in repeats. 0 is off.
@@ -1458,8 +1511,9 @@ impl AppState {
         db.execute("DELETE FROM node_clis WHERE node_id = ?", [&id])?;
         for c in clis {
             db.execute(
-                "INSERT INTO node_clis (node_id, cli_id, version, path) VALUES (?, ?, ?, ?)",
-                params![id, c.cli_id, c.version, c.path],
+                "INSERT INTO node_clis (node_id, cli_id, version, path, account)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![id, c.cli_id, c.version, c.path, c.account],
             )?;
         }
         db.execute(

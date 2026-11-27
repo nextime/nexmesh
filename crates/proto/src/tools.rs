@@ -70,12 +70,18 @@ pub fn team_instructions(who: &str, slot: &str) -> String {
          deciding (query_knowledge, query_code_graph) and write back what you learn \
          (store_knowledge), as you learn it rather than at the end. Contradicting a \
          teammate's memory is a conversation, not an overwrite. Everything you remember \
-         has a SCOPE, and it decides who is affected when you are wrong: 'agent' is \
-         yours alone and the place for anything provisional, 'session' is this team and \
-         is where most of it belongs, 'global' is the whole fleet for ever and is for \
-         what is true of the MACHINES rather than this job -- which host has the GPU, \
-         what a service is managed by. The test is whether the next team on a different \
-         task would still need it. A nearer scope shadows a wider one for the same key, \
+         has a SCOPE, and it decides who is affected when you are wrong. 'agent' is YOUR \
+         OWN MEMORY: use it instead of your CLI's built-in memory -- memory files, notes \
+         to self -- for whatever you would want to know next time: what you tried, where \
+         you had got to, how this operator likes things done. It belongs to your seat, \
+         survives restarts, machines and a change of CLI, so write to it freely. It is \
+         NOT loaded into you when you start -- you are told only that it exists: pull \
+         what the task in front of you needs with recall(scope: 'agent', search: ...), \
+         when you need it. 'session' is this team: decisions, \
+         conventions and findings for the project in hand. 'global' is the whole fleet \
+         for ever and is the ORCHESTRATOR'S to keep: unless you are one, do not write it \
+         -- if you find something plainly true across every session (which host has the \
+         GPU, what a service is managed by), tell your orchestrator and let it decide. A nearer scope shadows a wider one for the same key, \
          so a team can override a fleet-wide default without touching it. The code graph \
          has scopes for a different reason: it is parsed per workspace, so 'session' or \
          'global' is how you see past your own checkout -- neither parses anything, they \
@@ -107,6 +113,11 @@ pub fn team_instructions(who: &str, slot: &str) -> String {
          down to a handful of them. If you are handed a list of folds when you start, \
          that is what you did before: read the summaries, and unfold only what the work \
          in front of you actually needs.\n\n\
+         FIND WITH THE GRAPH, READ WITH THE FILES: before grepping a tree or opening files \
+         to learn where something is defined, what calls it or what a module depends on, \
+         ask query_code_graph and open only what it points you to -- reading a tree to \
+         orient yourself fills your context, and every teammate pays it again. It follows \
+         the files to within a minute or two and says when it is behind.\n\n\
          A STALE GRAPH: query_code_graph is DERIVED from the files and can lag them. If \
          what it says disagrees with what you read on disk, the files win -- and say so \
          in the chat, because a graph nobody trusts is worse than no graph. What you \
@@ -221,16 +232,20 @@ pub fn team_tools() -> Vec<ToolDef> {
             "See active locks and ownership zones for your workspace.", json!({}), &[]),
         tool("store_knowledge",
             "Record a decision, convention, discovery, blocker or context. Defaults to this \
-             team; 'global' is for what holds across every team on this fleet and 'agent' for \
-             a note only you keep. Shorthand for store_memory.",
+             team (session), for what is project-wide. 'agent' is your own memory -- use it in \
+             place of your CLI's built-in memory, and recall it when a task needs it. \
+             'global' holds across every team and is kept by orchestrators. Shorthand for \
+             store_memory.",
             json!({ "key": s("Short stable key"), "value": s("The content"),
                     "category": json!({ "type": "string",
                         "enum": ["decision", "convention", "discovery", "blocker", "context"] }),
                     "scope": json!({ "type": "string",
                         "enum": ["agent", "group", "session", "global"],
                         "description": "Who may see it. Defaults to this session (the team). \
-                                        'global' holds for every team and needs the \
-                                        'memory-writer' capability." }),
+                                        'agent' is your own memory, pulled with recall \
+                                        when needed. 'global' holds for every team: orchestrators \
+                                        keep it, any other seat needs the 'memory-writer' \
+                                        capability and should very rarely use it." }),
                     "group": s("Group name, required when scope is 'group'") }),
             &["key", "value"]),
         tool("query_knowledge",
@@ -246,10 +261,13 @@ pub fn team_tools() -> Vec<ToolDef> {
                                         can see." }) }), &[]),
         tool("store_memory",
             "Remember something, choosing who should be able to see it. 'session' (the \
-             default) is this team; 'agent' is private to you; 'group' is a named subset you \
-             belong to; 'global' outlives every session and needs the 'memory-writer' \
-             capability. A nearer scope shadows a wider one for the same key, so a group can \
-             override a global default without editing it.",
+             default) is this team, for what is project-wide; 'agent' is YOUR OWN memory -- \
+             use it instead of your CLI's built-in memory, write to it freely, and pull it \
+             back with recall when a task needs it; 'group' is a named subset you belong \
+             to; 'global' outlives every session, is kept by orchestrators, and any other \
+             seat needs the 'memory-writer' capability -- use it only for what is plainly \
+             true across sessions. A nearer scope shadows a wider one for the same key, so a \
+             group can override a global default without editing it.",
             json!({
                 "key": s("Short stable key"),
                 "value": s("The content"),
@@ -359,8 +377,12 @@ Folds fold into folds: pass `covers` with the ids of earlier folds to replace   
             }), &["capability", "request"]),
         tool("pending_asks",
             "Requests other teammates have sent you for a capability you offer. Answer each \
-             with answer_ask. Only for an agent that advertises a capability.",
-            json!({}), &[]),
+             with answer_ask. Only for an agent that advertises a capability. A program \
+             polling for work should pass wait_seconds rather than call this in a tight loop: \
+             the answer comes back the moment a request arrives.",
+            json!({ "wait_seconds": { "type": "integer",
+                "description": "Wait up to this long (at most 30) for a request when none is \
+                                waiting, instead of answering at once" } }), &[]),
         tool("answer_ask",
             "Return the result of a request from pending_asks. Say plainly if it failed -- the \
              asker is blocked until you answer, and a failure it can read beats a timeout it \
@@ -373,9 +395,12 @@ Folds fold into folds: pass `covers` with the ids of earlier folds to replace   
         tool("query_code_graph",
             "Ask about this workspace's code without reading it: what calls a function, what a \
              file imports, where a symbol is defined, which subsystem something belongs to. \
-             Parsed from the real syntax tree, so it is exact and costs you no context. Start \
-             with what='overview'. Call edges are resolved by name, so they are a strong hint \
-             rather than proof.",
+             Use it BEFORE grepping or opening files to find your way, then read only the \
+             files and lines it names. Parsed from the real syntax tree, so it is exact and \
+             costs you no context, and it follows the files to within a minute or two -- an \
+             answer that is behind says so; read the file yourself only for one you changed \
+             in the last minute or two. Start with what='overview'. Call edges are resolved \
+             by name, so they are a strong hint rather than proof.",
             json!({
                 "what": json!({ "type": "string",
                     "enum": ["overview", "find", "callers", "calls", "imports", "importers",

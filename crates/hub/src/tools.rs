@@ -805,6 +805,49 @@ pub fn reclaim_stale_inflight(db: &Connection, older_than_ms: i64) -> Result<usi
     )?)
 }
 
+/// How long a message nobody has consumed waits before it is aged out. A day:
+/// long enough that a seat offline overnight still gets its backlog, short
+/// enough that a message is never typed at an agent so late it is only noise.
+pub const UNDELIVERED_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Age out a message nobody has consumed in `older_than_ms`.
+///
+/// A teammate's message that has sat undelivered for a day should not suddenly
+/// be typed at an agent long after it mattered. This stamps such a message
+/// cancelled -- the ONE GATE (`pending_for_slot`) already excludes a cancelled
+/// message from every delivery route -- but `by system:expired`, so the row
+/// stays in the log and reads as "aged out", not "the operator withdrew it".
+///
+/// Only what was never consumed is touched; a message that reached its
+/// audience is left exactly as it was:
+///   - a direct message is unconsumed until it is acked;
+///   - a team message is unconsumed while any non-sender slot in its session
+///     still has no ack for it -- which also covers one nobody received at
+///     all, whose recipient rows do not exist yet.
+pub fn expire_undelivered(db: &Connection, older_than_ms: i64) -> Result<usize> {
+    let now = now_ms();
+    let cutoff = now - older_than_ms;
+    Ok(db.execute(
+        "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = 'system:expired'
+          WHERE cancelled_at_ms IS NULL
+            AND record = 0
+            AND sent_at_ms <= ?2
+            AND (
+                 (to_slot IS NOT NULL AND acked_at_ms IS NULL)
+              OR (to_slot IS NULL AND EXISTS (
+                    SELECT 1 FROM slots sl
+                     WHERE sl.session_id = messages.session_id
+                       AND sl.id IS NOT messages.from_slot
+                       AND NOT EXISTS (
+                             SELECT 1 FROM message_recipients r
+                              WHERE r.message_id = messages.id
+                                AND r.slot_id = sl.id
+                                AND r.acked_at_ms IS NOT NULL)))
+            )",
+        params![now, cutoff],
+    )?)
+}
+
 // ------------------------------------------------------------- dispatch ----
 
 pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
@@ -848,6 +891,16 @@ pub fn dispatch(ctx: &Ctx, tool: &str, args: &Value) -> Result<String> {
         // Otherwise it is a fleet tool, and that arm's own message is better
         // than this one -- it says where authority comes from and who can
         // grant it -- so leave it to answer, below.
+    }
+    // HOW OFTEN THIS SEAT ASKS FOR WHAT. A prompt can tell a seat to use the
+    // code graph and the team's memory; only a count shows whether it did,
+    // or went on reading the tree and forgetting. One upsert per call.
+    if nexmesh_proto::tools::is_known_tool(tool) {
+        let _ = ctx.db.execute(
+            "INSERT INTO tool_counts (slot_id, tool, n, last_ms) VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(slot_id, tool) DO UPDATE SET n = n + 1, last_ms = ?3",
+            params![ctx.slot_id, tool, now_ms()],
+        );
     }
     match tool {
         "list_peers" => list_peers(ctx, args),
@@ -1229,7 +1282,27 @@ fn send_message(ctx: &Ctx, args: &Value) -> Result<String> {
     let text = arg_str(args, "text")?;
     let target = ctx.resolve_peer(&to)?;
     ctx.insert_message(Some(&target), MessageKind::Text, &text)?;
-    Ok(format!("Sent to {}.", ctx.label_of(&target)))
+    // Queued either way -- but a sender waiting on an answer from a seat that
+    // cannot reach its model is told, rather than left to wait.
+    let held: Option<(String, Option<i64>)> = ctx
+        .db
+        .query_row(
+            "SELECT hold_reason, hold_until_ms FROM slots WHERE id = ? AND hold_reason IS NOT NULL",
+            [&target],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let who = ctx.label_of(&target);
+    Ok(match held {
+        Some((reason, until)) => format!(
+            "Queued for {who}, who is HELD: {}. It gets this when it is back{}; if it is \
+             urgent, give the work to someone else.",
+            if reason == "quota" { "its account is out of model allowance" }
+            else { "it cannot reach its model" },
+            until.map(|t| format!(", at {}", crate::quota::when(t))).unwrap_or_default()
+        ),
+        None => format!("Sent to {who}."),
+    })
 }
 
 /// An observer's one way of putting something in front of a teammate.
@@ -1357,21 +1430,38 @@ fn check_team_status(ctx: &Ctx) -> Result<String> {
         "SELECT COALESCE(s.display_name, s.role, 'slot-' || s.id), COALESCE(s.role, '-'),
                 s.task_state, s.summary,
                 COALESCE(n.name, CASE WHEN a.provenance = 'external' THEN 'external' ELSE '-' END),
-                s.id
+                s.id, a.activity, s.paused, s.hold_reason, s.hold_until_ms
          FROM slots s
          LEFT JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
          LEFT JOIN nodes n ON n.id = a.node_id
          WHERE s.session_id = ? ORDER BY 1",
     )?;
-    let rows: Vec<(String, String, String, String, String, String)> = stmt
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, String, String, String, String, String, Option<String>, i64,
+                   Option<String>, Option<i64>)> = stmt
         .query_map([&ctx.session_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                r.get(7)?, r.get(8)?, r.get(9)?))
         })?
         .collect::<std::result::Result<_, _>>()?;
     let mut out = String::from("Team:\n");
-    for (name, role, state, summary, host, id) in rows {
+    for (name, role, state, summary, host, id, activity, paused, hold, until) in rows {
         let me = if id == ctx.slot_id { "  <- you" } else { "" };
-        out.push_str(&format!("- {name} [{role}] on {host}: {state}{me}\n"));
+        // What it is doing NOW, beside what it is working on. A seat that
+        // cannot reach its model is said plainly, so nobody hands it work.
+        let now = match (hold.as_deref(), paused, activity.as_deref()) {
+            (Some("quota"), _, _) => format!(
+                " -- HELD: its account is out of model allowance{}; do not assign it work",
+                until.map(|t| format!(" until {}", crate::quota::when(t))).unwrap_or_default()
+            ),
+            (Some(_), _, _) => " -- HELD: it cannot reach its model; do not assign it work".into(),
+            (None, 1, _) => " -- paused".into(),
+            (None, _, Some("active")) => " -- working on a turn now".into(),
+            (None, _, Some("blocked")) => " -- waiting on a question only a person can answer".into(),
+            (None, _, Some("idle")) => " -- idle".into(),
+            _ => String::new(),
+        };
+        out.push_str(&format!("- {name} [{role}] on {host}: {state}{now}{me}\n"));
         if !summary.is_empty() {
             out.push_str(&format!("    {summary}\n"));
         }
@@ -3370,6 +3460,125 @@ mod tests {
         let err = dispatch(&ctx(&db, "sl-eng"), "update_plan",
             &json!({"item": "nonexistent", "status": "done"})).unwrap_err();
         assert!(err.to_string().contains("no plan item"), "{err}");
+    }
+
+    /// Every call through the one door is counted for the seat that made it,
+    /// which is what lets the operator see whether a team uses its graph and
+    /// its memory at all.
+    #[test]
+    fn each_tool_call_is_counted_for_the_seat_that_made_it() {
+        let db = fixture();
+        for _ in 0..3 {
+            dispatch(&ctx(&db, "sl-eng"), "query_knowledge", &json!({})).unwrap();
+        }
+        dispatch(&ctx(&db, "sl-rev"), "list_peers", &json!({})).unwrap();
+        let n: i64 = db
+            .query_row(
+                "SELECT n FROM tool_counts WHERE slot_id = 'sl-eng' AND tool = 'query_knowledge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+        let theirs: i64 = db
+            .query_row("SELECT COUNT(*) FROM tool_counts WHERE slot_id = 'sl-rev'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(theirs, 1, "and only under the seat that called it");
+    }
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    /// A direct message nobody ever saw, two days old, is aged out: stamped
+    /// `system:expired` so the log keeps it, and never handed to its agent.
+    #[test]
+    fn an_old_unseen_direct_message_is_aged_out() {
+        let db = fixture();
+        let old = now_ms() - 2 * DAY_MS;
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', 'sl-rev', 'sl-eng', 'text', 'still there?', ?)",
+            params![old],
+        )
+        .unwrap();
+        let id = db.last_insert_rowid();
+        assert!(pending_for_slot(&db, "s1", "sl-eng").unwrap().iter().any(|m| m.id == id));
+        assert_eq!(expire_undelivered(&db, DAY_MS).unwrap(), 1);
+        let by: String = db
+            .query_row("SELECT cancelled_by FROM messages WHERE id = ?", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(by, "system:expired");
+        assert!(
+            pending_for_slot(&db, "s1", "sl-eng").unwrap().iter().all(|m| m.id != id),
+            "an aged-out message must never be delivered"
+        );
+    }
+
+    /// A message that reached its agent is left exactly as it was: aging out
+    /// must never rewrite a delivered message as withdrawn.
+    #[test]
+    fn a_delivered_message_is_never_aged_out() {
+        let db = fixture();
+        let old = now_ms() - 2 * DAY_MS;
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms, acked_at_ms)
+             VALUES ('s1', 'sl-rev', 'sl-eng', 'text', 'got it', ?, ?)",
+            params![old, old + 1],
+        )
+        .unwrap();
+        assert_eq!(expire_undelivered(&db, DAY_MS).unwrap(), 0);
+    }
+
+    /// A recent message is untouched -- the timeout is a day, not a moment.
+    #[test]
+    fn a_recent_message_is_left_alone() {
+        let db = fixture();
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', 'sl-rev', 'sl-eng', 'text', 'just now', ?)",
+            params![now_ms()],
+        )
+        .unwrap();
+        assert_eq!(expire_undelivered(&db, DAY_MS).unwrap(), 0);
+    }
+
+    /// An old team broadcast still pending for a teammate is aged out; once
+    /// every teammate has acked it, there is nothing left to age out.
+    #[test]
+    fn an_old_pending_broadcast_is_aged_out_but_a_consumed_one_is_not() {
+        let db = fixture();
+        let old = now_ms() - 2 * DAY_MS;
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', 'sl-eng', NULL, 'text', 'anyone about?', ?)",
+            params![old],
+        )
+        .unwrap();
+        let id = db.last_insert_rowid();
+        assert!(pending_for_slot(&db, "s1", "sl-rev").unwrap().iter().any(|m| m.id == id));
+        assert_eq!(expire_undelivered(&db, DAY_MS).unwrap(), 1, "nobody saw it");
+        assert!(
+            pending_for_slot(&db, "s1", "sl-rev").unwrap().iter().all(|m| m.id != id),
+            "the straggler must not get a day-old broadcast"
+        );
+
+        // A second broadcast every non-sender slot has acked is fully
+        // consumed, so it is not aged out.
+        db.execute(
+            "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
+             VALUES ('s1', 'sl-eng', NULL, 'text', 'all here', ?)",
+            params![old],
+        )
+        .unwrap();
+        let id2 = db.last_insert_rowid();
+        for slot in ["sl-rev", "sl-ext"] {
+            db.execute(
+                "INSERT INTO message_recipients (message_id, slot_id, acked_at_ms)
+                 VALUES (?, ?, ?)",
+                params![id2, slot, old + 1],
+            )
+            .unwrap();
+        }
+        assert_eq!(expire_undelivered(&db, DAY_MS).unwrap(), 0, "a seen broadcast stays put");
     }
 }
 

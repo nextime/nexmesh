@@ -207,6 +207,9 @@ pub async fn run(
                 json!({ "prompt": { "text": text }, "delivery": "steer" }),
             )
             .await;
+        if r.is_ok() {
+            ctx.report_activity_of(&agent_id, proto::ActivityState::Active).await;
+        }
         match r {
             Ok(_) => {
                 tracing::info!(%agent_id, count = ids.len(), "steered into the opencode session");
@@ -234,6 +237,8 @@ pub async fn run(
 async fn events(ctx: Arc<NodeCtx>, agent_id: String, server: Server, session: String) {
     use futures_util::StreamExt;
     let seen_tokens = Arc::new(Mutex::new((0i64, 0i64, 0i64)));
+    // (the hub has been told it is blocked, a turn failed since the last idle)
+    let limit = Arc::new(Mutex::new((false, false)));
 
     loop {
         let req = server
@@ -259,7 +264,7 @@ async fn events(ctx: Arc<NodeCtx>, agent_id: String, server: Server, session: St
                 for line in frame.lines() {
                     let Some(payload) = line.strip_prefix("data:") else { continue };
                     let Ok(v) = serde_json::from_str::<Value>(payload.trim()) else { continue };
-                    handle_event(&ctx, &agent_id, &server, &session, &v, &seen_tokens).await;
+                    handle_event(&ctx, &agent_id, &server, &session, &v, &seen_tokens, &limit).await;
                 }
             }
         }
@@ -275,6 +280,7 @@ async fn handle_event(
     session: &str,
     v: &Value,
     seen: &Arc<Mutex<(i64, i64, i64)>>,
+    limit: &Arc<Mutex<(bool, bool)>>,
 ) {
     match v["type"].as_str().unwrap_or("") {
         // The server blocks on these. An unattended agent has nobody to ask,
@@ -292,9 +298,44 @@ async fn handle_event(
         }
         "session.error" => {
             tracing::warn!(%agent_id, error = %v["data"], "opencode reported a session error");
+            limit.lock().unwrap().1 = true;
+            if let Some(b) = usage_block(&v["data"]["error"]) {
+                limit.lock().unwrap().0 = true;
+                let _ = ctx
+                    .send_hub(&proto::NodeToHub::UsageLimited {
+                        agent_id: agent_id.to_string(),
+                        block: Some(b),
+                    })
+                    .await;
+            }
+        }
+        "session.status" if v["data"]["status"]["type"] == "busy" => {
+            ctx.report_activity_of(agent_id, proto::ActivityState::Active).await;
         }
         // Idle means a turn finished: a good moment to read the totals.
         "session.idle" | "session.updated" | "message.updated" => {
+            if v["type"] == "session.idle" {
+                ctx.report_activity_of(agent_id, proto::ActivityState::Idle).await;
+                // A turn that ended without an error, after one that hit the
+                // limit, is the allowance coming back.
+                let recovered = {
+                    let mut g = limit.lock().unwrap();
+                    let r = g.0 && !g.1;
+                    if r {
+                        g.0 = false;
+                    }
+                    g.1 = false;
+                    r
+                };
+                if recovered {
+                    let _ = ctx
+                        .send_hub(&proto::NodeToHub::UsageLimited {
+                            agent_id: agent_id.to_string(),
+                            block: None,
+                        })
+                        .await;
+                }
+            }
             if let Ok(s) = server.get(&format!("/api/session/{session}")).await {
                 let t = &s["data"]["tokens"];
                 let input = t["input"].as_i64().unwrap_or(0);
@@ -366,5 +407,69 @@ mod tests {
         // It is printed first, so mistaking it for the URL would break startup.
         let warn = "Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.";
         assert!(parse_server_url(warn).is_none());
+    }
+}
+
+
+/// Whether an opencode session error means the account cannot reach its
+/// model.
+///
+/// opencode passes the provider's answer through: a 429 that the provider
+/// does not call retryable is a used-up allowance, and an auth error is a
+/// login that is gone. When the provider said when it resets -- a
+/// `retry-after` in seconds, or Anthropic's unified reset as an epoch -- that
+/// is the time; otherwise the hub retries on its own schedule.
+fn usage_block(err: &Value) -> Option<proto::UsageBlock> {
+    let name = err["name"].as_str().unwrap_or("");
+    let d = &err["data"];
+    let text = d["message"].as_str().unwrap_or(name).to_string();
+    if name == "ProviderAuthError" {
+        return Some(proto::UsageBlock { kind: "auth".into(), reset_at_ms: None, window: None, text });
+    }
+    if d["statusCode"].as_i64() != Some(429) || d["isRetryable"].as_bool() == Some(true) {
+        return None;
+    }
+    let h = &d["responseHeaders"];
+    let now = proto::now_ms();
+    let reset = h["anthropic-ratelimit-unified-reset"]
+        .as_str()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|s| s * 1000)
+        .or_else(|| {
+            h["retry-after"]
+                .as_str()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .map(|s| now + s * 1000)
+        })
+        .filter(|at| *at > now);
+    Some(proto::UsageBlock { kind: "quota".into(), reset_at_ms: reset, window: None, text })
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn a_final_429_is_a_used_up_allowance_with_the_providers_reset() {
+        let e = json!({ "name": "APIError", "data": {
+            "message": "rate_limit_error", "statusCode": 429, "isRetryable": false,
+            "responseHeaders": { "anthropic-ratelimit-unified-reset": "4102444800" } } });
+        let b = usage_block(&e).unwrap();
+        assert_eq!(b.kind, "quota");
+        assert_eq!(b.reset_at_ms, Some(4_102_444_800_000));
+    }
+
+    #[test]
+    fn a_429_opencode_will_retry_is_not_a_hold() {
+        let e = json!({ "name": "APIError", "data": { "statusCode": 429, "isRetryable": true } });
+        assert!(usage_block(&e).is_none());
+        let e = json!({ "name": "APIError", "data": { "statusCode": 500 } });
+        assert!(usage_block(&e).is_none());
+    }
+
+    #[test]
+    fn a_lost_login_is_reported_as_one() {
+        let e = json!({ "name": "ProviderAuthError", "data": { "message": "no key" } });
+        assert_eq!(usage_block(&e).unwrap().kind, "auth");
     }
 }

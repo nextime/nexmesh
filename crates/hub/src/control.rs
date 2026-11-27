@@ -83,8 +83,13 @@ pub async fn set_paused(
     let (slot_id, name) = find_slot(st, session_id, who)?;
     {
         let db = st.db.lock().unwrap();
+        // A PERSON's pause or resume replaces any automatic hold: once the
+        // operator has decided, an allowance coming back must not undo it,
+        // and a seat they resumed by hand is no longer waiting on a reset.
         db.execute(
-            "UPDATE slots SET paused = ?, paused_at = ? WHERE id = ?",
+            "UPDATE slots SET paused = ?, paused_at = ?, hold_reason = NULL, hold_until_ms = NULL,
+                    hold_text = NULL, hold_since_ms = NULL, hold_account = NULL
+              WHERE id = ?",
             params![paused as i64, paused.then(now_ms), slot_id],
         )?;
     }

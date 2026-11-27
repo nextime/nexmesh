@@ -334,7 +334,7 @@ pub async fn nudge(st: &AppState, n: Nudge) {
         let db = st.db.lock().unwrap();
         let _ = db.execute(
             "INSERT INTO messages (session_id, from_slot, to_slot, kind, body, sent_at_ms)
-             VALUES (?, NULL, ?, 'system', ?, ?)",
+             VALUES (?, NULL, ?, 'nudge', ?, ?)",
             params![n.session_id, n.slot_id, text, now_ms()],
         );
         let _ = db.execute(

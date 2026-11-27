@@ -38,6 +38,8 @@ mod pairing;
 mod peer;
 mod pki;
 mod prompt;
+mod quota;
+mod reminders;
 mod seat;
 mod skills;
 mod state;
@@ -153,6 +155,16 @@ struct Args {
     /// Below 2 is refused: one "repeat" is a single turn.
     #[arg(long, env = "NEXMESH_LOOP_REPEATS", default_value_t = 0)]
     loop_repeats: i64,
+    /// Stop reminding seats to keep what they learn (store_memory,
+    /// store_knowledge, fold_context) after a stretch of work in which they
+    /// kept nothing. Fleet-wide default; a team or seat can set its own.
+    /// Reminders are ON unless this is given.
+    #[arg(long, env = "NEXMESH_NO_REMIND_MEMORY")]
+    no_remind_memory: bool,
+    /// Stop reminding seats that read many files without asking the code
+    /// graph that it is there. Fleet-wide default, ON unless this is given.
+    #[arg(long, env = "NEXMESH_NO_REMIND_GRAPH")]
+    no_remind_graph: bool,
     /// How many messages one seat may send a minute before the hub starts
     /// refusing them. Fleet-wide default; 0 is off, and off is the default.
     ///
@@ -479,6 +491,7 @@ async fn main() -> Result<()> {
         .with_pair_listen(args.pair_listen.clone())
         .with_identity_binding(!args.no_bind_identity)
         .with_watchdog(args.compact_at_pct, args.loop_repeats)
+        .with_reminders(!args.no_remind_memory, !args.no_remind_graph)
         .with_prompts_dir(prompts_dir)
         .with_assetlinks(args.assetlinks.clone())
         .with_flood(args.msg_rate_per_min, args.msg_pair_limit)
@@ -895,6 +908,15 @@ async fn main() -> Result<()> {
                         tracing::info!(reclaimed = n, "returned stale in-flight messages to the queue");
                     }
                 }
+                // A seat held for its allowance comes back at its reset.
+                quota::tick(&db);
+                // A message nobody has consumed in a day is aged out: kept in
+                // the log, but never typed at an agent so late it is noise.
+                if let Ok(n) = tools::expire_undelivered(&db, tools::UNDELIVERED_TTL_MS) {
+                    if n > 0 {
+                        tracing::info!(expired = n, "aged out undelivered messages nobody consumed");
+                    }
+                }
             }
         });
     }
@@ -918,7 +940,10 @@ async fn main() -> Result<()> {
         .route("/v1/slots/:id/role", post(api::set_role))
         .route("/v1/slots/:id/authority", post(api::set_authority))
         .route("/v1/slots/:id/auto-approve", post(api::slot_auto_approve))
+        .route("/v1/slots/:id/quota-resume", post(api::slot_quota_resume))
         .route("/v1/slots/:id/autorespawn", post(api::slot_autorespawn))
+        .route("/v1/slots/:id/switch", post(api::slot_switch))
+        .route("/v1/sessions/:id/switch", post(api::session_switch))
         .route("/v1/slots/:id/resume-handle", post(api::set_resume_handle))
         // What a seat tells its agent: GET reads the text, POST sets or
         // clears it. Deliberately not part of the status poll.
@@ -986,6 +1011,8 @@ async fn main() -> Result<()> {
         // the seat.
         .route("/v1/memory", get(api::list_memory).post(api::write_memory))
         .route("/v1/memory/history", get(api::memory_history))
+        .route("/v1/folds", get(api::list_folds))
+        .route("/v1/folds/:id", get(api::fold_detail))
         // The last thing an agent said, out of the screen it drew. The rule
         // for what is furniture lives in the proto crate and is shared with
         // the console; the screen itself lives in the browser.

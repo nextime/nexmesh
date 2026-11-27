@@ -181,6 +181,63 @@ fn language_of(id: &str) -> Option<tree_sitter::Language> {
 }
 
 /// Walk a workspace and build its graph.
+/// One file's parse, kept so a file that has not changed is never parsed twice.
+///
+/// Everything `collect` produces for a file depends on that file alone; only
+/// the steps after the loop -- imports, calls by name, pruning -- need the
+/// whole tree. So a file's own output can be replayed as long as the file is
+/// unchanged, and a rebuild after a one-file edit costs one file's parse
+/// instead of the tree's. Measured: 131 s for a 6,275-file tree, every time,
+/// for any change at all -- which is why the graph was only ever rebuilt
+/// rarely, and why it was so often behind the files agents were editing.
+#[derive(Clone)]
+struct FileFacts {
+    /// Size and mtime when it was parsed. Either changing means reparse.
+    stamp: (u64, i128),
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    by_name: Vec<(String, Vec<String>)>,
+    pending: Vec<(String, String)>,
+    imports: Vec<(String, String)>,
+}
+
+/// Per tree, per file: the last parse. In memory only -- a node that restarts
+/// parses each tree once and is incremental again from the second build.
+fn cache() -> &'static std::sync::Mutex<HashMap<PathBuf, HashMap<String, FileFacts>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, HashMap<String, FileFacts>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// How many trees' parses a node keeps. A node serves a handful of
+/// workspaces; one asked to parse far more than that drops them all and
+/// starts again rather than growing without bound.
+const CACHED_TREES: usize = 32;
+
+fn stamp_of(p: &Path) -> Option<(u64, i128)> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as i128;
+    Some((m.len(), t))
+}
+
+/// Add one file's parse to the graph being built.
+fn merge(
+    f: &FileFacts,
+    graph: &mut CodeGraph,
+    by_name: &mut HashMap<String, Vec<String>>,
+    pending: &mut Vec<(String, String)>,
+    imports: &mut Vec<(String, String)>,
+) {
+    graph.files += 1;
+    graph.nodes.extend(f.nodes.iter().cloned());
+    graph.edges.extend(f.edges.iter().cloned());
+    for (name, ids) in &f.by_name {
+        by_name.entry(name.clone()).or_default().extend(ids.iter().cloned());
+    }
+    pending.extend(f.pending.iter().cloned());
+    imports.extend(f.imports.iter().cloned());
+}
+
 pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
     let mut graph = CodeGraph::default();
     // name -> ids, for resolving a call by the only thing we have: its name.
@@ -195,6 +252,12 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
     let files = walk(root, limits, deadline, &mut graph);
     let walked = started.elapsed();
     let candidates = files.len();
+    // The last parse of this tree, taken out while this scan runs. Files not
+    // seen again -- deleted, or now skipped -- fall away with `old`.
+    let key = root.to_path_buf();
+    let mut old = cache().lock().unwrap().remove(&key).unwrap_or_default();
+    let mut fresh: HashMap<String, FileFacts> = HashMap::new();
+    let (mut reused, mut reparsed) = (0usize, 0usize);
     for abs in files {
         // The budget covers the parse too, and this is where it is usually
         // spent: 4,000 source files can take several minutes, and a graph
@@ -210,6 +273,14 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
             .to_string_lossy()
             .replace('\\', "/");
         let Some(spec) = spec_for(&abs) else { continue };
+        // UNCHANGED SINCE THE LAST SCAN: replay its parse.
+        let stamp = stamp_of(&abs);
+        if let Some(f) = stamp.and_then(|s| old.remove(&rel).filter(|f| f.stamp == s)) {
+            merge(&f, &mut graph, &mut by_name, &mut pending, &mut imports);
+            fresh.insert(rel, f);
+            reused += 1;
+            continue;
+        }
         let Some(lang) = language_of(spec.id) else {
             graph.skipped.push(SkippedFile {
                 path: rel.clone(),
@@ -238,31 +309,58 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
             continue;
         };
 
-        graph.files += 1;
         let file_id = rel.clone();
-        graph.nodes.push(GraphNode {
-            id: file_id.clone(),
-            kind: NodeKind::File,
-            name: Path::new(&rel)
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| rel.clone()),
-            path: rel.clone(),
-            line: 1,
-            lang: spec.id.to_string(),
-        });
-
+        let mut facts = FileFacts {
+            stamp: stamp.unwrap_or_default(),
+            nodes: vec![GraphNode {
+                id: file_id.clone(),
+                kind: NodeKind::File,
+                name: Path::new(&rel)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rel.clone()),
+                path: rel.clone(),
+                line: 1,
+                lang: spec.id.to_string(),
+            }],
+            edges: vec![],
+            by_name: vec![],
+            pending: vec![],
+            imports: vec![],
+        };
+        let mut own = CodeGraph::default();
+        let mut names: HashMap<String, Vec<String>> = HashMap::new();
         collect(
             tree.root_node(),
             source.as_bytes(),
             spec,
             &rel,
             &file_id,
-            &mut graph,
-            &mut by_name,
-            &mut pending,
-            &mut imports,
+            &mut own,
+            &mut names,
+            &mut facts.pending,
+            &mut facts.imports,
         );
+        facts.nodes.extend(own.nodes);
+        facts.edges = own.edges;
+        facts.by_name = names.into_iter().collect();
+        merge(&facts, &mut graph, &mut by_name, &mut pending, &mut imports);
+        reparsed += 1;
+        // A file whose stamp could not be read is never trusted from cache.
+        if stamp.is_some() {
+            fresh.insert(rel, facts);
+        }
+    }
+    // Kept even when the budget stopped the loop: every entry is still a
+    // correct parse of its file, so the next scan starts where this one
+    // stopped instead of from the top -- a tree too big for one budget
+    // finishes over two or three.
+    {
+        let mut c = cache().lock().unwrap();
+        if c.len() >= CACHED_TREES {
+            c.clear();
+        }
+        c.insert(key, fresh);
     }
 
     let parsed = started.elapsed();
@@ -294,6 +392,8 @@ pub fn scan(root: &Path, limits: &Limits) -> CodeGraph {
     tracing::info!(
         candidates,
         files = graph.files,
+        reused,
+        reparsed,
         nodes = graph.nodes.len(),
         edges = graph.edges.len(),
         walk_ms = walked.as_millis() as u64,
@@ -716,6 +816,57 @@ mod tests {
 
     fn has_edge(g: &CodeGraph, from: &str, to: &str, kind: EdgeKind) -> bool {
         g.edges.iter().any(|e| e.from == from && e.to == to && e.kind == kind)
+    }
+
+    fn names(g: &CodeGraph) -> Vec<String> {
+        let mut v: Vec<String> = g
+            .nodes
+            .iter()
+            .filter(|n| n.kind != NodeKind::File)
+            .map(|n| n.name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A rebuild replays the parse of every file that has not changed, and
+    /// the graph it gives is the graph a full parse would have given.
+    #[test]
+    fn an_unchanged_tree_rebuilds_to_the_same_graph() {
+        let d = scratch(&[
+            ("src/a.rs", "pub fn alpha() { beta(); }"),
+            ("src/b.rs", "pub fn beta() {}"),
+        ]);
+        let lim = Limits::default();
+        let one = scan(d.path(), &lim);
+        let two = scan(d.path(), &lim);
+        assert_eq!(one.nodes, two.nodes);
+        let mut e1: Vec<_> = one.edges.iter().map(|e| (&e.from, &e.to)).collect();
+        let mut e2: Vec<_> = two.edges.iter().map(|e| (&e.from, &e.to)).collect();
+        e1.sort();
+        e2.sort();
+        assert_eq!(e1, e2, "the cross-file call must survive a replayed parse");
+        assert_eq!(one.files, two.files);
+    }
+
+    /// THE POINT of the cache is a graph that follows the files: an edited
+    /// file is reparsed, a deleted one is gone, an added one appears.
+    #[test]
+    fn a_rebuild_follows_edits_additions_and_deletions() {
+        let d = scratch(&[
+            ("src/a.rs", "pub fn alpha() {}"),
+            ("src/b.rs", "pub fn beta() {}"),
+        ]);
+        let lim = Limits::default();
+        assert_eq!(names(&scan(d.path(), &lim)), ["alpha", "beta"]);
+        // The pause is the filesystem's mtime granularity, as above.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(d.path().join("src/a.rs"), "pub fn alpha_renamed() {}").unwrap();
+        std::fs::remove_file(d.path().join("src/b.rs")).unwrap();
+        std::fs::write(d.path().join("src/c.rs"), "pub fn gamma() {}").unwrap();
+        let g = scan(d.path(), &lim);
+        assert_eq!(names(&g), ["alpha_renamed", "gamma"], "stale symbols must not be replayed");
+        assert_eq!(g.files, 2);
     }
 
     #[test]
@@ -1166,3 +1317,4 @@ fn helper(s: &str) -> usize { s.len() }
         assert!(g.skipped.is_empty(), "nothing should be unreadable: {:?}", g.skipped);
     }
 }
+

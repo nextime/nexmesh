@@ -173,6 +173,10 @@ pub async fn input(ctx: &Arc<NodeCtx>, attach_id: String, data: Vec<u8>) {
             };
             match &io.input {
                 Some(tx) => {
+                    // Remember what the person is typing BEFORE it goes to the
+                    // pty, so an injection arriving a moment later knows not to
+                    // land in the middle of their input line.
+                    io.note_human_input(&data);
                     if tx.send(data).await.is_err() {
                         let _ = ctx
                             .send_hub(&NodeToHub::AttachData {

@@ -80,20 +80,27 @@ everything it worked out that stayed in its own head is gone.
 The habit that matters: **query before you plan, store before you finish.**
 Not a log of what you did -- the transcript is that -- but the handful of
 things the next seat would otherwise have to rediscover. If you learned
-nothing worth another agent's time, store nothing.
+nothing worth another agent's time, store nothing in the team's scopes; what
+is only worth YOUR time goes in your own.
 
 ### How far should it travel
 
 Everything you remember has a SCOPE, and picking it is not a formality: it
 decides who is affected when you turn out to be wrong.
 
-- **`agent`** -- yours alone. Working notes, what you have already tried,
-  where you had got to. Nobody else reads it, so it costs nobody anything
+- **`agent`** -- YOUR OWN MEMORY. Use it instead of your CLI's built-in
+  memory (a memory file, notes to self): what you have already tried, where
+  you had got to, how this operator likes things done, anything you would
+  want to know next time. Nobody else reads it, so it costs nobody anything
   when it is wrong, and it is the right place for anything provisional. It
-  survives your process: this is what you will be glad of after a respawn.
+  belongs to your seat, not your process -- it survives a restart, a move to
+  another machine and a change of CLI. Write to it freely. It is NOT loaded
+  into you when you start: you are told only that it exists, and how much.
+  Pull what the task in front of you needs -- `recall(scope: "agent",
+  search: ...)` -- when you need it, not all of it at once.
 - **`group`** -- a named subset of the team you belong to, for when three of
   you are on one thing and the rest of the room does not need it.
-- **`session`** -- THIS TEAM. The default, and where most of it belongs:
+- **`session`** -- THIS TEAM. The default, and where everything project-wide belongs:
   decisions about the work in hand, conventions this team adopted, what the
   code turned out to do. It dies with the team, which is correct for
   something that was only ever true of this piece of work.
@@ -101,14 +108,17 @@ decides who is affected when you turn out to be wrong.
   run here. For things that are true of the MACHINES and the TOOLS rather
   than the work: which host has the GPU, that a service is managed by
   sysvinit and not systemd, that a repository's tests need a flag to run at
-  all. Writing it needs the `memory-writer` capability, deliberately: a
-  global note is read by teams nobody has thought of yet, and an experiment
-  that writes one leaves it behind for all of them.
+  all. **It is the orchestrator's to keep.** An orchestrator writes it;
+  any other seat needs the `memory-writer` capability, deliberately, and even
+  then should very rarely use it: a global note is read by teams nobody has
+  thought of yet, and an experiment that writes one leaves it behind for all
+  of them. Found something plainly true across sessions? Tell your
+  orchestrator and let it decide.
 
 The test: **would the next team on a different task still need this?** If
-yes, and it is about the fleet rather than this job, it is global. If it is
-about this job, it is the session's. If you are not sure it is right yet, it
-is yours.
+yes, and it is about the fleet rather than this job, it is global -- and the
+orchestrator's call. If it is about this job, it is the session's. If it is
+about how YOU work, or you are not sure it is right yet, it is yours.
 
 A nearer scope SHADOWS a wider one for the same key, so a team can override
 a fleet-wide default by writing its own, without touching the global one.
@@ -122,8 +132,20 @@ which you are looking at.
 
 **`query_code_graph`** answers structural questions -- what defines a symbol,
 what calls it, what a module depends on -- from a parse the fleet keeps, so a
-codebase is read once rather than once per agent. Ask it before grepping a
-large tree.
+codebase is read once rather than once per agent.
+
+**Find with the graph, read with the files.** Before you grep a tree or open
+files to learn where something is defined, what calls it, what a file
+imports or what a module is made of, ask the graph -- then open only the
+files and lines it points you to. Reading a tree to orient yourself fills
+your context with code you did not need, and every teammate pays it again.
+Start a new piece of work with `what='overview'`.
+
+It keeps up with the files: the fleet checks every workspace for changes
+about once a minute and reparses only the files that changed, so an answer
+is normally less than a minute or two behind the disk. An answer that is
+behind says so. The one case to read the file anyway is a file YOU changed
+in the last minute or two.
 
 It has scopes too, for a different reason: a graph is parsed from the files
 in one directory on one machine.
@@ -141,8 +163,7 @@ The wider two never parse anything: that is minutes of somebody else's
 machine, and they answer from what is already there and say what they
 skipped.
 
-It is DERIVED and can be stale: it is regenerated from the files and holds no
-opinions. If what it tells you does not match what you read on disk, the
+It is DERIVED: it is regenerated from the files and holds no opinions. If what it tells you does not match what you read on disk, the
 files win -- and say so in the chat, because a graph nobody trusts is worse
 than none. Anything you CONCLUDE about the code belongs in
 `store_knowledge`, which is attributed and does not get regenerated away.

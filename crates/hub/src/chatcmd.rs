@@ -74,6 +74,10 @@ pub enum Cmd {
     /// How many times a seat may repeat the same turn before the hub
     /// interrupts it and pauses it. Same shape as `CompactAt`.
     LoopGuard { who: String, repeats: Option<i64> },
+    /// Whether the hub reminds a seat (or `session`) to keep what it learns
+    /// (`which` = remind_memory) or to use the code graph (remind_graph).
+    /// None restores "inherit".
+    Remind { who: String, which: &'static str, on: Option<bool> },
     /// Read or set the TEAM's standing rules: what everybody here is told,
     /// over and above their own brief. `text` of None is a read.
     Rules { text: Option<String> },
@@ -111,6 +115,12 @@ pub fn help() -> String {
      \u{2003} \u{2014} stop that seat if it repeats the same turn that many times \
      in a row: it is interrupted, paused and reported to you, with its \
      conversation intact. Off everywhere unless somebody sets it.\n\
+     \u{2022} /remind-memory <agent|session> <on|off|default>\n\
+     \u{2003} \u{2014} remind that seat to store what it learns after a stretch of \
+     work in which it kept nothing. On everywhere unless somebody turns it off.\n\
+     \u{2022} /remind-graph <agent|session> <on|off|default>\n\
+     \u{2003} \u{2014} point a seat that reads many files at the code graph. On \
+     everywhere unless somebody turns it off.\n\
      \u{2022} /rules [text]                \u{2014} what everybody in this team is told, \
      over and above their own brief: the conventions, what not to touch. With no \
      text it shows them; `clear` removes them. Only you and an orchestrating \
@@ -293,6 +303,17 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
             // that fires on that stops every agent the moment it is set.
             let repeats = policy_number(args.get(1).copied(), "a number of repeats", 2, 99)?;
             Ok(Parsed::Do(Cmd::LoopGuard { who, repeats }))
+        }
+        "remind-memory" | "remindmemory" | "remind-graph" | "remindgraph" => {
+            let which = if verb.contains("graph") { "remind_graph" } else { "remind_memory" };
+            let who = one("an agent, or 'session'")?;
+            let on = match args.get(1).map(|a| a.to_lowercase()) {
+                Some(a) if matches!(a.as_str(), "on" | "yes" | "true") => Some(true),
+                Some(a) if matches!(a.as_str(), "off" | "no" | "false" | "never") => Some(false),
+                Some(a) if matches!(a.as_str(), "default" | "inherit" | "clear") => None,
+                _ => return Err(format!("/{verb} {who} on, off or default")),
+            };
+            Ok(Parsed::Do(Cmd::Remind { who, which, on }))
         }
         "autorespawn" | "respawn" => {
             let who = one("an agent")?;

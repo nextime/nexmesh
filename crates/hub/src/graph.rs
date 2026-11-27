@@ -22,15 +22,50 @@ use serde_json::{json, Value};
 
 /// How long after the tree moves to rebuild.
 ///
-/// Not immediately: a team publishing a series of commits would otherwise
-/// start a parse per commit, and each one throws away the last. Long enough
-/// to coalesce a burst, short enough that an agent asking a structural
-/// question a few minutes later gets an answer about the tree that is
-/// actually there.
-const REBUILD_AFTER_MS: i64 = 90_000;
+/// Not immediately: an agent saving a file a few times in a row, or a team
+/// publishing a series of commits, would otherwise start a rebuild per save.
+/// Long enough to coalesce a burst; short, because a node replays the parse of
+/// every unchanged file and a rebuild after an edit costs that edit's files,
+/// not the tree's -- and a graph behind the file an agent just changed is a
+/// graph that agent stops trusting and stops asking.
+const REBUILD_AFTER_MS: i64 = 15_000;
 
-/// Don't retry a failing rebuild in a tight loop.
+/// Don't retry a FAILING rebuild in a tight loop.
 const RETRY_AFTER_MS: i64 = 600_000;
+
+/// The least time between two rebuilds of one graph...
+const MIN_REBUILD_GAP_MS: i64 = 30_000;
+
+/// ...and the multiple of the last build's own duration that must pass too.
+///
+/// Rebuilds are paced by what they cost, not by a fixed clock. On a node that
+/// replays unchanged files a rebuild is milliseconds to a few seconds, and
+/// the floor above is what applies. On one that still parses the whole tree
+/// every time -- measured at two minutes for a 6,275-file tree -- the gap
+/// grows with it, so that node is never kept parsing more than a quarter of
+/// the time however often the files move.
+const REBUILD_GAP_FACTOR: i64 = 3;
+
+/// The ONE selection of a graph that is due a rebuild, shared by `stale_tick`
+/// and the tests so the two cannot drift apart. ?1 = stale since at least,
+/// ?2 = failed no later than, ?3 = now.
+const DUE_SQL: &str = "SELECT m.workspace_id, w.name, wm.node_id, wm.path
+       FROM code_graph_meta m
+       JOIN workspaces w ON w.id = m.workspace_id
+       JOIN workspace_mounts wm ON wm.workspace_id = m.workspace_id
+       JOIN nodes n ON n.id = wm.node_id
+      WHERE m.stale_at_ms IS NOT NULL
+        AND m.stale_at_ms <= ?1
+        AND n.status = 'online'
+        AND (m.failed_at_ms IS NULL OR m.failed_at_ms <= ?2)
+        AND (m.built_at_ms IS NULL
+             OR m.built_at_ms + MAX(?4, ?5 * COALESCE(m.build_ms, 0)) <= ?3)
+      ORDER BY m.stale_at_ms
+      LIMIT 1";
+
+fn due_params(now: i64) -> [i64; 5] {
+    [now - REBUILD_AFTER_MS, now - RETRY_AFTER_MS, now, MIN_REBUILD_GAP_MS, REBUILD_GAP_FACTOR]
+}
 
 /// The tree this graph was built from has moved.
 ///
@@ -57,21 +92,9 @@ pub async fn stale_tick(st: &AppState) {
         let db = st.db.lock().unwrap();
         db.query_row(
             // The node that actually holds this workspace, and where. A
-            // repo workspace is on several; any of them will do, so take the
-            // one that synced most recently -- it is the one whose checkout
-            // is known to be current.
-            "SELECT m.workspace_id, w.name, wm.node_id, wm.path
-               FROM code_graph_meta m
-               JOIN workspaces w ON w.id = m.workspace_id
-               JOIN workspace_mounts wm ON wm.workspace_id = m.workspace_id
-               JOIN nodes n ON n.id = wm.node_id
-              WHERE m.stale_at_ms IS NOT NULL
-                AND m.stale_at_ms <= ?1
-                AND n.status = 'online'
-                AND (m.built_at_ms IS NULL OR m.built_at_ms <= ?2)
-              ORDER BY m.stale_at_ms
-              LIMIT 1",
-            params![now - REBUILD_AFTER_MS, now - RETRY_AFTER_MS],
+            // repo workspace is on several; any of them will do.
+            DUE_SQL,
+            rusqlite::params_from_iter(due_params(now)),
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
@@ -81,15 +104,18 @@ pub async fn stale_tick(st: &AppState) {
     let Some((ws_id, ws_name, node_id, path)) = due else { return };
     tracing::info!(workspace = %ws_id, name = %ws_name, node = %node_id,
                    "the tree moved; rebuilding the code graph");
+    let began = now_ms();
     match build(st, &ws_id, &node_id, &path).await {
         Ok(said) => {
             let db = st.db.lock().unwrap();
             // `build` -> `store` sets built_at_ms, so clearing the mark here
-            // is what says the graph matches what was last shared.
+            // is what says the graph matches what was last shared. What it
+            // cost is kept, because that is what paces the next one.
             let _ = db.execute(
-                "UPDATE code_graph_meta SET stale_at_ms = NULL, stale_reason = NULL
-                  WHERE workspace_id = ?",
-                [&ws_id],
+                "UPDATE code_graph_meta SET stale_at_ms = NULL, stale_reason = NULL,
+                        build_ms = ?2, failed_at_ms = NULL
+                  WHERE workspace_id = ?1",
+                params![ws_id, now_ms() - began],
             );
             tracing::info!(workspace = %ws_id, %said, "code graph rebuilt");
         }
@@ -99,8 +125,10 @@ pub async fn stale_tick(st: &AppState) {
             // which is the one outcome worth more than an error message.
             let why = e.to_string();
             let db = st.db.lock().unwrap();
+            // failed_at_ms, NOT built_at_ms: built_at is when the graph was
+            // last parsed, which every answer reports, and it is not this.
             let _ = db.execute(
-                "UPDATE code_graph_meta SET built_at_ms = ?2, stale_reason = ?3
+                "UPDATE code_graph_meta SET failed_at_ms = ?2, stale_reason = ?3
                   WHERE workspace_id = ?1",
                 params![ws_id, now_ms(), why],
             );
@@ -112,9 +140,12 @@ pub async fn stale_tick(st: &AppState) {
 /// How often one workspace may be asked what its tree looks like.
 ///
 /// A fingerprint is a walk with no parsing: seconds, not minutes. But it is
-/// still somebody else's disk, and a graph that is ten minutes behind the
-/// files is not a problem anybody has.
-const FINGERPRINT_EVERY_MS: i64 = 600_000;
+/// still somebody else's disk. Measured: 2 ms, 34 ms and 458 ms for trees of
+/// 141, 799 and 6,275 source files -- so once a minute is noise on even the
+/// largest, and it is what bounds how far the graph can fall behind the
+/// files. Ten minutes, the old figure, was long enough for an agent to edit
+/// a file, ask the graph about it, and be answered about the old version.
+const FINGERPRINT_EVERY_MS: i64 = 60_000;
 
 /// How long to wait for a node to answer before deciding it cannot.
 ///
@@ -770,7 +801,8 @@ pub fn query(db: &Connection, workspace_id: &str, what: &str, target: &str, to: 
     let age = now_ms() - built;
     if stale_at.is_some() {
         out.push_str(
-            "\n(The files have changed since this was parsed; a rebuild is on its way.              Read the file if the answer matters.)\n",
+            "\n(The files have changed since this was parsed; a rebuild is on its way, usually \
+             within a minute or two.              Read the file if the answer matters.)\n",
         );
     } else if age > 2 * 3_600_000 {
         out.push_str(&format!("\n(Parsed {}.)\n", crate::graph::ago(age)));
@@ -1086,22 +1118,10 @@ mod tests {
     /// node and a real parse to exercise end to end.
     fn due_now(st: &AppState, now: i64) -> Option<String> {
         let db = st.db.lock().unwrap();
-        db.query_row(
-            "SELECT m.workspace_id
-               FROM code_graph_meta m
-               JOIN workspaces w ON w.id = m.workspace_id
-               JOIN workspace_mounts wm ON wm.workspace_id = m.workspace_id
-               JOIN nodes n ON n.id = wm.node_id
-              WHERE m.stale_at_ms IS NOT NULL AND m.stale_at_ms <= ?1
-                AND n.status = 'online'
-                AND (m.built_at_ms IS NULL OR m.built_at_ms <= ?2)
-              LIMIT 1",
-            params![now - REBUILD_AFTER_MS, now - RETRY_AFTER_MS],
-            |r| r.get(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
+        db.query_row(DUE_SQL, rusqlite::params_from_iter(due_params(now)), |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// What `fresh_tick` would ask about, which is the whole of its
@@ -1336,20 +1356,63 @@ mod tests {
 
     #[test]
     fn a_failing_rebuild_is_not_retried_in_a_tight_loop() {
-        // `built_at_ms` is bumped on failure, which is what holds it off.
+        // `failed_at_ms` is what holds it off -- not built_at_ms, which is
+        // when the graph was last PARSED and is reported with every answer.
         let st = mounted();
         let now = now_ms();
         {
             let db = st.db.lock().unwrap();
             mark_stale(&db, "w1");
             db.execute(
-                "UPDATE code_graph_meta SET built_at_ms = ?1, stale_reason = 'no node'",
+                "UPDATE code_graph_meta SET built_at_ms = 0, failed_at_ms = ?1,
+                        stale_reason = 'no node'",
                 params![now],
             )
             .unwrap();
         }
         assert!(due_now(&st, now + REBUILD_AFTER_MS + 1).is_none());
         assert_eq!(due_now(&st, now + RETRY_AFTER_MS + 1).as_deref(), Some("w1"));
+    }
+
+    /// THE BUG THIS REPLACES: every successful build held off the next one
+    /// for ten minutes, because the failure guard read built_at_ms. A cheap
+    /// rebuild is due again once its floor has passed.
+    #[test]
+    fn a_cheap_build_does_not_hold_off_the_next_one_for_ten_minutes() {
+        let st = mounted();
+        let now = now_ms();
+        {
+            let db = st.db.lock().unwrap();
+            mark_stale(&db, "w1");
+            db.execute(
+                "UPDATE code_graph_meta SET built_at_ms = ?1, build_ms = 400, stale_at_ms = ?1",
+                params![now],
+            )
+            .unwrap();
+        }
+        assert!(due_now(&st, now + MIN_REBUILD_GAP_MS - 1).is_none(), "the floor holds");
+        assert_eq!(due_now(&st, now + MIN_REBUILD_GAP_MS + 1).as_deref(), Some("w1"),
+                   "a 400 ms build is due again after the floor, not ten minutes");
+    }
+
+    /// A node that still parses the whole tree is paced by what that costs.
+    #[test]
+    fn an_expensive_build_is_paced_by_its_own_cost() {
+        let st = mounted();
+        let now = now_ms();
+        let took = 120_000; // two minutes, a full parse of a large tree
+        {
+            let db = st.db.lock().unwrap();
+            mark_stale(&db, "w1");
+            db.execute(
+                "UPDATE code_graph_meta SET built_at_ms = ?1, build_ms = ?2, stale_at_ms = ?1",
+                params![now, took],
+            )
+            .unwrap();
+        }
+        assert!(due_now(&st, now + MIN_REBUILD_GAP_MS + 1).is_none());
+        assert!(due_now(&st, now + REBUILD_GAP_FACTOR * took - 1).is_none());
+        assert_eq!(due_now(&st, now + REBUILD_GAP_FACTOR * took + 1).as_deref(), Some("w1"));
     }
 
     #[test]

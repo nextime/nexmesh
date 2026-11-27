@@ -48,6 +48,7 @@ pub async fn detect(descriptors: &[CliDescriptor]) -> Vec<DetectedCli> {
                 cli_id: d.cli.id.clone(),
                 version,
                 path: Some(path),
+                account: d.cli.account.clone().filter(|a| !a.trim().is_empty()),
             }
         })
     });

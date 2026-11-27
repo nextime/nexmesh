@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS node_clis (
   cli_id  TEXT NOT NULL,
   version TEXT,
   path    TEXT,
+  -- The account this CLI signs in as, when its descriptor names one.
+  account TEXT,
   PRIMARY KEY (node_id, cli_id)
 );
 
@@ -624,6 +626,11 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- How many times a seat in this team may repeat the same turn before the
   -- hub stops it. Same three states: NULL inherits, 0 is off.
   loop_guard_repeats INTEGER,
+  -- Whether the hub reminds this team's seats to keep what they learn
+  -- (remind_memory) and to look things up in the code graph before reading
+  -- the tree (remind_graph). NULL follows the fleet, which is on; 0 is off.
+  remind_memory    INTEGER,
+  remind_graph     INTEGER,
   -- THE TEAM'S STANDING RULES: what every seat in this session is told, over
   -- and above its own brief.
   --
@@ -769,6 +776,9 @@ CREATE TABLE IF NOT EXISTS slots (
   -- Per seat for the same reason: a seat polling something until it changes
   -- is SUPPOSED to repeat itself, and a seat writing code is not.
   loop_guard_repeats INTEGER,
+  -- This seat's own reminder switches, over its team's. See `sessions`.
+  remind_memory     INTEGER,
+  remind_graph      INTEGER,
   -- This seat's own flood limits, overriding its team's. See `sessions`.
   -- A coordinator legitimately sends more than anybody else; a seat that
   -- only ever answers should never be sending thirty a minute.
@@ -790,6 +800,18 @@ CREATE TABLE IF NOT EXISTS slots (
   -- re-rendering it from a template would throw their edit away.
   prompt_template   TEXT,
   prompt_skills     TEXT,
+  -- HELD because its account cannot reach the model: quota | auth |
+  -- billing, NULL when not held. A seat paused with no hold reason was paused
+  -- by a person, and nothing automatic ever releases it. `hold_until_ms` is
+  -- when a quota hold lifts itself; NULL for one that needs a person.
+  hold_reason       TEXT,
+  hold_until_ms     INTEGER,
+  hold_text         TEXT,
+  hold_since_ms     INTEGER,
+  hold_account      TEXT,
+  hold_tries        INTEGER,
+  -- 0 keeps a held seat paused when its allowance comes back. NULL = resume.
+  quota_auto_resume INTEGER,
   created_at_ms     INTEGER NOT NULL
 );
 
@@ -863,6 +885,18 @@ CREATE TABLE IF NOT EXISTS agents (
   -- compacted -- the transcript file that was read, or the driver stream.
   context_source       TEXT,
   context_at_ms        INTEGER,
+  -- What the model is doing now: active (a turn is running), idle, blocked
+  -- on a question. NULL until the node has said: unknown, never assumed idle.
+  activity             TEXT,
+  activity_at_ms       INTEGER,
+  -- Turns finished since this agent last kept anything (store_memory,
+  -- store_knowledge, fold_context), and when it was last reminded to.
+  turns_unkept         INTEGER NOT NULL DEFAULT 0,
+  memory_reminded_at_ms INTEGER,
+  -- Files it has read since it last asked the code graph, and when it was
+  -- last reminded the graph is there.
+  reads_unguided       INTEGER NOT NULL DEFAULT 0,
+  graph_reminded_at_ms INTEGER,
   -- When the hub last told this agent to compact itself because its context
   -- was over the threshold. Per AGENT, not per seat: a respawn starts a new
   -- process on a conversation whose occupancy is measured afresh, and the
@@ -1092,4 +1126,15 @@ CREATE TABLE IF NOT EXISTS audit (
   node_id   TEXT,
   action    TEXT NOT NULL,
   detail    TEXT NOT NULL DEFAULT '{}'
+);
+
+-- How often each seat calls each nexmesh tool. What shows whether a team is
+-- actually using its code graph and its memory rather than reading the tree
+-- and forgetting: a prompt can ask for that, and only this says it happened.
+CREATE TABLE IF NOT EXISTS tool_counts (
+  slot_id TEXT NOT NULL,
+  tool    TEXT NOT NULL,
+  n       INTEGER NOT NULL DEFAULT 0,
+  last_ms INTEGER NOT NULL,
+  PRIMARY KEY (slot_id, tool)
 );

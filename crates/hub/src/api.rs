@@ -679,6 +679,85 @@ pub async fn slot_autorespawn(
     Ok(Json(json!({ "slot_id": id, "autorespawn": req.on })))
 }
 
+#[derive(Deserialize)]
+pub struct SwitchRequest {
+    /// compact | remind_memory | remind_graph
+    pub name: String,
+    /// true, false, or null to follow the level above.
+    pub on: Option<bool>,
+}
+
+/// The column a switch is stored in, and what "on" writes there.
+fn switch_value(st: &AppState, req: &SwitchRequest) -> Result<(&'static str, Option<i64>), String> {
+    let column = match req.name.as_str() {
+        "compact" | "compact_at_pct" | "autocompact" => "compact_at_pct",
+        "remind_memory" | "memory" => "remind_memory",
+        "remind_graph" | "graph" => "remind_graph",
+        other => return Err(format!(
+            "no switch '{other}': there are compact, remind_memory and remind_graph")),
+    };
+    let value = match req.on {
+        None => None,
+        Some(false) => Some(0),
+        // Compaction is a THRESHOLD. Switched on by hand it takes the fleet's
+        // own percentage, or 85 on a fleet that has none.
+        Some(true) if column == "compact_at_pct" => {
+            let fleet = st.fleet_compact_at_pct();
+            Some(if fleet > 0 { fleet } else { 85 })
+        }
+        Some(true) => Some(1),
+    };
+    Ok((column, value))
+}
+
+/// Flip one of a seat's switches: auto-compaction, memory reminders, graph
+/// reminders. Seat, then team, then fleet; `on: null` returns it to its team.
+pub async fn slot_switch(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SwitchRequest>,
+) -> ApiResult {
+    let (column, value) = switch_value(&st, &req).map_err(bad)?;
+    let db = st.db.lock().unwrap();
+    let n = db
+        .execute(&format!("UPDATE slots SET {column} = ? WHERE id = ?"), params![value, id])
+        .map_err(bad)?;
+    if n == 0 {
+        return Err(bad(format!("no seat '{id}'")));
+    }
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'switch',?)",
+        params![now_ms(), json!({ "slot": id, "switch": column, "value": value }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "slot_id": id, "switch": column, "value": value })))
+}
+
+/// The same, for every seat in a team that has not set its own.
+pub async fn session_switch(
+    State(st): State<AppState>,
+    Path(session_ref): Path<String>,
+    Json(req): Json<SwitchRequest>,
+) -> ApiResult {
+    let (column, value) = switch_value(&st, &req).map_err(bad)?;
+    let db = st.db.lock().unwrap();
+    let id = session_ref_to_id(&db, &session_ref);
+    let n = db
+        .execute(&format!("UPDATE sessions SET {column} = ? WHERE id = ?"), params![value, id])
+        .map_err(bad)?;
+    if n == 0 {
+        return Err(bad(format!("no team '{session_ref}'")));
+    }
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'switch',?)",
+        params![now_ms(), json!({ "session": id, "switch": column, "value": value }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "session_id": id, "switch": column, "value": value })))
+}
+
 /// What a seat tells its agent, over and above the CLI's own prompt.
 ///
 /// Two separate things, because they answer different questions:
@@ -1496,6 +1575,36 @@ pub async fn slot_auto_approve(
     )
     .ok();
     Ok(Json(json!({ "slot_id": id, "auto_approve": req.on })))
+}
+
+/// Whether a seat held for its model allowance resumes by itself when the
+/// allowance comes back (`on`, the default), or stays paused for a person.
+///
+/// The operator's "unless I say otherwise". Takes effect on the next hold,
+/// and on one already in place: a held seat switched off here keeps its pause
+/// when the hold lifts.
+pub async fn slot_quota_resume(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AutoApproveRequest>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let n = db
+        .execute(
+            "UPDATE slots SET quota_auto_resume = ? WHERE id = ?",
+            params![req.on as i64, id],
+        )
+        .map_err(bad)?;
+    if n == 0 {
+        return Err(bad(format!("no seat {id}")));
+    }
+    db.execute(
+        "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+         VALUES (?,'operator',NULL,'quota_auto_resume',?)",
+        params![now_ms(), json!({ "slot": id, "on": req.on }).to_string()],
+    )
+    .ok();
+    Ok(Json(json!({ "slot_id": id, "quota_auto_resume": req.on })))
 }
 
 /// ...or a whole team.
@@ -2952,6 +3061,98 @@ pub async fn list_memory(
     })))
 }
 
+/// Every fold on the fleet, for the knowledge page: the same scopes and the
+/// same filters as `/v1/memory`, summaries only. A fold's detail can be tens
+/// of thousands of tokens and is fetched one at a time by `fold_detail`.
+///
+/// Fleet-wide on purpose. The dashboard used to show only the folds the team
+/// on screen could see, and hid the panel when there were none -- so a fleet
+/// whose one folding seat was in another team looked as though nothing had
+/// ever been folded.
+pub async fn list_folds(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryQuery>,
+) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let scope = q.scope.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "all");
+    let reference = q.reference.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let like = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let mut stmt = db
+        .prepare(
+            "SELECT f.id, f.scope, f.scope_ref, f.tier, f.topic, f.summary,
+                    COALESCE(s.display_name, s.role, f.author_slot, '?'),
+                    f.tokens_before, f.tokens_after, f.created_at_ms,
+                    COALESCE(f.unfolded_count, 0), LENGTH(f.detail), f.active,
+                    CASE f.scope
+                      WHEN 'session' THEN COALESCE((SELECT name FROM sessions WHERE id = f.scope_ref),
+                                                   f.scope_ref)
+                      WHEN 'agent' THEN COALESCE((SELECT COALESCE(display_name, role, id)
+                                                    FROM slots WHERE id = f.scope_ref), f.scope_ref)
+                      ELSE f.scope_ref
+                    END,
+                    (SELECT x.name FROM slots y JOIN sessions x ON x.id = y.session_id
+                      WHERE y.id = f.author_slot)
+               FROM folds f LEFT JOIN slots s ON s.id = f.author_slot
+              WHERE f.active = 1
+                AND (?1 IS NULL OR f.scope = ?1)
+                AND (?2 IS NULL OR f.scope_ref = ?2)
+                AND (?3 IS NULL OR LOWER(f.topic) LIKE ?3 OR LOWER(f.summary) LIKE ?3
+                     OR LOWER(f.detail) LIKE ?3)
+              ORDER BY f.created_at_ms DESC LIMIT ?4",
+        )
+        .map_err(bad)?;
+    let rows: Vec<Value> = stmt
+        .query_map(
+            params![scope, reference, like, q.limit.unwrap_or(500).clamp(1, 2000)],
+            |r| {
+                let mut v = json!({
+                    "id": r.get::<_, String>(0)?, "scope": r.get::<_, String>(1)?,
+                    "scope_ref": r.get::<_, String>(2)?, "tier": r.get::<_, i64>(3)?,
+                    "topic": r.get::<_, String>(4)?, "summary": r.get::<_, String>(5)?,
+                    "who": r.get::<_, String>(6)?,
+                    "tokens_before": r.get::<_, i64>(7)?, "tokens_after": r.get::<_, i64>(8)?,
+                    "at_ms": r.get::<_, i64>(9)?, "unfolded": r.get::<_, i64>(10)?,
+                    "detail_bytes": r.get::<_, i64>(11)?,
+                });
+                v["scope_label"] = json!(r.get::<_, String>(13)?);
+                v["team"] = json!(r.get::<_, Option<String>>(14)?);
+                Ok(v)
+            },
+        )
+        .map_err(bad)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(bad)?;
+    let counts: Vec<Value> = db
+        .prepare("SELECT scope, COUNT(*) FROM folds WHERE active = 1 GROUP BY scope")
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok(json!({ "scope": r.get::<_, String>(0)?,
+                                             "n": r.get::<_, i64>(1)? })))
+                .and_then(|m| m.collect())
+        })
+        .map_err(bad)?;
+    Ok(Json(json!({ "folds": rows, "counts": counts })))
+}
+
+/// One fold in full: its detail, and the folds it covers.
+pub async fn fold_detail(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let db = st.db.lock().unwrap();
+    let Some(f) = crate::folds::get(&db, &id).map_err(bad)? else {
+        return Err(bad(format!("no fold '{id}'")));
+    };
+    let children: Vec<Value> = crate::folds::children(&db, &id)
+        .map_err(bad)?
+        .into_iter()
+        .map(|c| json!({ "id": c.id, "tier": c.tier, "topic": c.topic, "summary": c.summary }))
+        .collect();
+    Ok(Json(json!({
+        "id": f.id, "scope": f.scope, "scope_ref": f.scope_ref, "tier": f.tier,
+        "topic": f.topic, "summary": f.summary, "detail": f.detail,
+        "covers": children, "tokens_before": f.tokens_before,
+        "tokens_after": f.tokens_after, "at_ms": f.created_at_ms,
+    })))
+}
+
 #[derive(Deserialize)]
 pub struct MemoryWrite {
     /// global, session, group or agent. A session or agent scope needs its
@@ -3282,13 +3483,29 @@ pub async fn clear_unclaimed(
     Extension(op): Extension<std::sync::Arc<crate::state::Operator>>,
 ) -> ApiResult {
     let db = st.db.lock().unwrap();
-    let session_id = session_ref_to_id(&db, &session_ref);
-    let ids: Vec<i64> = db
-        .prepare("SELECT id FROM messages WHERE session_id = ? AND claimed_at_ms IS NULL")
+    // `*` is the whole fleet. The dashboard's "unclaimed" badge counts every
+    // session's messages at once on the all-sessions view, so clearing has to
+    // reach as wide as the number the operator is looking at -- a per-session
+    // clear there leaves every other team's messages on the board and looks
+    // like it did nothing. Any other ref is one team.
+    let fleet = session_ref.trim() == "*";
+    let session_id = if fleet { "*".to_string() } else { session_ref_to_id(&db, &session_ref) };
+    let ids: Vec<i64> = if fleet {
+        db.prepare(
+            "SELECT id FROM messages WHERE claimed_at_ms IS NULL AND cancelled_at_ms IS NULL",
+        )
+        .and_then(|mut q| q.query_map([], |r| r.get::<_, i64>(0)).and_then(|m| m.collect()))
+        .map_err(bad)?
+    } else {
+        db.prepare(
+            "SELECT id FROM messages
+              WHERE session_id = ? AND claimed_at_ms IS NULL AND cancelled_at_ms IS NULL",
+        )
         .and_then(|mut q| {
             q.query_map([&session_id], |r| r.get::<_, i64>(0)).and_then(|m| m.collect())
         })
-        .map_err(bad)?;
+        .map_err(bad)?
+    };
     let who = format!("operator:{}", op.label);
     let n = crate::tools::claim_messages(&db, &who, &ids).map_err(bad)?;
     Ok(Json(json!({ "cleared": n, "session_id": session_id })))
@@ -3700,7 +3917,12 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 -- What it is set to do about that, and about repeating
                 -- itself, with NULL meaning it follows its team.
                 s.compact_at_pct, s.loop_guard_repeats,
-                a.loop_period, a.loop_repeats
+                a.loop_period, a.loop_repeats,
+                -- What its model is doing now, for a live process only, and
+                -- whether it is held because its account cannot reach it.
+                CASE WHEN a.exited_at_ms IS NULL THEN a.activity END,
+                CASE WHEN a.exited_at_ms IS NULL THEN a.activity_at_ms END,
+                s.hold_reason, s.hold_until_ms, s.hold_text
          FROM slots s
          LEFT JOIN sessions hs ON hs.id = s.session_id
          LEFT JOIN agents a ON a.id = (
@@ -3715,7 +3937,7 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
     };
     let rows: Vec<Value> = stmt
         .query_map([&session_id], |r| {
-            Ok(json!({
+            let mut v = json!({
                 "slot_id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
                 "role": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
                 "cli": r.get::<_, String>(4)?, "task_state": r.get::<_, String>(5)?,
@@ -3774,7 +3996,15 @@ pub async fn session_status(State(st): State<AppState>, Path(session_ref): Path<
                 "loop_guard_repeats": r.get::<_, Option<i64>>(35)?,
                 "loop_period": r.get::<_, Option<i64>>(36)?,
                 "loop_repeats": r.get::<_, Option<i64>>(37)?,
-            }))
+            });
+            // Added after the literal: one more key in it passes the json!
+            // macro's recursion limit.
+            v["activity"] = json!(r.get::<_, Option<String>>(38)?);
+            v["activity_at_ms"] = json!(r.get::<_, Option<i64>>(39)?);
+            v["hold_reason"] = json!(r.get::<_, Option<String>>(40)?);
+            v["hold_until_ms"] = json!(r.get::<_, Option<i64>>(41)?);
+            v["hold_text"] = json!(r.get::<_, Option<String>>(42)?);
+            Ok(v)
         })
         .and_then(|m| m.collect())
         .unwrap_or_default();
@@ -3807,7 +4037,8 @@ pub async fn session_log(
     let db = st.db.lock().unwrap();
     let Ok(mut stmt) = db.prepare(&format!(
         "SELECT m.id, m.sent_at_ms, m.kind, m.body,
-                COALESCE(sf.display_name, sf.role, 'operator'),
+                CASE WHEN m.from_slot IS NULL AND m.kind = 'nudge' THEN 'nexmesh'
+                     ELSE COALESCE(sf.display_name, sf.role, 'operator') END,
                 CASE WHEN m.to_slot IS NULL THEN '(team)'
                      ELSE COALESCE(st2.display_name, st2.role, m.to_slot) END,
                 {delivered},
@@ -4516,9 +4747,10 @@ async fn run_command(
             // note in the chat from the node -- it is the only thing that
             // can see the screen.
             Ok(format!(
-                "Asked {name} to compact its context. Its CLI's own compaction command is \
-                 typed at it, and the result appears here \u{2014} including a refusal, if its \
-                 terminal is waiting for an answer."
+                "Asked {name} to compact its context, the way its CLI does it: typed at a \
+                 terminal, sent as a command to a headless claude, or through codex's own \
+                 protocol. A refusal -- a terminal waiting for an answer, a CLI that cannot \
+                 compact -- appears here."
             ))
         }
         // How full a seat may get before the hub compacts it, and how many
@@ -4532,6 +4764,20 @@ async fn run_command(
                 Some(n) => format!("is compacted once its context passes {n}% of its window"),
             };
             let scope = set_policy(st, session_id, who, "compact_at_pct", *pct)?;
+            Ok(format!("{scope} {said}."))
+        }
+        Cmd::Remind { who, which, on } => {
+            let what = if *which == "remind_graph" {
+                "pointed at the code graph when it reads many files"
+            } else {
+                "reminded to keep what it learns"
+            };
+            let said = match on {
+                None => format!("is {what} as its team, then the fleet, says"),
+                Some(true) => format!("is {what}"),
+                Some(false) => format!("is no longer {what}"),
+            };
+            let scope = set_policy(st, session_id, who, which, on.map(i64::from))?;
             Ok(format!("{scope} {said}."))
         }
         Cmd::LoopGuard { who, repeats } => {
@@ -5606,33 +5852,54 @@ pub async fn cancel_messages(
     Json(req): Json<CancelRequest>,
 ) -> ApiResult {
     let db = st.db.lock().unwrap();
-    let session_id = session_ref_to_id(&db, &session_ref);
+    // `*` is the whole fleet, matching the all-sessions view's "unseen" badge;
+    // anything else is one team. An `id` names a single message, so when the
+    // operator is clearing fleet-wide it needs no session filter at all --
+    // which also reaches a message carrying no session of its own.
+    let fleet = session_ref.trim() == "*";
+    let session_id = if fleet { "*".to_string() } else { session_ref_to_id(&db, &session_ref) };
     let who = format!("operator:{}", op.label);
     let now = now_ms();
 
     // ONLY WHAT NOBODY HAS SEEN. A message that reached a model cannot be
     // unsent, and saying it was cancelled afterwards would make the log lie
     // about what that agent knew when it acted.
-    let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (req.id, req.all_unseen) {
-        (Some(id), _) => (
-            "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
-              WHERE id = ?3 AND session_id = ?4
-                AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
-            vec![Box::new(now), Box::new(who.clone()), Box::new(id), Box::new(session_id.clone())],
-        ),
-        (None, true) => (
-            "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
-              WHERE session_id = ?3
-                AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
-            vec![Box::new(now), Box::new(who.clone()), Box::new(session_id.clone())],
-        ),
-        (None, false) => {
-            return Err(bad(
-                "say which message to cancel: an `id`, or `all_unseen: true` for every \
-                 message in this team that nobody has seen yet",
-            ))
-        }
-    };
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) =
+        match (req.id, req.all_unseen, fleet) {
+            (Some(id), _, true) => (
+                "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
+                  WHERE id = ?3 AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
+                vec![Box::new(now), Box::new(who.clone()), Box::new(id)],
+            ),
+            (Some(id), _, false) => (
+                "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
+                  WHERE id = ?3 AND session_id = ?4
+                    AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
+                vec![
+                    Box::new(now),
+                    Box::new(who.clone()),
+                    Box::new(id),
+                    Box::new(session_id.clone()),
+                ],
+            ),
+            (None, true, true) => (
+                "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
+                  WHERE acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
+                vec![Box::new(now), Box::new(who.clone())],
+            ),
+            (None, true, false) => (
+                "UPDATE messages SET cancelled_at_ms = ?1, cancelled_by = ?2
+                  WHERE session_id = ?3
+                    AND acked_at_ms IS NULL AND cancelled_at_ms IS NULL",
+                vec![Box::new(now), Box::new(who.clone()), Box::new(session_id.clone())],
+            ),
+            (None, false, _) => {
+                return Err(bad(
+                    "say which message to cancel: an `id`, or `all_unseen: true` for every \
+                     message in this team that nobody has seen yet",
+                ))
+            }
+        };
     let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let n = db.execute(sql, refs.as_slice()).map_err(bad)?;
     if n > 0 {
@@ -5765,6 +6032,84 @@ mod cancel_tests {
         let st = fleet();
         assert_eq!(cancel(&st, json!({ "id": 1 })).await["cancelled"], 1);
         assert_eq!(cancel(&st, json!({ "id": 1 })).await["cancelled"], 0);
+    }
+
+    /// Two teams, each with one unseen, unclaimed message. This is the shape
+    /// the all-sessions view shows: a badge counting both at once.
+    fn two_teams() -> AppState {
+        let st = AppState::in_memory().unwrap();
+        st.db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sessions (id,name,created_at_ms,last_active_ms)
+                   VALUES ('s1','A',1,1),('s2','B',1,1);
+                 INSERT INTO slots (id,session_id,display_name,cli_id,created_at_ms)
+                   VALUES ('sl-1','s1','Dev','claude',1),('sl-2','s2','Dev','claude',1);
+                 INSERT INTO messages (session_id,from_slot,to_slot,kind,body,sent_at_ms)
+                   VALUES ('s1',NULL,'sl-1','system','a',1),('s2',NULL,'sl-2','system','b',1);",
+            )
+            .unwrap();
+        st
+    }
+
+    async fn cancel_in(st: &AppState, session: &str, body: Value) -> Value {
+        cancel_messages(
+            State(st.clone()),
+            Path(session.to_string()),
+            Extension(std::sync::Arc::new(crate::state::Operator::super_as("tester"))),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .map(|Json(v)| v)
+        .unwrap_or_else(|(_, Json(v))| v)
+    }
+
+    async fn clear_in(st: &AppState, session: &str) -> Value {
+        clear_unclaimed(
+            State(st.clone()),
+            Path(session.to_string()),
+            Extension(std::sync::Arc::new(crate::state::Operator::super_as("tester"))),
+        )
+        .await
+        .map(|Json(v)| v)
+        .unwrap_or_else(|(_, Json(v))| v)
+    }
+
+    /// THE BUG: a per-session cancel from the all-sessions view leaves every
+    /// other team's messages waiting while the badge still counts them, so it
+    /// reads as a no-op. `*` withdraws every unseen message across the fleet.
+    #[tokio::test]
+    async fn fleet_cancel_reaches_every_team() {
+        let st = two_teams();
+        assert_eq!(cancel_in(&st, "s1", json!({ "all_unseen": true })).await["cancelled"], 1);
+        assert_eq!(cancel_in(&st, "*", json!({ "all_unseen": true })).await["cancelled"], 1);
+        let left: i64 = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM messages WHERE cancelled_at_ms IS NULL", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 0, "nothing unseen should be left anywhere in the fleet");
+    }
+
+    /// `*` clears unclaimed messages across every team at once, which is what
+    /// the all-sessions "clear unclaimed" button asks for.
+    #[tokio::test]
+    async fn fleet_clear_reaches_every_team() {
+        let st = two_teams();
+        let v = clear_in(&st, "*").await;
+        assert_eq!(v["cleared"], 2, "both teams' unclaimed messages: {v}");
+    }
+
+    /// A single id is cancellable from the fleet view, where no one session is
+    /// selected -- the id alone identifies the message.
+    #[tokio::test]
+    async fn fleet_cancel_by_id_needs_no_session() {
+        let st = two_teams();
+        assert_eq!(cancel_in(&st, "*", json!({ "id": 2 })).await["cancelled"], 1);
     }
 }
 

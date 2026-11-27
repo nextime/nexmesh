@@ -156,6 +156,22 @@
   .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
   .badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
   .badge.info { color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, transparent); }
+  /* A seat whose model is working right now: the one badge that moves, so a
+     roster of twenty can be read at a glance for who is doing something. */
+  .badge.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
+  .badge.live::before { content: ""; display: inline-block; width: 6px; height: 6px;
+    margin-right: 5px; border-radius: 50%; background: var(--ok); vertical-align: 1px;
+    animation: nmPulse 1.2s ease-in-out infinite; }
+  @keyframes nmPulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .badge.live::before { animation: none; } }
+  /* How full a context is, as a bar: a number alone does not read as "nearly
+     out of room" across a table. */
+  .ctxbar { display: inline-block; width: 46px; height: 6px; border-radius: 3px;
+    background: color-mix(in srgb, var(--dim) 22%, transparent); vertical-align: middle;
+    overflow: hidden; margin-right: 5px; }
+  .ctxbar > i { display: block; height: 100%; background: var(--ok); }
+  .ctxbar.warn > i { background: var(--warn); }
+  .ctxbar.bad > i { background: var(--bad); }
 
   .feed { max-height: 68vh; overflow-y: auto; padding: 4px 0; }
   .msg {
@@ -216,6 +232,7 @@
   .sw.off { opacity: .28; }
   .sw.on { color: var(--ok); }
   .sw.warn { color: var(--warn); }
+  .sw.inh { filter: saturate(.55); }
   .sw:hover { opacity: 1; }
 
   .composer { display: flex; gap: 8px; padding: 10px 12px; align-items: flex-end;
@@ -1102,8 +1119,84 @@ function contextCell(a) {
     : "follows its team's compaction setting";
   const looping = a.loop_repeats > 1
     ? ` · repeating itself ${a.loop_repeats}\u00d7` : "";
-  return `<span class="badge ${cls}" title="${human(used)} of ${human(lim)} tokens · ${note}${
-      looping}">${pct}%</span>`;
+  return `<span title="${human(used)} of ${human(lim)} tokens · ${note}${looping}"
+      ><span class="ctxbar ${cls}"><i style="width:${Math.min(100, pct)}%"></i></span
+      ><span class="badge ${cls}">${pct}%</span></span>`;
+}
+
+// Compact a seat's context NOW, the way its CLI does it. The same command the
+// chat box takes, so the reply -- including a refusal from a terminal that is
+// waiting on a question -- lands in the chat like any other.
+async function compactSeat(name, session) {
+  const sid = session || currentSession();
+  if (!sid || sid === "*") { note("Pick the seat's session first."); return; }
+  try {
+    const r = await post(`/v1/sessions/${encodeURIComponent(sid)}/messages`,
+                         { text: "/compact " + name });
+    if (r && r.error) throw new Error(r.error);
+    note((r && r.said) || `Asked ${name} to compact.`);
+  } catch (e) {
+    note(e.message || "could not ask it to compact");
+  }
+}
+
+// WHAT ITS MODEL IS DOING NOW -- distinct from the State badge beside it,
+// which is the WORK (working on a task, done, in review). "working" here means
+// a turn is running and we are waiting on its answer.
+function activityBadge(a, now) {
+  const since = a.activity_at_ms ? " for " + ago(a.activity_at_ms, now) : "";
+  switch (a.activity) {
+    case "active": return ` <span class="badge live" title="a turn is running${since}: the
+        model is working and we are waiting on its answer">thinking</span>`;
+    case "blocked": return ` <span class="badge warn" title="stopped on a question only a person
+        can answer${since}">needs you</span>`;
+    case "idle": return ` <span class="badge" title="waiting for input${since}; nothing is
+        running">idle</span>`;
+    default: return "";
+  }
+}
+
+// WHETHER A SEAT USES WHAT THE TEAM KEEPS: how often it asked the code graph,
+// read the memory, and wrote to it. A prompt can tell it to; this shows
+// whether it did. A seat that has spent a great deal and never once asked the
+// graph is reading the tree instead, which is marked.
+function usesLine(a) {
+  const u = a.uses || {};
+  const spent = (a.input_tokens || 0) + (a.output_tokens || 0);
+  if (!spent && !u.graph && !u.recall && !u.stored) return "";
+  const noGraph = !u.graph && spent > 2000000;
+  return `<br><span class="${noGraph ? "badge warn" : "muted"}" title="calls to query_code_graph,
+      to recall / query_knowledge, and to store_memory / store_knowledge${
+      noGraph ? " — it has spent a lot and never asked the code graph: it is reading files instead" : ""}"
+      >graph ${u.graph || 0} · recall ${u.recall || 0} · kept ${u.stored || 0}</span>`;
+}
+
+// Held because its account cannot reach the model -- or paused by a person.
+function holdBadge(a) {
+  if (!a.hold_reason) return a.paused ? ' <span class="badge warn">paused</span>' : "";
+  const why = a.hold_reason === "quota" ? "out of allowance"
+    : a.hold_reason === "auth" ? "signed out" : a.hold_reason === "billing" ? "billing" : "held";
+  const until = a.hold_until_ms
+    ? " until " + new Date(a.hold_until_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
+  const auto = a.quota_auto_resume !== false;
+  return ` <span class="badge bad" title="${esc(a.hold_text || "")}${
+      a.hold_reason === "quota" ? (auto ? " — it resumes on its own" : " — it stays paused when it lifts") : ""}"
+      >held: ${why}${until}</span>
+    <button class="tiny" title="${auto ? "Resumes on its own when the allowance is back; click to keep it paused instead"
+        : "Stays paused when the allowance is back; click to let it resume on its own"}"
+      onclick="setQuotaResume('${esc(a.slot_id)}', ${!auto})">${auto ? "auto-resume" : "stay paused"}</button>`;
+}
+
+async function setQuotaResume(slot, on) {
+  try {
+    await post(`/v1/slots/${encodeURIComponent(slot)}/quota-resume`, { on });
+    note(on ? "It will resume on its own when its allowance is back."
+            : "It will stay paused when its allowance is back, until you resume it.");
+  } catch (e) {
+    note(e.message || "could not change that");
+  }
+  tick();
 }
 
 function stateClass(s) {
@@ -1713,6 +1806,7 @@ function render() {
   const d = snap.detail, now = snap.hub.now_ms;
   // Before anything else on the page: somebody is stopped waiting for you.
   renderApprovals();
+  notifyModelAccess(d, now);
   // Is the hub serving a newer dashboard than this one?
   const served = snap.hub && snap.hub.build;
   if (served && PAGE_BUILD !== "__BUILD__" && served !== PAGE_BUILD) {
@@ -1924,7 +2018,7 @@ function viewAgents(d, now) {
        <span class="tiny muted">only seats a live one has replaced — same machine, same
          directory, same CLI; anything still waiting for them is carried over</span></div>`
     : "";
-  return panel(guestable + `<table><thead><tr>` +
+  return panel(teamSwitches(d) + guestable + `<table><thead><tr>` +
       th("Agent", "name") + (all ? th("Session", "session") : "") +
       th("Role", "role") + th("", "switches") + th("Authority", "authority") + "<th></th>" +
       th("Where", "host") + th("How", "cli", "hide") +
@@ -1969,7 +2063,7 @@ function viewAgents(d, now) {
                     ? "Answers its own permission prompts, taking the narrowest yes on offer. Click to bring them back to you."
                     : "Permission prompts come to you. Click to let this seat answer its own."}"
                   onclick="toggleSeat('${esc(a.slot_id)}','auto-approve',${!a.auto_approve})"
-                  >\u{1f511}</span></td>
+                  >\u{1f511}</span>${seatSwitches(a)}</td>
         <td><span class="auth ${esc(a.authority || "agent")}" id="au-${esc(a.slot_id)}"
               title="What this seat may do TO THE FLEET \u2014 click to change.&#10;&#10;agent: no fleet tools.&#10;orchestrator: runs this team, and can elect other orchestrators in it.&#10;superorchestrator: runs the whole fleet.&#10;&#10;This is not the Role beside it, which is the seat's job and confers nothing."
               onclick="editAuthority('${esc(a.slot_id)}', '${esc(a.authority || "agent")}')"
@@ -2018,14 +2112,81 @@ function viewAgents(d, now) {
                 a.io_kind ? " · " + esc(a.io_kind) : ""}</span>` : ""}</td>
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
             <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
-        <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span>
-            ${a.paused ? ' <span class="badge warn">paused</span>' : ""}</td>
+        <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span>${
+            dead ? "" : activityBadge(a, now)}${holdBadge(a)}</td>
         <td class="num hide tiny">${a.input_tokens || a.output_tokens
-            ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}</td>
-        <td class="num tiny">${contextCell(a)}</td>
+            ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}${usesLine(a)}</td>
+        <td class="num tiny">${contextCell(a)}${dead || a.kind === "external" ? ""
+            : ` <button class="tiny" title="Compact this seat's context now, the way its CLI
+                 does it"
+                 onclick="compactSeat('${esc(a.name).replace(/'/g, "\\'")}','${esc(a.session || "")}')"
+                 >compact</button>`}</td>
         <td class="muted">${esc(a.summary) || "<span class=tiny>—</span>"}</td>
       </tr>`;
     }).join("") + "</tbody></table>") + tidy;
+}
+
+// THE THREE SWITCHES -- auto-compaction, memory reminders, graph reminders --
+// per seat and per team. Each resolves seat, then team, then the fleet, and
+// says which of those it is reading from: a switch that shows "on" without
+// saying it is the team's is one somebody flips on the seat and then wonders
+// why the team's change did not reach it. Click flips it for this seat (or
+// team); right-click hands it back to the level above.
+const SWITCHES = [
+  ["compact", "\u{1f5dc}", "Auto-compaction",
+   (x) => x.on ? `compacts itself past ${x.pct}% of its window \u2014 asking it to fold first`
+               : "never compacted automatically"],
+  ["remind_memory", "\u{1f9e0}", "Memory reminders",
+   (x) => x.on ? "reminded to keep what it learns after a stretch of work with nothing kept"
+               : "never reminded to keep what it learns"],
+  ["remind_graph", "\u{1f578}", "Graph reminders",
+   (x) => x.on ? "pointed at the code graph after reading many files without it"
+               : "never pointed at the code graph"],
+];
+
+function switchSpan(target, kind, sw, x, scope) {
+  if (!x) return "";
+  const [name, icon, label, say] = sw;
+  const from = x.from === "seat" ? "set on this seat"
+    : x.from === "team" ? "from its team" : "the fleet's default";
+  const back = scope === "seat" ? "right-click to follow the team again"
+    : "right-click to follow the fleet again";
+  return `<span class="sw ${x.on ? "on" : "off"}${x.from === (scope === "seat" ? "seat" : "team")
+        ? "" : " inh"}"
+      title="${label}: ${esc(say(x))} (${from}).&#10;Click to turn it ${x.on ? "off" : "on"}; ${back}."
+      onclick="flipSwitch('${kind}','${esc(target)}','${name}',${!x.on})"
+      oncontextmenu="flipSwitch('${kind}','${esc(target)}','${name}',null);return false"
+      >${icon}</span>`;
+}
+
+function seatSwitches(a) {
+  const s = a.switches;
+  if (!s || a.kind === "external") return "";
+  return SWITCHES.map((sw) => switchSpan(a.slot_id, "slots", sw, s[sw[0]], "seat")).join("");
+}
+
+function teamSwitches(d) {
+  const t = d.team_switches;
+  if (!t || isAll()) return "";
+  const sid = currentSession();
+  return `<div class="pair"><span class="tiny muted">This team:</span>
+      <span class="switches">${SWITCHES.map((sw) =>
+        `${switchSpan(sid, "sessions", sw, t[sw[0]], "team")}<span class="tiny muted"
+           >${sw[2].toLowerCase()}</span>`).join(" ")}</span>
+      <span class="tiny muted">\u2014 for every seat that has not set its own</span></div>`;
+}
+
+async function flipSwitch(kind, target, name, on) {
+  try {
+    const r = await post(`/v1/${kind}/${encodeURIComponent(target)}/switch`, { name, on });
+    if (r && r.error) throw new Error(r.error);
+    const sw = SWITCHES.find((x) => x[0] === name);
+    note(`${sw ? sw[2] : name}: ${on === null ? "follows the level above again"
+      : on ? "on" : "off"}${kind === "sessions" ? " for this team" : " for that seat"}.`);
+  } catch (e) {
+    note(e.message || "could not change that");
+  }
+  tick();
 }
 
 // The whole fleet's traffic, read like a chat log.
@@ -2995,6 +3156,21 @@ function renderApprovals() {
   // Forget the ones that are gone, so a re-raised prompt notifies again.
   const live = new Set(list.map((a) => a.id));
   for (const id of [...seenApprovals]) if (!live.has(id)) seenApprovals.delete(id);
+}
+
+// A seat held because its account ran out of model allowance -- or let go
+// again -- is something to be TOLD, not to find by looking: notified once per
+// line, and only for lines from the last ten minutes, so opening the page on
+// an old one does not ring.
+let seenAccess = new Set();
+function notifyModelAccess(d, now) {
+  for (const m of (d && d.messages) || []) {
+    if (!String(m.body || "").startsWith("[MODEL ACCESS")) continue;
+    if (seenAccess.has(m.id)) continue;
+    seenAccess.add(m.id);
+    if (now - (m.at_ms || 0) > 600000) continue;
+    notifyOperator("Model access", String(m.body).replace(/^\[MODEL ACCESS[^\]]*\]\s*/, ""));
+  }
 }
 
 // Invite a seat from another team into the one on screen.
@@ -4886,17 +5062,41 @@ function viewGraph(d, now) {
 // often tens of thousands of tokens, and the whole point of a fold is that
 // nobody carries it until they ask. `unfold_context` is how an agent asks;
 // this is the operator's view of what exists.
+// WHAT THE SEATS PUT AWAY, fleet-wide and filtered like the memory above it:
+// the same scope chips, the same team/agent picker, the same search. It used
+// to show only the folds of the team on screen and to vanish when there were
+// none, which made a fleet whose only folding seat was in another team look
+// as though nothing had ever been folded.
+let foldBook = { rows: null, counts: [], err: "", open: null };
+
+function foldCount(scope) {
+  return (foldBook.counts || []).filter((c) => scope === "all" || c.scope === scope)
+    .reduce((a, c) => a + (c.n || 0), 0);
+}
+
 function foldsPanel(d, now) {
-  const f = d.folds || [];
-  if (!f.length) return "";
+  const f = (foldBook.rows || []).filter((x) => !memBook.ref || x.scope_ref === memBook.ref);
+  const total = foldCount("all");
+  const head = `<h3 class="tiny muted" style="margin:14px 2px 4px"
+      title="A fold is a stretch of a seat's work it has written down and put away: the summary is carried, the detail is kept whole here and comes back with unfold_context.">
+      Folded away — ${f.length}${f.length !== total ? ` of ${total}` : ""}
+      fold${total === 1 ? "" : "s"}</h3>`;
+  if (foldBook.err) return head + panel(`<div class="empty">${esc(foldBook.err)}</div>`);
+  if (foldBook.rows === null) return head + panel(`<div class="empty">reading…</div>`);
+  if (!f.length) {
+    return head + panel(`<div class="empty">${total
+      ? "No folds match this view."
+      : "Nothing folded yet. A seat folds with <code>fold_context</code> when a stretch of "
+        + "its work is done with, and the hub asks it to before it compacts."}</div>`);
+  }
   const before = f.reduce((a, x) => a + (x.tokens_before || 0), 0);
   const after = f.reduce((a, x) => a + (x.tokens_after || 0), 0);
-  return `<h3 class="tiny muted" style="margin:10px 2px">Folded away \u2014 ${f.length}
-      fold${f.length === 1 ? "" : "s"} carrying ${after.toLocaleString()} tokens of summary
-      over ${before.toLocaleString()} tokens of detail</h3>` + panel(
+  return head + `<div class="tiny muted" style="margin:0 2px 4px">carrying ${
+      after.toLocaleString()} tokens of summary over ${before.toLocaleString()} of detail</div>`
+    + panel(
     `<table><thead><tr><th class="num">Tier</th><th>Scope</th><th>What</th>
       <th>The summary it carries</th><th class="num hide">Folded</th>
-      <th class="hide">By</th><th class="num hide">Age</th></tr></thead><tbody>` +
+      <th class="hide">By</th><th class="num hide">Age</th><th></th></tr></thead><tbody>` +
     f.map((x) => `<tr>
       <td class="num"><span class="badge ${x.tier > 1 ? "info" : ""}"
           title="${x.tier > 1
@@ -4904,15 +5104,47 @@ function foldsPanel(d, now) {
             : "folds a stretch of the agent's own work"}">${x.tier}</span></td>
       <td><span class="badge ${x.scope === "global" ? "warn"
             : x.scope === "agent" ? "" : x.scope === "group" ? "info" : ""}">${
-          esc(x.scope)}</span></td>
+          esc(x.scope)}</span><div class="tiny muted">${esc(x.scope_label || "")}</div></td>
       <td>${esc(x.topic)}<div class="mono tiny muted">${esc(x.id)}</div></td>
       <td>${esc(x.summary)}</td>
       <td class="num hide muted tiny" title="${(x.detail_bytes || 0).toLocaleString()} bytes
           of detail kept, read back ${x.unfolded || 0} time(s)">${
           (x.tokens_before || 0).toLocaleString()}</td>
-      <td class="hide muted tiny">${esc(x.who)}</td>
-      <td class="num hide muted tiny">${ago(x.at_ms, now)}</td></tr>`).join("") +
+      <td class="hide muted tiny">${esc(x.who)}${x.team ? ` <span class="badge info">${
+          esc(x.team)}</span>` : ""}</td>
+      <td class="num hide muted tiny">${ago(x.at_ms, now)}</td>
+      <td class="num"><button class="tiny" onclick="openFold(${(foldBook.rows || []).indexOf(x)})"
+          title="read the detail it put away">detail</button></td></tr>`).join("") +
     "</tbody></table>");
+}
+
+/// A fold in full, in the memory sheet: summary, the detail, and what it covers.
+async function openFold(i) {
+  const x = (foldBook.rows || [])[i];
+  const host = $("memModal");
+  if (!x || !host) return;
+  host.hidden = false;
+  host.innerHTML = `<div class="sheet"><div class="muted">reading…</div></div>`;
+  try {
+    const f = await getJSON(`/v1/folds/${encodeURIComponent(x.id)}`);
+    if (f && f.error) throw new Error(f.error);
+    host.innerHTML = `<div class="sheet" style="max-width:900px">
+      <div class="row" style="justify-content:space-between">
+        <strong>${esc(f.topic)}</strong>
+        <button class="tiny" onclick="closeMem()">close</button></div>
+      <div class="tiny muted">${esc(x.scope)} ${esc(x.scope_label || "")} · tier ${f.tier}
+        · by ${esc(x.who)} · <span class="mono">${esc(f.id)}</span></div>
+      <h4 class="tiny muted">Summary</h4><div style="white-space:pre-wrap">${esc(f.summary)}</div>
+      ${(f.covers || []).length ? `<h4 class="tiny muted">Folds underneath</h4><ul>${
+        f.covers.map((c) => `<li><span class="mono tiny">${esc(c.id)}</span> ${esc(c.topic)}</li>`)
+          .join("")}</ul>` : ""}
+      <h4 class="tiny muted">Detail</h4>
+      <pre style="white-space:pre-wrap;max-height:55vh;overflow:auto">${
+        esc(f.detail || "(no detail kept)")}</pre></div>`;
+  } catch (e) {
+    host.innerHTML = `<div class="sheet"><div class="empty">${esc(e.message || "could not read it")}</div>
+      <button class="tiny" onclick="closeMem()">close</button></div>`;
+  }
 }
 
 // ------------------------------------------------------ what the fleet knows
@@ -4952,7 +5184,7 @@ let skillCat = { roles: null, skills: null, at: 0, pending: false, err: "" };
 function knowSignature(d) {
   return [memBook.at, memBook.scope, memBook.ref, memBook.q, memBook.err,
           memBook.rows ? memBook.rows.length : -1,
-          (d && d.folds || []).length].join("~");
+          foldBook.rows ? foldBook.rows.length : -1, foldBook.err].join("~");
 }
 
 async function loadMemory(force) {
@@ -4967,6 +5199,16 @@ async function loadMemory(force) {
     if (r && r.error) throw new Error(r.error);
     memBook.rows = r.memory || [];
     memBook.counts = r.counts || [];
+    try {
+      const fr = await getJSON("/v1/folds" + (u.toString() ? "?" + u.toString() : ""));
+      if (fr && fr.error) throw new Error(fr.error);
+      foldBook.rows = fr.folds || [];
+      foldBook.counts = fr.counts || [];
+      foldBook.err = "";
+    } catch (e) {
+      foldBook.err = e.message || "could not read the folds";
+      foldBook.rows = [];
+    }
     if ((r.categories || []).length) memBook.cats = r.categories;
     memBook.err = "";
   } catch (e) {
@@ -5017,7 +5259,8 @@ function viewKnowledge(d, now) {
   const chip = (scope, label, hint) =>
     `<button class="tiny" aria-selected="${memBook.scope === scope}"
              title="${hint}" onclick="memScope('${scope}')">${label}<span class="count"> ${
-      scope === "all" ? total : memCount(scope)}</span></button>`;
+      scope === "all" ? total : memCount(scope)}${foldCount(scope)
+        ? ` +${foldCount(scope)} fold${foldCount(scope) === 1 ? "" : "s"}` : ""}</span></button>`;
   // The scopes are always all four, with their counts, whether or not
   // anything is in them: a page that simply leaves out an empty scope is a
   // page that cannot tell you the scope is empty.
@@ -5026,7 +5269,7 @@ function viewKnowledge(d, now) {
   // (not "everything" or "global", which is a single fleet-wide bucket).
   const picks = [];
   if (memBook.scope === "session" || memBook.scope === "group" || memBook.scope === "agent") {
-    for (const r of rows) {
+    for (const r of rows.concat(foldBook.rows || [])) {
       const rf = r.scope_ref || "";
       if (!picks.some((p) => p.ref === rf)) {
         picks.push({ ref: rf, label: r.scope_label || rf || "(unnamed)" });

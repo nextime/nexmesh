@@ -150,6 +150,12 @@ pub async fn run(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut seq = 0u64;
+            // The newest rate-limit picture codex has sent: where the reset
+            // time comes from when a turn fails on the allowance.
+            let mut limits = Value::Null;
+            // Whether the hub has been told this seat cannot reach its model,
+            // so the first turn that succeeds afterwards can say it can again.
+            let mut blocked = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
                     continue;
@@ -206,14 +212,47 @@ pub async fn run(
                     "turn/started" => {
                         let id = p["turn"]["id"].as_str().map(|s| s.to_string());
                         *active_turn.lock().unwrap() = id;
+                        ctx.report_activity(&agent_id, &io, proto::ActivityState::Active).await;
                     }
                     "turn/completed" => {
                         *active_turn.lock().unwrap() = None;
+                        ctx.report_activity(&agent_id, &io, proto::ActivityState::Idle).await;
                         if p["turn"]["status"] == "failed" {
                             tracing::warn!(%agent_id, "a codex turn failed");
+                            if let Some(b) = usage_block(&p["turn"]["error"], &limits) {
+                                blocked = true;
+                                let _ = ctx.send_hub(&proto::NodeToHub::UsageLimited {
+                                    agent_id: agent_id.clone(), block: Some(b) }).await;
+                            }
+                        } else if blocked {
+                            // A turn went through: the allowance is back.
+                            blocked = false;
+                            let _ = ctx.send_hub(&proto::NodeToHub::UsageLimited {
+                                agent_id: agent_id.clone(), block: None }).await;
                         }
                     }
+                    "account/rateLimits/updated" => {
+                        limits = p["rateLimits"].clone();
+                    }
                     "thread/tokenUsage/updated" => {
+                        // HOW FULL, from the last call -- not the running total,
+                        // which is spend. Codex says its own window size.
+                        let last = &p["tokenUsage"]["last"];
+                        if let (Some(used), Some(limit)) = (
+                            last["totalTokens"].as_i64(),
+                            p["tokenUsage"]["modelContextWindow"].as_i64(),
+                        ) {
+                            if used > 0 && limit > 0 {
+                                let _ = ctx
+                                    .send_hub(&proto::NodeToHub::ContextUsage {
+                                        agent_id: agent_id.clone(),
+                                        used,
+                                        limit,
+                                        source: "codex app-server".into(),
+                                    })
+                                    .await;
+                            }
+                        }
                         let t = &p["tokenUsage"]["total"];
                         let _ = ctx
                             .send_hub(&proto::NodeToHub::TokenUsage {
@@ -227,6 +266,14 @@ pub async fn run(
                     "error" => {
                         tracing::warn!(%agent_id, error = %p["error"], will_retry = %p["willRetry"],
                             "codex reported an error");
+                        // Not while codex is still retrying it itself.
+                        if p["willRetry"].as_bool() != Some(true) {
+                            if let Some(b) = usage_block(&p["error"], &limits) {
+                                blocked = true;
+                                let _ = ctx.send_hub(&proto::NodeToHub::UsageLimited {
+                                    agent_id: agent_id.clone(), block: Some(b) }).await;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -317,8 +364,25 @@ pub async fn run(
         Err(e) => tracing::warn!(%agent_id, error = %e, "the first codex turn failed to start"),
     }
 
+    // Requests that are not messages -- "compact now" -- arrive here.
+    let (ctl_tx, mut ctl_rx) = mpsc::channel::<crate::ctx::DriverControl>(4);
+    io.set_control(ctl_tx);
+
     // Injection loop: steer a live turn, or start a new one.
-    while let Some(messages) = inject_rx.recv().await {
+    loop {
+        let messages = tokio::select! {
+            m = inject_rx.recv() => match m { Some(m) => m, None => break },
+            c = ctl_rx.recv() => {
+                if let Some(crate::ctx::DriverControl::Compact) = c {
+                    match rpc.call("thread/compact/start", json!({ "threadId": tid })).await {
+                        Ok(_) => tracing::info!(%agent_id, "asked codex to compact its thread"),
+                        Err(e) => tracing::warn!(%agent_id, error = %e,
+                            "codex refused to compact its thread"),
+                    }
+                }
+                continue;
+            }
+        };
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let text = crate::driver::render_injection(&messages);
         let current = active_turn.lock().unwrap().clone();
@@ -423,5 +487,85 @@ mod tests {
         assert_eq!(v[0]["type"], "text");
         assert_eq!(v[0]["text"], "hello");
         assert!(v.is_array(), "turn/start takes an ARRAY of UserInput");
+    }
+}
+
+
+/// Whether a codex error means the account cannot reach its model, and if so
+/// what to tell the hub.
+///
+/// From codex's own error class, never its wording: `usageLimitExceeded` is
+/// the allowance, `unauthorized` the login. The reset time is the latest of
+/// the rate-limit windows codex says are full -- both have to reset before a
+/// turn can go through -- or none when codex has not said.
+fn usage_block(err: &Value, limits: &Value) -> Option<proto::UsageBlock> {
+    let class = err["codexErrorInfo"].as_str()?;
+    let kind = match class {
+        "usageLimitExceeded" => "quota",
+        "unauthorized" => "auth",
+        _ => return None,
+    };
+    let mut reset: Option<i64> = None;
+    let mut window: Option<String> = None;
+    for w in ["primary", "secondary"] {
+        let win = &limits[w];
+        if win["usedPercent"].as_i64().unwrap_or(0) < 100 {
+            continue;
+        }
+        if let Some(at) = win["resetsAt"].as_i64() {
+            // Seconds since the epoch; a value already in milliseconds is
+            // taken as one.
+            let at = if at < 100_000_000_000 { at * 1000 } else { at };
+            if reset.map_or(true, |r| at > r) {
+                reset = Some(at);
+                window = win["windowDurationMins"].as_i64().map(|m| match m {
+                    300 => "five_hour".to_string(),
+                    10_080 => "seven_day".to_string(),
+                    m => format!("{m}_minutes"),
+                });
+            }
+        }
+    }
+    Some(proto::UsageBlock {
+        kind: kind.into(),
+        reset_at_ms: if kind == "quota" { reset } else { None },
+        window,
+        text: err["message"].as_str().unwrap_or(class).to_string(),
+    })
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn a_used_up_allowance_is_held_until_the_later_full_window_resets() {
+        let err = json!({ "message": "You've hit your usage limit.",
+                          "codexErrorInfo": "usageLimitExceeded" });
+        let limits = json!({
+            "primary":   { "usedPercent": 100, "resetsAt": 1_800_000_000, "windowDurationMins": 300 },
+            "secondary": { "usedPercent": 100, "resetsAt": 1_800_500_000, "windowDurationMins": 10080 },
+        });
+        let b = usage_block(&err, &limits).unwrap();
+        assert_eq!(b.kind, "quota");
+        assert_eq!(b.reset_at_ms, Some(1_800_500_000_000), "both must reset: the later one");
+        assert_eq!(b.window.as_deref(), Some("seven_day"));
+    }
+
+    #[test]
+    fn a_window_that_is_not_full_does_not_set_the_reset() {
+        let err = json!({ "message": "limit", "codexErrorInfo": "usageLimitExceeded" });
+        let limits = json!({ "primary": { "usedPercent": 40, "resetsAt": 1_800_000_000 } });
+        assert_eq!(usage_block(&err, &limits).unwrap().reset_at_ms, None);
+    }
+
+    #[test]
+    fn other_errors_are_not_a_used_up_allowance() {
+        for class in ["serverOverloaded", "contextWindowExceeded", "rateLimitExceeded"] {
+            let err = json!({ "message": "x", "codexErrorInfo": class });
+            assert!(usage_block(&err, &Value::Null).is_none(), "{class}");
+        }
+        assert_eq!(usage_block(&json!({ "message": "x", "codexErrorInfo": "unauthorized" }),
+                               &Value::Null).unwrap().kind, "auth");
     }
 }

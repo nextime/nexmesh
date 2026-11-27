@@ -190,6 +190,9 @@ pub struct Envelope {
 /// TEAMMATE does not reach them. One did exactly that: it was asked in the
 /// chat whether it was connected, answered a sibling seat, and the question
 /// read as ignored.
+/// What an automatic note from the hub is said to be from.
+pub const AUTOMATIC: &str = "nexmesh (automatic, not a person -- no answer expected)";
+
 pub fn render_pending(deliver: &[Envelope]) -> String {
     if deliver.is_empty() {
         return String::new();
@@ -198,6 +201,11 @@ pub fn render_pending(deliver: &[Envelope]) -> String {
     let mut from_operator = false;
     for m in deliver {
         let who = match (&m.from_slot, &m.from_name) {
+            // The hub's own automatic notes -- a reminder, a fold nudge, a
+            // seat's memory pointer. Not a person, and labelled so: called
+            // "the OPERATOR", each one came with the line telling the agent
+            // to answer the person, and every reminded seat did.
+            (None, _) if m.kind == MessageKind::Nudge => AUTOMATIC.to_string(),
             (None, _) => {
                 from_operator = true;
                 "the OPERATOR".to_string()
@@ -476,6 +484,40 @@ pub enum NodeToHub {
     /// matters: how many repeats are too many is the operator's setting, and
     /// it lives with the rest of them in the hub. Sent when the cycle
     /// changes, not on every turn.
+    /// The agent's model started or stopped working.
+    ///
+    /// ACTIVE means a turn is running: the model is generating and somebody
+    /// is waiting on its answer. IDLE means it is waiting for input and doing
+    /// nothing. BLOCKED means it stopped on a question only a person can
+    /// answer. Sent when it CHANGES, by whichever part of the node can see the
+    /// turn -- a driver's own turn events, or the screen of a terminal seat --
+    /// and repeated on every heartbeat, so a lost frame is repaired rather
+    /// than shown for ever.
+    Activity {
+        agent_id: String,
+        state: ActivityState,
+        /// When it changed, by the node's clock.
+        since_ms: i64,
+    },
+    /// The agent can no longer reach its model -- or, with `block: None`, it
+    /// can again.
+    ///
+    /// Read from what the CLI itself reported, never guessed from silence: a
+    /// claude transcript's `quotaLimits` and API error class, codex's
+    /// `usageLimitExceeded`, a provider's 429. The node reports; the hub
+    /// decides what to hold and when to let it go.
+    UsageLimited {
+        agent_id: String,
+        block: Option<UsageBlock>,
+    },
+    /// Files this agent has read since the last report, counted from its
+    /// own conversation (a Read, Grep or Glob, or a shell `cat`/`rg`/...).
+    /// What the hub compares against its code-graph queries: a seat reading
+    /// the tree file by file is a seat the graph could have answered.
+    FileReads {
+        agent_id: String,
+        n: u32,
+    },
     LoopSuspected {
         agent_id: String,
         period: i64,
@@ -625,6 +667,53 @@ pub struct DetectedCli {
     pub cli_id: String,
     pub version: Option<String>,
     pub path: Option<String>,
+    /// The account this CLI signs in as, when its descriptor names one. Seats
+    /// on one account share one allowance, so when it runs out it runs out
+    /// for all of them. Absent: every seat of this CLI on this machine is
+    /// taken to share one login, which is what one config directory means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// Whether an agent's model is working right now. See [`NodeToHub::Activity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityState {
+    /// A turn is running: the model is generating, and we wait on it.
+    Active,
+    /// Waiting for input. Nothing is running.
+    Idle,
+    /// Stopped on a question only a person can answer.
+    Blocked,
+}
+
+impl ActivityState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// Why an agent cannot reach its model. See [`NodeToHub::UsageLimited`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageBlock {
+    /// `quota`: the account's allowance is used up, and comes back on its
+    /// own -- at `reset_at_ms` when the CLI said. `auth`: the login is gone.
+    /// `billing`: the subscription cannot be used. Only `quota` recovers
+    /// without a person.
+    pub kind: String,
+    /// When the allowance comes back, if the CLI said.
+    #[serde(default)]
+    pub reset_at_ms: Option<i64>,
+    /// Which window ran out, as the provider names it: `five_hour`,
+    /// `seven_day`, ...
+    #[serde(default)]
+    pub window: Option<String>,
+    /// What the CLI said, verbatim, for the operator.
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,7 +722,12 @@ pub struct AgentHealth {
     /// Verified by re-reading `/proc/<pid>/stat` and comparing start_ticks, so
     /// a recycled pid cannot masquerade as a live agent.
     pub alive: bool,
+    /// How long since the agent last produced output. 0 when unknown.
     pub idle_ms: u64,
+    /// What it is doing now, repeated so a lost `Activity` edge is repaired
+    /// within a heartbeat. Absent from a node that cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityState>,
 }
 
 // --------------------------------------------------------- hub -> node ----
@@ -966,6 +1060,19 @@ pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn render_pending_tells_a_hub_note_from_the_operator() {
+        let note = |kind| Envelope {
+            id: 7, from_slot: None, from_name: None, to_slot: None, kind,
+            body: "keep it".into(), sent_at_ms: 0,
+        };
+        let auto = render_pending(&[note(MessageKind::Nudge)]);
+        assert!(auto.contains(AUTOMATIC) && !auto.contains("OPERATOR") && !auto.contains("`reply`"),
+                "{auto}");
+        let person = render_pending(&[note(MessageKind::System)]);
+        assert!(person.contains("the OPERATOR") && person.contains("`reply`"), "{person}");
+    }
+
     use super::*;
 
     #[test]
