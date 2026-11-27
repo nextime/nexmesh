@@ -728,6 +728,13 @@ pub struct AgentHealth {
     /// within a heartbeat. Absent from a node that cannot tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ActivityState>,
+    /// Whether the seat's nexmesh tools are connected: a shim is registered
+    /// for it on this node. `Some(false)` is a CLI that takes an MCP server
+    /// and has had none for over a minute and a half -- typable, but every
+    /// fleet tool it has is dead. Absent for a CLI with no MCP at all (a tmux
+    /// screen) and from a node too old to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_link: Option<bool>,
 }
 
 // --------------------------------------------------------- hub -> node ----

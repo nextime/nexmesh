@@ -779,6 +779,10 @@ CREATE TABLE IF NOT EXISTS slots (
   -- This seat's own reminder switches, over its team's. See `sessions`.
   remind_memory     INTEGER,
   remind_graph      INTEGER,
+  -- When this seat was last reminded. The seat's, not the agent's: a
+  -- respawn or reattach must not restart the cooldown.
+  memory_reminded_at_ms INTEGER,
+  graph_reminded_at_ms  INTEGER,
   -- This seat's own flood limits, overriding its team's. See `sessions`.
   -- A coordinator legitimately sends more than anybody else; a seat that
   -- only ever answers should never be sending thirty a minute.
@@ -891,6 +895,10 @@ CREATE TABLE IF NOT EXISTS agents (
   activity_at_ms       INTEGER,
   -- Turns finished since this agent last kept anything (store_memory,
   -- store_knowledge, fold_context), and when it was last reminded to.
+  -- Whether its nexmesh tools are connected (a shim is registered for it on
+  -- its node): 1, 0 once it has had none for a while, NULL when the node
+  -- does not say (a CLI with no MCP, a seat still coming up).
+  mcp_link             INTEGER,
   turns_unkept         INTEGER NOT NULL DEFAULT 0,
   memory_reminded_at_ms INTEGER,
   -- Files it has read since it last asked the code graph, and when it was

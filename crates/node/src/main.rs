@@ -516,6 +516,7 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
                                 ))
                                 .collect()
                         };
+                        ctx.prune_shims(&live.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>());
                         let agents: Vec<AgentHealth> = live
                             .into_iter()
                             .map(|(agent_id, alive)| {
@@ -523,6 +524,7 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
                                 AgentHealth {
                                     idle_ms: io.as_ref().map(|io| io.idle_ms()).unwrap_or(0),
                                     activity: io.as_ref().and_then(|io| io.activity().map(|(s, _)| s)),
+                                    mcp_link: if alive { ctx.mcp_link(&agent_id) } else { None },
                                     agent_id,
                                     alive,
                                 }

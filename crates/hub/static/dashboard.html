@@ -1172,6 +1172,16 @@ function usesLine(a) {
 }
 
 // Held because its account cannot reach the model -- or paused by a person.
+// A seat that can be typed at while every fleet tool it has fails: its CLI
+// is running but no nexmesh shim is connected for it. Read as "running"
+// everywhere until now.
+function linkBadge(a) {
+  return a.mcp_link === false ? ` <span class="badge bad" title="its CLI is running but its
+      nexmesh tools are not connected: it cannot read or answer messages, keep memory or set
+      a summary. Reconnect the nexmesh MCP server in the CLI (/mcp in claude), or restart the
+      seat.">no tools</span>` : "";
+}
+
 function holdBadge(a) {
   if (!a.hold_reason) return a.paused ? ' <span class="badge warn">paused</span>' : "";
   const why = a.hold_reason === "quota" ? "out of allowance"
@@ -2113,7 +2123,7 @@ function viewAgents(d, now) {
         <td class="hide tiny muted">${esc(a.cli)} · ${esc(a.mode)}${a.push_capable ? " · driven" : ""}
             <br><span class="badge ${a.provenance === "external" ? "info" : ""}">${esc(a.provenance)}</span></td>
         <td><span class="badge ${stateClass(a.task_state)}">${esc(a.task_state)}</span>${
-            dead ? "" : activityBadge(a, now)}${holdBadge(a)}</td>
+            dead ? "" : activityBadge(a, now) + linkBadge(a)}${holdBadge(a)}</td>
         <td class="num hide tiny">${a.input_tokens || a.output_tokens
             ? human(a.input_tokens) + "/" + human(a.output_tokens) : "—"}${usesLine(a)}</td>
         <td class="num tiny">${contextCell(a)}${dead || a.kind === "external" ? ""

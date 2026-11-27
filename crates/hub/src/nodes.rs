@@ -226,6 +226,13 @@ async fn handle(
                          WHERE id = ?",
                         params![now_ms(), a.agent_id],
                     )?;
+                    // Whether its fleet tools are connected. Written every
+                    // beat, NULL included: a node that stops saying leaves
+                    // no stale "down" behind.
+                    db.execute(
+                        "UPDATE agents SET mcp_link = ? WHERE id = ?",
+                        params![a.mcp_link, a.agent_id],
+                    )?;
                     // A lost `Activity` frame is repaired here, a heartbeat
                     // later. The time is kept when the state has not moved.
                     if let Some(act) = a.activity {

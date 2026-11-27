@@ -51,10 +51,22 @@ pub async fn serve(ctx: Arc<NodeCtx>) -> Result<()> {
     }
 }
 
+/// One shim's connection. Whichever way it ends -- Bye, EOF, or an error
+/// writing to a shim that has gone -- the seat loses a shim, which is what
+/// `mcp_link` reports.
 async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
+    let mut agent_id: Option<String> = None;
+    let r = serve_shim(&ctx, stream, &mut agent_id).await;
+    if let Some(a) = &agent_id {
+        ctx.shim_down(a);
+    }
+    r
+}
+
+async fn serve_shim(ctx: &Arc<NodeCtx>, stream: UnixStream, agent_id: &mut Option<String>) -> Result<()> {
+    let ctx = ctx.clone();
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
-    let mut agent_id: Option<String> = None;
     // Whether this shim joined a seat of its own rather than attaching to one
     // a spawn already created. It decides who reports the exit: a managed
     // agent's real lifecycle is reported by the spawn path, and saying it
@@ -91,7 +103,10 @@ async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
                                name, cli_session, cli_session_is_own).await {
                     Ok(frame) => {
                         if let NodeToMcpd::Registered { agent_id: ref a, .. } = frame {
-                            agent_id = Some(a.clone());
+                            if let Some(old) = agent_id.replace(a.clone()) {
+                                ctx.shim_down(&old);
+                            }
+                            ctx.shim_up(a);
                         }
                         reply(&mut write, &frame).await?;
                     }
@@ -164,7 +179,7 @@ async fn connection(ctx: Arc<NodeCtx>, stream: UnixStream) -> Result<()> {
     }
     // The loop ended: Bye, or the socket closed because the process went.
     if attached {
-        if let Some(a) = &agent_id {
+        if let Some(a) = agent_id.as_ref() {
             announce_attached_exit(&ctx, a).await;
         }
     }
@@ -195,7 +210,7 @@ async fn register(
     pid: i32,
     cwd: String,
     agent_hint: Option<String>,
-    _slot_hint: Option<String>,
+    slot_hint: Option<String>,
     session_hint: Option<String>,
     role: Option<String>,
     name: Option<String>,
@@ -225,17 +240,58 @@ async fn register(
         // The seat this shim belongs to, found either by the id it was given
         // or -- after a reattach, when the hub has minted a new one and the
         // shim cannot know it -- by the process it is running inside.
-        let found = ctx.agent(&hint).or_else(|| {
-            let rec = ctx.agent_of_process(pid)?;
+        // THE PROCESS OUTRANKS THE CLAIM. Two seats whose CLI reads its MCP
+        // config from one shared project file (opencode's opencode.json, two
+        // seats in one directory) each start a shim carrying whichever seat
+        // wrote the file LAST: one seat's tools spoke as the other and the
+        // first had none. Ancestry cannot be shared, so when the two
+        // disagree, the seat this shim is running inside is the one it is.
+        let claimed = ctx.agent(&hint);
+        let inside = ctx.agent_of_process(pid);
+        let claimed = match (claimed, &inside) {
+            (Some(c), Some(i)) if c.agent_id != i.agent_id => {
+                tracing::warn!(
+                    claimed = %c.agent_id, claimed_slot = %c.slot_id,
+                    agent = %i.agent_id, slot = %i.slot_id, shim_pid = pid,
+                    "this shim claims one seat but runs inside another (a shared MCP \
+                     config file?); registering it as the seat it is inside"
+                );
+                None
+            }
+            (c, _) => c,
+        };
+        let found = claimed.or_else(|| {
+            let rec = inside?;
             tracing::info!(
                 stale = %hint, agent = %rec.agent_id, slot = %rec.slot_id, shim_pid = pid,
                 "this shim belongs to a seat this node reattached; registering it under the \
                  seat's current agent instead of refusing it"
             );
             Some(rec)
+        }).or_else(|| {
+            // NOT INSIDE THE SEAT'S PROCESS, BUT NAMING A SEAT THIS NODE RUNS.
+            //
+            // A second CLI process on the same seat: a twin started by hand on
+            // the seat's own --mcp-config, or a CLI's background fork of the
+            // seat's conversation (claude's bg-pty-host), which is not a child
+            // of the process the node spawned. Each time the seat was respawned
+            // its agent id changed and this shim's went stale, and refusing it
+            // left a model the team was talking to answering "the node is not
+            // answering" every five seconds for hours. It is the seat's, so it
+            // speaks as the seat. What it may ASSERT about the seat (which
+            // conversation it is in) stays gated on ancestry below.
+            let slot = slot_hint.as_deref().filter(|s| !s.is_empty())?;
+            let rec = ctx.agent_in_slot(slot)?;
+            tracing::warn!(
+                stale = %hint, agent = %rec.agent_id, slot = %rec.slot_id, shim_pid = pid,
+                cli_pid = rec.proc.pid,
+                "a second process speaks for this seat (a twin or a background fork of its \
+                 CLI); registering it under the seat's current agent"
+            );
+            Some(rec)
         });
         if let Some(rec) = found {
-            if ctx.agent(&hint).is_some() {
+            if rec.agent_id == hint {
                 tracing::info!(agent = %hint, slot = %rec.slot_id, "managed shim registered");
             }
             let tools = proto::tools::team_tools_for(rec.authority);
@@ -320,8 +376,9 @@ async fn register(
         // is this process. Do NOT silently create a second slot for it: that
         // would duplicate a team member.
         anyhow::bail!(
-            "agent '{hint}' is not known to this node (it may have restarted); \
-             restart the agent so it can be re-placed"
+            "agent '{hint}' is not known to this node and no seat it runs matches \
+             (the seat was removed or moved to another machine); this process is no \
+             longer anybody's seat -- start the seat again from the dashboard"
         );
     }
 

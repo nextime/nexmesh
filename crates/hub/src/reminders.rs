@@ -21,9 +21,11 @@
 //!
 //! Each is rate-limited per agent, and either one goes quiet as soon as the
 //! seat does the thing: a write resets the turn count and a graph query
-//! resets the read count. A reminder is never an order -- the text says that
-//! "nothing worth keeping" is a fine answer and asks for no reply, because a
-//! reminder that makes six models answer "noted" is worse than none.
+//! resets the read count. A reminder asks for no reply, because a reminder
+//! that makes six models answer "noted" is worse than none. It does not offer
+//! "nothing worth keeping" as an answer either: seats took that exit after
+//! stretches that had found real causes. It is never sent to a seat whose
+//! tools the node reports gone (`mcp_link` = 0); that seat can keep nothing.
 //!
 //! BOTH ARE ON UNLESS SOMEBODY TURNS THEM OFF -- the opposite of the
 //! watchdogs, deliberately. They cost a short message every few hours at
@@ -84,17 +86,23 @@ pub struct Reminder {
 /// would get the reminder hours later about work it no longer remembers; not
 /// an external participant, which is a program and not a model.
 fn remindable(db: &Connection, agent_id: &str) -> Result<Option<(String, String)>> {
-    let row: Option<(String, String, Option<String>, i64, Option<String>)> = db
+    let row: Option<(String, String, Option<String>, i64, Option<String>, Option<i64>)> = db
         .query_row(
-            "SELECT s.id, s.session_id, s.authority, COALESCE(s.paused, 0), s.participant_kind
+            "SELECT s.id, s.session_id, s.authority, COALESCE(s.paused, 0), s.participant_kind,
+                    a.mcp_link
                FROM agents a JOIN slots s ON s.id = a.slot_id
               WHERE a.id = ? AND a.exited_at_ms IS NULL",
             [agent_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()?;
-    let Some((slot, session, authority, paused, kind)) = row else { return Ok(None) };
+    let Some((slot, session, authority, paused, kind, link)) = row else { return Ok(None) };
     if paused != 0 || kind.as_deref() == Some("external") {
+        return Ok(None);
+    }
+    // A seat whose node says its nexmesh tools are gone cannot call any of
+    // them: asking it to is a turn spent on "the tools are down anyway".
+    if link == Some(0) {
         return Ok(None);
     }
     if authority.as_deref().map(nexmesh_proto::authority::Authority::parse).map(|a| a.is_read_only())
@@ -164,7 +172,8 @@ fn memory_due(
         return Ok(None);
     }
     let (turns, last): (i64, Option<i64>) = db.query_row(
-        "SELECT COALESCE(turns_unkept, 0), memory_reminded_at_ms FROM agents WHERE id = ?",
+        "SELECT COALESCE(a.turns_unkept, 0), o.memory_reminded_at_ms
+           FROM agents a JOIN slots o ON o.id = a.slot_id WHERE a.id = ?",
         [agent_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -172,8 +181,8 @@ fn memory_due(
         return Ok(None);
     }
     db.execute(
-        "UPDATE agents SET memory_reminded_at_ms = ? WHERE id = ?",
-        params![now_ms(), agent_id],
+        "UPDATE slots SET memory_reminded_at_ms = ? WHERE id = ?",
+        params![now_ms(), &slot],
     )?;
     let when = if done {
         "You have just finished a piece of work".to_string()
@@ -181,14 +190,17 @@ fn memory_due(
         format!("You have worked through {turns} turns")
     };
     let text = format!(
-        "[nexmesh] {when} without keeping anything from it. If it established something you \
-         or the team will need again -- a decision and why, where something lives, a gotcha, \
-         a command that works, what a teammate owns -- keep it now, in a line or two each:\n\
+        "[nexmesh] {when} without keeping anything from it. Your nexmesh tools are connected \
+         and working. Look back over that stretch: a cause you found, a number you measured, \
+         where something lives, a command that worked, a decision and why, what a teammate \
+         owns. Whatever of that you would have to rediscover after a restart, keep now, a \
+         line or two each:\n\
          \u{2022} `store_memory` with scope 'agent' for your own working knowledge: it stands \
          in for your CLI's own memory and outlives your restarts (`recall` brings it back);\n\
          \u{2022} `store_knowledge` for what the team should know;\n\
          \u{2022} `fold_context` for a finished stretch of work you no longer need to carry.\n\
-         Nothing worth keeping is a fine answer. Do not reply to this message."
+         Then carry on with what you were doing. This note needs no answer: do not write \
+         about it to anyone."
     );
     Ok(Some(Reminder { slot_id: slot, session_id: session, kind: "memory", text }))
 }
@@ -227,7 +239,8 @@ pub fn files_read(
         return Ok(None);
     }
     let (reads, last): (i64, Option<i64>) = db.query_row(
-        "SELECT COALESCE(reads_unguided, 0), graph_reminded_at_ms FROM agents WHERE id = ?",
+        "SELECT COALESCE(a.reads_unguided, 0), o.graph_reminded_at_ms
+           FROM agents a JOIN slots o ON o.id = a.slot_id WHERE a.id = ?",
         [agent_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -235,8 +248,8 @@ pub fn files_read(
         return Ok(None);
     }
     db.execute(
-        "UPDATE agents SET graph_reminded_at_ms = ? WHERE id = ?",
-        params![now_ms(), agent_id],
+        "UPDATE slots SET graph_reminded_at_ms = ? WHERE id = ?",
+        params![now_ms(), &slot],
     )?;
     let text = format!(
         "[nexmesh] You have opened {reads} files since you last asked the code graph anything. \
@@ -336,6 +349,31 @@ mod tests {
         assert!(r.text.contains("store_memory"));
         // And not again inside the cooldown, however many turns follow.
         assert!(turns(&db, 30).is_none());
+    }
+
+    #[test]
+    fn a_respawn_does_not_restart_the_cooldown() {
+        let db = setup();
+        assert!(turns(&db, MEMORY_AFTER_TURNS).is_some());
+        // The seat comes back as a new agent, as a node restart does.
+        db.execute_batch(
+            "UPDATE agents SET exited_at_ms = 2, status = 'exited' WHERE id = 'ag1';
+             INSERT INTO agents (id,slot_id,provenance,status,started_at_ms,last_seen_ms)
+               VALUES ('ag2','sl1','managed','running',3,3);",
+        )
+        .unwrap();
+        for _ in 0..30 {
+            assert!(turn_ended(&db, "ag2", true).unwrap().is_none(), "reminded again after a respawn");
+        }
+    }
+
+    #[test]
+    fn a_seat_whose_tools_are_gone_is_not_asked() {
+        let db = setup();
+        db.execute("UPDATE agents SET mcp_link = 0 WHERE id = 'ag1'", []).unwrap();
+        assert!(turns(&db, 30).is_none(), "asked a seat that cannot call store_memory");
+        db.execute("UPDATE agents SET mcp_link = 1 WHERE id = 'ag1'", []).unwrap();
+        assert!(turn_ended(&db, "ag1", true).unwrap().is_some());
     }
 
     #[test]

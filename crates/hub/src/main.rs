@@ -454,9 +454,40 @@ fn guard_db_exists(args: &Args) -> anyhow::Result<()> {
     )
 }
 
+/// A log sink that never reports an I/O error -- the node's fix, for the hub.
+///
+/// The hub is built `panic = "abort"` and its service sends stdout and stderr
+/// to one logfile. When that filesystem fills, the fmt layer's failed write
+/// falls back to `eprintln!`, which fails on the same disk and panics; abort
+/// then takes the hub down with no word in its log, and every seat on the
+/// fleet loses its team. That happened on 27 Nov 2026 when another service's
+/// database filled the hub's root. Dropping the line is the right loss.
+struct NeverErr(std::io::Stdout);
+
+impl std::io::Write for NeverErr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::Write::write_all(&mut self.0, buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::Write::flush(&mut self.0);
+        Ok(())
+    }
+}
+
+struct SafeWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SafeWriter {
+    type Writer = NeverErr;
+    fn make_writer(&'a self) -> Self::Writer {
+        NeverErr(std::io::stdout())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(SafeWriter)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

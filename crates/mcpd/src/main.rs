@@ -162,6 +162,10 @@ struct Link {
     /// Woken when a reconnect finishes, so a tool call that arrived in the
     /// gap waits for the link rather than failing into the model's lap.
     back: tokio::sync::Notify,
+    /// Why the node last turned this process away, while it keeps doing so.
+    /// Told to the model as it is: "the node is not answering" sent a seat
+    /// round in circles for hours over a refusal that had a reason.
+    refused: std::sync::Mutex<Option<String>>,
 }
 
 impl Link {
@@ -224,13 +228,17 @@ async fn relink(link: &Link) -> (tokio::io::Lines<BufReader<tokio::net::unix::Ow
                 match register(&mut node, &link.args, link.pid, &link.cwd).await {
                     Ok((agent_id, slot_id, _tools)) => {
                         tracing::info!(%agent_id, %slot_id, "registered with the node again");
+                        *link.refused.lock().unwrap() = None;
                         return (node.lines, node.write, slot_id);
                     }
                     // A node that refuses the registration will keep refusing
                     // it until something changes, so this waits like any
                     // other failure rather than spinning. Dropping `node`
                     // closes the socket we just opened.
-                    Err(e) => tracing::warn!(error = %e, "the node refused the registration"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "the node refused the registration");
+                        *link.refused.lock().unwrap() = Some(e.to_string());
+                    }
                 }
             }
             Err(e) => tracing::debug!(error = %e, "the node is not there yet"),
@@ -383,6 +391,7 @@ async fn main() -> Result<()> {
         slot: std::sync::Mutex::new(slot_id.clone()),
         seq: std::sync::atomic::AtomicU64::new(1),
         back: tokio::sync::Notify::new(),
+        refused: std::sync::Mutex::new(None),
     });
     {
         let link = link.clone();
@@ -460,6 +469,10 @@ async fn main() -> Result<()> {
                 let mut trouble = String::new();
                 for attempt in 0..2 {
                     if attempt > 0 {
+                        if let Some(why) = link.refused.lock().unwrap().clone() {
+                            trouble = format!("the node turned this process away: {why}");
+                            break;
+                        }
                         // The keeper is already putting the link back. Wait
                         // for it rather than racing it with a second dial:
                         // two registrations for one conversation is how a
@@ -470,7 +483,10 @@ async fn main() -> Result<()> {
                         )
                         .await;
                         if waited.is_err() {
-                            trouble = "the node is not answering".into();
+                            trouble = match link.refused.lock().unwrap().clone() {
+                                Some(why) => format!("the node turned this process away: {why}"),
+                                None => "the node is not answering".into(),
+                            };
                             break;
                         }
                     }

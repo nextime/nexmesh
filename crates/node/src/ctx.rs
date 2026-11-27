@@ -752,6 +752,9 @@ pub struct NodeCtx {
     /// nothing at all. Queued here by agent id and flushed once the start is
     /// registered.
     pending_notes: Mutex<HashMap<String, Vec<String>>>,
+    /// Shims registered per agent, and when that count last changed (or was
+    /// first looked at). See `mcp_link`.
+    shims: Mutex<HashMap<String, (u32, i64)>>,
     seq: AtomicU64,
 }
 
@@ -777,6 +780,7 @@ impl NodeCtx {
             local_attaches: Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
             pending_notes: Mutex::new(HashMap::new()),
+            shims: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         })
     }
@@ -1049,6 +1053,52 @@ impl NodeCtx {
     pub fn shim_is_inside(&self, shim_pid: i32, rec: &AgentRec) -> bool {
         crate::proc::is_same_process(rec.proc.pid, rec.proc.start_ticks)
             && crate::proc::ancestors(shim_pid).contains(&rec.proc.pid)
+    }
+
+    /// A shim registered as this agent.
+    pub fn shim_up(&self, agent_id: &str) {
+        let mut m = self.shims.lock().unwrap();
+        let e = m.entry(agent_id.to_string()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = proto::now_ms();
+    }
+
+    /// A shim that was registered as this agent has gone.
+    pub fn shim_down(&self, agent_id: &str) {
+        let mut m = self.shims.lock().unwrap();
+        if let Some(e) = m.get_mut(agent_id) {
+            e.0 = e.0.saturating_sub(1);
+            e.1 = proto::now_ms();
+        }
+    }
+
+    /// Are this agent's fleet tools connected?
+    ///
+    /// None for a CLI that takes no MCP server, and while a seat is still
+    /// coming up or relinking (a shim redials within seconds of a node
+    /// restart). Some(false) only after `MCP_LINK_GRACE_MS` with none: a seat
+    /// that can be typed at while every tool it has fails, which until now
+    /// read as `running` everywhere.
+    pub fn mcp_link(&self, agent_id: &str) -> Option<bool> {
+        const MCP_LINK_GRACE_MS: i64 = 90_000;
+        let cli = self.agent(agent_id)?.cli_id;
+        if matches!(self.descriptor(&cli)?.mcp(), nexmesh_proto::cli_descriptor::McpRegistration::None) {
+            return None;
+        }
+        let mut m = self.shims.lock().unwrap();
+        let e = m.entry(agent_id.to_string()).or_insert((0, proto::now_ms()));
+        if e.0 > 0 {
+            Some(true)
+        } else if proto::now_ms() - e.1 > MCP_LINK_GRACE_MS {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Forget shim counts for agents that are gone.
+    pub fn prune_shims(&self, live: &[String]) {
+        self.shims.lock().unwrap().retain(|k, _| live.contains(k));
     }
 
     pub fn agent_of_process(&self, shim_pid: i32) -> Option<AgentRec> {

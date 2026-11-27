@@ -123,7 +123,19 @@ pub fn render_injection_line(messages: &[Envelope], newlines_safe: bool) -> Stri
             body.push('\n');
         }
     }
-    body.push_str(if newlines_safe { "respond to these before continuing." } else { " | respond to these before continuing." });
+    // The hub's own notes ask for no answer. Telling a seat to "respond"
+    // to a batch of nothing but those is what made seats write a line back
+    // about a reminder that said not to.
+    let all_automatic = messages.iter().all(|m| m.from_slot.is_none() && m.kind == proto::MessageKind::Nudge);
+    let tail = if all_automatic {
+        "act on these if they apply, then continue; they need no answer."
+    } else {
+        "respond to these before continuing."
+    };
+    if !newlines_safe {
+        body.push_str(" | ");
+    }
+    body.push_str(tail);
     body
 }
 
@@ -520,6 +532,20 @@ mod tests {
         assert!(line.contains("from orchestrator: ship it then tell me"));
         assert!(line.contains("from Max: and rebase first"));
         assert!(line.ends_with("respond to these before continuing."));
+    }
+
+    #[test]
+    fn a_batch_of_automatic_notes_asks_for_no_answer() {
+        let mut note = env(3, "x", "[nexmesh] keep what you learned. Do not reply.");
+        note.from_slot = None;
+        note.from_name = None;
+        note.kind = MessageKind::Nudge;
+        let line = render_injection_line(&[note.clone()], false);
+        assert!(!line.contains("respond to these"), "{line}");
+        assert!(line.ends_with("they need no answer."), "{line}");
+        // One person's message in the batch and it is answered as before.
+        let line = render_injection_line(&[note, env(4, "Max", "status?")], true);
+        assert!(line.ends_with("respond to these before continuing."), "{line}");
     }
 
     #[test]

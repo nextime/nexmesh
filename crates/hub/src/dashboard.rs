@@ -649,7 +649,10 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                             -- The three switches, seat then team: NULL at
                             -- both means the fleet's own setting.
                             sx.compact_at_pct, s.remind_memory, sx.remind_memory,
-                            s.remind_graph, sx.remind_graph
+                            s.remind_graph, sx.remind_graph,
+                            -- Whether its nexmesh tools are connected, as
+                            -- its node reports it (NULL: not said).
+                            CASE WHEN a.exited_at_ms IS NULL THEN a.mcp_link END
                      FROM slots s
                      LEFT JOIN sessions sx ON sx.id = s.session_id
                      LEFT JOIN agents a ON a.id = (
@@ -728,6 +731,7 @@ pub async fn snapshot(State(st): State<AppState>, Query(q): Query<StateQuery>) -
                         v["hold_until_ms"] = json!(r.get::<_, Option<i64>>(41)?);
                         v["hold_text"] = json!(r.get::<_, Option<String>>(42)?);
                         v["quota_auto_resume"] = json!(r.get::<_, i64>(43)? == 1);
+                        v["mcp_link"] = json!(r.get::<_, Option<bool>>(49)?);
                         // EFFECTIVE, resolved seat -> team -> fleet, with
                         // where the answer came from, so a switch can say
                         // "on (team)" rather than leave the reader to work

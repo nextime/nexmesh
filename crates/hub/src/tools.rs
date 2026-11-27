@@ -253,6 +253,10 @@ impl<'a> Ctx<'a> {
         let n = needle.trim().to_lowercase();
         let rows = self.peers()?;
 
+        // A seat's id is never ambiguous and never renamed.
+        if let Some(p) = rows.iter().find(|p| p.id.to_lowercase() == n) {
+            return Ok(p.id.clone());
+        }
         let exact: Vec<&Peer> = rows.iter().filter(|p| p.name == n || p.role == n).collect();
         if exact.len() == 1 {
             return Ok(exact[0].id.clone());
@@ -279,6 +283,27 @@ impl<'a> Ctx<'a> {
             .iter()
             .filter(|p| p.name.contains(&n) || p.role.contains(&n))
             .collect();
+        // A NAME THE SEAT WAS RENAMED FROM. A teammate that learnt the old
+        // handle keeps using it, and a send that bounced on it lost the
+        // message: "my reply to 'Claude-host-5' bounced" after that seat
+        // became 'reviewer'. Only when nobody holds the name now, and only a
+        // seat in a room this one shares.
+        if partial.is_empty() {
+            let was: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT json_extract(detail, '$.slot') FROM audit
+                      WHERE action = 'slot_renamed'
+                        AND LOWER(json_extract(detail, '$.from')) = ?
+                      ORDER BY at_ms DESC LIMIT 1",
+                    [&n],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = was.filter(|id| rows.iter().any(|p| &p.id == id)) {
+                return Ok(id);
+            }
+        }
         match partial.len() {
             1 => Ok(partial[0].id.clone()),
             // The guidance is the SAME whether or not a seat by this name
@@ -1123,7 +1148,12 @@ fn list_peers(ctx: &Ctx, args: &Value) -> Result<String> {
                 s.session_id <> (SELECT session_id FROM slots WHERE id = ?1),
                 COALESCE(se.name, s.session_id)
          FROM slots s
-         LEFT JOIN agents a ON a.slot_id = s.id AND a.exited_at_ms IS NULL
+         -- ONE process per seat. Joining every live agent listed a seat twice
+         -- whenever it briefly had two -- a reattach before the old one was
+         -- written off, a twin -- and a reader took it for two teammates.
+         LEFT JOIN agents a ON a.id = (
+            SELECT id FROM agents WHERE slot_id = s.id AND exited_at_ms IS NULL
+             ORDER BY started_at_ms DESC LIMIT 1)
          LEFT JOIN nodes n ON n.id = a.node_id
          LEFT JOIN sessions se ON se.id = s.session_id
          WHERE {scope} AND s.id != ?1
@@ -2309,6 +2339,25 @@ fn get_history(ctx: &Ctx, args: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A send to a seat's id, or to a name it was renamed from, reaches it.
+    #[test]
+    fn a_seat_is_reached_by_its_id_and_by_a_name_it_used_to_have() {
+        let db = fixture();
+        let ctx = Ctx { db: &db, session_id: "s1".into(), slot_id: "sl-eng".into(),
+                        flood: (0, 0) };
+        assert_eq!(ctx.resolve_peer("sl-rev").unwrap(), "sl-rev");
+        db.execute(
+            "INSERT INTO audit (at_ms, actor, node_id, action, detail)
+             VALUES (1, 'operator', NULL, 'slot_renamed',
+                     '{\"slot\":\"sl-rev\",\"from\":\"Claude-box-5\",\"to\":\"Iris\"}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(ctx.resolve_peer("claude-box-5").unwrap(), "sl-rev");
+        // A name nobody ever had still bounces, with the guidance.
+        assert!(ctx.resolve_peer("nobody-at-all").is_err());
+    }
 
     /// One seat claiming a TEAM message must not take it from the others.
     ///

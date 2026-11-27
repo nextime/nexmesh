@@ -166,6 +166,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("agents", "memory_reminded_at_ms", "INTEGER"),
         ("agents", "reads_unguided", "INTEGER NOT NULL DEFAULT 0"),
         ("agents", "graph_reminded_at_ms", "INTEGER"),
+        // The cooldowns are the SEAT's: kept per agent, every respawn or
+        // reattach reset them and the seat was reminded again minutes later.
+        ("agents", "mcp_link", "INTEGER"),
+        ("slots", "memory_reminded_at_ms", "INTEGER"),
+        ("slots", "graph_reminded_at_ms", "INTEGER"),
         // The account a node's CLI signs in as, when its descriptor names one.
         ("node_clis", "account", "TEXT"),
         ("code_graph_meta", "failed_at_ms", "INTEGER"),
