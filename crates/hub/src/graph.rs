@@ -375,8 +375,73 @@ pub async fn store_off_thread(
         .context("storing a code graph")?
 }
 
-/// Replace a workspace's graph and recompute its communities.
+/// A fingerprint of the MAP itself: every symbol, where it is, and every
+/// relationship. Not of the files -- an edit inside a function body changes a
+/// file and leaves this exactly as it was.
+///
+/// FNV-1a over the serialised nodes and edges, written out here rather than
+/// taken from `std`'s hasher, whose output is allowed to change between Rust
+/// releases: this one is stored, and a hub upgrade must not read every
+/// workspace's map as changed.
+pub fn map_hash(graph: &CodeGraph) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    eat(serde_json::to_string(&graph.nodes).unwrap_or_default().as_bytes());
+    eat(b"|");
+    eat(serde_json::to_string(&graph.edges).unwrap_or_default().as_bytes());
+    eat(if graph.truncated { b"t" } else { b"f" });
+    format!("{h:016x}")
+}
+
+/// Replace a workspace's graph and recompute its communities -- unless the
+/// map has not changed.
+///
+/// Most edits do not change it: a fix inside a function moves no symbol and
+/// adds no call. The node's reparse after such an edit is already cheap (it
+/// replays every unchanged file from its cache); what is NOT cheap is this
+/// side, which rewrote every row and regrouped the whole tree each time. So a
+/// rebuild whose map is the one already stored only says the graph is
+/// current again.
 pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<String> {
+    let hash = map_hash(graph);
+    {
+        let db = st.db.lock().unwrap();
+        let same: bool = db
+            .query_row(
+                "SELECT map_hash = ?2 FROM code_graph_meta WHERE workspace_id = ?1",
+                params![workspace_id, &hash],
+                |r| r.get::<_, Option<bool>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or(false);
+        if same {
+            db.execute(
+                "UPDATE code_graph_meta SET built_at_ms = ?2, files = ?3, skipped = ?4,
+                        stale_at_ms = NULL, stale_reason = NULL
+                  WHERE workspace_id = ?1",
+                params![
+                    workspace_id,
+                    now_ms(),
+                    graph.files,
+                    serde_json::to_string(&graph.skipped).unwrap_or_else(|_| "[]".into()),
+                ],
+            )?;
+            tracing::info!(%workspace_id, "reparsed: the map did not change, so the graph stands");
+            return Ok(format!(
+                "Parsed {} file(s): the map is unchanged ({} symbols, {} relationships), so \
+                 the stored graph stands and is current.",
+                graph.files,
+                graph.nodes.len(),
+                graph.edges.len()
+            ));
+        }
+    }
     let (communities, grouped_fully) = assign_communities(graph);
     let db = st.db.lock().unwrap();
     // One transaction for the lot. A large workspace is 200,000 symbols, and
@@ -426,6 +491,10 @@ pub fn store(st: &AppState, workspace_id: &str, graph: &CodeGraph) -> Result<Str
             graph.truncated_reason,
             distinct as i64
         ],
+    )?;
+    tx.execute(
+        "UPDATE code_graph_meta SET map_hash = ? WHERE workspace_id = ?",
+        params![&hash, workspace_id],
     )?;
     tx.commit()?;
     // The dashboard's view of this graph, worked out now rather than on

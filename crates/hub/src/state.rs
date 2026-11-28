@@ -162,6 +162,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("sessions", "remind_graph", "INTEGER"),
         ("slots", "remind_memory", "INTEGER"),
         ("slots", "remind_graph", "INTEGER"),
+        ("code_graph_meta", "map_hash", "TEXT"),
         ("agents", "turns_unkept", "INTEGER NOT NULL DEFAULT 0"),
         ("agents", "memory_reminded_at_ms", "INTEGER"),
         ("agents", "reads_unguided", "INTEGER NOT NULL DEFAULT 0"),

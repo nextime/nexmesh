@@ -547,8 +547,13 @@ async fn session(args: &Args, detected: &[proto::DetectedCli], ctx: Arc<NodeCtx>
                         })
                         .await;
                         let Ok(found) = found else { continue };
-                        for (agent_id, n) in found.reads {
-                            let frame = NodeToHub::FileReads { agent_id, n };
+                        for (agent_id, a) in found.reads {
+                            let frame = NodeToHub::FileReads {
+                                agent_id,
+                                n: a.n,
+                                paths: a.paths,
+                                edited: a.edited,
+                            };
                             if out_tx.send(serde_json::to_string(&frame).unwrap()).await.is_err() {
                                 break;
                             }

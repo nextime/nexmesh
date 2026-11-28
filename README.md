@@ -3,7 +3,7 @@
 **One team of AI agents, across every machine you own.**
 
 nexmesh runs agent CLIs (Claude Code, Codex, opencode, qwen, gemini, Cursor,
-Freebuff, anything that speaks MCP) on as many machines as you like and makes
+GitHub Copilot CLI, Freebuff, anything that speaks MCP) on as many machines as you like and makes
 them one team: one message log, one shared memory, one plan, one set of file
 locks. You watch it and drive it from a terminal, a browser or a phone, and
 you can attach to any agent's real terminal from anywhere.

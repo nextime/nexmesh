@@ -36,10 +36,22 @@ entry = { type = "local", command = ["{mcpd}"], enabled = true }
 [modes.headless]
 # Not `run`: a one-shot run cannot be steered. The server can.
 args = ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+# The seat's system prompt and the team's standing habits, ADDED through
+# opencode's inline config: `instructions` are files combined with AGENTS.md,
+# and OPENCODE_CONFIG_CONTENT is merged over the project's opencode.json
+# rather than replacing it, so seats sharing a directory each get their own.
+# Checked against opencode 1.19.5 on this fleet (`opencode debug config`).
+append_system_prompt_env = { OPENCODE_CONFIG_CONTENT = '{"instructions": ["{prompt_file}"]}' }
 attachable = true   # `opencode attach` opens a real TUI onto the same session
 
 [modes.interactive]
 args = ["{cwd}"]
+# The seat's system prompt and the team's standing habits, ADDED through
+# opencode's inline config: `instructions` are files combined with AGENTS.md,
+# and OPENCODE_CONFIG_CONTENT is merged over the project's opencode.json
+# rather than replacing it, so seats sharing a directory each get their own.
+# Checked against opencode 1.19.5 on this fleet (`opencode debug config`).
+append_system_prompt_env = { OPENCODE_CONFIG_CONTENT = '{"instructions": ["{prompt_file}"]}' }
 resume_args = ["--session", "{resume}"]
 # `--continue` is opencode's own "continue the last session". Safe only
 # because this seat has a store of its own; see the session_store section.
@@ -102,3 +114,10 @@ env = "XDG_DATA_HOME"
 store_rel = "opencode"
 root = "~/.local/share/opencode"
 share = ["auth.json"]
+
+[context]
+# HOW FULL a seat's conversation is: the newest assistant message with token
+# counts in the seat's own opencode.db. opencode records no window, so it is
+# declared: per model where known, else this.
+source = "opencode_db"
+limit_tokens = 128000

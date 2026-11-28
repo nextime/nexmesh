@@ -147,6 +147,26 @@ pub fn record_context(
     limit: i64,
     source: &str,
 ) -> Result<Next> {
+    record_context_with(db, fleet_pct, true, agent_id, used, limit, source)
+}
+
+/// How full a seat must be before it is asked to fold when NOTHING will
+/// compact it. With auto-compaction off (the default) a seat used never to
+/// be asked at all, and folding is the one way it keeps what matters before
+/// its CLI's own compaction, or the window, throws it away.
+const FOLD_ONLY_PCT: i64 = 70;
+
+/// `record_context`, with the fleet's memory-reminder switch, which is what
+/// decides the fold ask for a seat nothing compacts.
+pub fn record_context_with(
+    db: &Connection,
+    fleet_pct: i64,
+    fleet_memory: bool,
+    agent_id: &str,
+    used: i64,
+    limit: i64,
+    source: &str,
+) -> Result<Next> {
     db.execute(
         "UPDATE agents SET context_used_tokens = ?, context_limit_tokens = ?,
                            context_source = ?, context_at_ms = ?
@@ -179,7 +199,41 @@ pub fn record_context(
     let pct = used.saturating_mul(100) / limit;
 
     if threshold <= 0 {
-        return Ok(Next::Nothing);
+        // NOTHING COMPACTS THIS SEAT. It is still asked to fold, once it is
+        // past FOLD_ONLY_PCT and has grown by the same quarter-window gate
+        // as below -- under the memory-reminder switch, because a fold ask
+        // is that reminder at the moment it matters most.
+        if !crate::reminders::enabled(db, &slot_id, "remind_memory", fleet_memory)? {
+            return Ok(Next::Nothing);
+        }
+        let baseline = baseline.unwrap_or(0);
+        if baseline == 0 || pct < FOLD_ONLY_PCT {
+            // The baseline is where growth is counted from: set on the first
+            // reading, and moved down when the seat has been compacted by
+            // its own CLI so the next filling-up is measured afresh.
+            if baseline == 0 || used < baseline {
+                db.execute(
+                    "UPDATE agents SET fold_baseline_tokens = ? WHERE id = ?",
+                    params![used.max(1), agent_id],
+                )?;
+            }
+            return Ok(Next::Nothing);
+        }
+        if used - baseline < fold_gate(limit) && fold_asked.is_some() {
+            return Ok(Next::Nothing);
+        }
+        db.execute(
+            "UPDATE agents SET fold_asked_at_ms = ?, fold_baseline_tokens = ? WHERE id = ?",
+            params![now_ms(), used, agent_id],
+        )?;
+        return Ok(Next::Fold(Nudge {
+            agent_id: agent_id.to_string(),
+            slot_id: slot_id.clone(),
+            session_id,
+            name: name.unwrap_or_else(|| slot_id.clone()),
+            urgent: false,
+            folds: crate::folds::folded_since(db, &slot_id, 0)?,
+        }));
     }
 
     // FOLD BEFORE THE THRESHOLD, not at it.

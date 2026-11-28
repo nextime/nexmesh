@@ -1080,6 +1080,38 @@ An existing seat can be made one from the chat, the dashboard or the API:
 curl -X POST .../v1/slots/<slot>/authority -d '{"authority":"observer"}'
 ```
 
+### Reminders: keeping what is learnt, and reading the graph
+
+Two reminders go to a seat as messages, when its work shows it has skipped the
+habit the system prompt describes. Both are **on by default**, and each is set
+per seat, per team, or fleet-wide, like the compaction switch:
+
+- **Memory.** After eight finished turns with nothing kept, or sooner when a
+  seat reports a finished piece of work, it is asked once to keep what it
+  established: `store_memory` for its own, `store_knowledge` for the team, or
+  `fold_context`. At most once every three hours per agent, and any keeping call
+  resets the count.
+- **Graph.** After twenty-five file reads with no `query_code_graph`, the seat
+  is pointed at the graph, and the reminder carries what the graph already knows
+  about the two files it opened last: what they define and what depends on
+  them. At most once every two hours.
+
+Neither asks for a reply, and neither is sent to a paused, held, external, or
+read-only seat. A seat whose nexmesh tools are not connected is not reminded,
+since it cannot keep anything.
+
+```bash
+nexmesh-hub --no-remind-memory --no-remind-graph    # the fleet default, off
+```
+
+In the chat, `/remind-memory` and `/remind-graph` take a scope and a setting:
+`/remind-memory session off` switches memory reminders off for the team,
+`/remind-graph agent on` turns graph reminders on for one seat, and `default`
+returns either to the level above.
+
+The dashboard shows each seat's memory and graph switch with where its value
+comes from; a click flips it, and a right-click returns it to the level above.
+
 ### Keeping a team from running away
 
 Three things go wrong on their own, at three in the morning, and all three are
@@ -1327,11 +1359,37 @@ A CLI is a descriptor in `clis/`, not Rust. Delivery has three tiers:
 
 Shipped and verified against the real binaries: `claude`, `opencode`, `qwen`,
 `codex`, `freebuff`. Shipped from the CLI's own published documentation, with
-nothing run against it here: `gemini`, `cursor` -- the descriptors say so at
-the top, and say which facts are therefore absent rather than guessed (where a
+nothing run against it here: `gemini`, `cursor`, `copilot` -- the descriptors
+say so at the top, and say which facts are therefore absent rather than guessed (where a
 CLI keeps its conversations, which key stops a turn). A malformed descriptor is
 skipped loudly rather than taking the node down, and `cargo test` validates
 every shipped descriptor.
+
+#### How a seat is told how to work
+
+Every seat is given a short set of standing habits in its **system prompt**,
+after its own prompt if it has one: when to call `recall` before planning, to
+keep what it learns as it learns it, to fold finished work before its context
+fills, and to ask `query_code_graph` before grepping. A message is read once and
+then compacted away, and the habits are what a model takes as how it works, so
+they live where they are read on every turn. The reminders described under
+[Keeping a team from running away](#keeping-a-team-from-running-away) are the
+backstop for a seat that drifts from them anyway.
+
+Each CLI takes the prompt by its own route, chosen so that seats sharing one
+working directory each get their own:
+
+| CLI | route | adds to its own prompt |
+|---|---|---|
+| claude | `--append-system-prompt` | yes |
+| codex | `-c developer_instructions=…` (TOML-quoted) | yes, a developer message |
+| opencode | `OPENCODE_CONFIG_CONTENT` with `instructions` pointing at a file the node writes for the seat | yes, combined with `AGENTS.md` |
+| copilot | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` pointing at the seat's own directory | yes, combined with the project's |
+| cursor | `--plugin-dir` pointing at a plugin the node writes for the seat | documented, not yet confirmed to apply |
+| any other | none: the habits are left out and the seat is told nothing about it | no |
+
+A CLI with no route is not refused; the habits are simply not given to it. A
+seat's own prompt that cannot be given is still said out loud, as before.
 
 > **opencode is a special case worth exploiting.** It already has a client/server
 > split of its own: `opencode serve --port N --hostname H` plus `opencode attach
@@ -1722,6 +1780,14 @@ mid-upgrade rather than a failure. Those workspaces fall back to the clock:
 older than six hours, and the graph is rebuilt anyway, with
 `this node cannot say whether the tree has moved` as the reason.
 
+**An edit is noticed at once, and a rebuild that changes nothing is free.** When
+a seat's own file tools change a file, its graph is marked stale immediately
+rather than at the next fingerprint a minute later. The rebuild that follows
+replays every unchanged file from the node's cache, and the hub compares the
+map it produces (every symbol, where it is, and every relationship) with the
+one it holds. An edit inside a function body moves none of those, so the stored
+graph is kept and only marked current.
+
 **A partial graph says what it is missing, and why.** The walk stops at 12,000
 source files or four minutes, whichever comes first, and either way the graph
 is labelled `partial` with the limit that stopped it — in every answer an agent
@@ -1931,6 +1997,12 @@ unfolded by guessing its id.
 
 **When it happens, without anybody asking.** Two steps, in this order, both
 riding on the compaction threshold that is already set:
+
+**When nothing compacts the seat**, the same ask still happens, at seventy per
+cent of the window and under the memory switch: a seat whose CLI would never
+be compacted by nexmesh is otherwise never asked to keep anything before its
+window runs out. codex and opencode seats are measured from their own stores,
+so this works for them too.
 
 - Well under the threshold — above a floor of six tenths of it, so the recent
   part of the conversation is never summarised — a seat that has taken on

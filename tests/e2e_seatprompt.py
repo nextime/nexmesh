@@ -135,7 +135,11 @@ attachable = true
         [f"{BIN}/nexmesh-hub", "--db", DB, "enrol", "machine-b"],
         capture_output=True, text=True).stdout.splitlines() if l.startswith("token:")][0]
     procs.append(subprocess.Popen([f"{BIN}/nexmesh-hub", "--db", DB, "--listen",
-        f"127.0.0.1:{PORT}", "serve"], stdout=open(f"{T}/hub.log","w"),
+        f"127.0.0.1:{PORT}",
+        # The fleet's standing habits ride on every seat's system prompt
+        # (see section 5b). Off here so the checks below see the seat's OWN
+        # text alone; 5b switches them on for one seat.
+        "--no-remind-memory", "--no-remind-graph", "serve"], stdout=open(f"{T}/hub.log","w"),
         stderr=subprocess.STDOUT, env=dict(os.environ, RUST_LOG="info", NO_COLOR="1")))
     check("hub is up", until(lambda: http("GET", "/healthz")[1].get("ok")))
 
@@ -189,6 +193,24 @@ attachable = true
     argv = cmdline(start(slot))
     check("and the CLI is started with neither flag",
           "--system-sp" not in argv and "--append-sp" not in argv, " ".join(argv))
+
+    print("\n=== 5b. the team's habits are added after the seat's own text ===")
+    stop(slot)
+    http("POST", f"/v1/slots/{slot}/prompt", {"system_prompt_mode": "append"})
+    s, j = http("POST", f"/v1/slots/{slot}/switch", {"name": "remind_memory", "on": True})
+    check("memory reminders switched on for the seat", s == 200, f"{s} {j}")
+    argv = cmdline(start(slot))
+    check("a seat with no prompt of its own is given the habits by appending",
+          "--append-sp" in argv and any("`recall`" in a for a in argv), " ".join(argv))
+    stop(slot)
+    http("POST", f"/v1/slots/{slot}/prompt", {"system_prompt": SP})
+    argv = cmdline(start(slot))
+    joined = [a for a in argv if SP in a]
+    check("with a prompt of its own, that comes first and the habits after",
+          bool(joined) and joined[0].startswith(SP) and "`recall`" in joined[0], " ".join(argv))
+    stop(slot)
+    http("POST", f"/v1/slots/{slot}/switch", {"name": "remind_memory", "on": False})
+    http("POST", f"/v1/slots/{slot}/prompt", {"system_prompt": ""})
 
     print("\n=== 6. the status says what is set, without the text ===")
     http("POST", f"/v1/slots/{slot}/prompt", {"system_prompt": SP, "instructions": "Read the diff."})

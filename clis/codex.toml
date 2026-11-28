@@ -21,6 +21,12 @@ entry = { command = "{mcpd}", args = [] }
 # The prompt is NOT passed here or on stdin: it becomes the first
 # `turn/start`, which the app_server driver issues after the handshake.
 args = ["app-server"]
+# The seat's system prompt and the team's standing habits, ADDED as codex's
+# `developer_instructions` -- a developer message beside codex's own
+# instructions, not in place of them. `-c` is a global flag (its value parsed
+# as TOML, hence {prompt_toml}), so it applies after `resume` and to
+# `app-server` alike. Checked against codex 0.169 on this fleet.
+append_system_prompt_args = ["-c", "developer_instructions={prompt_toml}"]
 attachable = false
 
 [modes.interactive]
@@ -37,6 +43,12 @@ attachable = false
 # on, which is codex's own documented unattended mode: failures go back to
 # the model instead of to a human who is not there.
 args = ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+# The seat's system prompt and the team's standing habits, ADDED as codex's
+# `developer_instructions` -- a developer message beside codex's own
+# instructions, not in place of them. `-c` is a global flag (its value parsed
+# as TOML, hence {prompt_toml}), so it applies after `resume` and to
+# `app-server` alike. Checked against codex 0.169 on this fleet.
+append_system_prompt_args = ["-c", "developer_instructions={prompt_toml}"]
 # `codex resume <id>` continues a thread. It is a SUBCOMMAND, so it lands
 # after the options above -- verified that clap accepts
 # `codex --ask-for-approval never --sandbox workspace-write resume ...`.
@@ -103,3 +115,11 @@ root = "~/.codex"
 share = ["auth.json", "auth.json.lock", "auth.lock", "config.toml",
          "packages", "plugins", "skills", "models_cache.json",
          "installation_id", "version.json", "shell_snapshots"]
+
+[context]
+# HOW FULL a seat's conversation is: the newest `token_count` event in its own
+# rollout (the seat has a store of its own, see session_store). codex writes
+# the last call's input and output AND the model's window into that record,
+# so the window is read, not declared; this is only the fallback.
+source = "codex_rollout"
+limit_tokens = 272000

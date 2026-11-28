@@ -60,6 +60,9 @@ struct Record {
     /// change model halfway, and a percentage mixing one model's usage with
     /// another's window is a number with nothing behind it.
     model: Option<String>,
+    /// The window, when the record itself says (codex's
+    /// `model_context_window`). Wins over the descriptor.
+    window: Option<i64>,
 }
 
 /// One agent's file, and how far we have read it.
@@ -100,7 +103,7 @@ struct Watch {
     /// Files read in turns appended since the last report. Never counted
     /// from a file's first look, which reads its tail -- that is history,
     /// not what the seat is doing now.
-    reads: u32,
+    reads: Activity,
     /// The conversation the seat recorded when this file was chosen.
     ///
     /// Deciding WHICH file is a seat's can mean opening the head of two
@@ -154,7 +157,7 @@ pub struct Poll {
     /// handshake, or the one the seat itself named. Never for a guess.
     pub conversations: Vec<(String, String, String)>,
     /// Files each agent has read since the last pass. See `file_reads`.
-    pub reads: Vec<(String, u32)>,
+    pub reads: Vec<(String, Activity)>,
 }
 
 impl Watcher {
@@ -174,7 +177,8 @@ impl Watcher {
 
             // How full it is.
             if let Some(last) = watch.last.as_ref() {
-                let limit = spec.limit_for(last.model.as_deref());
+                let limit = last.window.filter(|w| *w > 0)
+                    .unwrap_or_else(|| spec.limit_for(last.model.as_deref()));
                 if limit > 0 {
                     let reading = Reading {
                         used: last.tokens,
@@ -241,7 +245,7 @@ impl Watcher {
                 watch.told_block = now_blocked;
             }
 
-            if watch.reads > 0 {
+            if !watch.reads.is_empty() {
                 out.reads.push((rec.agent_id.clone(), std::mem::take(&mut watch.reads)));
             }
 
@@ -265,8 +269,12 @@ impl Watcher {
     fn follow(&mut self, ctx: &Arc<NodeCtx>, rec: &AgentRec) -> Option<ContextSpec> {
         let desc = ctx.descriptor(&rec.cli_id)?;
         let spec = desc.context.as_ref()?;
-        if spec.source != ContextSource::ClaudeTranscript {
-            return None;
+        match spec.source {
+            ContextSource::ClaudeTranscript => {}
+            ContextSource::CodexRollout | ContextSource::OpencodeDb => {
+                return self.follow_store(rec, spec);
+            }
+            ContextSource::None => return None,
         }
         // The file layout belongs to the CLI, not to a mode: claude's
         // interactive and headless modes name the same template, and a CLI
@@ -308,7 +316,7 @@ impl Watcher {
                         reported_loop: None,
                         told_hub: None,
                         evidenced,
-                        reads: 0,
+                        reads: Activity::default(),
                         resolved_for: rec.conversation.clone(),
                     },
                 );
@@ -353,7 +361,7 @@ impl Watcher {
                 }
                 watch.sigs.extend(scanned.signatures);
                 if watch.offset > 0 {
-                    watch.reads = watch.reads.saturating_add(scanned.reads);
+                    watch.reads.add(scanned.reads);
                 }
                 let overflow = watch.sigs.len().saturating_sub(crate::loopguard::RING);
                 watch.sigs.drain(..overflow);
@@ -372,6 +380,66 @@ impl Watcher {
                     watch.offset
                 };
             }
+        }
+        Some(spec.clone())
+    }
+
+    /// Occupancy for a CLI whose seat has a store of its own (codex,
+    /// opencode): the newest usage record in it.
+    ///
+    /// Simpler than a claude transcript, on purpose. The store is this
+    /// seat's alone, so there is no question of WHICH conversation is its;
+    /// and only occupancy is read -- no reads, no loop signatures -- because
+    /// those are counted from claude's tool records, which these CLIs do not
+    /// write in that shape. Re-read only when the file's size or time moved.
+    fn follow_store(&mut self, rec: &AgentRec, spec: &ContextSpec) -> Option<ContextSpec> {
+        let base = crate::spawn::seat_store_base(&rec.cli_id, &rec.slot_id)?;
+        let path = match spec.source {
+            ContextSource::CodexRollout => newest_rollout(Path::new(&base).join("sessions").as_path())?,
+            _ => Path::new(&base).join("opencode").join("opencode.db"),
+        };
+        // The database is written through its WAL: the main file's stamp
+        // stands still for minutes while every message lands in -wal.
+        let stamp_of = |p: &Path| {
+            std::fs::metadata(p).ok().map(|m| {
+                let t = m.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                m.len() ^ t
+            })
+        };
+        let mut stamp = stamp_of(&path)?;
+        if spec.source == ContextSource::OpencodeDb {
+            let wal = path.with_file_name("opencode.db-wal");
+            stamp ^= stamp_of(&wal).unwrap_or(0).rotate_left(17);
+        }
+        let watch = self.seen.entry(rec.agent_id.clone()).or_insert_with(|| Watch {
+            path: path.clone(),
+            offset: u64::MAX,
+            last: None,
+            reported: None,
+            outcome: None,
+            told_block: None,
+            sigs: Vec::new(),
+            reported_loop: None,
+            told_hub: None,
+            // Never told to the hub as a conversation: see `poll`.
+            evidenced: false,
+            reads: Activity::default(),
+            resolved_for: None,
+        });
+        if watch.path == path && watch.offset == stamp {
+            return Some(spec.clone());
+        }
+        watch.path = path.clone();
+        watch.offset = stamp;
+        let found = match spec.source {
+            ContextSource::CodexRollout => codex_usage(&path),
+            _ => opencode_usage(&path),
+        };
+        if found.is_some() {
+            watch.last = found;
         }
         Some(spec.clone())
     }
@@ -568,8 +636,8 @@ struct Scan {
     outcome: Option<Option<proto::UsageBlock>>,
     /// What each turn in it DID, oldest first. See `loopguard`.
     signatures: Vec<u64>,
-    /// Files the seat read in it: see `file_reads`.
-    reads: u32,
+    /// What the seat did to files in it: see `file_activity`.
+    reads: Activity,
     /// How many bytes of the chunk were COMPLETE lines. The rest is a record
     /// still being written, and the next pass must start at the beginning of
     /// it rather than after it.
@@ -584,7 +652,7 @@ struct Scan {
 /// would be the same work and one more thing to get wrong.
 fn scan(chunk: &[u8], drop_first_line: bool) -> Scan {
     let mut out =
-        Scan { newest: None, outcome: None, signatures: Vec::new(), reads: 0, consumed: 0 };
+        Scan { newest: None, outcome: None, signatures: Vec::new(), reads: Activity::default(), consumed: 0 };
     let text = String::from_utf8_lossy(chunk);
     let mut at = 0usize;
     let mut first = true;
@@ -615,7 +683,7 @@ fn scan(chunk: &[u8], drop_first_line: bool) -> Scan {
         if let Some(sig) = crate::loopguard::signature(&v) {
             out.signatures.push(sig);
         }
-        out.reads = out.reads.saturating_add(file_reads(&v));
+        out.reads.add(file_activity(&v));
         if let Some(b) = api_block(&v) {
             out.outcome = Some(Some(b));
         } else if let Some(r) = usage_of(&v) {
@@ -675,6 +743,70 @@ fn api_block(v: &serde_json::Value) -> Option<proto::UsageBlock> {
         _ => return None,
     };
     Some(proto::UsageBlock { kind: kind.into(), reset_at_ms: reset, window, text })
+}
+
+/// What one stretch of a conversation shows the seat doing to files.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// Files read: see `file_reads`.
+    pub n: u32,
+    /// The files read by path, newest last, capped at `PATHS_KEPT`.
+    pub paths: Vec<String>,
+    /// Files changed: Edit, Write, MultiEdit, NotebookEdit.
+    pub edited: u32,
+}
+
+/// How many read paths are carried to the hub per report. Enough for the
+/// graph reminder to answer about what the seat is working in; more is
+/// bytes on every report for nothing.
+const PATHS_KEPT: usize = 6;
+
+impl Activity {
+    fn add(&mut self, other: Activity) {
+        self.n = self.n.saturating_add(other.n);
+        self.edited = self.edited.saturating_add(other.edited);
+        for p in other.paths {
+            self.paths.retain(|q| *q != p);
+            self.paths.push(p);
+        }
+        let over = self.paths.len().saturating_sub(PATHS_KEPT);
+        self.paths.drain(..over);
+    }
+    fn is_empty(&self) -> bool {
+        self.n == 0 && self.edited == 0
+    }
+}
+
+/// What one record shows the seat doing to files: reads (as `file_reads`
+/// counts them), the paths of the files it Read, and edits.
+fn file_activity(v: &serde_json::Value) -> Activity {
+    let mut a = Activity { n: file_reads(v), ..Activity::default() };
+    if a.n == 0 && v["type"].as_str() != Some("assistant") {
+        return a;
+    }
+    if v.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true) {
+        return a;
+    }
+    let Some(blocks) = v["message"]["content"].as_array() else { return a };
+    for b in blocks {
+        if b["type"].as_str() != Some("tool_use") {
+            continue;
+        }
+        match b["name"].as_str().unwrap_or("") {
+            "Read" | "NotebookRead" => {
+                let p = b["input"]["file_path"]
+                    .as_str()
+                    .or_else(|| b["input"]["notebook_path"].as_str())
+                    .unwrap_or("");
+                if !p.is_empty() {
+                    a.add(Activity { n: 0, paths: vec![p.to_string()], edited: 0 });
+                }
+            }
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => a.edited += 1,
+            _ => {}
+        }
+    }
+    a
 }
 
 /// How many files one record shows the seat reading.
@@ -747,7 +879,7 @@ fn usage_of(v: &serde_json::Value) -> Option<Record> {
     if tokens <= 0 {
         return None;
     }
-    Some(Record { tokens, model })
+    Some(Record { tokens, model, window: None })
 }
 
 #[cfg(test)]
@@ -821,7 +953,7 @@ mod tests {
             chunk.push_str(&line("Read", serde_json::json!({}), false).to_string());
             chunk.push('\n');
         }
-        assert_eq!(scan(chunk.as_bytes(), false).reads, 3);
+        assert_eq!(scan(chunk.as_bytes(), false).reads.n, 3);
     }
 
     #[test]
@@ -1149,4 +1281,147 @@ mod tests {
         let d = project_dir("~/.claude/projects/{cwd_slug}/{id}.jsonl", "/working/nexmesh").unwrap();
         assert_eq!(d.to_string_lossy(), "/home/someone/.claude/projects/-working-nexmesh");
     }
+
+    #[test]
+    fn codex_occupancy_is_the_last_call_and_its_window() {
+        let text = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"output_tokens":10},"model_context_window":475000}}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":72467,"output_tokens":148},"model_context_window":475000}}}"#, "\n",
+        );
+        let r = codex_usage_in(text).expect("a reading");
+        assert_eq!(r.tokens, 72615);
+        assert_eq!(r.window, Some(475000));
+        assert_eq!(r.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn opencode_occupancy_counts_cache_and_skips_empty_messages() {
+        assert!(opencode_record(r#"{"role":"assistant","tokens":{"input":0,"output":0,"cache":{"read":0,"write":0}}}"#).is_none());
+        let r = opencode_record(r#"{"role":"assistant","modelID":"m1","tokens":{"input":100,"output":20,"cache":{"read":5000,"write":30}}}"#).unwrap();
+        assert_eq!(r.tokens, 5150);
+        assert_eq!(r.model.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn reads_carry_their_paths_and_edits_are_counted() {
+        let v = serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"/w/a.rs"}},
+            {"type":"tool_use","name":"Edit","input":{"file_path":"/w/a.rs"}},
+            {"type":"tool_use","name":"Read","input":{"file_path":"/w/b.rs"}}]}});
+        let a = file_activity(&v);
+        assert_eq!(a.n, 2);
+        assert_eq!(a.edited, 1);
+        assert_eq!(a.paths, vec!["/w/a.rs".to_string(), "/w/b.rs".to_string()]);
+    }
+
+}
+
+/// The most recently written `rollout-*.jsonl` under a codex sessions tree
+/// (`YYYY/MM/DD/`). The seat's store is its own, so the newest is the one
+/// it is in.
+fn newest_rollout(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut stack = vec![(dir.to_path_buf(), 0u8)];
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(m) = e.metadata() else { continue };
+            if m.is_dir() {
+                if depth < 3 {
+                    stack.push((p, depth + 1));
+                }
+            } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with("rollout-") && n.ends_with(".jsonl")
+            }) {
+                let t = m.modified().unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().map_or(true, |(bt, _)| t > *bt) {
+                    best = Some((t, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// How much of a rollout's tail is read for its newest usage record.
+const ROLLOUT_TAIL_BYTES: u64 = 512 * 1024;
+
+/// The newest `token_count` in a codex rollout: the last call's input plus
+/// output is what the next turn carries, and the record names the window.
+fn codex_usage(path: &Path) -> Option<Record> {
+    let size = std::fs::metadata(path).ok()?.len();
+    let from = size.saturating_sub(ROLLOUT_TAIL_BYTES);
+    let chunk = read_from(path, from, size)?;
+    codex_usage_in(&String::from_utf8_lossy(&chunk))
+}
+
+fn codex_usage_in(text: &str) -> Option<Record> {
+    let mut model: Option<String> = None;
+    let mut found: Option<Record> = None;
+    for line in text.lines() {
+        if !line.contains("token_count") && !line.contains("\"model\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if let Some(m) = v["payload"]["model"].as_str() {
+            model = Some(m.to_string());
+        }
+        if v["payload"]["type"].as_str() != Some("token_count") {
+            continue;
+        }
+        let info = &v["payload"]["info"];
+        let last = &info["last_token_usage"];
+        let (Some(i), o) = (last["input_tokens"].as_i64(), last["output_tokens"].as_i64().unwrap_or(0))
+        else {
+            continue;
+        };
+        found = Some(Record {
+            tokens: i + o,
+            model: model.clone(),
+            window: info["model_context_window"].as_i64(),
+        });
+    }
+    found
+}
+
+/// The newest assistant message with token counts in an opencode database.
+///
+/// Read-only and briefly: opencode holds this file open and writes through
+/// its WAL, which a read-only connection reads without blocking it.
+fn opencode_usage(path: &Path) -> Option<Record> {
+    let uri = format!("file:{}?mode=ro", path.to_string_lossy());
+    let db = rusqlite::Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    let _ = db.busy_timeout(std::time::Duration::from_millis(500));
+    let mut q = db
+        .prepare(
+            "SELECT data FROM message
+              WHERE json_extract(data, '$.role') = 'assistant'
+              ORDER BY time_created DESC LIMIT 20",
+        )
+        .ok()?;
+    let rows = q.query_map([], |r| r.get::<_, String>(0)).ok()?;
+    for data in rows.flatten() {
+        if let Some(r) = opencode_record(&data) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+fn opencode_record(data: &str) -> Option<Record> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let t = &v["tokens"];
+    let n = |k: &serde_json::Value| k.as_i64().unwrap_or(0);
+    let total = n(&t["input"]) + n(&t["output"]) + n(&t["cache"]["read"]) + n(&t["cache"]["write"]);
+    if total <= 0 {
+        // A message still being answered, or one that failed: says nothing.
+        return None;
+    }
+    Some(Record { tokens: total, model: v["modelID"].as_str().map(str::to_string), window: None })
 }

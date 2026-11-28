@@ -1504,6 +1504,7 @@ dependencies = [
  "nix 0.29.0",
  "portable-pty",
  "reqwest",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",

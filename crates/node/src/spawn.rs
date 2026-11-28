@@ -212,6 +212,84 @@ fn conversation_exists_at(tpl: &str, handle: &str, cwd: &str) -> bool {
     std::path::Path::new(&path).exists()
 }
 
+/// Fill a system-prompt template: `{prompt}` as it is, `{prompt_toml}` and
+/// `{prompt_json}` as quoted strings in those languages, `{prompt_file}` the
+/// file the text was written to and `{prompt_dir}` its directory
+/// (`{prompt_plugin_dir}` the same directory, laid out as a Cursor plugin).
+pub(crate) fn fill_prompt(template: &str, text: &str, file: &str, dir: &str) -> String {
+    template
+        .replace("{prompt_toml}", &toml_string(text))
+        .replace("{prompt_json}", &serde_json::Value::String(text.to_string()).to_string())
+        .replace("{prompt_file}", file)
+        .replace("{prompt_plugin_dir}", dir)
+        .replace("{prompt_dir}", dir)
+        .replace("{prompt}", text)
+}
+
+/// A TOML basic string. codex parses the value of `-c key=value` as TOML,
+/// so a prompt with a quote or a newline in it must arrive escaped.
+fn toml_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Write a seat's system prompt where a CLI that takes instructions by PATH
+/// can read it, in the seat's own directory, replaced on every spawn so it is
+/// never an older prompt than the one this start was given.
+///
+/// `<seat>/nexmesh-prompt/AGENTS.md`: named so because Copilot's
+/// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` takes DIRECTORIES and reads the
+/// `AGENTS.md` in each; opencode's `instructions` take the file itself. With
+/// `plugin`, the same directory is also laid out as a Cursor plugin
+/// (`.cursor-plugin/plugin.json` and an always-applied rule), for
+/// `cursor-agent --plugin-dir`. Returns (file, directory).
+fn write_prompt_file(cli_id: &str, slot_id: &str, text: &str, plugin: bool) -> Option<(String, String)> {
+    let dir = format!("{}/nexmesh-prompt", seat_store_base(cli_id, slot_id)?);
+    std::fs::create_dir_all(&dir).ok()?;
+    let put = |rel: &str, body: &str| -> Option<()> {
+        let path = format!("{dir}/{rel}");
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, body).ok()?;
+        std::fs::rename(&tmp, &path).ok()
+    };
+    put("AGENTS.md", text)?;
+    if plugin {
+        put(".cursor-plugin/plugin.json",
+            "{\"name\": \"nexmesh-seat\", \"description\": \"This seat's nexmesh instructions\"}\n")?;
+        put("rules/nexmesh.mdc",
+            &format!("---\ndescription: This seat's nexmesh instructions\nalwaysApply: true\n---\n\n{text}\n"))?;
+    }
+    Some((format!("{dir}/AGENTS.md"), dir))
+}
+
+/// Where a seat's own data directory for one CLI is: the base, before the
+/// descriptor's `store_rel`. The same rule `prepare_session_store` makes it
+/// by, for whatever needs to find it again (the context watcher).
+pub(crate) fn seat_store_base(cli_id: &str, slot_id: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let root_dir = std::env::var("NEXMESH_CLI_STATE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{home}/.nexmesh/cli-state"));
+    Some(format!("{root_dir}/{cli_id}/{slot_id}"))
+}
+
 /// Give one seat its own copy of a CLI's data directory.
 ///
 /// Returns the environment variable to set, its value, and whether that
@@ -683,6 +761,10 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         ResumePlan::Nothing => {}
     }
 
+    // Set below by a CLI that takes its system prompt through the
+    // environment; applied after the descriptor's own, so it wins.
+    let mut prompt_env: Vec<(String, String)> = Vec::new();
+
     // THE SEAT'S OWN SYSTEM PROMPT.
     //
     // `append` adds to what the CLI already tells the model and is almost
@@ -693,8 +775,24 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
     // A CLI that declares neither is told so out loud rather than starting
     // without it: a seat whose operator believes it has been given a prompt,
     // and has not, is worse than one that was refused.
-    if let Some(text) = spec.system_prompt.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        let replace = spec.system_prompt_mode.as_deref() == Some("replace");
+    // The fleet's standing habits ride on the seat's own prompt, after it.
+    // Alone, they are given only where this CLI can take them: they are the
+    // fleet's, so a CLI that cannot is not worth a note to the seat.
+    let own = spec.system_prompt.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let habits = spec.habits.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let replace = spec.system_prompt_mode.as_deref() == Some("replace");
+    let can_take = if replace {
+        !mode.system_prompt_args.is_empty()
+    } else {
+        !mode.append_system_prompt_args.is_empty() || !mode.append_system_prompt_env.is_empty()
+    };
+    let combined = match (own, habits) {
+        (Some(o), Some(h)) if can_take => Some(format!("{o}\n\n{h}")),
+        (Some(o), _) => Some(o.to_string()),
+        (None, Some(h)) if can_take => Some(h.to_string()),
+        _ => None,
+    };
+    if let Some(text) = combined.as_deref() {
         let chosen = if replace {
             (&mode.system_prompt_args, "replace")
         } else {
@@ -704,7 +802,9 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
         // what was asked: appending when told to replace leaves the CLI's
         // own prompt in place, and replacing when told to append throws it
         // away. Both are worse than saying so.
-        if chosen.0.is_empty() {
+        let by_env = if replace { None } else { Some(&mode.append_system_prompt_env) }
+            .filter(|e| !e.is_empty());
+        if chosen.0.is_empty() && by_env.is_none() {
             tracing::warn!(
                 slot = %spec.slot_id, cli = %spec.cli_id, mode = chosen.1,
                 "this seat has a system prompt but this CLI declares no way to {} one; \
@@ -723,11 +823,34 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
                 ),
             );
         } else {
-            for a in chosen.0 {
-                args.push(a.replace("{prompt}", text));
+            let uses = |needle: &str| {
+                chosen.0.iter().any(|a| a.contains(needle))
+                    || by_env.is_some_and(|e| e.values().any(|v| v.contains(needle)))
+            };
+            let plugin = uses("{prompt_plugin_dir}");
+            let wants_file = plugin || uses("{prompt_file}") || uses("{prompt_dir}");
+            let file = if wants_file {
+                write_prompt_file(&spec.cli_id, &spec.slot_id, text, plugin)
+            } else {
+                None
+            };
+            if wants_file && file.is_none() {
+                tracing::warn!(slot = %spec.slot_id, cli = %spec.cli_id,
+                    "could not write this seat's system prompt to a file; starting without it");
+            } else {
+                let (f, dir) = file.clone().unwrap_or_default();
+                let fill = |t: &str| fill_prompt(t, text, &f, &dir);
+                for a in chosen.0 {
+                    args.push(fill(a));
+                }
+                if let Some(e) = by_env {
+                    for (k, v) in e {
+                        prompt_env.push((k.clone(), fill(v)));
+                    }
+                }
+                tracing::info!(slot = %spec.slot_id, mode = chosen.1, bytes = text.len(),
+                               by_env = by_env.is_some(), "gave this seat its own system prompt");
             }
-            tracing::info!(slot = %spec.slot_id, mode = chosen.1, bytes = text.len(),
-                           "gave this seat its own system prompt");
         }
     }
 
@@ -750,6 +873,7 @@ pub async fn spawn_agent(ctx: Arc<NodeCtx>, spec: SpawnSpec) -> Result<()> {
 
     // Descriptor environment first, the shim's own afterwards so it wins.
     let mut env = descriptor_env(&d);
+    env.extend(prompt_env);
     env.extend(shim_env(&spec, &ctx.sock_path));
     // Point the CLI at this seat's own data directory. Last, so it wins over
     // anything inherited -- and NOT over an explicit value in the descriptor
@@ -2148,6 +2272,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_prompt_reaches_codex_as_toml_and_opencode_as_a_file() {
+        let text = "say \"hi\"\nthen C:\\path";
+        let toml_arg = fill_prompt("developer_instructions={prompt_toml}", text, "", "");
+        let v: toml::Value = toml::from_str(&toml_arg).expect("codex's -c value parses as TOML");
+        assert_eq!(v["developer_instructions"].as_str(), Some(text));
+        let env = fill_prompt(r#"{"instructions": ["{prompt_file}"]}"#, text, "/s/AGENTS.md", "/s");
+        let j: serde_json::Value = serde_json::from_str(&env).unwrap();
+        assert_eq!(j["instructions"][0], "/s/AGENTS.md");
+        assert_eq!(fill_prompt("{prompt_dir}", text, "/s/AGENTS.md", "/s"), "/s");
+    }
+
     fn spec(cwd: &str) -> SpawnSpec {
         SpawnSpec {
             authority: None,
@@ -2165,6 +2301,7 @@ mod tests {
             resume_candidates: vec![],
             system_prompt: None,
             system_prompt_mode: None,
+            habits: None,
             tmux_target: None,
             model: None,
         }

@@ -385,7 +385,11 @@ CREATE TABLE IF NOT EXISTS code_graph_meta (
   tree_fingerprint TEXT,
   fp_at_ms     INTEGER,
   fp_asked_at_ms INTEGER,
-  fp_files     INTEGER
+  fp_files     INTEGER,
+  -- A fingerprint of the MAP (symbols, places, relationships), not of the
+  -- files. A rebuild that comes back with the same one changes nothing
+  -- stored: most edits are inside a function and move nothing on the map.
+  map_hash     TEXT
 );
 
 -- ------------------------------------------------------------- memory ----

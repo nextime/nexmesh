@@ -343,6 +343,11 @@ pub async fn launch_slot(
             .clone()
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty()),
+        habits: {
+            let db = st.db.lock().unwrap();
+            let (memory, graph) = st.fleet_reminders();
+            crate::reminders::habits(&db, slot_id, memory, graph).ok().flatten()
+        },
         system_prompt_mode: Some(row.system_prompt_mode.clone()),
         tmux_target: row.tmux_target,
         model: row.model,

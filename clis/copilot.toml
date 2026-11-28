@@ -1,0 +1,77 @@
+# GitHub Copilot CLI. NOT INSTALLED on any machine here, so like
+# clis/cursor.toml this is built from the published documentation
+# (docs.github.com: "Adding custom instructions for GitHub Copilot CLI" and
+# the CLI command reference, and the github/copilot-cli changelog) and has not
+# been seen to work against a real binary. Every flag below is quoted from
+# those pages; what they do not say is recorded as an absence, not guessed.
+[cli]
+id = "copilot"
+display_name = "GitHub Copilot CLI"
+command = "copilot"
+version_args = ["--version"]
+# Installed from npm (@github/copilot), which puts it wherever the user's npm
+# prefix is -- not on a service's PATH.
+extra_paths = ["~/.npm-global/bin", "~/.local/bin"]
+model_args = ["--model", "{model}"]
+
+[mcp]
+# `--additional-mcp-config` takes JSON or `@file` and is documented as "Add
+# an MCP server for this session only ... Augments the configuration from
+# ~/.copilot/mcp-config.json": a file per launch, so the user's own
+# configuration is never written. The flag itself is in the mode args below
+# (`@{mcp_config}`), because it needs the `@`.
+style = "inline_flag"
+flag = "--additional-mcp-config"
+pointer = "/mcpServers/nexmesh"
+env_key = "env"
+entry = { type = "local", command = "{mcpd}", args = [], tools = ["*"] }
+
+[modes.headless]
+# `-p` runs one prompt and exits. `--allow-all` is the documented sum of
+# --allow-all-tools, --allow-all-paths and --allow-all-urls: a fleet seat has
+# nobody at its keyboard to approve each one. `--no-ask-user` stops it asking
+# questions back. `-s` prints only the answer.
+args = ["-p", "{prompt}", "--allow-all", "--no-ask-user", "-s",
+        "--additional-mcp-config", "@{mcp_config}"]
+# The seat's system prompt and the team's habits, through
+# COPILOT_CUSTOM_INSTRUCTIONS_DIRS: "Additional AGENTS.md and
+# *.instructions.md files", combined with the project's own rather than
+# replacing them. The node writes this seat's AGENTS.md into a directory of
+# its own, so seats sharing a working directory each get theirs.
+append_system_prompt_env = { COPILOT_CUSTOM_INSTRUCTIONS_DIRS = "{prompt_dir}" }
+attachable = false
+
+[modes.interactive]
+# The default mode is a TUI that takes typed input.
+args = ["--allow-all", "--additional-mcp-config", "@{mcp_config}"]
+append_system_prompt_env = { COPILOT_CUSTOM_INSTRUCTIONS_DIRS = "{prompt_dir}" }
+# `-r/--resume[=ID|name]`. Dormant like cursor's: Copilot tells its MCP
+# children no session id, so the hub has no handle to give back.
+resume_args = ["--resume={resume}"]
+# NOT resume_latest_args: `--continue` resumes the USER's most recent
+# session, and without a store of this seat's own (COPILOT_HOME would be
+# that, but it also moves the login, which is not tested) that is somebody
+# else's conversation.
+attachable = true
+typed_delivery = true
+# No compact_command and no interrupt_keys: the reference pages do not name
+# them, and the keys next to the right one end the session.
+
+[driver]
+# `--output-format json` (JSONL) with `-p` is the shape a driver would be
+# written against. Not written yet; claiming one would leave a seat with no
+# delivery at all, so this stays at the floor.
+kind = "mcp_only"
+
+[user_install]
+# "Configure persistent servers in ~/.copilot/mcp-config.json."
+style = "json_file"
+path = "~/.copilot/mcp-config.json"
+pointer = "/mcpServers/{name}"
+env_key = "env"
+entry = { type = "local", command = "{command}", args = [], tools = ["*"] }
+
+# No [session_store] and no [context]: where Copilot keeps a session on disk,
+# and how large its window is, are not documented, so there is nothing to
+# isolate and nothing to measure. A seat of it is never compacted or asked to
+# fold on a reading; the reminders and its system prompt still reach it.

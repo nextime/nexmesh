@@ -205,11 +205,97 @@ fn memory_due(
     Ok(Some(Reminder { slot_id: slot, session_id: session, kind: "memory", text }))
 }
 
+/// What a seat is told, in its SYSTEM PROMPT, about keeping what it learns
+/// and asking the graph -- the standing half of the reminders.
+///
+/// A reminder is a message: it arrives at one moment, is compacted away and
+/// was being brushed off. The system prompt is read on every turn and is
+/// what a model takes as how it works, so the habit lives there and the
+/// reminders are the backstop. Each half follows its reminder's switch, so a
+/// seat or team that turned memory or graph reminders off gets neither.
+///
+/// None for a seat that would be told nothing: an external participant (a
+/// program), or one with both switches off.
+pub fn habits(db: &Connection, slot_id: &str, fleet_memory: bool, fleet_graph: bool) -> Result<Option<String>> {
+    let row: Option<(Option<String>, Option<String>, bool)> = db
+        .query_row(
+            "SELECT participant_kind, authority, workspace_id IS NOT NULL FROM slots WHERE id = ?",
+            [slot_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((kind, authority, has_tree)) = row else { return Ok(None) };
+    if kind.as_deref() == Some("external") {
+        return Ok(None);
+    }
+    let read_only = authority
+        .as_deref()
+        .map(nexmesh_proto::authority::Authority::parse)
+        .is_some_and(|a| a.is_read_only());
+    let memory = !read_only && enabled(db, slot_id, "remind_memory", fleet_memory)?;
+    let graph = has_tree && enabled(db, slot_id, "remind_graph", fleet_graph)?;
+    Ok(habits_text(memory, graph))
+}
+
+/// The text itself, apart from the database so it can be read in a test.
+pub fn habits_text(memory: bool, graph: bool) -> Option<String> {
+    if !memory && !graph {
+        return None;
+    }
+    let mut out = String::from(
+        "# How you work in this nexmesh team\n\n\
+         These are standing habits, not suggestions. Your nexmesh tools are how you keep and \
+         find things; your CLI's own memory does not reach your teammates or survive your \
+         restarts the same way.\n",
+    );
+    if memory {
+        out.push_str(
+            "\n## Memory\n\
+             - When you start, after a restart and after your context is compacted, call \
+             `recall` (scope 'agent') and `query_knowledge` about the task in front of you \
+             BEFORE you plan. What you and the team worked out earlier is there, and nothing \
+             brings it back unless you ask.\n\
+             - Keep things AS you learn them, in the same turn, a line or two each: a cause \
+             you found, a number you measured, where something lives, a command that worked, \
+             a decision and why. Your own working knowledge goes in `store_memory` with scope \
+             'agent'; what the team needs goes in `store_knowledge`. Not at the end: the end \
+             is where it gets lost.\n\
+             - When a stretch of work is finished and you no longer need its detail, \
+             `fold_context` it, before your context fills rather than after.\n",
+        );
+    }
+    if graph {
+        out.push_str(
+            "\n## Code graph\n\
+             - To find where something is defined, who calls it, or what a file depends on, \
+             ask `query_code_graph` FIRST, before grep or opening files. One call answers \
+             across the whole tree; then read only the files it points you to.\n\
+             - The graph is a map, not the files: it holds where things are, never their \
+             contents. Read a file from disk before you change it, and if the graph and the \
+             disk disagree, the disk wins -- say so in the chat. It follows edits on its own \
+             within a minute or two.\n",
+        );
+    }
+    Some(out)
+}
+
 /// The node counted `n` more files read by this agent.
 pub fn files_read(
     db: &Connection,
     agent_id: &str,
     n: i64,
+    fleet_graph: bool,
+) -> Result<Option<Reminder>> {
+    files_read_with(db, agent_id, n, &[], fleet_graph)
+}
+
+/// The same, knowing WHICH files: the reminder then carries what the graph
+/// already says about them, instead of saying that it exists.
+pub fn files_read_with(
+    db: &Connection,
+    agent_id: &str,
+    n: i64,
+    paths: &[String],
     fleet_graph: bool,
 ) -> Result<Option<Reminder>> {
     if n <= 0 {
@@ -227,17 +313,11 @@ pub fn files_read(
     }
     // A seat with no workspace has no tree of its own to parse; the graph
     // would only answer it about other teams' code.
-    let has_tree: bool = db
-        .query_row(
-            "SELECT workspace_id IS NOT NULL FROM slots WHERE id = ?",
-            [&slot],
-            |r| r.get(0),
-        )
+    let workspace: Option<String> = db
+        .query_row("SELECT workspace_id FROM slots WHERE id = ?", [&slot], |r| r.get(0))
         .optional()?
-        .unwrap_or(false);
-    if !has_tree {
-        return Ok(None);
-    }
+        .flatten();
+    let Some(workspace) = workspace else { return Ok(None) };
     let (reads, last): (i64, Option<i64>) = db.query_row(
         "SELECT COALESCE(a.reads_unguided, 0), o.graph_reminded_at_ms
            FROM agents a JOIN slots o ON o.id = a.slot_id WHERE a.id = ?",
@@ -251,15 +331,74 @@ pub fn files_read(
         "UPDATE slots SET graph_reminded_at_ms = ? WHERE id = ?",
         params![now_ms(), &slot],
     )?;
-    let text = format!(
-        "[nexmesh] You have opened {reads} files since you last asked the code graph anything. \
-         `query_code_graph` answers where a symbol is defined, who calls it and what a file \
-         depends on in one call, across the whole tree, without reading it -- then read only \
-         the files it points you to. It follows the files within a minute or two of a change; \
-         if it disagrees with what is on disk, the disk wins, and say so in the chat. Do not \
-         reply to this message."
-    );
+    let shown = graph_on(db, &workspace, paths);
+    let text = if shown.is_empty() {
+        format!(
+            "[nexmesh] You have opened {reads} files since you last asked the code graph \
+             anything. `query_code_graph` answers where a symbol is defined, who calls it and \
+             what a file depends on in one call, across the whole tree, without reading it -- \
+             then read only the files it points you to. It is a map, not the files: read a \
+             file from disk before changing it, and if the two disagree the disk wins (say so \
+             in the chat). This note needs no answer."
+        )
+    } else {
+        format!(
+            "[nexmesh] You have opened {reads} files since you last asked the code graph \
+             anything. Here is what it already knew about the ones you opened last, from \
+             one query each:\n{shown}\n\
+             `query_code_graph` (find, defines, callers, importers, subsystem) gives this for \
+             any symbol or file in one call; then read only what it points you to. It is a \
+             map, not the files: read a file from disk before changing it, and if the two \
+             disagree the disk wins. This note needs no answer."
+        )
+    };
     Ok(Some(Reminder { slot_id: slot, session_id: session, kind: "graph", text }))
+}
+
+/// What the graph says about up to two of `paths` (newest first): what each
+/// defines and what depends on it, cut short. Empty when none of them is in
+/// this workspace's graph -- a reminder then advertises, which is all it can.
+///
+/// The seat reads by absolute path and the graph keeps paths relative to the
+/// tree, so a file matches when its graph path ends the absolute one.
+fn graph_on(db: &Connection, workspace: &str, paths: &[String]) -> String {
+    const EACH: usize = 420;
+    let cut = |s: &str| -> String {
+        let s = s.trim();
+        if s.chars().count() <= EACH {
+            return s.replace('\n', "\n    ");
+        }
+        let short: String = s.chars().take(EACH).collect();
+        format!("{}...", short.trim_end()).replace('\n', "\n    ")
+    };
+    let mut out = String::new();
+    let mut done = 0;
+    for p in paths.iter().rev() {
+        if done == 2 {
+            break;
+        }
+        let rel: Option<String> = db
+            .query_row(
+                "SELECT path FROM code_graph_nodes
+                  WHERE workspace_id = ?1 AND kind = 'file' AND path <> ''
+                    AND (?2 = path OR ?2 LIKE '%/' || path)
+                  ORDER BY LENGTH(path) DESC LIMIT 1",
+                params![workspace, p],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(rel) = rel else { continue };
+        let defines = crate::graph::query(db, workspace, "defines", &rel, "").unwrap_or_default();
+        let users = crate::graph::query(db, workspace, "importers", &rel, "").unwrap_or_default();
+        out.push_str(&format!("\u{2022} {rel}\n    {}\n", cut(&defines)));
+        if !users.trim().is_empty() {
+            out.push_str(&format!("    {}\n", cut(&users)));
+        }
+        done += 1;
+    }
+    out.trim_end().to_string()
 }
 
 /// A tool call went through: reset whatever it answers.
@@ -374,6 +513,19 @@ mod tests {
         assert!(turns(&db, 30).is_none(), "asked a seat that cannot call store_memory");
         db.execute("UPDATE agents SET mcp_link = 1 WHERE id = 'ag1'", []).unwrap();
         assert!(turn_ended(&db, "ag1", true).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_standing_habits_follow_their_switches() {
+        assert!(habits_text(false, false).is_none());
+        let m = habits_text(true, false).unwrap();
+        assert!(m.contains("recall") && m.contains("store_memory") && !m.contains("query_code_graph"));
+        let g = habits_text(false, true).unwrap();
+        assert!(g.contains("query_code_graph") && g.contains("disk wins") && !g.contains("store_memory"));
+        let db = setup();
+        assert!(habits(&db, "sl1", true, true).unwrap().is_some());
+        db.execute("UPDATE slots SET remind_memory = 0, remind_graph = 0 WHERE id = 'sl1'", []).unwrap();
+        assert!(habits(&db, "sl1", true, true).unwrap().is_none(), "both switched off");
     }
 
     #[test]

@@ -298,6 +298,13 @@ pub struct SpawnSpec {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub system_prompt_mode: Option<String>,
+    /// The team's standing habits (keeping memory, asking the graph), ADDED
+    /// to whatever system prompt the seat has. Separate from
+    /// `system_prompt` because it is the fleet's and not the seat's: a CLI
+    /// that cannot take a system prompt starts without it SILENTLY, where a
+    /// seat's own prompt that cannot be given is said out loud.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub habits: Option<String>,
     /// For an adopted slot: the tmux target whose terminal to mirror.
     #[serde(default)]
     pub tmux_target: Option<String>,
@@ -517,6 +524,16 @@ pub enum NodeToHub {
     FileReads {
         agent_id: String,
         n: u32,
+        /// The files read, newest last, when the record names them (a Read's
+        /// `file_path`). Capped by the node. What lets the hub's graph
+        /// reminder answer about THESE files rather than advertise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        /// Files this agent changed in the same stretch (Edit, Write...).
+        /// Any at all makes the seat's code graph stale at once, instead of
+        /// at the next tree fingerprint a minute later.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        edited: u32,
     },
     LoopSuspected {
         agent_id: String,
@@ -1128,4 +1145,8 @@ mod tests {
     fn schema_applies_cleanly() {
         assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS nodes"));
     }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }

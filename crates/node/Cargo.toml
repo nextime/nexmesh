@@ -9,6 +9,7 @@ name = "nexmesh-node"
 path = "src/main.rs"
 
 [dependencies]
+rusqlite = { workspace = true }
 nexmesh-proto = { workspace = true, features = ["pair-client"] }
 anyhow = { workspace = true }
 clap = { workspace = true }

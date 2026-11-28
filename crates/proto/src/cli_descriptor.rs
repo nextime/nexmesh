@@ -157,6 +157,16 @@ pub enum ContextSource {
     /// record is the occupancy -- no estimating, no counting tokens
     /// ourselves, and it is the same number the CLI shows its user.
     ClaudeTranscript,
+    /// The newest `token_count` event in the seat's own codex rollout file
+    /// (`<store>/sessions/YYYY/MM/DD/rollout-*.jsonl`). codex writes the
+    /// last call's input and output and the model's context window into the
+    /// same record, so the window is read rather than declared; `limit_tokens`
+    /// is only the fallback for a record that leaves it out.
+    CodexRollout,
+    /// The newest assistant message with token counts in the seat's own
+    /// opencode database (`<store>/opencode/opencode.db`). opencode records
+    /// no window, so it comes from `models` by the message's `modelID`.
+    OpencodeDb,
 }
 
 impl ContextSpec {
@@ -490,6 +500,20 @@ pub struct ModeSpec {
     /// throws that away.
     #[serde(default)]
     pub append_system_prompt_args: Vec<String>,
+    /// How to ADD to the system prompt through the ENVIRONMENT, for a CLI
+    /// that reads instructions from a config it takes inline (opencode's
+    /// `OPENCODE_CONFIG_CONTENT`). Values take the same placeholders as the
+    /// args. Used with or instead of `append_system_prompt_args`.
+    ///
+    /// Placeholders, in args and here: `{prompt}` the text as it is,
+    /// `{prompt_toml}` and `{prompt_json}` the text as a quoted TOML or JSON
+    /// string (codex's `-c key=value` parses its value as TOML), and
+    /// `{prompt_file}` the path of a file the node writes the text into, in
+    /// the seat's own directory, for a CLI that takes instructions by path
+    /// (it is named `AGENTS.md`), `{prompt_dir}` that file's directory, and
+    /// `{prompt_plugin_dir}` the same directory laid out as a Cursor plugin.
+    #[serde(default)]
+    pub append_system_prompt_env: BTreeMap<String, String>,
     /// Where this CLI keeps a named conversation on disk, so a handle can be
     /// CHECKED before it is used.
     ///
@@ -961,6 +985,9 @@ mod shipped_descriptors {
             // mcp.json -- so the seat would come up with no team tools and
             // no visible reason why.
             ("freebuff", &["--trust-agents"]),
+            // Copilot asks before each tool, path and URL; `--allow-all` is
+            // the documented sum of the three (docs, not run here).
+            ("copilot", &["--allow-all"]),
             // These take their permissions from their own configuration,
             // not from a flag nexmesh passes.
             ("claude", &[]),

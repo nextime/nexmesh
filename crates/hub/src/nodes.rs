@@ -591,13 +591,39 @@ async fn handle(
             crate::quota::report(st, &agent_id, block);
         }
 
-        NodeToHub::FileReads { agent_id, n } => {
+        NodeToHub::FileReads { agent_id, n, paths, edited } => {
             let db = st.db.lock().unwrap();
-            let (_, graph) = st.fleet_reminders();
-            crate::reminders::deliver(
-                &db,
-                crate::reminders::files_read(&db, &agent_id, n as i64, graph),
-            );
+            // A seat changed files: its graph is stale NOW, not at the next
+            // fingerprint a minute away. The rebuild replays every unchanged
+            // file from the node's cache, and stores nothing when the map
+            // came out the same (see graph::store), so this costs little
+            // when the edit moved nothing.
+            if edited > 0 {
+                let ws: Option<String> = db
+                    .query_row(
+                        "SELECT s.workspace_id FROM agents a JOIN slots s ON s.id = a.slot_id
+                          WHERE a.id = ?",
+                        [&agent_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(ws) = ws {
+                    crate::graph::mark_stale(&db, &ws);
+                    let _ = db.execute(
+                        "UPDATE code_graph_meta SET stale_reason = 'a seat edited files'
+                          WHERE workspace_id = ? AND stale_reason IS NULL",
+                        [&ws],
+                    );
+                }
+            }
+            if n > 0 {
+                let (_, graph) = st.fleet_reminders();
+                crate::reminders::deliver(
+                    &db,
+                    crate::reminders::files_read_with(&db, &agent_id, n as i64, &paths, graph),
+                );
+            }
         }
 
         // HOW FULL this agent's context is -- not what it has spent. See
@@ -605,9 +631,10 @@ async fn handle(
         NodeToHub::ContextUsage { agent_id, used, limit, source } => {
             let next = {
                 let db = st.db.lock().unwrap();
-                crate::watchdog::record_context(
+                crate::watchdog::record_context_with(
                     &db,
                     st.fleet_compact_at_pct(),
+                    st.fleet_reminders().0,
                     &agent_id,
                     used,
                     limit,

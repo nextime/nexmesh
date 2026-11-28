@@ -48,6 +48,13 @@ entry = { type = "stdio", command = "{mcpd}", args = [] }
 # before using an MCP server's tools. --trust answers the workspace trust
 # question, which the docs say is a headless-mode flag only.
 args = ["-p", "--force", "--approve-mcps", "--trust", "{prompt}"]
+# The seat's system prompt and the team's standing habits, through a Cursor
+# PLUGIN directory the node writes per seat (`.cursor-plugin/plugin.json` and
+# an always-applied rule) -- Cursor has no system-prompt flag, and its rules
+# otherwise live in the project, which seats sharing a directory would
+# share. From cursor.com/docs (cli parameters, plugins); NOT RUN: whether the
+# CLI applies a plugin's rules is unconfirmed.
+append_system_prompt_args = ["--plugin-dir", "{prompt_plugin_dir}"]
 attachable = false
 
 [modes.interactive]
@@ -55,6 +62,13 @@ attachable = false
 # as headless-only. If an interactive seat turns out to stop on a trust
 # question, this is the line to add it to.
 args = ["--force", "--approve-mcps"]
+# The seat's system prompt and the team's standing habits, through a Cursor
+# PLUGIN directory the node writes per seat (`.cursor-plugin/plugin.json` and
+# an always-applied rule) -- Cursor has no system-prompt flag, and its rules
+# otherwise live in the project, which seats sharing a directory would
+# share. From cursor.com/docs (cli parameters, plugins); NOT RUN: whether the
+# CLI applies a plugin's rules is unconfirmed.
+append_system_prompt_args = ["--plugin-dir", "{prompt_plugin_dir}"]
 # `--resume [chatId]`. Dormant for now: Cursor publishes no chat id to its
 # MCP children and takes no caller-chosen id at launch, so the hub has no
 # handle to give back. `agent create-chat` prints one, which is the shape a
